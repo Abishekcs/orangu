@@ -1615,11 +1615,46 @@ fn prepare(args: Args) -> Result<Prepared> {
         {
             let cpu: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
             let probe_started = std::time::Instant::now();
-            let device_step = engine::decode_backend::seconds_per_token(&model);
             let cpu_model = build_model(&loaded, &cpu).ok();
-            // The cores at their best: in each CPU pool when there are two
-            // (`engine::cpu_pools`), which also decides the decode pool.
-            let cpu_step = cpu_model.as_ref().and_then(decode_seconds_in_best_pool);
+            // **Both arms, alternating, best of two rounds each.**
+            //
+            // Measured one after the other, the two arms do not share their
+            // conditions: a server shutting down on the same machine, or
+            // anything else transient, lands on whichever window it happens
+            // to overlap. That is not hypothetical — the cores' reading has
+            // been seen to swing by half between starts of the same binary
+            // while the card's held steady, and since the decision turns on
+            // a ratio of the two, the placement went with it.
+            //
+            // Alternating shares the conditions the way
+            // `step_probe::ArmProbe` does for the vocabulary projection, and
+            // for the same stated reason. The *minimum* of each arm's rounds
+            // is taken rather than the mean: a contended round is slow, never
+            // fast, so the fastest round is the one least polluted by
+            // something that is not this model.
+            //
+            // Two rounds, not more: each is a settled probe of its own and
+            // the pair already costs a second or so of start-up.
+            let mut device_step: Option<f64> = None;
+            let mut cpu_step: Option<f64> = None;
+            let keep_faster = |slot: &mut Option<f64>, s: Option<f64>| {
+                if let Some(s) = s {
+                    *slot = Some(slot.map_or(s, |b: f64| b.min(s)));
+                }
+            };
+            for _ in 0..2 {
+                keep_faster(
+                    &mut device_step,
+                    engine::decode_backend::seconds_per_token(&model),
+                );
+                // The cores at their best: in each CPU pool when there are
+                // two (`engine::cpu_pools`), which also decides the decode
+                // pool.
+                keep_faster(
+                    &mut cpu_step,
+                    cpu_model.as_ref().and_then(decode_seconds_in_best_pool),
+                );
+            }
             match (device_step, cpu_model, cpu_step) {
                 (Some(device_s), Some(cpu_model), Some(cpu_s)) => {
                     let because = format!(
@@ -1629,11 +1664,51 @@ fn prepare(args: Args) -> Result<Prepared> {
                         cpu_s * 1e3,
                         probe_started.elapsed().as_secs_f64()
                     );
-                    if engine::decode_backend::cpu_wins(device_s, cpu_s) {
+                    // **A decode probe cannot decide prompts.** Giving the
+                    // cores decode releases the device copy, and prompts go
+                    // with it — but the two run different kernels at
+                    // different widths and can point opposite ways: measured
+                    // on a delta-net mixture whose cores win decode by
+                    // 1.05–1.22× while the card wins prefill by 1.9×. So
+                    // before releasing anything, time a prompt-shaped pass on
+                    // each as well, and keep the device unless the cores win
+                    // that too. Only on this branch, because it is the only
+                    // one that would throw the device away, and a prompt pass
+                    // is not free.
+                    let prompt_pass =
+                        engine::decode_backend::cpu_wins(device_s, cpu_s).then(|| {
+                            (
+                                engine::prefill_backend::seconds_per_prompt_pass(&model),
+                                engine::prefill_backend::seconds_per_prompt_pass(&cpu_model),
+                            )
+                        });
+                    let cores_lose_prompts = matches!(
+                        prompt_pass,
+                        Some((Some(device_pp), Some(cpu_pp))) if cpu_pp > device_pp
+                    );
+                    let prompts_because = match prompt_pass {
+                        Some((Some(device_pp), Some(cpu_pp))) => format!(
+                            "; a prompt pass takes {:.0} ms on the device and {:.0} ms on the cpu",
+                            device_pp * 1e3,
+                            cpu_pp * 1e3
+                        ),
+                        _ => String::new(),
+                    };
+                    if cores_lose_prompts {
+                        engine::adapt::note(
+                            "decode",
+                            format!("on the device ({backend_label})"),
+                            format!(
+                                "{because}{prompts_because}, so the device keeps the model \
+                                 rather than give up the prompts with it"
+                            ),
+                        );
+                        (backend, backend_label, model, false, None)
+                    } else if engine::decode_backend::cpu_wins(device_s, cpu_s) {
                         engine::adapt::note(
                             "decode",
                             "on the cpu",
-                            format!("{because}; the device's copy released"),
+                            format!("{because}{prompts_because}; the device's copy released"),
                         );
                         drop(model);
                         engine::prefill_backend::force_prompts_on_cpu();

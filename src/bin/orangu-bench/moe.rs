@@ -76,7 +76,7 @@ pub fn drop_cache(client: &reqwest::blocking::Client, url: &str) -> serde_json::
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn get_json(client: &reqwest::blocking::Client, url: &str) -> serde_json::Value {
+pub fn get_json(client: &reqwest::blocking::Client, url: &str) -> serde_json::Value {
     client
         .get(url)
         .send()
@@ -288,8 +288,21 @@ pub fn stage_lines(stages: &serde_json::Value) -> Option<Vec<String>> {
     if total <= 0.0 {
         return None;
     }
+    // A prefill window's passes are chunks of a width the sizer chose, so
+    // the header carries that width: a per-chunk cost without it cannot be
+    // compared with anything, including itself at another prompt length.
+    let tokens = number(stages, &["tokens"]).unwrap_or(passes);
+    let which = stages
+        .get("which")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("decode");
+    let width = if tokens > passes {
+        format!(" of {:.0} tokens each", tokens / passes)
+    } else {
+        String::new()
+    };
     let mut lines = vec![format!(
-        "  stages   {:.1} ms per forward pass over {passes:.0} passes",
+        "  stages   {:.1} ms per {which} pass over {passes:.0} passes{width}",
         total / passes,
     )];
     let mut attributed = 0.0;

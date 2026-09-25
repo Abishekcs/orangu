@@ -2289,10 +2289,20 @@ fn run_in_chunks(
     // exists to price a submission against a driver limit this backend does
     // not have, and pricing a streamed model by the clock is what shrinks the
     // chunk into a read spiral. Start at the full width and stay there.
+    // Evened only under `Adaptive`. `Flat` exists to take the full width and
+    // stay there — a streamed model pays for every extra pass in re-reads —
+    // so narrowing its opening chunk would be answering a question it was
+    // built not to ask.
     let mut width = snap(match policy {
-        ChunkPolicy::Adaptive => cost
-            .opening_width(start_pos, budget, batch)
-            .unwrap_or(PREFILL_PROBE_TOKENS.max(chunk_floor()).min(batch)),
+        // Evened only once the sizer has a *priced* opinion. The probe is
+        // deliberately narrow and exists to learn this machine's cost; there
+        // is nothing to plan a split around before it has run, and narrowing
+        // it further buys nothing.
+        ChunkPolicy::Adaptive => match cost.opening_width(start_pos, budget, batch) {
+            Some(priced) if even_chunks() => even_chunk_width(tokens.len(), priced),
+            Some(priced) => priced,
+            None => PREFILL_PROBE_TOKENS.max(chunk_floor()).min(batch),
+        },
         ChunkPolicy::Flat => batch,
     });
     // One line per prefill, not one per submission — which is the whole point.
@@ -2324,8 +2334,30 @@ fn run_in_chunks(
             widths.push(n);
         }
         if policy == ChunkPolicy::Adaptive {
-            cost.observe(n, budget_elapsed(elapsed, submits));
-            width = snap(cost.next_width(budget, batch));
+            if !chunk_is_priced(submits) {
+                // **A chunk that put nothing in front of the driver cannot
+                // have tripped the timeout the budget exists for**, whatever
+                // it cost on the host. Priced by the clock anyway, a model
+                // whose layers all run on the host is cut into chunks to fit
+                // a limit it is not subject to, and every extra pass re-pays
+                // each layer's fixed cost — for a mixture, its whole expert
+                // stack. So such a chunk is not priced at all: the width goes
+                // to the configured maximum and the cost model is left
+                // untouched rather than fed a point that means nothing.
+                //
+                // Per chunk rather than once per model, because a split model
+                // submits on some passes and not others, and the question is
+                // always about the pass that just ran.
+                width = snap(batch);
+            } else {
+                cost.observe(n, budget_elapsed(elapsed, submits));
+                let asked = cost.next_width(budget, batch);
+                width = snap(if even_chunks() {
+                    even_chunk_width(tokens.len() - done, asked)
+                } else {
+                    asked
+                });
+            }
         }
     }
     if chunks_report {
@@ -2343,6 +2375,34 @@ fn run_in_chunks(
 
 /// Whether `ORANGU_PREFILL_CHUNKS=1` asked for one line per prefill naming the
 /// widths the sizer chose.
+/// `ORANGU_PREFILL_EVEN=0` takes the sizer's width as it comes — the control
+/// arm for [`even_chunk_width`]. On unless turned off.
+fn even_chunks() -> bool {
+    crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_EVEN")
+}
+
+/// The widest chunk that divides `remaining` into the **same number of
+/// passes** as `width` would, so the passes come out even.
+///
+/// The sizer answers "how wide may the next chunk be"; it never asks what
+/// that leaves for the ones after it. Under a 2048 ceiling a 2236-token
+/// prompt is taken as `[2048, 188]` — two passes, the first at the ceiling —
+/// where `[1118, 1118]` is also two passes and its widest chunk is **half**
+/// as wide. Peak scratch is set by the widest chunk, and on a full card that
+/// scratch is what pages.
+///
+/// Never wider than `width`, so a bound the caller established for the
+/// driver's sake still holds, and never fewer passes, so nothing is made
+/// more expensive to stream. `width == 0` is the no-limit opt-out and passes
+/// through untouched.
+fn even_chunk_width(remaining: usize, width: usize) -> usize {
+    if width == 0 || remaining == 0 {
+        return width;
+    }
+    let passes = remaining.div_ceil(width);
+    remaining.div_ceil(passes.max(1))
+}
+
 /// What a chunk's wall time is worth against the budget, given how many
 /// device submissions it was.
 ///
@@ -2370,6 +2430,19 @@ fn budget_elapsed(elapsed: Duration, submits: u64) -> Duration {
         return elapsed;
     }
     elapsed.mul_f64(spread as f64 / submits as f64)
+}
+
+/// Whether a chunk of `submits` submissions is subject to the budget at all.
+///
+/// The budget bounds the longest **device submission**, because a submission
+/// the driver runs past its timeout resets the device. A chunk that made no
+/// submission has no such exposure, and its wall time — however long — is not
+/// evidence about a limit it cannot reach.
+///
+/// `ORANGU_PREFILL_CHUNK_SPREAD=0` opts back out, with the rest of the
+/// submission-aware pricing, so the whole rule has one control arm.
+fn chunk_is_priced(submits: u64) -> bool {
+    submits > 0 || chunk_submission_spread() == 0
 }
 
 fn chunk_submission_spread() -> u64 {
@@ -5187,12 +5260,20 @@ mod tests {
         primed.observe(16, Duration::from_millis(270));
         primed.observe(122, Duration::from_millis(733));
         let warm = widths(&mut primed);
-        // 469, not 512: that pair prices the machine at 200 ms fixed and
-        // 4.37 ms a token, and 469 is what the budget then affords. The point
-        // is that it opens at a working width instead of the 16-token probe.
+        // That pair prices the machine at 200 ms fixed and 4.37 ms a token,
+        // which affords 469 tokens — and `even_chunk_width` then takes 374,
+        // the widest width dividing 1120 into the same three passes. Both
+        // facts matter: it opens at a *working* width rather than the
+        // 16-token probe, and the passes come out even so the widest chunk
+        // (and therefore the peak scratch) is 374 instead of 512.
         assert_eq!(
-            warm[0], 469,
-            "a priced machine must open at a working width: {warm:?}"
+            warm[0], 374,
+            "a priced machine must open at an evened working width: {warm:?}"
+        );
+        assert_eq!(
+            warm.len(),
+            1120_usize.div_ceil(469),
+            "evening must not change the pass count: {warm:?}"
         );
         assert_eq!(warm.iter().sum::<usize>(), 1120);
     }
@@ -5329,6 +5410,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(seen, vec![5]);
+    }
+
+    /// The split must come out even without ever widening a chunk or adding
+    /// a pass.
+    ///
+    /// The case this exists for: 2236 tokens under a 2048 ceiling is two
+    /// passes either way, but `[2048, 188]` peaks at 2048 of scratch and
+    /// `[1118, 1118]` at 1118.
+    #[test]
+    fn evening_a_split_keeps_the_pass_count_and_lowers_the_peak() {
+        // The case from the task list.
+        assert_eq!(even_chunk_width(2236, 2048), 1118);
+        // A prompt that already fits one pass is untouched.
+        assert_eq!(even_chunk_width(1000, 2048), 1000);
+        assert_eq!(even_chunk_width(2048, 2048), 2048);
+        // A probe-width opening still divides evenly.
+        assert_eq!(even_chunk_width(2236, 256), 249);
+        // Never wider than asked, never more passes than asked.
+        for remaining in [1usize, 7, 100, 513, 2236, 4097, 22_000] {
+            for width in [1usize, 16, 249, 256, 1118, 2048, 8192] {
+                let got = even_chunk_width(remaining, width);
+                assert!(got <= width.max(1), "{remaining}/{width} widened to {got}");
+                assert!(got >= 1, "{remaining}/{width} gave zero");
+                assert_eq!(
+                    remaining.div_ceil(got),
+                    remaining.div_ceil(width),
+                    "{remaining}/{width} changed the pass count"
+                );
+            }
+        }
+        // The no-limit opt-out passes through.
+        assert_eq!(even_chunk_width(2236, 0), 0);
+        assert_eq!(even_chunk_width(0, 2048), 2048);
+    }
+
+    /// A chunk that made no device submission is not priced against the
+    /// budget, because the budget bounds a driver timeout it cannot reach.
+    /// A chunk that made some is, however few — that is the stream, and
+    /// leaving it where it was is what `budget_elapsed`'s spread rule is
+    /// for.
+    ///
+    /// The case this exists for, measured: a host-run mixture's 2239-token
+    /// prompt was cut to 114-token chunks by its wall time alone, and each
+    /// chunk re-paid every layer's expert stack.
+    #[test]
+    fn a_chunk_that_submitted_nothing_is_not_priced_against_the_driver() {
+        // SAFETY: single-threaded test, and the value is restored below.
+        let was = std::env::var("ORANGU_PREFILL_CHUNK_SPREAD").ok();
+        assert!(!chunk_is_priced(0), "no submission, no driver exposure");
+        assert!(chunk_is_priced(1));
+        assert!(chunk_is_priced(1_000));
+        assert_eq!(was, std::env::var("ORANGU_PREFILL_CHUNK_SPREAD").ok());
     }
 
     /// A prompt that fits in one chunk — and `ORANGU_PREFILL_BATCH=0` at

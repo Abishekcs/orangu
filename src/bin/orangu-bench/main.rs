@@ -1269,6 +1269,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
             image::warmup(&client, &args.url, &args.model)?;
         } else if args.embed.is_empty() {
             run_once(&client, &args.url, &p, 8, &args.model, args.temperature)?;
+            settle_tail_probe(&client, args, &p)?;
         } else {
             run_embed_once(&client, &args.url, &p, &args.model)?;
         }
@@ -2968,6 +2969,13 @@ fn run_tg(
     label: &str,
 ) -> anyhow::Result<Vec<history::Record>> {
     let mut records = Vec::new();
+    // Where the vocabulary projection stood *before* any of this ran — see
+    // `tail_line`. A window that opens mid-probe blends the probe's two
+    // arms, and asking only afterwards reports it as settled.
+    let tail_before: Option<String> = moe::get_json(client, &format!("{}/props", args.url))
+        .get("tail")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
 
     if !args.json {
         println!(
@@ -3080,6 +3088,11 @@ fn run_tg(
             args.reps.max(1),
         ));
         if !args.json {
+            // A generated window is `--gen` tokens at the measured rate; the
+            // same short-window doubt applies as to a prefill point.
+            if let Some(line) = window_line(f64::from(args.n_gen), stats.mean, args.reps.max(1)) {
+                println!("{line}");
+            }
             if let Some(line) = moe::summary_line(&moe_stats) {
                 println!("{line}");
             }
@@ -3089,6 +3102,12 @@ fn run_tg(
                 }
             }
             if let Some(line) = moe::io_line(&moe_stats, generated) {
+                println!("{line}");
+            }
+            // Re-read after the workload: this placement is decided over
+            // served steps, so the header's copy always says "probing".
+            let after = moe::get_json(client, &format!("{}/props", args.url));
+            if let Some(line) = tail_line(tail_before.as_deref(), after.get("tail")) {
                 println!("{line}");
             }
         }
@@ -3950,6 +3969,13 @@ fn run_pp(
             );
         }
 
+        if !args.json
+            && s.server_reported
+            && let Some(line) =
+                window_line(f64::from(s.prompt_tokens), stats.mean, args.reps.max(1))
+        {
+            println!("{line}");
+        }
         // A row without server timings is a time-to-first-token, not a prefill
         // rate. Recording it would put a different measurement on the same line
         // as the real ones, so it is printed and dropped.
@@ -4762,6 +4788,163 @@ fn take_gpu_timings(client: &reqwest::blocking::Client, url: &str) -> serde_json
 /// Returns what it read as well as printing it, so [`write_bundle`] archives
 /// the configuration that was live *during* the measurement. Re-fetching it
 /// afterwards would usually agree and would occasionally, silently, not.
+/// The server's own placement decisions, one line each, for the per-point
+/// header.
+///
+/// `/props.adapt` is an **array** of `{layer, chose, because}`, in the order
+/// the layers decided; only `chose` goes in the header, because the header
+/// is what a reader scans to check two arms are comparable and the
+/// reasoning behind each choice is in the server's log. Empty for an engine
+/// that reports none, which prints nothing rather than a row of "unknown".
+///
+/// Decision order is kept rather than sorted: it is the order the server
+/// resolved them in, and a later layer's choice is often a consequence of
+/// an earlier one.
+fn adapt_lines(adapt: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(rows) = adapt.and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let layer = row.get("layer").and_then(serde_json::Value::as_str)?;
+            let chose = row.get("chose").and_then(serde_json::Value::as_str)?;
+            Some(format!("  placed   {layer}: {chose}"))
+        })
+        .collect()
+}
+
+/// The `tail` line: where the vocabulary projection ended up, read **after**
+/// the workload.
+///
+/// Read after and not with the rest of the header, because this is the one
+/// placement decided over served steps rather than at load — asked before
+/// the run it always answers "probing", which says nothing. Asked after, it
+/// separates a window the probe finished inside from one it did not, and
+/// the second cannot be quoted: its steps are split between two arms.
+///
+/// `None` for an engine that reports nothing, and for a model whose
+/// architecture never asks.
+fn tail_line(before: Option<&str>, tail: Option<&serde_json::Value>) -> Option<String> {
+    let tail = tail.and_then(serde_json::Value::as_str)?;
+    if tail == "not asked" {
+        return None;
+    }
+    // **The test is whether the probe was still running when the window
+    // opened**, not whether it had finished by the time it closed. A run
+    // that starts mid-probe spends its first steps alternating and the
+    // rest settled, so its rate is a blend in a proportion nothing
+    // records — which is how the same model and setting came out bimodal
+    // across arms of one sweep. Asking only at the end reports "settled"
+    // for exactly that window.
+    let note = match (before, tail) {
+        (_, "probing") => "  <- UNSETTLED: this window mixes both arms, do not quote it",
+        (Some("probing"), _) => "  <- settled DURING this window; its rate is a blend",
+        _ => "",
+    };
+    Some(format!("  tail     vocabulary projection: {tail}{note}"))
+}
+
+/// Generate until the server's vocabulary-projection probe has voted.
+///
+/// That probe alternates two arms over about seventy decode steps before it
+/// settles, and a window opened while it is still running spends its steps
+/// split between them — on a model whose arms are far apart the result is
+/// bimodal and reads as engine noise. An eight-token warm-up does not get
+/// near it, and `--sweep` restarts the server for every point, so without
+/// this *every* point of a sweep is a blend.
+///
+/// Costs nothing on a server that has no such probe or has already settled:
+/// the field is read first and the loop is skipped. Bounded, because a
+/// server that never settles must not hang the run — if the budget is spent
+/// the point is still measured, and the `tail` line will say it was taken
+/// mid-probe.
+fn settle_tail_probe(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    /// Decode steps per attempt, and attempts. The probe needs ~74; this
+    /// allows comfortably more without being open-ended.
+    const PER_ATTEMPT: u32 = 48;
+    const ATTEMPTS: usize = 4;
+    let probing = |c: &reqwest::blocking::Client| {
+        moe::get_json(c, &format!("{}/props", args.url))
+            .get("tail")
+            .and_then(serde_json::Value::as_str)
+            .map(|t| t == "probing")
+            .unwrap_or(false)
+    };
+    for _ in 0..ATTEMPTS {
+        if !probing(client) {
+            return Ok(());
+        }
+        run_once(
+            client,
+            &args.url,
+            prompt,
+            PER_ATTEMPT,
+            &args.model,
+            args.temperature,
+        )?;
+    }
+    Ok(())
+}
+
+/// The `warning` line for an instrument that changes what it measures.
+///
+/// The per-stage timer costs about a percent and needs no notice. The
+/// per-dispatch timer (`ORANGU_GPU_TIMESTAMPS=ops`) resolves a query set
+/// in a submission of its own every step — on a small model that is about
+/// a third of the token — so a rate measured under it is not this
+/// machine's rate, and a device total from its table cannot be subtracted
+/// from one measured without it. Both mistakes have been made; the second
+/// invented two milliseconds of overhead that did not exist.
+///
+/// `None` when the timer is off, and for any engine that does not report
+/// the field.
+fn instrument_warning(props: Option<&serde_json::Value>) -> Option<String> {
+    props
+        .and_then(|p| p.get("gpu_op_timer"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        .then(|| {
+            "  warning  per-dispatch GPU timer is on: rates here are well below this \
+             machine's, and its device totals are comparable only with each other"
+                .to_string()
+        })
+}
+
+/// The `window` line: how long one timed repetition actually ran, when that
+/// is short enough to doubt.
+///
+/// A rate is `tokens / seconds`, and when the seconds are small everything
+/// that happens once — a driver's first submission, a clock ramp, a
+/// scheduler hiccup — is a large fraction of the answer rather than noise
+/// in it. Measured on a 0.36 GiB model, a 572-token prefill is about 150 ms
+/// a repetition, and across four sweeps the *reference* engine's rate at
+/// that point spanned 52% while its rate at a 586 ms point was steady. So
+/// the number to warn about is the repetition's duration, not the model's
+/// size or the token count.
+///
+/// `None` above [`WINDOW_SHORT_MS`], which is where this machine's readings
+/// stopped moving; a threshold, not a law.
+fn window_line(tokens: f64, rate: f64, reps: u32) -> Option<String> {
+    if rate <= 0.0 || tokens <= 0.0 || rate.is_nan() {
+        return None;
+    }
+    let per_rep_ms = 1000.0 * tokens / rate;
+    (per_rep_ms < WINDOW_SHORT_MS).then(|| {
+        format!(
+            "  window   {per_rep_ms:.0} ms per rep x {reps} — short: start-up effects are a \
+             large fraction of this rate, prefer a longer point"
+        )
+    })
+}
+
+/// Below this, one repetition is short enough that its rate is not stable —
+/// see [`window_line`].
+const WINDOW_SHORT_MS: f64 = 500.0;
+
 fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Environment {
     let props: Option<serde_json::Value> = client
         .get(format!("{}/props", args.url))
@@ -4791,6 +4974,14 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
     // omitted rather than printed as "unknown".
     let build = server_build(props.as_ref());
     let gpus = gpu_clock_states();
+    // What the server *measured about this machine* and chose because of it
+    // (`/props.adapt`). The `backend` field above names the API that
+    // answered, not where the work went: a model can report `Vulkan` and
+    // still have had its decode, its prompts or whole layers placed on the
+    // cores. Three rounds of one campaign compared arms that differed in
+    // exactly that, reading them as identical because the backend string
+    // matched — so the choices travel beside the rate from here on.
+    let adapt = props.as_ref().and_then(|p| p.get("adapt")).cloned();
     // `null` from a server without one, and from orangu-server on a non-`wgpu`
     // backend; a full `VulkanBackend::tuning_report` otherwise.
     let gpu_tuning = props.as_ref().and_then(|p| p.get("gpu")).cloned();
@@ -4821,6 +5012,9 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
                 // an NPU this is the largest single thing separating two
                 // otherwise identical runs — see `format_npu`.
                 "npu": props.as_ref().and_then(|p| p.get("npu")).cloned(),
+                // Verbatim: which of these fired is the difference between
+                // two arms that otherwise look the same.
+                "adapt": adapt,
                 "model_cache": model_cache,
             })
         );
@@ -4833,6 +5027,12 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
         // *which build* it is running.
         if let Some(build) = &build {
             println!("  build    {build}");
+        }
+        for line in adapt_lines(adapt.as_ref()) {
+            println!("{line}");
+        }
+        if let Some(line) = instrument_warning(props.as_ref()) {
+            println!("{line}");
         }
         // Beside the GPU's tuning, because the two together are what a
         // stored result needs to be comparable — see `format_npu`.
@@ -5556,6 +5756,79 @@ fn run_curve(
 
 #[cfg(test)]
 mod tests {
+
+    /// A short repetition must be flagged and a long one left alone. The
+    /// numbers are the ones that prompted it: a 572-token prefill at ~3800
+    /// tok/s is about 150 ms, where the reference engine's own rate spanned
+    /// 52% across sweeps, and a 2238-token one at the same rate is 586 ms,
+    /// where it was steady.
+    #[test]
+    fn a_short_measured_window_is_flagged_and_a_long_one_is_not() {
+        let short = window_line(572.0, 3800.0, 2).expect("~151 ms is short");
+        assert!(short.contains("151 ms per rep"), "{short}");
+        assert!(short.contains("x 2"), "{short}");
+        assert!(
+            window_line(2238.0, 3800.0, 2).is_none(),
+            "586 ms is not short"
+        );
+        // Degenerate inputs say nothing rather than dividing by zero.
+        assert!(window_line(572.0, 0.0, 2).is_none());
+        assert!(window_line(0.0, 3800.0, 2).is_none());
+        assert!(window_line(572.0, f64::NAN, 2).is_none());
+    }
+
+    /// The per-dispatch timer must announce itself beside the rate, because
+    /// a rate measured under it is not the machine's rate. Absent or false
+    /// prints nothing, and so does any engine that does not report the
+    /// field — a warning on every point of another engine's run would be
+    /// noise.
+    #[test]
+    fn the_per_dispatch_timer_warns_and_nothing_else_does() {
+        let on = serde_json::json!({"gpu_op_timer": true});
+        assert!(
+            instrument_warning(Some(&on))
+                .is_some_and(|l| l.contains("per-dispatch GPU timer is on")),
+            "an on timer warns"
+        );
+        assert!(instrument_warning(Some(&serde_json::json!({"gpu_op_timer": false}))).is_none());
+        assert!(instrument_warning(Some(&serde_json::json!({}))).is_none());
+        assert!(instrument_warning(None).is_none());
+    }
+
+    /// The header must name what the server *placed where*, not just which
+    /// API answered — a model can report `Vulkan` and still have had its
+    /// decode or its prompts moved to the cores, and two arms that differ
+    /// only in that read as identical otherwise.
+    ///
+    /// An engine that reports no decisions prints nothing, rather than a
+    /// row of "unknown" that would push the real lines off a reader's
+    /// screen.
+    #[test]
+    fn the_header_names_the_placement_and_not_only_the_backend() {
+        // The shape `engine::adapt::decisions` actually serializes: an
+        // array of `Decision`, in decision order. Asserted against that
+        // and not against a guess — the first version of this read an
+        // object, matched nothing, and printed silently empty through a
+        // whole two-engine run.
+        let adapt = serde_json::json!([
+            {"layer": "decode", "chose": "on the device (Vulkan)", "because": "…"},
+            {"layer": "prompt weights (K-quant)", "chose": "the file's", "because": "…"},
+        ]);
+        assert_eq!(
+            adapt_lines(Some(&adapt)),
+            vec![
+                "  placed   decode: on the device (Vulkan)".to_string(),
+                "  placed   prompt weights (K-quant): the file's".to_string(),
+            ],
+            "decision order, one line each, reason left to the server's log"
+        );
+        assert!(adapt_lines(None).is_empty());
+        assert!(adapt_lines(Some(&serde_json::json!(null))).is_empty());
+        assert!(adapt_lines(Some(&serde_json::json!([]))).is_empty());
+        // An object is what this used to expect; it must now read as
+        // "nothing to show" rather than quietly matching.
+        assert!(adapt_lines(Some(&serde_json::json!({"decode": {}}))).is_empty());
+    }
 
     /// An interleaved A/B repeats its arms, and every occurrence of a value
     /// carries the same label. The row must carry each point in run order —

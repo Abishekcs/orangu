@@ -135,6 +135,19 @@ impl ArmProbe {
         }
     }
 
+    /// The arm this probe has settled on, or `None` while it is still
+    /// alternating.
+    ///
+    /// A measured window that ends before this goes `Some` was taken *while
+    /// the probe was running*, so its steps are split between arms and its
+    /// rate is somewhere between theirs. Where the arms are close that is
+    /// invisible; where they are far apart the window comes out bimodal and
+    /// reads as engine noise. A caller that reports machine state should
+    /// say which of the two it was.
+    pub(crate) const fn decided_arm(&self) -> Option<usize> {
+        self.decided
+    }
+
     #[cfg(test)]
     const fn warmup(&self) -> usize {
         self.warmup

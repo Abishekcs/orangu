@@ -794,7 +794,30 @@ impl LlamaModel {
         let n_embd = cfg.n_embd;
         let head_dim = self.head_dim();
 
+        // **Where the recording's elapsed time goes**, under
+        // `ORANGU_PREFILL_TRACE`. The stage timer puts this call at a third
+        // of a small model's token while a CPU profile puts its *work* at a
+        // fortieth of that, so most of it is the thread blocked rather than
+        // busy — and the three candidates block in different places. The
+        // first layer is timed apart from the rest because that is the
+        // discriminator: a host waiting for the previous submission's
+        // resources to retire pays at the token's first allocation, where a
+        // per-dispatch driver cost is spread evenly over the layers.
+        // **`device.record` is opened here, not by the caller, because the
+        // chain submits from inside its own loop.** A guard held across
+        // the whole call charges those submissions to recording, which is
+        // how half this stage came to be submission time wearing the wrong
+        // name. Closed and reopened around each one instead; the stages
+        // accumulate, so several openings report as one total.
+        let mut recording =
+            crate::engine::decode_stages::enter(crate::engine::decode_stages::Stage::DeviceRecord);
+        let trace = super::gemma::submission_trace();
+        let t_pre = std::time::Instant::now();
+        let t_enc = std::time::Instant::now();
         let mut encoder = vulkan.new_encoder("orangu-server llama decode");
+        let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+        let (mut first_ms, mut rest_ms) = (0.0f64, 0.0f64);
+        let mut pre_ms = 0.0f64;
         vulkan.begin_op_step(&mut encoder);
         // Per-stage GPU timing for this step, when `ORANGU_GPU_TIMESTAMPS=1`
         // and the adapter has the query; inert otherwise. See
@@ -874,6 +897,10 @@ impl LlamaModel {
             super::decode_chunk_ends(layers.len())
         };
         let mut cursor = PassCursor::new(&mut encoder);
+        if trace {
+            pre_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
+        }
+        let t_tail = std::time::Instant::now();
         for il in layers.clone() {
             let layer = &self.layers[il];
             let x_input = if (npu.is_some() || moe_seam) && !host_x.is_empty() {
@@ -888,6 +915,7 @@ impl LlamaModel {
             // stop at the norm and hand back the post-attention residual.
             let dense = layer.dense();
             let ffn_gate_up = dense.and_then(|(gate, up, _)| super::ffn_gate_up_pair(gate, up));
+            let t_layer = trace.then(std::time::Instant::now);
             let out = vulkan.record_fused_layer(
                 &mut cursor,
                 FusedLayerInput {
@@ -953,6 +981,14 @@ impl LlamaModel {
                     attn_ts: ts.attn_slot(il, n_layer),
                 },
             );
+            if let Some(at) = t_layer {
+                let ms = at.elapsed().as_secs_f64() * 1000.0;
+                if il == layers.start {
+                    first_ms = ms;
+                } else {
+                    rest_ms += ms;
+                }
+            }
             ts.after_layer(cursor.encoder(), il);
             let chunk_done = il + 1 < layers.end && chunk_ends.contains(&(il - layers.start + 1));
             if chunk_done {
@@ -965,7 +1001,18 @@ impl LlamaModel {
                     &mut encoder,
                     vulkan.new_encoder("orangu-server llama decode chunk"),
                 );
-                vulkan.submit_intermediate(finished);
+                // Out of `device.record` for the submission, and back in
+                // after it — see the guard's comment above.
+                drop(recording.take());
+                {
+                    let _submit = crate::engine::decode_stages::enter(
+                        crate::engine::decode_stages::Stage::DeviceSubmit,
+                    );
+                    vulkan.submit_intermediate(finished);
+                }
+                recording = crate::engine::decode_stages::enter(
+                    crate::engine::decode_stages::Stage::DeviceRecord,
+                );
                 cursor = PassCursor::new(&mut encoder);
             }
 
@@ -1097,6 +1144,30 @@ impl LlamaModel {
             }
             bufs.push(out);
         }
+        // The loop is done submitting; what follows is the tail's own
+        // recording, under a guard of its own so the two cannot be
+        // confused again.
+        drop(recording.take());
+        let _tail_recording =
+            crate::engine::decode_stages::enter(crate::engine::decode_stages::Stage::DeviceRecord);
+        if trace {
+            let loop_ms = t_tail.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "orangu-server: [prefill-trace]   decode-record pre={pre_ms:.2}ms \
+                 encoder={enc_ms:.2}ms layer0={first_ms:.2}ms rest={rest_ms:.2}ms \
+                 loop={loop_ms:.2}ms over {} layers",
+                layers.len().saturating_sub(1)
+            );
+        }
+        let t_after = std::time::Instant::now();
+        let after_trace = |what: &str| {
+            if trace {
+                eprintln!(
+                    "orangu-server: [prefill-trace]   decode-record tail[{what}]={:.2}ms",
+                    t_after.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        };
         drop(cursor);
 
         // On the NPU path the layer loop ends with the hidden state on the
@@ -1121,6 +1192,7 @@ impl LlamaModel {
             );
             if tail == Tail::Host {
                 ts.finish(vulkan, &mut encoder, n_layer);
+                after_trace("host");
                 return Some((encoder, normed, 0));
             }
             let (logits_buf, logits_offset) = vulkan.record_full_matmul(
@@ -1130,6 +1202,7 @@ impl LlamaModel {
                 slot_id + 1,
             );
             ts.finish(vulkan, &mut encoder, n_layer);
+            after_trace("device");
             return Some((encoder, logits_buf, logits_offset));
         }
 
@@ -1194,16 +1267,40 @@ impl LlamaModel {
         vulkan.fill_deferred_kv_rows(cache);
         let host_tail = self.tail_on_host();
         let tail = if host_tail { Tail::Host } else { Tail::Device };
+        // **The two halves of a chained token.** This path is one
+        // submission, so the finer stages an unfused architecture reports
+        // have nothing to divide: every layer's work is inside a command
+        // buffer that has not run yet. What *is* divisible, and what
+        // decides whether a token is short of cores or of card, is the
+        // host building that buffer against the host waiting for it —
+        // which is the split `Stage::DeviceRecord` and
+        // `Stage::DeviceSubmit` exist for. Without them this family
+        // reported its whole token under `other`.
         let (encoder, buf, offset) =
             self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id, tail)?;
         let mut encoder = encoder;
         vulkan.finish_op_step(&mut encoder);
+        // `device.submit` and `head` are **siblings, not nested**: the
+        // guard closes before the host projection runs. A stage inside
+        // another is counted twice and the breakdown stops summing to the
+        // pass, which shows up as `other` pinned at exactly 0.00.
         let logits = if host_tail {
-            // `[n_embd]` back instead of `[n_vocab]` — on a 128k vocabulary
-            // that is half a megabyte of readback this no longer does.
-            let normed = vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd);
-            self.host_tail(&normed)
+            // `[n_embd]` back instead of `[n_vocab]` — on a 128k
+            // vocabulary that is half a megabyte of readback this no
+            // longer does.
+            let normed = {
+                let _submit = crate::engine::decode_stages::enter(
+                    crate::engine::decode_stages::Stage::DeviceSubmit,
+                );
+                vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd)
+            };
+            crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::Head, || {
+                self.host_tail(&normed)
+            })
         } else {
+            let _submit = crate::engine::decode_stages::enter(
+                crate::engine::decode_stages::Stage::DeviceSubmit,
+            );
             vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1)
         };
         if vulkan.gpu_timestamps() {
@@ -2022,7 +2119,12 @@ impl ModelForward for LlamaModel {
                 );
                 let mut encoder = encoder;
                 vulkan.finish_op_step(&mut encoder);
-                let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
+                let next = {
+                    let _submit = crate::engine::decode_stages::enter(
+                        crate::engine::decode_stages::Stage::DeviceSubmit,
+                    );
+                    vulkan.submit_and_readback_u32(encoder, &sample_buf)
+                };
                 if vulkan.gpu_timestamps() {
                     vulkan.report_timestamps(start_pos, self.layers.len());
                 }

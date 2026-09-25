@@ -1611,6 +1611,17 @@ gemma 4 checkpoint."
             .take(layers.end)
             .skip(layers.start)
         {
+            // **The attention half of the layer, timed.** The mixture helper
+            // this architecture calls already enters `Stage::FfnRouted` for
+            // the routed experts, so the feed-forward half reports itself;
+            // everything before it — the norms, the projections, the
+            // attention itself and the residual — had no stage and landed
+            // in `other`, which on the largest mixture here is half the
+            // token. Opened as a guard rather than a scope because the
+            // region ends mid-function, and closed before the FFN so the
+            // two are siblings rather than one nested inside the other.
+            let _attn =
+                crate::engine::decode_stages::enter(crate::engine::decode_stages::Stage::Attn);
             let head_dim = layer.head_dim;
             let freq_factors = (!layer.is_swa)
                 .then_some(self.rope_freqs.as_deref())
@@ -2121,6 +2132,8 @@ gemma 4 checkpoint."
                         None
                     }
                 };
+
+                drop(_attn);
 
                 // FFN. Dense (GEGLU) for most Gemma variants; a MoE layer
                 // (`gemma-4-26B-A4B`) instead runs a dense shared MLP plus routed

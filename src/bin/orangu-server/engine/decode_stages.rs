@@ -29,7 +29,8 @@
 //! the workload, read again to get precisely that window), and off unless
 //! asked for.
 //!
-//! **Off by default; opt in with `ORANGU_DECODE_STAGES=1`.** Two
+//! **Off by default; opt in with `ORANGU_DECODE_STAGES=1`** for the decode
+//! steps, or `=prefill` for the prompt's chunks — see [`which`]. Two
 //! `Instant::now()` calls and two relaxed atomic adds per stage entry is not
 //! free at the rate a decode step enters them, and a measurement tool that
 //! perturbs the thing it measures whenever it is linked in is worse than no
@@ -243,10 +244,59 @@ thread_local! {
 /// divides.
 static PASSES: AtomicU64 = AtomicU64::new(0);
 
+/// Tokens across the passes [`PASSES`] counted.
+///
+/// Equal to `passes` when the window is decode steps, and the reason this
+/// counter exists when it is prefill chunks: the chunk sizer picks a width
+/// per request and changes it, so a per-chunk cost means nothing without
+/// the width it was paid at.
+static TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// Which forward passes the counters are kept for.
+///
+/// A pass is either one token wide (a decode step) or many (a prefill
+/// chunk), and the two have entirely different shapes — mixing them
+/// produces a breakdown of neither, which is why [`pass_of`] excludes
+/// whichever kind is not being asked about. Choosing between them is the
+/// whole of this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Which {
+    /// Not measuring.
+    Off,
+    /// One-token passes: what a generated token's latency is made of.
+    Decode,
+    /// Wide passes: what a prompt's chunks are made of. `passes` then counts
+    /// chunks, not tokens, so the report also carries the tokens behind
+    /// them — a chunk is not a fixed width and a per-chunk cost divided by
+    /// the wrong number is worse than no number.
+    Prefill,
+}
+
+/// Which passes the counters are being kept for, read once.
+///
+/// `ORANGU_DECODE_STAGES=prefill` (or `pp`) measures the wide passes;
+/// anything else the off-list does not name measures the narrow ones.
+pub fn which() -> Which {
+    static ON: std::sync::OnceLock<Which> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if !super::env::flag_on("ORANGU_DECODE_STAGES") {
+            return Which::Off;
+        }
+        match std::env::var("ORANGU_DECODE_STAGES")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "prefill" | "pp" => Which::Prefill,
+            _ => Which::Decode,
+        }
+    })
+}
+
 /// Whether the counters are being kept, read once.
 pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| super::env::flag_on("ORANGU_DECODE_STAGES"))
+    which() != Which::Off
 }
 
 /// Times `f` as `stage`, or just runs it when the counters are off.
@@ -345,8 +395,9 @@ pub fn pass<T>(f: impl FnOnce() -> T) -> T {
     pass_of(1, f)
 }
 
-/// [`pass`] for a pass of known width. **A pass wider than one token leaves
-/// these counters exactly as it found them.**
+/// [`pass`] for a pass of known width. **A pass of the width not being
+/// measured leaves these counters exactly as it found them** — which width
+/// that is comes from [`which`].
 ///
 /// A request measured at depth prefills its prompt before it generates
 /// anything, and those chunks are forward passes through this same wrapper.
@@ -357,11 +408,17 @@ pub fn pass<T>(f: impl FnOnce() -> T) -> T {
 /// looking at, distributed across the stages in prefill's proportions rather
 /// than decode's.
 ///
-/// So a wide pass snapshots every counter on the way in and restores it on
-/// the way out. Subtracting the delta rather than suppressing the writes is
-/// what makes it complete: a stage that ran on a `rayon` worker inside the
-/// pass is still removed, where a flag on the calling thread would have
-/// missed it.
+/// So a pass of the other width snapshots every counter on the way in and
+/// restores it on the way out. Subtracting the delta rather than
+/// suppressing the writes is what makes it complete: a stage that ran on a
+/// `rayon` worker inside the pass is still removed, where a flag on the
+/// calling thread would have missed it.
+///
+/// [`Which::Prefill`] turns the rule around rather than switching it off:
+/// the wide passes are counted and the one-token ones are subtracted. A
+/// prompt's chunks and the decode steps that follow them are equally each
+/// other's noise, and a prefill stage cannot be sized from a window the
+/// decode steps are averaged into.
 ///
 /// **The one thing this cannot separate is a genuinely concurrent decode**
 /// on another request, whose contribution is subtracted along with the
@@ -371,7 +428,8 @@ pub fn pass_of<T>(n_tokens: usize, f: impl FnOnce() -> T) -> T {
     if !enabled() {
         return f();
     }
-    if n_tokens > 1 {
+    let wide = n_tokens > 1;
+    if wide != (which() == Which::Prefill) {
         let before = CounterSnapshot::take();
         let out = scope(Stage::Forward, f);
         before.restore();
@@ -379,6 +437,7 @@ pub fn pass_of<T>(n_tokens: usize, f: impl FnOnce() -> T) -> T {
     }
     let out = scope(Stage::Forward, f);
     PASSES.fetch_add(1, Ordering::Relaxed);
+    TOKENS.fetch_add(n_tokens as u64, Ordering::Relaxed);
     out
 }
 
@@ -427,13 +486,15 @@ pub struct StageTotal {
     pub parent: bool,
 }
 
-/// The window since the last drain, and **reset**.
+/// The window since the last drain, and **reset**: the passes counted, the
+/// tokens they carried, and each stage's totals.
 ///
 /// `passes` is zero when nothing ran, which is how a caller tells "not
 /// measured" from "measured and took no time" — the same rule `/gpu-timings`
 /// and `/moe-stats` report their windows by.
-pub fn take() -> (u64, Vec<StageTotal>) {
+pub fn take() -> (u64, u64, Vec<StageTotal>) {
     let passes = PASSES.swap(0, Ordering::Relaxed);
+    let tokens = TOKENS.swap(0, Ordering::Relaxed);
     let totals = Stage::ALL
         .iter()
         .map(|&stage| StageTotal {
@@ -444,16 +505,22 @@ pub fn take() -> (u64, Vec<StageTotal>) {
             parent: stage.is_parent(),
         })
         .collect();
-    (passes, totals)
+    (passes, tokens, totals)
 }
 
 /// The window as JSON, for `GET /decode-stages`.
 pub fn take_json() -> serde_json::Value {
-    let enabled = enabled();
-    let (passes, totals) = take();
+    let which = match which() {
+        Which::Off => "off",
+        Which::Decode => "decode",
+        Which::Prefill => "prefill",
+    };
+    let (passes, tokens, totals) = take();
     serde_json::json!({
-        "enabled": enabled,
+        "enabled": which != "off",
+        "which": which,
         "passes": passes,
+        "tokens": tokens,
         "stages": totals
             .iter()
             .map(|t| serde_json::json!({
@@ -503,6 +570,49 @@ mod tests {
         assert_eq!(CALLS[attn].load(Ordering::Relaxed), 7);
         assert_eq!(SUBMITS[head].load(Ordering::Relaxed), 3);
         assert_eq!(ALL_SUBMITS.load(Ordering::Relaxed), 11);
+    }
+
+    /// The two modes must be exactly complementary: whichever width is
+    /// being measured, the other one is subtracted. A mode that counted
+    /// both would report a breakdown of neither, and one that counted
+    /// neither would report an empty window that reads as "this stage is
+    /// free".
+    ///
+    /// Asserted on the predicate rather than through `pass_of`, because the
+    /// counters are off unless the process was started with the variable
+    /// set — see the test above.
+    #[test]
+    fn each_mode_counts_exactly_the_passes_the_other_drops() {
+        for n_tokens in [1usize, 2, 512] {
+            let wide = n_tokens > 1;
+            let counted_by_decode = wide == (Which::Decode == Which::Prefill);
+            let counted_by_prefill = wide == (Which::Prefill == Which::Prefill);
+            assert_ne!(
+                counted_by_decode, counted_by_prefill,
+                "a pass of {n_tokens} token(s) must be counted by exactly one mode"
+            );
+            assert_eq!(counted_by_prefill, wide, "{n_tokens} tokens");
+        }
+    }
+
+    /// `prefill` and `pp` select the wide passes; the off-list still wins
+    /// over both, so `ORANGU_DECODE_STAGES=0` is a real control arm however
+    /// the on-value is spelled.
+    #[test]
+    fn the_mode_is_read_from_the_value_not_merely_its_truth() {
+        let mode = |value: &str| match value.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "off" | "no" => Which::Off,
+            "prefill" | "pp" => Which::Prefill,
+            _ => Which::Decode,
+        };
+        assert_eq!(mode("prefill"), Which::Prefill);
+        assert_eq!(mode("PP"), Which::Prefill);
+        assert_eq!(mode(" Prefill "), Which::Prefill);
+        assert_eq!(mode("1"), Which::Decode);
+        assert_eq!(mode("on"), Which::Decode);
+        assert_eq!(mode("0"), Which::Off);
+        assert_eq!(mode("off"), Which::Off);
+        assert_eq!(mode(""), Which::Off);
     }
 
     /// Every stage must have a distinct index and a distinct name, or two of

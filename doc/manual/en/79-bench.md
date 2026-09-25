@@ -1220,7 +1220,7 @@ Start the server with `ORANGU_DECODE_STAGES=1` and each measured point gains a
 breakdown in the same units as the rate it explains:
 
 ```text
-  stages   217.6 ms per forward pass over 256 passes
+  stages   217.6 ms per decode pass over 256 passes
            recurrent.project     31.13 ms/pass   14.3%  (30.0 calls/pass)
            recurrent.delta       54.47 ms/pass   25.0%  (75.5 calls/pass)
            recurrent.out         29.72 ms/pass   13.7%  (37.7 calls/pass)
@@ -1235,6 +1235,21 @@ breakdown in the same units as the rate it explains:
 The counters are drained on read, exactly like `moe` and `gpu-timings`: the
 tool reads once before the workload to discard the warmup and once after, so
 the window is the measured one and nothing else.
+
+`ORANGU_DECODE_STAGES=prefill` breaks down the **prompt** instead. A forward
+pass is either one token wide or many, and the two have nothing in common: a
+multi-second prompt averaged into a 90 ms token is a breakdown of neither, so
+whichever width is asked for, the other is subtracted. The header then names
+the width, because a prefill pass is a chunk whose size the sizer chose and
+changes:
+
+```text
+  stages   74.3 ms per prefill pass over 31 passes of 72 tokens each
+```
+
+Divide by the tokens, not by the passes, to compare one prompt length with
+another — and expect the shape to differ from decode's on the same model,
+which is the reason for the second mode.
 
 Read it with three rules:
 
@@ -1424,6 +1439,40 @@ is 0.37 cores because it is waiting on the GPU, which is where the tokens per
 second are decided.
 
 ### Why `--flamegraph` needs the warmup
+
+A point whose repetitions are short prints a **`window`** line:
+
+```text
+     512 |     572 |       0 |     228.9 |  2498.50 |  2171.44 ± 462.53
+  window   263 ms per rep x 2 — short: start-up effects are a large fraction
+           of this rate, prefer a longer point
+```
+
+A rate is tokens over seconds, and when the seconds are small everything
+that happens once — a driver's first submission, a clock ramp, a scheduler
+hiccup — is a large fraction of the answer rather than noise in it. The
+threshold is half a second a repetition, which is where readings on the
+machine this was written on stopped moving; it is a threshold, not a law.
+The example above is the case it exists for: that point's deviation is 21%
+of its mean, where the 2236-token point of the same run is 2%.
+
+The warm-up also **settles the server's vocabulary-projection probe** before
+anything is timed. That probe alternates two arms over about seventy decode
+steps before it votes, and a window opened while it is still running spends
+its steps split between them — on a model whose arms are far apart the
+result is bimodal and reads as engine noise. Since `--sweep` restarts the
+server for every point, without this every point of a sweep is such a
+window. The warm-up therefore generates in short bursts until `GET /props`
+stops reporting `tail` as `probing`, skipping the loop entirely for a server
+that has no such probe or has already settled, and giving up after a bounded
+number of attempts rather than hanging the run. Each point then prints
+
+```text
+  tail     vocabulary projection: device
+```
+
+and, where the probe was still moving, says so — `settled DURING this
+window; its rate is a blend`, or `UNSETTLED ... do not quote it`.
 
 `--flamegraph` is **refused** together with `--no-warmup`, and the reason is
 worth knowing because it applies to profiling any server this way.

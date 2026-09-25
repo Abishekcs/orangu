@@ -405,6 +405,36 @@ fn tail_forced() -> Option<bool> {
     })
 }
 
+/// Where the vocabulary projection is running, for `/props.adapt` — and
+/// crucially whether that is **settled**.
+///
+/// `"probing"` means the answer is not in yet: the probe alternates its
+/// arms over roughly seventy steps before it votes, so a benchmark that
+/// generates fewer than that measures a mix of both. Where the arms are
+/// close that is invisible; where they are far apart the run comes out
+/// bimodal and reads as engine noise rather than as an unfinished
+/// measurement. Reported so a number taken in that window can be told
+/// apart from one taken after it.
+pub(crate) fn tail_state() -> &'static str {
+    match tail_forced() {
+        Some(true) => return "host (forced)",
+        Some(false) => return "device (forced)",
+        None => {}
+    }
+    if !TAIL_PROBE_USED.load(std::sync::atomic::Ordering::Relaxed) {
+        return "not asked";
+    }
+    match TAIL_PROBE
+        .lock()
+        .expect("tail probe poisoned")
+        .decided_arm()
+    {
+        Some(TAIL_HOST) => "host",
+        Some(_) => "device",
+        None => "probing",
+    }
+}
+
 /// The A/B behind [`tail_prefers_host`]: arm 0 the device, arm 1 the
 /// host, the host taken only when it is 10% faster — the device answer
 /// keeps the host free and the card busy, and a near-tie is noise. The
@@ -415,8 +445,31 @@ fn tail_forced() -> Option<bool> {
 /// its own presence; one pair of blocks timed on a process's first tokens
 /// saw the device arm at twice its settled step and lost to the host one
 /// start in six, and that process then ran 40% behind for its whole window.
-static TAIL_PROBE: std::sync::Mutex<crate::engine::step_probe::ArmProbe> =
-    std::sync::Mutex::new(crate::engine::step_probe::ArmProbe::new(2, 10));
+/// How much faster the host arm must be, in percent, before it takes the
+/// tail — `ORANGU_TAIL_MARGIN`, default [`TAIL_MARGIN_DEFAULT`].
+///
+/// The margin is what stops a near-tie from churning, and this probe's two
+/// arms *are* near-tied on the models where it matters: measured on a
+/// delta-net mixture, the host arm read 5% faster in one round, 0.7% in the
+/// next and 6% slower in the third. A margin wide enough to ignore that
+/// noise also ignores a real win — the same projection measured **+7.5%**
+/// end to end while the probe declined it.
+///
+/// Per-probe by construction: [`crate::engine::step_probe::ArmProbe::new`]
+/// takes it, and the chunk-plan probe next door already uses a different
+/// value. So this is a number to measure, not a mechanism to build.
+const TAIL_MARGIN_DEFAULT: u64 = 10;
+
+static TAIL_PROBE: std::sync::LazyLock<std::sync::Mutex<crate::engine::step_probe::ArmProbe>> =
+    std::sync::LazyLock::new(|| {
+        let margin = env_tuning_value(
+            "ORANGU_TAIL_MARGIN",
+            TAIL_MARGIN_DEFAULT,
+            "a percentage from 0 to 50",
+            |n| n <= 50,
+        );
+        std::sync::Mutex::new(crate::engine::step_probe::ArmProbe::new(2, margin))
+    });
 
 /// The tail probe's host arm.
 const TAIL_HOST: usize = 1;

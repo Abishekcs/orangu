@@ -437,6 +437,20 @@ impl Glm5Model {
         start_pos: usize,
     ) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
+        // **Hold the card's clock, and stamp the dispatches.** This family
+        // orchestrates from the host — the delta rule, the routed experts
+        // and the projections all run on the cores — and hands the card a
+        // few small dispatches per token. Between them it parks, and the
+        // host then waits on the wake-up rather than on the kernel; the
+        // same shape in `arch::bailingmoe` was measured that way. The span
+        // is what lets `ORANGU_GPU_TIMESTAMPS=ops` see this family at all,
+        // since nothing here records a chain that resolves its own stamps.
+        //
+        // Not measured on this architecture: the files it serves do not fit
+        // this machine. The reasoning is the shape, and `ORANGU_CLOCK_HOLD=0`
+        // turns the hold off.
+        let _clock = super::hold_clock_for_step(self.backend.as_ref(), n_tokens);
+        let _ops = super::OpSpan::open(self.backend.as_ref(), start_pos);
         let n_embd = self.config.n_embd;
 
         let mut embeddings = vec![0f32; n_tokens * n_embd];

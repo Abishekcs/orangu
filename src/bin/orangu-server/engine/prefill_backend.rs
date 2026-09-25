@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
+use super::arch::ModelForward;
 use super::backend::{Backend, CpuBackend};
 use super::loader::QuantMatrix;
 
@@ -107,6 +108,35 @@ pub fn prompts_on_cpu() -> Option<bool> {
 /// The tokens the probe's GEMM carries: a short prompt, past the point
 /// where a device switches to its batched kernels.
 const PROBE_TOKENS: usize = 64;
+
+/// Seconds for one prompt-shaped pass of the whole model — a
+/// [`PROBE_TOKENS`]-wide chunk through its own forward, with the logits
+/// skipped exactly as every chunk of a real prompt but the last skips them.
+///
+/// The counterpart to `decode_backend::seconds_per_token`, and needed for
+/// the same reason that one is: **a decode measurement says nothing about a
+/// prompt.** The two run different kernels at different widths, and on a
+/// discrete card they can point opposite ways — measured on a delta-net
+/// mixture whose cores beat the card by 1.05–1.22× at decode while the card
+/// beat the cores by 1.9× at prefill.
+///
+/// One untimed pass first, so pipelines, the clock and first-touch are not
+/// in the number; each pass gets a fresh cache so both do identical work.
+/// Two passes rather than a median of eight because a prompt pass costs
+/// hundreds of milliseconds and this runs at startup — it is a comparison
+/// between two backends that differ by a lot, not a rate to quote.
+pub fn seconds_per_prompt_pass(model: &Arc<dyn ModelForward>) -> Option<f64> {
+    let token = 1u32.min(model.config().n_vocab.saturating_sub(1) as u32);
+    let tokens = vec![token; PROBE_TOKENS];
+    let once = || -> Option<f64> {
+        let mut cache = model.new_kv_cache(PROBE_TOKENS + 1);
+        let started = Instant::now();
+        model.forward_no_logits(&mut cache, &tokens, 0, 0).ok()?;
+        Some(started.elapsed().as_secs_f64())
+    };
+    once()?;
+    once()
+}
 
 /// The CPU backend when prompts should run there rather than on
 /// `device`, by the configured choice — for `auto`, by timing `w` (a

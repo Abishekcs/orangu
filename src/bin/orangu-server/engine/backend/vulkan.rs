@@ -2236,6 +2236,16 @@ fn expert_pack() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_PACK"))
 }
 
+/// The `gpu-ops` label for the interval between one device chain's last
+/// dispatch and the next chain's first — the previous chain's readbacks and,
+/// on a mixture whose experts run on the cores, the host's whole expert
+/// turn. Named for the time it holds rather than for the dispatch that
+/// follows it, because a name borrowed from the next dispatch invites a
+/// reader to take host time for device work — on such a mixture this is the
+/// largest line in the table and the attention kernel it precedes is a
+/// twentieth of it.
+const HOST_TURN_LABEL: &str = "host.turn";
+
 impl VulkanBackend {
     /// Places `w` in the permanent weight arena now, ahead of whatever
     /// would place it (or a part of it) later — for a pair whose halves
@@ -8029,6 +8039,15 @@ impl VulkanBackend {
                 self.record_mmvq_quantize(&mut pass, guard);
             }
         }
+        // **Each dispatch is stamped.** An architecture that records its own
+        // chain resolves stamps as it goes (`tail.matmul`, `bd.attn.*`,
+        // `moe.*`); one that orchestrates from the host and submits a
+        // matmul at a time reaches only this path, so without a stamp here
+        // `ORANGU_GPU_TIMESTAMPS=ops` opens a span over such a pass and
+        // fills it with nothing. The label is the same for every op because
+        // this function cannot name them — the table is ordered, so a pass
+        // reads as the sequence of its dispatches and the large one is
+        // where it falls.
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server matmul batch pass"),
@@ -8045,6 +8064,7 @@ impl VulkanBackend {
             {
                 if let Some((bg, grid, kernel)) = mmq {
                     self.record_mmq(&mut pass, bg, *grid, *kernel);
+                    self.op_stamp(&mut pass, "matmul");
                     continue;
                 }
                 if let Some(mmvq) = &guard.mmvq
@@ -8054,12 +8074,14 @@ impl VulkanBackend {
                     pass.set_bind_group(0, &mmvq.mmvq_bind_group, &[]);
                     let (wx, wy, wz) = mmvq.mmvq_workgroups;
                     pass.dispatch_workgroups(wx, wy, wz);
+                    self.op_stamp(&mut pass, "matmul");
                     continue;
                 }
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &guard.bind_group, &[]);
                 let (wx, wy, wz) = guard.workgroups;
                 pass.dispatch_workgroups(wx, wy, wz);
+                self.op_stamp(&mut pass, "matmul");
             }
         }
         // Every op in this batch is actually read back (this is the
@@ -19014,9 +19036,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let (mut encoder, grouped) =
             self.take_prefill_encoder("orangu-server fused prefill attention encoder");
         // Stamped at the chain's first command, so what the previous chain
-        // left unstamped after its last dispatch (its readback copies) is
-        // reported under its own name rather than under this chain's norm.
-        self.op_stamp_encoder(&mut encoder, "pp.attn.begin");
+        // left unstamped after its last dispatch is reported under its own
+        // name rather than under this chain's norm.
+        //
+        // **Named for what it measures, which is not attention.** A stamp's
+        // time is the interval since the *previous* stamp, so this one
+        // carries everything between the last chain's final dispatch and
+        // this chain's first: the previous chain's readbacks, and on a
+        // mixture whose routed experts run on the cores, the whole host
+        // expert turn. On such a model that is the largest line in the
+        // table, so a name taken from the dispatch that follows it would
+        // have a reader sizing an attention kernel from the host's work.
+        self.op_stamp_encoder(&mut encoder, HOST_TURN_LABEL);
         if let Some((bg, ..)) = &attn_norm_rows {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server fused prefill attention norm pass"),
@@ -24131,6 +24162,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.gpu_timestamps
     }
 
+    /// Whether the **per-dispatch** timer is on (`ORANGU_GPU_TIMESTAMPS=ops`).
+    ///
+    /// Reported to `/props` because this one is not a cheap observer: it
+    /// resolves a query set in a submission of its own every step, which
+    /// on a small model is about a third of the token. A device total read
+    /// from its table therefore cannot be subtracted from a rate measured
+    /// without it — a subtraction that has already invented a couple of
+    /// milliseconds of overhead that did not exist. The per-stage timer is
+    /// two clock reads and costs about a percent; this is the one that
+    /// needs to announce itself.
+    pub fn op_timer_on(&self) -> bool {
+        self.op_timer.is_some()
+    }
+
     /// The query set `record_decode_forward` writes this decode step's
     /// timestamps into — built once, on the first call, sized to `n_layer`
     /// (see `TimestampQueries`'s own doc comment for the exact slot
@@ -24336,10 +24381,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .map(|prev| ticks[0].saturating_sub(prev) as f64 * ns_per_tick / 1e6);
         t.prev_end = Some(ticks[n - 1]);
         order.sort_by(|a, b| totals[b].1.total_cmp(&totals[a].1));
+        // The span is `last - first`, so it includes every interval between
+        // dispatches as well as the dispatches themselves. Split out the one
+        // interval that is known to be the host's, or a reader takes the
+        // span for device work — which is exactly what happened.
+        let host_ns = totals.get(HOST_TURN_LABEL).map_or(0.0, |(_, ns)| *ns);
+        let device_ns = (total_ns - host_ns).max(0.0);
         eprintln!(
-            "orangu-server: [gpu-ops] pos {start_pos}: {} stamps, total {:.3}ms, idle before {}{}",
+            "orangu-server: [gpu-ops] pos {start_pos}: {} stamps, span {:.3}ms \
+             = device {:.3}ms + host {:.3}ms, idle before {}{}",
             n - 1,
             total_ns / 1e6,
+            device_ns / 1e6,
+            host_ns / 1e6,
             gap.map_or("-".to_string(), |g| format!("{g:.3}ms")),
             if t.overflowed {
                 " (overflowed; later dispatches unstamped)"

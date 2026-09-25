@@ -372,21 +372,32 @@ impl KdaLayer {
             }
 
             let dst = &mut scan[t * d_inner..(t + 1) * d_inner];
-            for h in 0..n_head {
-                let q_h = &mut q_t[h * head_dim..(h + 1) * head_dim];
+            // **One head per core.** The scan is sequential in *position* —
+            // each token's state update reads the one the token before it
+            // wrote — but not in head: every head owns its own state matrix
+            // and its own slice of this token's q, k, v and output, and
+            // nothing crosses between them. So the position loop stays
+            // serial and the head loop inside it is a fan-out, which is the
+            // shape `arch::nemotron`'s state-space heads already use.
+            //
+            // Per head the arithmetic is `delta_step` unchanged, in the same
+            // order, so this is bit-identical to the loop it replaces.
+            let (states, state_size) = state.delta_states_mut();
+            let step_head = |h: usize,
+                             head_state: &mut [f32],
+                             q_h: &mut [f32],
+                             k_h: &mut [f32],
+                             dst_h: &mut [f32]| {
                 tensor::l2_norm_inplace(q_h, shape.l2_eps);
                 for value in q_h.iter_mut() {
                     *value *= q_scale;
                 }
-                let k_h = &mut k_t[h * head_dim..(h + 1) * head_dim];
                 tensor::l2_norm_inplace(k_h, shape.l2_eps);
-                let q_h = &q_t[h * head_dim..(h + 1) * head_dim];
-                let k_h = &k_t[h * head_dim..(h + 1) * head_dim];
                 let v_h = &v_t[h * head_dim..(h + 1) * head_dim];
                 let beta_h = tensor::sigmoid(beta[t * n_head + h]);
                 let decay_h = &decay[h * head_dim..(h + 1) * head_dim];
 
-                let mut o = delta_step(state.delta_state_mut(h), decay_h, k_h, v_h, q_h, beta_h);
+                let mut o = delta_step(head_state, decay_h, k_h, v_h, q_h, beta_h);
 
                 // Gated RMSNorm: norm the scan output, then scale it by a
                 // sigmoid gate read from the layer input.
@@ -395,7 +406,49 @@ impl KdaLayer {
                 for (value, &g) in o.iter_mut().zip(gate_h.iter()) {
                     *value *= tensor::sigmoid(g);
                 }
-                dst[h * head_dim..(h + 1) * head_dim].copy_from_slice(&o);
+                dst_h.copy_from_slice(&o);
+            };
+            if delta_fanout() {
+                use rayon::prelude::*;
+                // **Several heads per task, not one.** One head's work is a
+                // `head_dim x head_dim` update, and handing that to the pool
+                // one head at a time makes the dispatch a real fraction of
+                // it: profiling a prompt on this architecture puts about a
+                // ninth of all CPU in the scheduler and in `crossbeam`'s
+                // steal and epoch paths, and the fan-out over heads gains
+                // only a few percent on work that is perfectly independent.
+                // Grouping heads amortizes the hand-off over more
+                // arithmetic without changing any of it — the tasks stay
+                // disjoint, so this is the same fan-out with a coarser
+                // grain.
+                let group = delta_heads_per_task().min(n_head.max(1));
+                states
+                    .par_chunks_mut(state_size * group)
+                    .zip(q_t.par_chunks_mut(head_dim * group))
+                    .zip(k_t.par_chunks_mut(head_dim * group))
+                    .zip(dst.par_chunks_mut(head_dim * group))
+                    .enumerate()
+                    .for_each(|(g, (((states, q_g), k_g), dst_g))| {
+                        for (i, (((head_state, q_h), k_h), dst_h)) in states
+                            .chunks_mut(state_size)
+                            .zip(q_g.chunks_mut(head_dim))
+                            .zip(k_g.chunks_mut(head_dim))
+                            .zip(dst_g.chunks_mut(head_dim))
+                            .enumerate()
+                        {
+                            step_head(g * group + i, head_state, q_h, k_h, dst_h);
+                        }
+                    });
+            } else {
+                for (h, (((head_state, q_h), k_h), dst_h)) in states
+                    .chunks_mut(state_size)
+                    .zip(q_t.chunks_mut(head_dim))
+                    .zip(k_t.chunks_mut(head_dim))
+                    .zip(dst.chunks_mut(head_dim))
+                    .enumerate()
+                {
+                    step_head(h, head_state, q_h, k_h, dst_h);
+                }
             }
         }
 
@@ -454,22 +507,36 @@ fn delta_step(
     let head_dim = decay.len();
     debug_assert_eq!(state.len(), head_dim * head_dim);
 
-    for (i, &d) in decay.iter().enumerate() {
-        for s in &mut state[i * head_dim..(i + 1) * head_dim] {
+    // **Two sweeps of the state, not four**, with the accumulation order
+    // unchanged: the decay folds into the `S^T k` read because that read
+    // wants the decayed value anyway, and the output projection folds into
+    // the rank-1 update because row `i` after the update is exactly what
+    // the projection multiplies by `q[i]`. Each fused loop walks its row
+    // once with two independent accumulations, a shape the vectorizer
+    // keeps.
+    //
+    // This halves the passes and measures **level** — the state is one
+    // head's `head_dim x head_dim`, small enough to stay in cache across
+    // all four, so the passes cost cache bandwidth rather than memory. The
+    // form is kept because it is the same arithmetic in fewer lines, not
+    // because it is faster. What this stage is short of is arithmetic, not
+    // traffic.
+    let mut sk = vec![0f32; head_dim];
+    for (i, (&d, &k_i)) in decay.iter().zip(k).enumerate() {
+        let row = &mut state[i * head_dim..(i + 1) * head_dim];
+        for (s, acc) in row.iter_mut().zip(sk.iter_mut()) {
             *s *= d;
+            *acc += *s * k_i;
         }
     }
-    let mut sk = vec![0f32; head_dim];
-    for i in 0..head_dim {
-        tensor::axpy_inplace(&mut sk, &state[i * head_dim..(i + 1) * head_dim], k[i]);
-    }
     let delta: Vec<f32> = (0..head_dim).map(|j| beta * (v[j] - sk[j])).collect();
-    for i in 0..head_dim {
-        tensor::axpy_inplace(&mut state[i * head_dim..(i + 1) * head_dim], &delta, k[i]);
-    }
     let mut out = vec![0f32; head_dim];
-    for i in 0..head_dim {
-        tensor::axpy_inplace(&mut out, &state[i * head_dim..(i + 1) * head_dim], q[i]);
+    for (i, (&k_i, &q_i)) in k.iter().zip(q).enumerate() {
+        let row = &mut state[i * head_dim..(i + 1) * head_dim];
+        for ((s, &d_j), o) in row.iter_mut().zip(&delta).zip(out.iter_mut()) {
+            *s += d_j * k_i;
+            *o += *s * q_i;
+        }
     }
     out
 }
@@ -543,6 +610,41 @@ pub(crate) struct MlaLayer {
 /// The hoist is the only thing about this module that changes behaviour at
 /// `n_tokens > 1`, which makes it the first suspect whenever a batched
 /// forward disagrees with the same tokens fed one at a time.
+/// Whether a dense prompt takes the batched causal attention —
+/// `ORANGU_ATTN_BATCHED`, on unless it is turned off.
+///
+/// The control arm for it: `0` runs the per-token loop instead, which is
+/// the same arithmetic in a different accumulation order, so the two can be
+/// swept against each other from one binary.
+/// `ORANGU_DELTA_FANOUT=0` runs the delta rule's heads one after another on
+/// the calling thread — the control arm for the fan-out over heads. On
+/// unless `0`.
+/// Heads handed to one task by the delta rule's fan-out —
+/// `ORANGU_DELTA_HEADS_PER_TASK`, default [`DELTA_HEADS_PER_TASK`]. `0` and
+/// values past the head count collapse to the whole layer in one task.
+fn delta_heads_per_task() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_DELTA_HEADS_PER_TASK")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DELTA_HEADS_PER_TASK)
+    })
+}
+
+/// See [`delta_heads_per_task`]. One head per task is the finest grain the
+/// fan-out can have and the most dispatch per unit of arithmetic.
+const DELTA_HEADS_PER_TASK: usize = 1;
+
+fn delta_fanout() -> bool {
+    crate::engine::env::flag_on_unless_disabled("ORANGU_DELTA_FANOUT")
+}
+
+fn batched_attention() -> bool {
+    crate::engine::env::flag_on_unless_disabled("ORANGU_ATTN_BATCHED")
+}
+
 fn mla_no_hoist() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_MLA_NO_HOIST"))
@@ -852,44 +954,88 @@ impl MlaLayer {
         // decompression below can run head-outer for the same reason.
         let mut compressed_all = vec![0f32; n_tokens * n_head * shape.kv_lora_rank];
         let mut attn_out = vec![0f32; n_tokens * n_head * shape.head_v_mla];
+        // **The whole prompt's rows appended first, and gathered once.**
+        // A dense selection is the causal prefix `0..=start_pos + t`, so
+        // every token reads a *prefix of the same buffer* — rebuilding it
+        // per token copied the cache again for each one, which over a
+        // prompt is quadratic: at 2048 tokens and this model's row width
+        // that is gigabytes of `memmove` to produce megabytes of distinct
+        // bytes. A sparse selection picks arbitrary rows and keeps the
+        // per-token gather below.
+        let dense_keys: Option<Vec<f32>> = selection.is_none().then(|| {
+            for t in 0..n_tokens {
+                let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
+                cache.layers[self.cache_index].push(kv_t, kv_t);
+            }
+            let slot = &cache.layers[self.cache_index];
+            let rows = start_pos + n_tokens;
+            let mut all = vec![0f32; rows * shape.kv_row];
+            for p in 0..rows {
+                all[p * shape.kv_row..(p + 1) * shape.kv_row].copy_from_slice(slot.key_at(
+                    p,
+                    0,
+                    shape.kv_row,
+                ));
+            }
+            all
+        });
+        // The queries token-major, which is the layout the batched form
+        // below reads: the absorption above is head-major because that is
+        // how its weight blocks are laid out, and this is the one
+        // transpose between them.
+        let mut qs_all = vec![0f32; n_tokens * n_head * absorbed_dim];
         for t in 0..n_tokens {
-            let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
-            cache.layers[self.cache_index].push(kv_t, kv_t);
-
-            let dense: Vec<usize>;
-            let chosen: &[usize] = match selection {
-                Some(rows) => &rows[t],
+            for (h, head) in qs_by_head.iter().enumerate() {
+                let at = (t * n_head + h) * absorbed_dim;
+                qs_all[at..at + absorbed_dim]
+                    .copy_from_slice(&head[t * absorbed_dim..(t + 1) * absorbed_dim]);
+            }
+        }
+        // **A dense prompt is one batched call over the single gather
+        // above.** A tile of consecutive tokens shares one pass over the
+        // keys, so the prefix is read once per tile instead of once per
+        // token, and the scores never exist as a matrix — each lane keeps
+        // a running maximum and sum, rescaled per key block. A sparse
+        // selection picks arbitrary rows per token and keeps the loop
+        // below.
+        if let Some(all) = dense_keys.as_ref().filter(|_| batched_attention()) {
+            let compressed = super::attend_shared_causal(
+                &qs_all,
+                n_head,
+                n_tokens,
+                &all[..(start_pos + n_tokens) * shape.kv_row],
+                shape.kv_row,
+                shape.kv_lora_rank,
+                shape.kq_scale,
+                start_pos,
+            );
+            compressed_all.copy_from_slice(&compressed);
+        }
+        for t in (0..n_tokens).take_while(|_| dense_keys.is_none() || !batched_attention()) {
+            let owned_keys;
+            let keys: &[f32] = match &dense_keys {
+                Some(all) => &all[..(start_pos + t + 1) * shape.kv_row],
                 None => {
-                    dense = (0..=start_pos + t).collect();
-                    &dense
+                    let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
+                    cache.layers[self.cache_index].push(kv_t, kv_t);
+                    let chosen: &[usize] = &selection.expect("the sparse path")[t];
+                    let mut keys = vec![0f32; chosen.len() * shape.kv_row];
+                    {
+                        let slot = &cache.layers[self.cache_index];
+                        for (i, &p) in chosen.iter().enumerate() {
+                            keys[i * shape.kv_row..(i + 1) * shape.kv_row]
+                                .copy_from_slice(slot.key_at(p, 0, shape.kv_row));
+                        }
+                    }
+                    owned_keys = keys;
+                    &owned_keys
                 }
             };
-            let mut keys = vec![0f32; chosen.len() * shape.kv_row];
-            {
-                let slot = &cache.layers[self.cache_index];
-                for (i, &p) in chosen.iter().enumerate() {
-                    keys[i * shape.kv_row..(i + 1) * shape.kv_row].copy_from_slice(slot.key_at(
-                        p,
-                        0,
-                        shape.kv_row,
-                    ));
-                }
-            }
-
-            // This token's queries, gathered out of the head-major
-            // absorption above, then **one** pass of attention for all of
-            // them: latent attention's keys are shared across heads, so
-            // scoring a head at a time read the whole cache `n_head` times
-            // over — see `super::attend_shared`.
-            let mut qs = vec![0f32; n_head * absorbed_dim];
-            for h in 0..n_head {
-                qs[h * absorbed_dim..(h + 1) * absorbed_dim]
-                    .copy_from_slice(&qs_by_head[h][t * absorbed_dim..(t + 1) * absorbed_dim]);
-            }
+            let at = t * n_head * absorbed_dim;
             let compressed = super::attend_shared(
-                &qs,
+                &qs_all[at..at + n_head * absorbed_dim],
                 n_head,
-                &keys,
+                keys,
                 shape.kv_row,
                 shape.kv_lora_rank,
                 shape.kq_scale,

@@ -173,11 +173,25 @@ fn props_json(state: &AppState) -> serde_json::Value {
         // `null` on a backend with no kernel selection to report — see
         // `AppState::gpu_tuning`.
         "gpu": state.gpu_tuning,
+        // Whether the per-dispatch timer is on. Reported because it is the
+        // one instrument here that changes what it measures by enough to
+        // matter — see `VulkanBackend::op_timer_on`.
+        "gpu_op_timer": state
+            .wgpu_backend
+            .as_ref()
+            .and_then(|b| b.as_wgpu())
+            .is_some_and(crate::engine::backend::vulkan::VulkanBackend::op_timer_on),
         // `null` on a machine with no NPU — see `npu_tool::npu_props`.
         "npu": crate::npu_tool::npu_props(),
         // What the server detected about this machine and chose because of
         // it — the `[adapt]` log lines, for a program: see `engine::adapt`.
         "adapt": crate::engine::adapt::decisions(),
+        // Where the vocabulary projection runs, and whether that is
+        // settled — see `backend::tail_state`. Separate from `adapt`
+        // because the others are decided once at load and this one is
+        // decided over the first few dozen served steps, so a reader has
+        // to be able to see that it is still moving.
+        "tail": crate::engine::backend::tail_state(),
         // The served file's architecture. On a `qwen_image` server the
         // engine's `ModelForward` is the text encoder, so `cfg` describes
         // that; `architecture` names what was asked for.

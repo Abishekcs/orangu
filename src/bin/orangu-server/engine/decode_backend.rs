@@ -45,6 +45,16 @@ pub const MIN_GAIN: f64 = 1.10;
 const STEPS: usize = 8;
 const WARMUP: usize = 4;
 
+/// The most warm-up steps taken while waiting for a device's clock to
+/// settle — see [`seconds_per_token_unless`]. Bounded so a backend whose
+/// step time never stops falling cannot hold up the server's start.
+const WARMUP_CAP: usize = 24;
+
+/// How much faster a warm-up step must be than the best one so far to count
+/// as "still ramping". Two consecutive steps that do not beat the best by
+/// this much end the warm-up.
+const SETTLE: f64 = 0.02;
+
 /// Whether the probe may run — `ORANGU_DECODE_PROBE=0` turns it off.
 pub fn enabled() -> bool {
     crate::engine::env::flag_on_unless_disabled("ORANGU_DECODE_PROBE")
@@ -80,18 +90,50 @@ pub fn seconds_per_token_unless(
     give_up_above: f64,
 ) -> Option<f64> {
     let (warmup_steps, timed) = (warmup, steps.max(1));
-    let mut cache = model.new_kv_cache(warmup_steps + timed + 1);
+    let cap = warmup_steps.max(WARMUP_CAP);
+    let mut cache = model.new_kv_cache(cap + timed + 1);
     // A token every vocabulary has; its value does not change the cost.
     let token = 1u32.min(model.config().n_vocab.saturating_sub(1) as u32);
-    let mut times = Vec::with_capacity(timed);
-    for pos in 0..warmup_steps + timed {
+    // **Warm until the step time stops falling, not for a fixed count.** A
+    // discrete card idles at a low clock and ramps under the probe's own
+    // load, so a fixed warm-up times whatever the governor happened to have
+    // reached: on one machine this probe read 49.4 ms and 55.8 ms for the
+    // same model on consecutive starts of the same binary, a 13% spread
+    // against cores that read 45.7 and 47.0 — and since the decision turns
+    // on [`MIN_GAIN`], which sits inside that spread, the same machine
+    // placed the same model differently from one start to the next.
+    //
+    // Two steps that fail to beat the best seen by [`SETTLE`] end it. The
+    // floor is the caller's `warmup`, so a backend that is already warm
+    // pays nothing extra, and [`WARMUP_CAP`] bounds the case where the
+    // times never settle.
+    let mut best = f64::INFINITY;
+    let mut steady = 0usize;
+    let mut pos = 0usize;
+    while pos < cap {
         let started = Instant::now();
         model.forward(&mut cache, &[token], pos, 0).ok()?;
+        let took = started.elapsed().as_secs_f64();
+        pos += 1;
         if pos >= warmup_steps {
-            times.push(started.elapsed().as_secs_f64());
-            if times.iter().filter(|&&t| t > give_up_above).count() >= 2 {
-                break;
+            if took < best * (1.0 - SETTLE) {
+                steady = 0;
+            } else {
+                steady += 1;
+                if steady >= 2 {
+                    break;
+                }
             }
+        }
+        best = best.min(took);
+    }
+    let mut times = Vec::with_capacity(timed);
+    for pos in pos..pos + timed {
+        let started = Instant::now();
+        model.forward(&mut cache, &[token], pos, 0).ok()?;
+        times.push(started.elapsed().as_secs_f64());
+        if times.iter().filter(|&&t| t > give_up_above).count() >= 2 {
+            break;
         }
     }
     times.sort_by(f64::total_cmp);
@@ -121,6 +163,51 @@ fn cpu_wins_by(device: f64, cpu: f64, gain: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The warm-up ends when two consecutive steps stop beating the best
+    /// seen, and not before the caller's floor — the rule that keeps a
+    /// ramping clock out of the timed window. Asserted on the rule itself
+    /// rather than through a model, because there is no backend in a unit
+    /// test whose clock ramps.
+    ///
+    /// The case this exists for, measured: the same model on consecutive
+    /// starts of the same binary read 49.4 ms and 55.8 ms on the device
+    /// against 45.7 and 47.0 on the cores, so `MIN_GAIN` fell inside the
+    /// spread and the placement flipped between starts.
+    #[test]
+    fn the_warm_up_runs_until_the_step_time_stops_falling() {
+        // A ramp that settles: each step beats the last until step 5.
+        let ramp = [100.0, 80.0, 64.0, 55.0, 54.5, 54.4, 54.4, 54.4];
+        let settled_at = |times: &[f64], warmup: usize| {
+            let (mut best, mut steady) = (f64::INFINITY, 0usize);
+            for (i, &t) in times.iter().enumerate() {
+                let pos = i + 1;
+                if pos >= warmup {
+                    if t < best * (1.0 - SETTLE) {
+                        steady = 0;
+                    } else {
+                        steady += 1;
+                        if steady >= 2 {
+                            return pos;
+                        }
+                    }
+                }
+                best = best.min(t);
+            }
+            times.len()
+        };
+        // 54.5 is within 2% of 55.0 and 54.4 of 54.5: two steady steps.
+        assert_eq!(settled_at(&ramp, WARMUP), 6);
+        // A backend already warm pays only the caller's floor plus the two
+        // steps it takes to observe that nothing is improving.
+        let flat = [50.0; 8];
+        assert_eq!(settled_at(&flat, WARMUP), WARMUP + 1);
+        // One that never settles is bounded by the cap, not by this rule.
+        let falling: Vec<f64> = (0..WARMUP_CAP)
+            .map(|i| 100.0 * 0.5f64.powi(i as i32))
+            .collect();
+        assert_eq!(settled_at(&falling, WARMUP), falling.len());
+    }
 
     #[test]
     fn the_device_keeps_decode_unless_the_cores_are_clearly_faster() {

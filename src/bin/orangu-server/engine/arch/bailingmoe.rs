@@ -363,14 +363,27 @@ impl BailingMoeModel {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
 
+        // The per-dispatch device table over this whole pass — see
+        // [`super::OpSpan`]. This architecture resolves no stamps of its
+        // own: it orchestrates from the host and submits one op at a time,
+        // so without the span `ORANGU_GPU_TIMESTAMPS=ops` reports nothing
+        // for it and `perf/llamacpp/ops.sh` cannot see it at all. That gap
+        // is why two rounds of measuring this model's decode could not
+        // separate a kernel's time from the host's around it.
+        let _ops = super::OpSpan::open(self.backend.as_ref(), start_pos);
+
         let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(
-                tok < self.config.n_vocab,
-                "token id {tok} is out of vocab range"
-            );
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+        {
+            let _embed =
+                crate::engine::decode_stages::enter(crate::engine::decode_stages::Stage::Embed);
+            for (t, &tok) in tokens.iter().enumerate() {
+                let tok = tok as usize;
+                anyhow::ensure!(
+                    tok < self.config.n_vocab,
+                    "token id {tok} is out of vocab range"
+                );
+                x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+            }
         }
 
         // Grown once and reused across layers rather than allocated per
@@ -509,10 +522,48 @@ impl ModelForward for BailingMoeModel {
         _slot_id: usize,
     ) -> Result<Vec<f32>> {
         anyhow::ensure!(!tokens.is_empty(), "forward called with no tokens");
+        // Timed when it is a decode step, so `backend::tail_prefers_host`
+        // can compare its two arms on whole steps — the only comparison
+        // that charges each for exactly what it costs. Reading the probe's
+        // arm without feeding it back leaves it deciding nothing, which is
+        // half a mechanism and measures worse than either arm alone.
+        let at = (tokens.len() == 1).then(std::time::Instant::now);
+        // **Hold the card's clock across the step.** This model's token is
+        // almost all host work — the delta rule, the routed experts and
+        // every projection run on the cores — and the card sees one
+        // dispatch of about 0.2 ms. Between them it parks, and the wait for
+        // that dispatch to come back was measured at 4 to 13 ms against a
+        // copy of 0.07: the cost is the device waking, not the kernel and
+        // not the readback. See `super::hold_clock_for_step`.
+        let _clock = super::hold_clock_for_step(self.backend.as_ref(), tokens.len());
         let hidden = self.run_layers(cache, tokens, start_pos)?;
         let n_embd = self.config.n_embd;
         let last = &hidden[(tokens.len() - 1) * n_embd..];
-        Ok(self.backend.matmul(last, 1, &self.output_weight))
+        // **Where the vocabulary projection runs is measured, not inferred
+        // from its size.** `backend::tail_prefers_host` runs whole decode
+        // steps both ways and keeps the faster; the size rule that would
+        // otherwise decide cannot, because above its crossing the device's
+        // bandwidth only wins for *some* weight formats. This model's
+        // vocabulary is wide enough that the projection is the largest
+        // matmul in a decode step by two orders of magnitude, so the choice
+        // is worth a third of the token.
+        //
+        // Only for a single-token step: the probe alternates its arms over
+        // decode steps to decide, and a prompt chunk consuming one would be
+        // measuring something else.
+        let on_host = tokens.len() == 1 && crate::engine::backend::tail_prefers_host();
+        let logits =
+            crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::Head, || {
+                if on_host {
+                    crate::engine::backend::CpuBackend.matmul(last, 1, &self.output_weight)
+                } else {
+                    self.backend.matmul(last, 1, &self.output_weight)
+                }
+            });
+        if let Some(at) = at {
+            crate::engine::backend::note_tail_step(at.elapsed());
+        }
+        Ok(logits)
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -681,6 +732,88 @@ mod real_model_tests {
         top: 11959,
         margin: 10.0,
     };
+
+    /// This engine's own top-20 log-probabilities for the `LONG` prompt
+    /// repeated three times, printed so they can be put beside real
+    /// `llama.cpp`'s for the **same token ids**.
+    ///
+    /// Ids, not text: `llama-server`'s `/completion` takes a token array,
+    /// so passing one removes the tokenizer from the comparison entirely
+    /// and what is left is the forward pass. Log-probabilities rather than
+    /// the argmax, because the question this answers is not "does the
+    /// ranking survive" — the ranking survives everywhere — but whether
+    /// the distribution sits inside the ~0.5-logit band that the batched
+    /// and decode kernel paths already differ by on every architecture
+    /// (see `one_pass_over_a_prompt_equals_one_token_at_a_time`).
+    #[test]
+    #[ignore]
+    fn top_logprobs_for_the_reference_ids() {
+        let path = std::env::var("ORANGU_TEST_BAILINGMOE_MODEL")
+            .expect("set ORANGU_TEST_BAILINGMOE_MODEL to a Ling 3.0 GGUF");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model = BailingMoeModel::load_with_backend(
+            &loaded,
+            Arc::new(crate::engine::backend::CpuBackend),
+        )
+        .expect("build model");
+        let tokens: Vec<u32> = LONG
+            .tokens
+            .iter()
+            .chain(LONG.tokens.iter())
+            .chain(LONG.tokens.iter())
+            .copied()
+            .collect();
+        let mut cache = model.new_kv_cache(tokens.len() + 1);
+        let logits = model.forward(&mut cache, &tokens, 0, 0).expect("forward");
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|l| (l - max).exp()).sum();
+        let log_z = max + sum.ln();
+        let mut ranked: Vec<(usize, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (i, l - log_z))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("finite"));
+        for (id, lp) in ranked.iter().take(20) {
+            println!("LP {id} {lp:.6}");
+        }
+
+        // Real `llama.cpp` on the same ids, `/completion` with `n_probs`
+        // at `temperature 0`: the prompt went over as a **token array**, so
+        // no tokenizer stands between the two engines.
+        const REFERENCE: &[(usize, f32)] = &[
+            (198, -0.660_039),
+            (56346, -1.282_374),
+            (51190, -3.105_238),
+            (4059, -3.956_394),
+            (6301, -3.984_819),
+        ];
+        assert_eq!(
+            ranked[0].0,
+            REFERENCE[0].0,
+            "top-1 disagrees with the reference at {} tokens",
+            tokens.len()
+        );
+        // **A band, not equality, and the band is measured.** At this
+        // length this engine's own batched and per-token paths differ by
+        // ~3 logits on this architecture — a delta-net compounds the
+        // ~0.5-logit gap between the tiled and decode matmul kernels that
+        // every model here shows. So anything inside that is indistinguishable
+        // from where our own two valid answers already sit, and only
+        // something well outside it would be evidence of a wrong graph.
+        for (id, want) in REFERENCE {
+            let got = ranked
+                .iter()
+                .find(|(i, _)| i == id)
+                .unwrap_or_else(|| panic!("reference id {id} is not in our top 20"));
+            assert!(
+                (got.1 - want).abs() < 3.0,
+                "token {id}: {} against the reference's {want}, past the band this \
+                 architecture's own two paths already span",
+                got.1
+            );
+        }
+    }
 
     /// Where the one-pass and per-token paths start to disagree, as a
     /// function of prompt length — the bisect for

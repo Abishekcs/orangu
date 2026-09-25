@@ -271,6 +271,144 @@ pub(crate) fn attend_shared(
         )
 }
 
+/// Query tokens per tile — how many consecutive prompt positions share one
+/// pass over the keys. `ORANGU_ATTN_TOKEN_TILE` overrides it.
+///
+/// This is the whole lever: the key buffer is read once per *tile* instead
+/// of once per token, so the traffic divides by this. What bounds it is
+/// cache — the tile holds `tokens x n_q x key_dim` of queries and
+/// `tokens x n_q x value_dim` of accumulator, both of which must stay
+/// resident across the sweep over keys or the saving is handed straight
+/// back. Eight is the largest that keeps both inside a core's L2 at this
+/// architecture's widths.
+const ATTN_TOKEN_TILE: usize = 8;
+
+/// Keys scored per tile. The score tile is `tokens x n_q x this` floats and
+/// has to stay in L1 — that is the constraint Round 57 broke by making it
+/// `tokens x n_q x n_keys`.
+const ATTN_KEY_TILE: usize = 32;
+
+fn attn_token_tile() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_ATTN_TOKEN_TILE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(ATTN_TOKEN_TILE)
+    })
+}
+
+/// [`attend_shared`] for **a whole prompt at once**, each token attending to
+/// the causal prefix that ends at its own position.
+///
+/// The per-token form reads the whole key prefix once per token, so a prompt
+/// costs `O(n^2)` reads of a buffer that is itself `O(n)`. Here a *tile* of
+/// consecutive tokens shares one pass over the keys, dividing those reads by
+/// the tile — and, unlike the attempt this replaces, the scores never exist
+/// as a matrix. Each lane carries a running maximum and a running sum, and
+/// the accumulator is rescaled whenever a key block raises the maximum: the
+/// online (flash) softmax. The only score buffer is one tile, a few
+/// kilobytes, which is what keeps the traffic saved rather than moved.
+///
+/// Two orderings matter and both are load-bearing. Keys are the **outer**
+/// loop within a block so a key row is read once and scored against every
+/// lane while it is in L1; scoring lane-outer instead reads the key buffer
+/// once per lane, which is `n_q x tile` times worse than the loop it
+/// replaces. And the causal bound is applied by shortening each lane's key
+/// range, never by computing a score and discarding it.
+///
+/// `qs` is `[n_tokens, n_q, key_dim]` token-major, `keys` has at least
+/// `first_pos + n_tokens` rows, and the result is `[n_tokens, n_q,
+/// value_dim]`. Query `(t, ..)` attends to keys `0..=first_pos + t`, and the
+/// values are each key row's leading `value_dim` elements exactly as
+/// [`attend_shared`] takes them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attend_shared_causal(
+    qs: &[f32],
+    n_q: usize,
+    n_tokens: usize,
+    keys: &[f32],
+    key_dim: usize,
+    value_dim: usize,
+    scale: f32,
+    first_pos: usize,
+) -> Vec<f32> {
+    debug_assert!(value_dim <= key_dim);
+    debug_assert_eq!(qs.len(), n_tokens * n_q * key_dim);
+    let mut out = vec![0f32; n_tokens * n_q * value_dim];
+    if n_q == 0 || n_tokens == 0 {
+        return out;
+    }
+    let tile = attn_token_tile();
+    out.par_chunks_mut(tile * n_q * value_dim)
+        .enumerate()
+        .for_each(|(block, out)| {
+            let t0 = block * tile;
+            let nt = tile.min(n_tokens - t0);
+            let lanes = nt * n_q;
+            // One lane is one (token, head). `m` and `s` are the online
+            // softmax's running maximum and denominator; `out` is the
+            // accumulator, written in place and normalized at the end.
+            let mut m = vec![f32::NEG_INFINITY; lanes];
+            let mut s = vec![0f32; lanes];
+            let mut scores = vec![0f32; lanes * ATTN_KEY_TILE];
+            // The last key any token in this tile may see.
+            let last = first_pos + t0 + nt - 1;
+            for k0 in (0..=last).step_by(ATTN_KEY_TILE) {
+                let nk = ATTN_KEY_TILE.min(last + 1 - k0);
+                // **Keys outer.** One key row, scored against every lane
+                // while it is in cache.
+                for kk in 0..nk {
+                    let key = &keys[(k0 + kk) * key_dim..(k0 + kk + 1) * key_dim];
+                    for (lane, slot) in scores.chunks_mut(ATTN_KEY_TILE).enumerate() {
+                        let q = &qs[(t0 * n_q + lane) * key_dim..][..key_dim];
+                        slot[kk] = tensor::dot(q, key) * scale;
+                    }
+                }
+                for lane in 0..lanes {
+                    // This lane's causal bound, as a count of the keys in
+                    // this block it may attend to.
+                    let limit = first_pos + t0 + lane / n_q;
+                    if k0 > limit {
+                        continue;
+                    }
+                    let nk = nk.min(limit + 1 - k0);
+                    let row = &scores[lane * ATTN_KEY_TILE..lane * ATTN_KEY_TILE + nk];
+                    let peak = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let acc = &mut out[lane * value_dim..(lane + 1) * value_dim];
+                    if peak > m[lane] {
+                        // The maximum moved: everything accumulated so far
+                        // was scaled against the old one. `exp(-inf - x)` is
+                        // zero, which is exactly right for the first block.
+                        let rescale = (m[lane] - peak).exp();
+                        s[lane] *= rescale;
+                        for v in acc.iter_mut() {
+                            *v *= rescale;
+                        }
+                        m[lane] = peak;
+                    }
+                    for (kk, &score) in row.iter().enumerate() {
+                        let w = (score - m[lane]).exp();
+                        s[lane] += w;
+                        tensor::axpy_inplace(
+                            acc,
+                            &keys[(k0 + kk) * key_dim..(k0 + kk) * key_dim + value_dim],
+                            w,
+                        );
+                    }
+                }
+            }
+            for lane in 0..lanes {
+                let inv = 1.0 / s[lane];
+                for v in out[lane * value_dim..(lane + 1) * value_dim].iter_mut() {
+                    *v *= inv;
+                }
+            }
+        });
+    out
+}
+
 /// How a MoE layer turns its router's logits into probabilities —
 /// `<arch>.expert_gating_func`, upstream's
 /// `llama_expert_gating_func_type`.
@@ -3543,6 +3681,98 @@ pub struct MtpStep {
 #[cfg(test)]
 mod tests {
 
+    /// The batched causal form must agree, token for token, with calling
+    /// [`attend_shared`] once per token over that token's own prefix — the
+    /// loop it replaces.
+    ///
+    /// The shapes matter more than usual. A token count that straddles the
+    /// tile (9 against a tile of 8, and 33) catches a lane leaking across
+    /// tiles; a key count that straddles `ATTN_KEY_TILE` catches the causal
+    /// bound being applied to the wrong block; a non-zero `first_pos`
+    /// catches a prefix measured from the wrong origin; and a value width
+    /// narrower than the key width is the latent form's defining property.
+    ///
+    /// The tolerance is tight on purpose. This reorders a softmax, so it is
+    /// not bit-identical — but an online softmax that is *correct* differs
+    /// only in rounding, and anything larger is a real disagreement.
+    #[test]
+    fn the_batched_causal_attention_agrees_with_the_per_token_loop() {
+        for (n_q, n_tokens, first_pos, key_dim, value_dim) in [
+            (3usize, 5usize, 0usize, 6usize, 4usize),
+            (2, 9, 0, 5, 3),
+            (2, 33, 0, 5, 3),
+            (4, 7, 11, 6, 6),
+            (2, 20, 40, 5, 3),
+            (1, 1, 0, 4, 2),
+            (3, 8, 0, 4, 4),
+        ] {
+            let n_keys = first_pos + n_tokens;
+            let qs: Vec<f32> = (0..n_tokens * n_q * key_dim)
+                .map(|i| ((i * 31 % 19) as f32 - 9.0) * 0.07)
+                .collect();
+            let keys: Vec<f32> = (0..n_keys * key_dim)
+                .map(|i| ((i * 13 % 23) as f32 - 11.0) * 0.04)
+                .collect();
+            let scale = 0.4;
+            let got = attend_shared_causal(
+                &qs, n_q, n_tokens, &keys, key_dim, value_dim, scale, first_pos,
+            );
+            assert_eq!(got.len(), n_tokens * n_q * value_dim);
+            for t in 0..n_tokens {
+                let prefix = &keys[..(first_pos + t + 1) * key_dim];
+                let q = &qs[t * n_q * key_dim..(t + 1) * n_q * key_dim];
+                let want = attend_shared(q, n_q, prefix, key_dim, value_dim, scale);
+                for (i, (g, e)) in got[t * n_q * value_dim..(t + 1) * n_q * value_dim]
+                    .iter()
+                    .zip(&want)
+                    .enumerate()
+                {
+                    assert!(
+                        (g - e).abs() <= 1e-5 * e.abs().max(1.0),
+                        "n_q {n_q} tokens {n_tokens} first_pos {first_pos} \
+                         token {t} at {i}: {g} vs {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A lane whose causal prefix ends inside a key block must not see the
+    /// rest of that block. Checked by giving the masked keys values that
+    /// would dominate the softmax if they were ever scored — a mask applied
+    /// as "compute and discard" would pass a tolerance test on the early
+    /// tokens and fail here.
+    #[test]
+    fn a_masked_key_cannot_reach_an_earlier_token() {
+        let (n_q, n_tokens, key_dim, value_dim) = (2usize, 6usize, 4usize, 3usize);
+        let qs: Vec<f32> = (0..n_tokens * n_q * key_dim)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let mut keys = vec![0f32; n_tokens * key_dim];
+        for (i, v) in keys.iter_mut().enumerate() {
+            *v = ((i % 5) as f32 - 2.0) * 0.1;
+        }
+        let got = attend_shared_causal(&qs, n_q, n_tokens, &keys, key_dim, value_dim, 0.5, 0);
+        // The first token sees exactly one key, so its output *is* that
+        // key's value row, whatever the later keys hold.
+        let mut huge = keys.clone();
+        for v in huge[key_dim..].iter_mut() {
+            *v = 50.0;
+        }
+        let with_huge = attend_shared_causal(&qs, n_q, n_tokens, &huge, key_dim, value_dim, 0.5, 0);
+        for h in 0..n_q {
+            let mine = &got[h * value_dim..(h + 1) * value_dim];
+            let theirs = &with_huge[h * value_dim..(h + 1) * value_dim];
+            for ((g, w), k) in mine.iter().zip(theirs).zip(&keys[..value_dim]) {
+                assert!(
+                    (g - w).abs() < 1e-6,
+                    "token 0 head {h} moved when a masked key changed: {g} vs {w}"
+                );
+                assert!((g - k).abs() < 1e-6, "token 0 is key 0's value");
+            }
+        }
+    }
+
     /// `attend_shared` must agree with the per-head `attend` it replaces at
     /// every head, including the awkward shapes: a value width narrower
     /// than the key width (which is the whole point of the latent form), a
@@ -3592,8 +3822,9 @@ mod tests {
     }
     use super::{
         ExpertGating, ExpertProjection, ExpertRouting, SwigluLimit, attend, attend_shared,
-        device_expert_admissible, evaluate_routed_experts, evaluate_routed_experts_batched_views,
-        flag_is_on, matmul_host_fallback, project_expert, restore_order, top_k_indices,
+        attend_shared_causal, device_expert_admissible, evaluate_routed_experts,
+        evaluate_routed_experts_batched_views, flag_is_on, matmul_host_fallback, project_expert,
+        restore_order, top_k_indices,
     };
     use crate::engine::backend::Backend;
     use crate::engine::loader::{QuantMatrix, test_quant_matrix};

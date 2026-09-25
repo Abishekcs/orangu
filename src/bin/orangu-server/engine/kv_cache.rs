@@ -3562,24 +3562,14 @@ impl RecurrentLayerState {
         out
     }
 
-    /// The state matrix for `head` (`[head_dim, state_dim]`, `state_dim`
-    /// fastest-varying, mutable — the recurrence updates it in place every
-    /// token).
-    pub fn delta_state_mut(&mut self, head: usize) -> &mut [f32] {
-        self.ensure_host();
-        self.fresh = Fresh::Host;
-        let size = self.head_dim * self.state_dim;
-        let start = head * size;
-        &mut self.delta_state[start..start + size]
-    }
-
     /// Every head's state matrix at once, with the stride between them —
-    /// `(states, size)`, where head `h` owns `states[h * size..][..size]`.
+    /// `(states, size)`, where head `h` owns `states[h * size..][..size]`,
+    /// laid out `[head_dim, state_dim]` with `state_dim` fastest-varying and
+    /// updated in place every token.
     ///
-    /// [`Self::delta_state_mut`] hands out one head at a time, which is what a
-    /// sequential loop wants and what a parallel one cannot use: the heads are
-    /// independent, so their update is a fan-out, and a fan-out needs every
-    /// head's slice disjoint and alive at once rather than one at a time.
+    /// Handed out together rather than a head at a time because the heads
+    /// are independent, so their update is a fan-out, and a fan-out needs
+    /// every head's slice disjoint and alive at once.
     pub fn delta_states_mut(&mut self) -> (&mut [f32], usize) {
         self.ensure_host();
         self.fresh = Fresh::Host;
@@ -4970,12 +4960,12 @@ mod tests {
         let spec = RecurrentSpec::delta_net(4, 2, 2, 2);
         let mut src = KvCache::new_mixed(8, &[4], &[spec]);
         src.layers[0].push(&[1.0; 4], &[2.0; 4]);
-        src.recurrent[0].delta_state_mut(0)[0] = 42.0;
+        src.recurrent[0].delta_states_mut().0[0] = 42.0;
 
         let mut dst = KvCache::new_mixed(8, &[4], &[spec]);
         dst.adopt_prefix(src, 1);
         assert_eq!(dst.committed_len(), 1);
-        assert_eq!(dst.recurrent[0].delta_state_mut(0)[0], 42.0);
+        assert_eq!(dst.recurrent[0].delta_states_mut().0[0], 42.0);
     }
 
     /// The mirror is sized to what has been generated, not to what was asked
@@ -5150,7 +5140,7 @@ mod tests {
         assert_eq!(downloads.load(Ordering::Relaxed), 1);
         assert_eq!(state.fresh, super::Fresh::Device);
         // A host writer gets the downloaded copy and owns it from then on.
-        state.delta_state_mut(0)[0] = 1.0;
+        state.delta_states_mut().0[0] = 1.0;
         assert_eq!(downloads.load(Ordering::Relaxed), 2);
         assert_eq!(state.fresh, super::Fresh::Host);
         assert_eq!(state.host_snapshot().state[0], 1.0);
@@ -5179,16 +5169,22 @@ mod tests {
         assert!(other.conv_history.iter().all(|&v| v == -7.0));
     }
 
+    /// Each head's state must be a disjoint slice of the one buffer, which
+    /// is what lets the delta rule fan its heads over cores: a stride that
+    /// overlapped would let two heads write each other's state, and the
+    /// symptom would be a wrong answer only under load.
     #[test]
-    fn delta_state_mut_is_independent_per_head() {
+    fn every_head_owns_a_disjoint_state() {
         let mut state = RecurrentLayerState::new(RecurrentSpec::delta_net(1, 2, 2, 2));
-        state
-            .delta_state_mut(0)
-            .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
-        state
-            .delta_state_mut(1)
-            .copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(state.delta_state_mut(0), &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(state.delta_state_mut(1), &[5.0, 6.0, 7.0, 8.0]);
+        let (states, size) = state.delta_states_mut();
+        assert_eq!(size, 4, "head_dim x state_dim");
+        let mut heads: Vec<&mut [f32]> = states.chunks_mut(size).collect();
+        assert_eq!(heads.len(), 2);
+        heads[0].copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        heads[1].copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        let (states, size) = state.delta_states_mut();
+        let heads: Vec<&[f32]> = states.chunks(size).collect();
+        assert_eq!(heads[0], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(heads[1], &[5.0, 6.0, 7.0, 8.0]);
     }
 }
