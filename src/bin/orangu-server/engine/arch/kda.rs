@@ -421,7 +421,7 @@ impl KdaLayer {
                 // arithmetic without changing any of it — the tasks stay
                 // disjoint, so this is the same fan-out with a coarser
                 // grain.
-                let group = delta_heads_per_task().min(n_head.max(1));
+                let group = delta_heads_per_task(n_head).min(n_head.max(1));
                 states
                     .par_chunks_mut(state_size * group)
                     .zip(q_t.par_chunks_mut(head_dim * group))
@@ -619,23 +619,41 @@ pub(crate) struct MlaLayer {
 /// `ORANGU_DELTA_FANOUT=0` runs the delta rule's heads one after another on
 /// the calling thread — the control arm for the fan-out over heads. On
 /// unless `0`.
-/// Heads handed to one task by the delta rule's fan-out —
-/// `ORANGU_DELTA_HEADS_PER_TASK`, default [`DELTA_HEADS_PER_TASK`]. `0` and
-/// values past the head count collapse to the whole layer in one task.
-fn delta_heads_per_task() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
+/// Heads handed to one task by the delta rule's fan-out, for a layer of
+/// `n_head` — `ORANGU_DELTA_HEADS_PER_TASK` overrides it with a fixed
+/// number, and `0` falls back to the rule below.
+///
+/// **A floor on the task count, not a target.** One head per task is the
+/// finest grain available and the most dispatch per unit of arithmetic,
+/// and grouping is worth a little: measured on a delta-net mixture, four
+/// heads a task beat one in four of four alternating pairs. What that
+/// measurement also shows is that the pool was never the constraint —
+/// four tasks across sixteen workers still won — so matching the task
+/// count to the worker count would be solving the wrong problem and would
+/// give back the whole gain.
+///
+/// The risk is the other end: a layer with few heads, grouped, is a serial
+/// loop wearing a fan-out's clothes. So the grain is whatever keeps at
+/// least [`DELTA_MIN_TASKS`] tasks, and a layer that cannot afford that
+/// many is left at one head each.
+fn delta_heads_per_task(n_head: usize) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let forced = *OVERRIDE.get_or_init(|| {
         std::env::var("ORANGU_DELTA_HEADS_PER_TASK")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(DELTA_HEADS_PER_TASK)
-    })
+    });
+    match forced {
+        Some(n) => n,
+        None => (n_head / DELTA_MIN_TASKS).max(1),
+    }
 }
 
-/// See [`delta_heads_per_task`]. One head per task is the finest grain the
-/// fan-out can have and the most dispatch per unit of arithmetic.
-const DELTA_HEADS_PER_TASK: usize = 1;
+/// The fewest tasks the delta rule's fan-out will split a layer into — see
+/// [`delta_heads_per_task`]. Below this a grouped layer starts leaving
+/// cores idle, which costs more than the dispatch it saves.
+const DELTA_MIN_TASKS: usize = 4;
 
 fn delta_fanout() -> bool {
     crate::engine::env::flag_on_unless_disabled("ORANGU_DELTA_FANOUT")
@@ -1156,6 +1174,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fan-out grain must group where there are heads to spare and
+    /// never below the task floor, because a grouped layer with few heads
+    /// is a serial loop wearing a fan-out's clothes.
+    ///
+    /// The measured case is the middle one: sixteen heads at four a task
+    /// beat one a task in four of four alternating pairs, and four tasks
+    /// across sixteen workers is fewer than the pool — which is why the
+    /// rule is a floor on tasks rather than a match to workers.
+    #[test]
+    fn the_fan_out_grain_groups_but_never_starves_the_pool() {
+        let tasks = |n_head: usize| n_head.div_ceil(delta_heads_per_task(n_head));
+        // Too few heads to group at all.
+        for n_head in 1..=DELTA_MIN_TASKS {
+            assert_eq!(
+                delta_heads_per_task(n_head),
+                1,
+                "{n_head} heads must stay one a task"
+            );
+        }
+        // Enough to group, and never below the floor.
+        for n_head in [5usize, 8, 12, 16, 24, 32, 64, 128] {
+            let grain = delta_heads_per_task(n_head);
+            assert!(grain >= 1);
+            assert!(
+                tasks(n_head) >= DELTA_MIN_TASKS,
+                "{n_head} heads gave {} tasks at grain {grain}",
+                tasks(n_head)
+            );
+            assert!(
+                grain <= n_head,
+                "{n_head} heads cannot be grouped {grain} at a time"
+            );
+        }
+        // The arm that was measured.
+        assert_eq!(delta_heads_per_task(16), 4);
     }
 
     /// Two steps of [`delta_step`], pinning **which axis the decay
