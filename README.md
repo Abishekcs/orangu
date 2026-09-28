@@ -25,9 +25,7 @@ Every layer communicates over OpenAI-compatible APIs.
 
 ---
 
-## 30-Second Quickstart
-
-### 1. Install
+## Install
 
 **Linux / macOS** (via `curl` or `wget`):
 ```sh
@@ -51,7 +49,9 @@ curl -fsSL https://mnemosyne-systems.github.io/orangu/install.sh | INSTALL_DIR=/
 set "INSTALL_DIR=C:\Tools" && install.cmd
 ```
 
-### 2. Shell Completions
+---
+
+## Shell Completions
 
 Run `orangu -s` to print completion scripts for bash, zsh, fish, or PowerShell (supported by all binaries: `orangu`, `orangu-server`, `orangu-coordinator`, `orangu-bench`, and `orangu-gguf`):
 
@@ -69,7 +69,11 @@ orangu -s | source
 orangu -s | Out-String | Invoke-Expression
 ```
 
-### 3. Configure
+for each of the binaries.
+
+---
+
+## Configure
 
 Run the interactive setup wizard:
 ```sh
@@ -82,7 +86,11 @@ Alternatively, copy the sample configuration:
 cp doc/etc/orangu.conf ./orangu.conf
 ```
 
-### 4. Launch
+for each of the binaries.
+
+---
+
+## Launch
 
 ```sh
 # Start in the current repository
