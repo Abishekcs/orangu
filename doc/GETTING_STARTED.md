@@ -58,10 +58,11 @@ asked for a picture model, which is asked its own keys instead:
 | `read_size` | `8192` | KiB per model-file read. |
 | `log_type` | `console` | `console` or `file`; `file` asks for `log_path`. |
 | `Add web console` | `Y` | Answering `n` writes no `[web]` section, and no console is served. |
-| `Add Prometheus metrics` | `N` | Accepting asks for its `host` and `port` (`8300`). |
+| `Add Prometheus metrics` | `Y` | `n` writes no `[prometheus]` section. Accepting asks for its `host` and `port` (`8300`). |
+| `Add workers` | `Y` | `n` writes no `[workers]` section. Accepting asks for its `host`, `port` (`8400`), `workers`, `standby`, `secret` and `activations`; with no workers listed the server is a node another can use as a worker. |
 
 Accepting the web console asks four more: its `host` (defaulting to the address
-the API just took), `port` (`8101`), `reexec` (`Y` — may the console load a
+the API just took), `port` (`8200`), `reexec` (`Y` — may the console load a
 different model), and `delete` (`Y` — may the console delete models).
 
 The wizard then prints the file it is about to write and asks
@@ -76,7 +77,15 @@ port = 8100
 
 [web]
 host = all
-port = 8101
+port = 8200
+
+[prometheus]
+host = all
+port = 8300
+
+[workers]
+host = all
+port = 8400
 ```
 
 Note that `-i` always writes `~/.orangu/orangu-server.conf`; it ignores

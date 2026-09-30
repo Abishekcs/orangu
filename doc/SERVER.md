@@ -1389,7 +1389,7 @@ delete = yes
 
 - `port` — where the console listens, bound alongside `[orangu-server].port`
   rather than instead of it. Defaults to `8101` when the section is present
-  but says nothing.
+  but says nothing; `-i`/`--init` offers `8200` and writes it.
 - `host` — the address it binds, prompted for with the same interface
   completion and ghost suggestion `[orangu-server].host` gets, and defaulting
   to whatever that was just answered. **When the key is absent it falls back
@@ -1427,8 +1427,8 @@ takes precedence over it wherever both appear.
 A second, dedicated Prometheus listener, configured the same way as `[web]`:
 **having this section at all is what enables it**. A config with no
 `[prometheus]` binds no third listener; `-i`/`--init` asks
-`Add Prometheus metrics` and then `host` and `port`, or writes no
-section at all.
+`Add Prometheus metrics` (default yes) and then `host` and `port`, or
+writes no section at all.
 
 ```ini
 [prometheus]
@@ -1463,7 +1463,7 @@ prefill chunk and every generated token. `doc/WORKERS.md` has the design
 and what is still to come.
 
 Like `[web]` and `[prometheus]`, a config with no `[workers]` section has
-none. `-i`/`--init` asks `Add workers` (default no), then `host`, `port`,
+none. `-i`/`--init` asks `Add workers` (default yes), then `host`, `port`,
 `workers`, `secret` and `activations`, or writes no section at all.
 
 ```ini
@@ -1735,7 +1735,7 @@ applies without it (`api_key`, `tls_cert`/`tls_key`, `slots`,
 `console`) and — only on `file` — `log_path` (TAB-completing real
 filesystem paths as you type, and ghosting its default,
 `orangu-server.log` in the current directory, on the empty line), then
-`Add web console` and `Add Prometheus metrics`, shows the resulting file, and asks for confirmation before writing (creating the
+`Add web console`, `Add Prometheus metrics` and `Add workers` (each defaulting to yes), shows the resulting file, and asks for confirmation before writing (creating the
 directory if needed, and overwriting any existing file). Only writes the
 `role =` line when a non-default value was chosen; a `file` log's
 `log_path` is always written, since its default moves with the directory

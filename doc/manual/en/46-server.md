@@ -2059,7 +2059,7 @@ delete = yes
 
 - `port` — where the console listens, bound alongside `[orangu-server].port`
   rather than instead of it. Defaults to `8101` when the section is present
-  but says nothing.
+  but says nothing; `-i`/`--init` offers `8200` and writes it.
 - `host` — the address it binds, prompted for with the same interface
   completion and ghost suggestion `[orangu-server].host` gets, and defaulting
   to whatever that was just answered. **When the key is absent it falls back
@@ -2129,7 +2129,7 @@ prefill chunk and every generated token. `doc/WORKERS.md` has the design
 and what is still to come.
 
 Like `[web]` and `[prometheus]`, a config with no `[workers]` section has
-none. `-i`/`--init` asks `Add workers` (default no), then `host`, `port`,
+none. `-i`/`--init` asks `Add workers` (default yes), then `host`, `port`,
 `workers`, `secret` and `activations`, or writes no section at all.
 
 ```ini
@@ -2391,10 +2391,10 @@ without it — `api_key`, `tls_cert` (and, with one, `tls_key`), `slots`,
 an address other than loopback the `api_key` prompt says that a blank
 answer leaves the server reachable off this machine**; blank writes no key.
 It also asks `Add Prometheus
-metrics` — declining (the default)
+metrics` (default yes) — declining
 writes no `[prometheus]` section at all; accepting prompts for a `host`
 (defaulting to the API's) and a `port` (suggesting `8300`) and writes a `[prometheus]` section.
-Then `Add workers` — declining (the default) writes no `[workers]` section;
+Then `Add workers` (default yes) — declining writes no `[workers]` section;
 accepting prompts for a `host` (defaulting to the API's), a `port`
 (suggesting `8400`), the comma-separated `host:port` list of `workers`
 — an entry without a port takes that `port` — re-prompting until the list

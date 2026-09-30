@@ -19,7 +19,7 @@ use crate::config::{
     DEFAULT_DRAFT_TOKENS, DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, KvCache, PROMETHEUS_SECTION,
     Role, WEB_SECTION, WORKERS_SECTION, WorkerAddress, default_delete, default_host,
     default_npu_cache_gb, default_npu_precompile, default_port, default_prometheus_port,
-    default_reexec, default_web_port, default_workers_port, parse_workers_list,
+    default_reexec, default_workers_port, parse_workers_list,
 };
 use crate::workers::protocol::ActivationFormat;
 use anyhow::{Context, Result, anyhow};
@@ -46,6 +46,12 @@ use std::path::{Path, PathBuf};
 /// duplicated from `orangu-coordinator`'s wizard: it's a one-line constant
 /// and each `--init` wizard is its own self-contained binary.
 const GHOST_TEXT: &str = "\x1b[38;2;120;120;120m";
+
+/// The web console port `-i` offers: the `8200` a bundle's console takes, clear
+/// of the `8101`, `8102`, … a machine running several servers gives their
+/// APIs. Written into the `[web]` section, so it holds whatever the loader's
+/// own default for a section without a port.
+const INIT_WEB_PORT: u16 = 8200;
 const ANSI_RESET: &str = "\x1b[0m";
 
 pub fn run_init() -> Result<()> {
@@ -123,7 +129,7 @@ pub fn run_init() -> Result<()> {
         // Enter through this section puts the console wherever the API is,
         // and answering differently is how the two get separated.
         let web_host = prompt_host(&host)?;
-        let web_port = prompt_line("port", &default_web_port().to_string())?;
+        let web_port = prompt_line("port", &INIT_WEB_PORT.to_string())?;
         let reexec = prompt_bool("reexec", default_reexec())?;
         let delete = prompt_bool("delete", default_delete())?;
         Some((web_host, web_port, reexec, delete))
@@ -131,9 +137,9 @@ pub fn run_init() -> Result<()> {
         None
     };
 
-    // A section of its own, the same shape as the web console above. Off by
+    // A section of its own, the same shape as the web console above. On by
     // default; declining writes no `[prometheus]` section at all.
-    let metrics = if prompt_bool("Add Prometheus metrics", false)? {
+    let metrics = if prompt_bool("Add Prometheus metrics", true)? {
         // Defaults to the API's address, like the console's; answering
         // differently is how a keyless metrics port stays off the network.
         let metrics_host = prompt_host(&host)?;
@@ -143,9 +149,9 @@ pub fn run_init() -> Result<()> {
         None
     };
 
-    // The same shape again: off by default, and declining writes no
+    // The same shape again: on by default, and declining writes no
     // `[workers]` section at all.
-    let workers = if prompt_bool("Add workers", false)? {
+    let workers = if prompt_bool("Add workers", true)? {
         let workers_host = prompt_host(&host)?;
         let workers_port = prompt_line("port", &default_workers_port().to_string())?;
         let workers_list = prompt_workers_list("workers", workers_port.trim())?;
@@ -1655,10 +1661,14 @@ impl WorkersAnswers {
             .collect::<Vec<_>>()
             .join(", ");
         let mut section = format!(
-            "\n[{WORKERS_SECTION}]\nhost = {}\nport = {}\nworkers = {list}\n",
+            "\n[{WORKERS_SECTION}]\nhost = {}\nport = {}\n",
             self.host,
             self.port.trim()
         );
+        // None: a node others use as a worker, with none of its own.
+        if !list.is_empty() {
+            section.push_str(&format!("workers = {list}\n"));
+        }
         if !self.standby.is_empty() {
             let standby = self
                 .standby
