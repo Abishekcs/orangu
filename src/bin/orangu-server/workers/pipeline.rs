@@ -2307,10 +2307,10 @@ mod tests {
         // A stage that cannot copy: nothing shared.
         let slow = delegating(
             0..2,
-            vec![Box::new(Slow {
-                inner: Box::new(LoopbackStage::new(store_of(2..4, vec![]), f32)),
-                forwards: Arc::new(AtomicUsize::new(0)),
-            })],
+            vec![Box::new(Slow::new(Box::new(LoopbackStage::new(
+                store_of(2..4, vec![]),
+                f32,
+            ))))],
         );
         let mut conversation = slow.new_kv_cache(N_CTX);
         slow.forward(&mut conversation, &history, 0, 0).unwrap();
@@ -2733,10 +2733,25 @@ mod tests {
         assert_eq!(cache.committed_len(), 18);
     }
 
-    /// A stage that takes its time over every forward, and counts them.
+    /// A stage that takes its time over every forward, and counts them —
+    /// and, through `busy`, how many forwards of the stages sharing it ran
+    /// at once at most (`peak`).
     struct Slow {
         inner: Box<dyn Stage>,
         forwards: Arc<AtomicUsize>,
+        busy: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl Slow {
+        fn new(inner: Box<dyn Stage>) -> Self {
+            Self {
+                inner,
+                forwards: Arc::new(AtomicUsize::new(0)),
+                busy: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     impl Stage for Slow {
@@ -2756,7 +2771,10 @@ mod tests {
             start_pos: usize,
             rows: Rows,
         ) -> Result<Vec<f32>> {
+            let busy = self.busy.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(busy, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(40));
+            self.busy.fetch_sub(1, Ordering::SeqCst);
             self.forwards.fetch_add(1, Ordering::Relaxed);
             self.inner.forward(session, hidden, tokens, start_pos, rows)
         }
@@ -2777,34 +2795,30 @@ mod tests {
     #[test]
     fn a_node_s_workers_overlap_on_a_prompt() {
         let model = fixture::model();
+        let busy = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
         let slow = |layers: Range<usize>| -> Box<dyn Stage> {
             Box::new(Slow {
-                inner: Box::new(LoopbackStage::new(
+                busy: busy.clone(),
+                peak: peak.clone(),
+                ..Slow::new(Box::new(LoopbackStage::new(
                     Arc::new(SessionStore::new(
                         Arc::new(LayerPipeline::new(model.clone(), layers, vec![]).unwrap()),
                         N_CTX,
                         8,
                     )),
                     ActivationFormat::F32,
-                )),
-                forwards: Arc::new(AtomicUsize::new(0)),
+                )))
             })
         };
         let tree = delegating(0..1, vec![slow(1..3), slow(3..4)]).with_sub_chunk(2);
         let tokens: Vec<u32> = (0..21u32).map(|t| (t * 7) % 60 + 1).collect();
         let mut cache = tree.new_kv_cache(N_CTX);
-        let started = Instant::now();
         // Ten parts queued, the last forward waiting for them all.
         tree.forward_no_logits(&mut cache, &tokens[..20], 0, 0)
             .unwrap();
         let got = tree.forward(&mut cache, &tokens[20..], 20, 0).unwrap();
-        let elapsed = started.elapsed();
-        // Taking turns: eleven forwards of 2 × 40 ms, 880 ms. Overlapped:
-        // about twelve of 40.
-        assert!(
-            elapsed < Duration::from_millis(700),
-            "{elapsed:?}: the workers took turns"
-        );
+        assert_eq!(peak.load(Ordering::SeqCst), 2, "the workers took turns");
         let mut alone = model.new_kv_cache(N_CTX);
         for at in (0..20).step_by(2) {
             model
@@ -2830,8 +2844,11 @@ mod tests {
         let tree = delegating(
             0..2,
             vec![Box::new(Slow {
-                inner: Box::new(LoopbackStage::new(leaf.clone(), ActivationFormat::F32)),
                 forwards: forwards.clone(),
+                ..Slow::new(Box::new(LoopbackStage::new(
+                    leaf.clone(),
+                    ActivationFormat::F32,
+                )))
             })],
         )
         .with_sub_chunk(2);
@@ -2840,15 +2857,18 @@ mod tests {
         // Twenty parts go on through the tree without waiting.
         tree.forward_no_logits(&mut cache, &tokens, 0, 0).unwrap();
         drop(cache);
+        let before = forwards.load(Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(5);
         while leaf.len() > 0 {
             assert!(Instant::now() < deadline, "the worker still holds it");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let ran = forwards.load(Ordering::Relaxed);
+        // At most the part on the worker when the drop came finishes.
+        let ran = forwards.load(Ordering::Relaxed) - before;
         assert!(
-            ran < 5,
-            "{ran} of 20 parts ran after the sequence was dropped"
+            ran <= 1,
+            "{ran} of {} parts ran after the sequence was dropped",
+            20 - before
         );
     }
 
