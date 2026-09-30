@@ -451,8 +451,25 @@ impl Residency {
     /// Worth a line because it is the one condition here an operator can act
     /// on, and because its symptom without one is "the NPU stopped helping
     /// part way through the model" with nothing in the log.
-    fn note_device_refusal(&self) {
-        if !self.exhausted.swap(true, Ordering::Relaxed) {
+    ///
+    /// `error` is the OS error the failed allocation left: the runtime
+    /// exports every buffer as a file descriptor, so a refusal can be the
+    /// process's descriptor limit and not the device's memory.
+    fn note_device_refusal(&self, error: std::io::Error) {
+        if self.exhausted.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if error.raw_os_error() == Some(libc::EMFILE) {
+            let limit = orangu::os::open_files_limit();
+            eprintln!(
+                "orangu-server: [npu] out of file descriptors (limit {}): the runtime \
+                 holds one per device buffer. The weights already on the device stay \
+                 there and the rest of the model runs on the CPU. Raise the hard \
+                 limit (`ulimit -Hn`, or LimitNOFILE= in a systemd unit), or lower \
+                 ORANGU_NPU_WEIGHTS_GB.",
+                limit.map_or_else(|| "unknown".to_string(), |(soft, _)| soft.to_string())
+            );
+        } else {
             eprintln!(
                 "orangu-server: [npu] the device refused more memory; the weights \
                  already on it stay there and the rest of the model runs on the CPU. \
@@ -789,7 +806,7 @@ impl Weight {
         // `Weight` drops.
         let b = unsafe { (api.create_mem)(ctx, b_size) };
         if b.is_null() {
-            residency.note_device_refusal();
+            residency.note_device_refusal(std::io::Error::last_os_error());
             return None;
         }
         // SAFETY: `create_mem` returned non-null, so `virt_addr` is a
@@ -935,10 +952,15 @@ impl Weight {
             }
             // SAFETY: the context is live for as long as `self` is.
             let a = unsafe { (self.api.create_mem)(self.ctx, attr.a.size) };
+            let a_error = std::io::Error::last_os_error();
             // SAFETY: as above.
             let c = unsafe { (self.api.create_mem)(self.ctx, attr.c.size) };
             if a.is_null() || c.is_null() {
-                self.residency.note_device_refusal();
+                self.residency.note_device_refusal(if a.is_null() {
+                    a_error
+                } else {
+                    std::io::Error::last_os_error()
+                });
                 self.release(u64::from(attr.a.size) + u64::from(attr.c.size));
                 // SAFETY: each pointer, if non-null, came from this
                 // context's `create_mem` and has not been destroyed.

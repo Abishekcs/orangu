@@ -251,6 +251,43 @@ fn detect_open_files_limit() -> Option<(u64, u64)> {
     None
 }
 
+/// `RLIMIT_NOFILE` as (soft, hard), without the rest of [`detect`].
+pub fn open_files_limit() -> Option<(u64, u64)> {
+    detect_open_files_limit()
+}
+
+/// macOS refuses a soft `RLIMIT_NOFILE` above `OPEN_MAX` even when the hard
+/// limit is unlimited.
+#[cfg(unix)]
+const OPEN_MAX_FALLBACK: u64 = 10240;
+
+/// Raises the soft `RLIMIT_NOFILE` to the hard one, and returns the soft
+/// limit before and after when it moved. The soft default of 1024 exists
+/// for `select()`, which nothing here uses; a device runtime that hands out
+/// a descriptor per buffer exhausts it, and the listener's `bind` is then
+/// what fails.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+pub fn raise_open_files_limit() -> Option<(u64, u64)> {
+    let (soft, hard) = detect_open_files_limit()?;
+    [hard, hard.min(OPEN_MAX_FALLBACK)]
+        .into_iter()
+        .filter(|target| *target > soft)
+        .find(|target| {
+            let limit = libc::rlimit {
+                rlim_cur: *target as libc::rlim_t,
+                rlim_max: hard as libc::rlim_t,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 }
+        })
+        .map(|raised| (soft, raised))
+}
+
+#[cfg(not(unix))]
+pub fn raise_open_files_limit() -> Option<(u64, u64)> {
+    None
+}
+
 // ---------------------------------------------------------------- Linux ---
 
 /// SMBIOS/DMI's vendor and product strings, the same pair `dmidecode` prints
@@ -736,6 +773,21 @@ mod tests {
             section.contains("Uptime           : "),
             "section:\n{section}"
         );
+    }
+
+    /// The soft limit ends at the hard one, and a second call has nothing
+    /// left to raise.
+    #[cfg(unix)]
+    #[test]
+    fn the_open_files_limit_is_raised_to_the_hard_one() {
+        let (_, hard) = detect_open_files_limit().unwrap();
+        raise_open_files_limit();
+        let (soft, _) = detect_open_files_limit().unwrap();
+        assert!(
+            soft == hard || soft == hard.min(OPEN_MAX_FALLBACK),
+            "{soft} of {hard}"
+        );
+        assert_eq!(raise_open_files_limit(), None);
     }
 
     /// `RLIMIT_NOFILE`'s hard limit is very often `RLIM_INFINITY`.

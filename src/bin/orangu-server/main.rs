@@ -687,6 +687,11 @@ fn main() -> ExitCode {
         .then(|| TerminalTitleGuard::new(TERMINAL_TITLE))
         .flatten();
 
+    // Before anything opens a descriptor: an NPU runtime holds one per
+    // device buffer, and the soft default runs out before the listeners
+    // bind. Inherited by a handover's image and the coordinator's children.
+    orangu::os::raise_open_files_limit();
+
     // `config`/`workspace` are needed again below if this start fails and a
     // fallback has to be exec'd, and `prepare` consumes `args`.
     let config_arg = args.config.clone();
