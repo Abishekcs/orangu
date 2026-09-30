@@ -2603,6 +2603,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                     n_ctx,
                     slots.total(),
                     conf.prompt_weights,
+                    &backend_label,
                 )?;
                 workers::node::set_global(node.clone());
                 match node.delegating_model() {
@@ -3242,17 +3243,28 @@ fn build_model(
 #[allow(clippy::too_many_arguments)]
 /// This machine's processors, as a `[workers]` node reports them to its
 /// parent (W-86): the CPU, every GPU, and an NPU — marked where this node's
-/// layers run. The NPU is listed, and not marked: a tree node does not
-/// prepare it (W-24).
-fn node_devices(backend: &Arc<dyn Backend>) -> Vec<workers::protocol::Device> {
+/// layers run.
+fn node_devices(backend: &Arc<dyn Backend>, backend_label: &str) -> Vec<workers::protocol::Device> {
     use workers::protocol::Device;
     let cpu = orangu::hardware::detect_cpu();
+    // Every kind of core, where they differ: a big.LITTLE part is not its
+    // first core's name (B-8).
+    let classes = orangu::hardware::core_classes();
+    let cpu_name = if classes.len() > 1 && classes.iter().all(|c| c.name.is_some()) {
+        classes
+            .iter()
+            .map(|c| format!("{} × {}", c.cores.len(), c.name.unwrap_or("cores")))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    } else {
+        cpu.brand.trim().to_string()
+    };
     let in_use = backend
         .as_wgpu()
         .map(|wgpu| wgpu.device_in_use().name.clone());
     let mut devices = vec![Device {
         kind: "cpu".to_string(),
-        name: cpu.brand.trim().to_string(),
+        name: cpu_name,
         cores: cpu.logical_cores as u32,
         memory_bytes: cpu.total_memory_bytes,
         in_use: backend.is_cpu() || engine::prefill_backend::prompts_on_cpu() == Some(true),
@@ -3272,10 +3284,15 @@ fn node_devices(backend: &Arc<dyn Backend>) -> Vec<workers::protocol::Device> {
             name: format!("{} {}", npu.vendor, npu.target),
             cores: npu.cores,
             memory_bytes: 0,
-            in_use: false,
+            in_use: is_npu(backend_label),
         });
     }
     devices
+}
+
+/// Whether the backend `select_backend` labelled is the NPU (`NPU/…`).
+fn is_npu(backend_label: &str) -> bool {
+    backend_label.starts_with("NPU/")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3289,6 +3306,7 @@ fn start_workers_node(
     n_ctx: usize,
     slots: usize,
     prompt_weights: engine::prompt_weights::PromptWeights,
+    backend_label: &str,
 ) -> Result<Arc<workers::node::Node>> {
     let host = config::resolve_bind_host(&workers_conf.host);
     if workers_conf.secret.is_none()
@@ -3332,13 +3350,20 @@ fn start_workers_node(
                 .unwrap_or(0);
             let host_bytes = orangu::hardware::detect_cpu().total_memory_bytes;
             workers::protocol::Capacity {
-                backend: if backend.is_cpu() { "cpu" } else { "gpu" }.to_string(),
+                backend: if backend.is_cpu() {
+                    "cpu"
+                } else if is_npu(backend_label) {
+                    "npu"
+                } else {
+                    "gpu"
+                }
+                .to_string(),
                 device_bytes,
                 host_bytes,
                 budget_bytes: workers::plan::budget(device_bytes, host_bytes),
                 setups: vec![workers::protocol::NodeSetup {
                     name: format!("{hostname}:{}", workers_conf.port),
-                    devices: node_devices(backend),
+                    devices: node_devices(backend, backend_label),
                     ..Default::default()
                 }],
                 ..Default::default()
