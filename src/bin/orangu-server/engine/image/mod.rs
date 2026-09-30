@@ -412,9 +412,15 @@ pub fn calibrate(transformer: &LoadedModel, device: Option<&dyn Backend>) -> Res
     let w = transformer
         .matrix(tensor)
         .with_context(|| format!("picture model calibration tensor {tensor}"))?;
-    let macs_per_token_pass = Variant::from_architecture(&transformer.config.architecture)
-        .unwrap_or(Variant::QwenImage)
-        .macs_per_token_pass();
+    let variant =
+        Variant::from_architecture(&transformer.config.architecture).unwrap_or(Variant::QwenImage);
+    let macs_per_token_pass = variant.macs_per_token_pass();
+    // The CPU half on the kernel a step runs: a Qwen-Image 2.1 that holds
+    // the per-row `int8` copy (one byte per multiply-add of a token pass)
+    // runs its block linears on that, not on the file's weights.
+    let rowi8 = (variant == Variant::QwenImage21
+        && transformer21::use_rowi8(macs_per_token_pass as u64))
+    .then(|| crate::engine::vecdot::RowI8::quantize(w.out_dim, w.in_dim, |o| w.row(o)));
     let n_tokens = CALIBRATION_TOKENS;
     let x: Vec<f32> = (0..n_tokens * w.in_dim)
         .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
@@ -430,12 +436,21 @@ pub fn calibrate(transformer: &LoadedModel, device: Option<&dyn Backend>) -> Res
         let _ = backend.matmul_batch(std::slice::from_ref(&op));
         started.elapsed()
     };
+    let cpu = match &rowi8 {
+        Some(rows) => {
+            let _ = crate::engine::vecdot::matmul_rowi8(&x, n_tokens, rows);
+            let started = Instant::now();
+            let _ = crate::engine::vecdot::matmul_rowi8(&x, n_tokens, rows);
+            started.elapsed()
+        }
+        None => time(&crate::engine::backend::CpuBackend),
+    };
     Ok(Calibration {
         in_dim: w.in_dim,
         out_dim: w.out_dim,
         n_tokens,
         device: device.map(time),
-        cpu: time(&crate::engine::backend::CpuBackend),
+        cpu,
         macs_per_token_pass,
     })
 }

@@ -247,6 +247,12 @@ impl QwenImage21Transformer {
                     map.insert(w.raw_bytes().as_ptr() as usize, rows);
                 }
             }
+            if !crate::engine::vecdot::have_i8mm() {
+                log::warn!(
+                    "orangu-server: [image] image_weights = int8 on a core without i8mm runs \
+                     the scalar int8 tile, far slower than image_weights = file"
+                );
+            }
             let bytes: usize = map.values().map(|r| r.bytes()).sum();
             log::info!(
                 "orangu-server: [image] the blocks' linears as per-row int8 ({:.1} GB, \
@@ -641,11 +647,14 @@ impl QwenImage21Transformer {
 /// How the blocks' linears are held — `[orangu-server].image_weights`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ImageWeights {
-    /// Per-row `int8` when the machine has room for it: total memory at
-    /// least three times the copy (21 GB for Qwen-Image 2.1's 7 GB).
+    /// Per-row `int8` when the core has `i8mm` and the machine has room
+    /// for it: total memory at least three times the copy (21 GB for
+    /// Qwen-Image 2.1's 7 GB). Without `i8mm` the tile is the scalar
+    /// definition, far slower than the file's K-quant kernel.
     #[default]
     Auto,
-    /// Always per-row `int8` (`vecdot::RowI8`) — the 8 × 8 `smmla` tile.
+    /// Always per-row `int8` (`vecdot::RowI8`) — the 8 × 8 `smmla` tile,
+    /// or its scalar definition on a core without `i8mm`.
     Int8,
     /// The file's own weights on the K-quant kernel, and no copy.
     File,
@@ -672,7 +681,8 @@ pub fn set_weights(choice: ImageWeights) {
 
 /// Whether the blocks' `copy_bytes` of per-row `int8` are held: the
 /// configuration, `ORANGU_IMAGE_WEIGHTS` (`int8`/`file`) over it for an A/B.
-fn use_rowi8(copy_bytes: u64) -> bool {
+/// The startup calibration asks too, so it times the kernel a step runs.
+pub fn use_rowi8(copy_bytes: u64) -> bool {
     let choice = std::env::var("ORANGU_IMAGE_WEIGHTS")
         .ok()
         .and_then(|v| ImageWeights::parse(&v))
@@ -684,7 +694,10 @@ fn use_rowi8(copy_bytes: u64) -> bool {
     match choice {
         ImageWeights::Int8 => true,
         ImageWeights::File => false,
-        ImageWeights::Auto => orangu::hardware::detect_cpu().total_memory_bytes >= 3 * copy_bytes,
+        ImageWeights::Auto => {
+            crate::engine::vecdot::have_i8mm()
+                && orangu::hardware::detect_cpu().total_memory_bytes >= 3 * copy_bytes
+        }
     }
 }
 
