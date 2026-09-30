@@ -1198,6 +1198,14 @@ button:disabled {
 #mcps-path { flex: 1; min-width: 0; }
 .mcps-note { color: var(--text-dim); font-size: .9rem; margin: 0; min-height: 1.2em; }
 #mcps-table table { width: 100%; border-collapse: collapse; }
+#workers-header { display: flex; align-items: center; gap: 10px; }
+#workers-header h2 { margin: 0; font-size: 1.1em; }
+#workers-role { flex: 1; min-width: 0; }
+.workers-sub { margin: 1rem 0 .25rem; font-size: .95em; }
+.workers-table { color: var(--text-dim); font-size: .9rem; overflow-x: auto; }
+.workers-table table { width: 100%; border-collapse: collapse; color: var(--text); font-size: 1rem; }
+.workers-table th, .workers-table td { padding: .55rem; border-bottom: 1px solid var(--border); text-align: left; }
+.workers-table th { font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }
 #mcps-table th, #mcps-table td { padding: .55rem; border-bottom: 1px solid var(--border); text-align: left; }
 #mcps-table th { font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }
 #mcps-table td:last-child { text-align: right; white-space: nowrap; }

@@ -2526,6 +2526,78 @@ pub struct KvCache {
     /// host-side reader of K/V rows already bounds itself by
     /// [`Self::host_committed_len`], which is what makes the wait movable.
     pub deferred_fill: Option<Box<dyn std::any::Any + Send>>,
+    /// The part of this sequence's cache that lives on other machines, when
+    /// the model is spread over a tree of workers (`crate::workers`) —
+    /// `None` for every cache of a model that runs here alone.
+    ///
+    /// Held here rather than beside the cache because the cache is what
+    /// `engine::generate` rolls back and drops: [`Self::truncate`] reaches
+    /// the workers through it, and dropping it releases their rows.
+    ///
+    /// Boxed: only a top-level node of a tree has one, and every cache
+    /// carries the slot.
+    pub remote: Option<Box<RemoteSession>>,
+    /// Every layer's rows are here: a tree's top-level node took them over
+    /// from its workers to decode alone (`crate::workers`, W-60), and the
+    /// sequence goes on here. `false` for every other cache.
+    pub whole: bool,
+}
+
+/// Where the layers a node does not run itself keep their rows — see
+/// [`KvCache::remote`]. Implemented by `crate::workers`.
+pub trait RemoteLayers: Send + Sync {
+    /// The remote rows of `session` past `len` positions are to be rolled
+    /// back. Nothing need happen at once; the next forward of the session
+    /// has to see it.
+    fn truncate(&self, session: u64, len: usize);
+    /// `session` is finished: every node may free its rows.
+    fn release(&self, session: u64);
+    /// Session `to` is to start with a copy of `from`'s first `len`
+    /// positions, on every node that holds them. `false` when it cannot,
+    /// and nothing may then be taken from `from`.
+    fn fork(&self, _from: u64, _to: u64, _len: usize) -> bool {
+        false
+    }
+    /// The request `session` served has ended; its rows may yet serve the
+    /// next one (a slot's retained conversation). Answers where the
+    /// request's time went, per node, in pipeline order.
+    fn request_finished(&self, _session: u64) -> Vec<(String, std::time::Duration)> {
+        Vec::new()
+    }
+}
+
+/// One sequence's handle on its remote rows: an id every node of the tree
+/// knows the sequence by, and how many positions the remote layers hold.
+/// Dropping it releases them.
+pub struct RemoteSession {
+    pub id: u64,
+    /// Positions the remote layers hold — kept here, beside the local
+    /// layers' own lengths, so [`KvCache::committed_len`] is right on a node
+    /// that runs no layer itself.
+    pub len: usize,
+    /// The capacity of the cache this handle belongs to: what a sequence
+    /// rebuilt on other workers is given. It travels with the handle, since
+    /// a handle taken over by a later request ([`KvCache::take_remote_prefix`])
+    /// takes that request's capacity.
+    pub capacity: usize,
+    owner: std::sync::Arc<dyn RemoteLayers>,
+}
+
+impl RemoteSession {
+    pub fn new(id: u64, capacity: usize, owner: std::sync::Arc<dyn RemoteLayers>) -> Self {
+        Self {
+            id,
+            len: 0,
+            capacity,
+            owner,
+        }
+    }
+}
+
+impl Drop for RemoteSession {
+    fn drop(&mut self) {
+        self.owner.release(self.id);
+    }
 }
 
 impl KvCache {
@@ -2554,6 +2626,8 @@ impl KvCache {
                 .collect(),
             recent_tokens: Vec::new(),
             deferred_fill: None,
+            remote: None,
+            whole: false,
         }
     }
 
@@ -2929,6 +3003,154 @@ impl KvCache {
         self.recent_tokens = std::mem::take(&mut src.recent_tokens);
     }
 
+    /// Layer `layer`'s first `len` positions as the host holds them — its
+    /// `kv_dim`, keys and values — for a tree's top-level node taking a
+    /// sequence's rows over from its workers (`crate::workers`, W-60). `None`
+    /// when the host does not hold them all, or the layer keeps more than one
+    /// position a row. A layer that stores nothing (`kv_dim` 0) gives nothing.
+    pub fn layer_rows(&self, layer: usize, len: usize) -> Option<(usize, Vec<f32>, Vec<f32>)> {
+        let l = self.layers.get(layer)?;
+        if l.kv_dim == 0 {
+            return Some((0, Vec::new(), Vec::new()));
+        }
+        if l.stride != 1 || l.len.min(l.host_len()) < len {
+            return None;
+        }
+        let (k, v) = l.flatten(len);
+        Some((l.kv_dim, k, v))
+    }
+
+    /// Writes rows [`Self::layer_rows`] gave as layer `layer`'s first
+    /// positions, in a cache that holds none there yet.
+    /// Whether `src` holds every layer's first `len` positions here
+    /// ([`Self::whole`]) and this cache is laid out for all of them: a
+    /// conversation a tree's top-level node went on with alone, taken up
+    /// again. The workers hold nothing of it; the model goes on here.
+    fn takes_whole(&self, src: &KvCache, len: usize) -> bool {
+        src.remote.is_none()
+            && src.whole
+            && src.holds_every_layer(len)
+            && self.layers.len() == src.layers.len()
+            && self.layers.iter().zip(&src.layers).all(|(mine, theirs)| {
+                theirs.kv_dim == 0 || (mine.kv_dim == theirs.kv_dim && mine.capacity >= len)
+            })
+    }
+
+    /// Whether every layer that stores rows holds its first `len` positions
+    /// on the host: a cache the model can go on with here alone.
+    pub fn holds_every_layer(&self, len: usize) -> bool {
+        self.layers
+            .iter()
+            .all(|l| l.kv_dim == 0 || (l.stride == 1 && l.len.min(l.host_len()) >= len))
+    }
+
+    pub fn set_layer_rows(
+        &mut self,
+        layer: usize,
+        kv_dim: usize,
+        k: Vec<f32>,
+        v: Vec<f32>,
+    ) -> anyhow::Result<()> {
+        let dst = self
+            .layers
+            .get_mut(layer)
+            .ok_or_else(|| anyhow::anyhow!("no layer {layer} in this cache"))?;
+        if kv_dim == 0 && dst.kv_dim == 0 {
+            return Ok(());
+        }
+        let len = k.len() / kv_dim.max(1);
+        anyhow::ensure!(
+            dst.kv_dim == kv_dim
+                && dst.stride == 1
+                && dst.paged.is_none()
+                && dst.len == 0
+                && k.len() == len * kv_dim
+                && v.len() == k.len()
+                && len <= dst.capacity,
+            "layer {layer}: {len} rows of {kv_dim} do not fit a layer of {} with room for {}",
+            dst.kv_dim,
+            dst.capacity
+        );
+        dst.copy_prefix_from(&LayerCache::from_parts(kv_dim, len, k, v), len);
+        Ok(())
+    }
+
+    /// Tells the owner of this cache's remote rows, if any, that the request
+    /// it served has ended ([`RemoteLayers::request_finished`]), and answers
+    /// where its time went — nothing for a cache with no remote rows.
+    pub fn request_finished(&self) -> Vec<(String, std::time::Duration)> {
+        match &self.remote {
+            Some(remote) => remote.owner.request_finished(remote.id),
+            None => Vec::new(),
+        }
+    }
+
+    /// The remote half of copying `src`'s first `len` positions — the local
+    /// half is [`Self::copy_prefix_from`] — for a source that is kept: the
+    /// workers copy `src`'s rows into this cache's own session
+    /// ([`RemoteLayers::fork`]). Whether the copy may go ahead: `true` for a
+    /// cache with no remote rows, `false` when `src` has none, holds fewer
+    /// than `len` there, or the workers cannot copy.
+    pub fn fork_remote_prefix(&mut self, src: &KvCache, len: usize) -> bool {
+        if self.remote.is_some() && self.takes_whole(src, len) {
+            self.whole = true;
+            return true;
+        }
+        let Some(mine) = self.remote.as_mut() else {
+            return true;
+        };
+        let Some(theirs) = src.remote.as_ref() else {
+            return false;
+        };
+        if len > theirs.len || !mine.owner.fork(theirs.id, mine.id, len) {
+            return false;
+        }
+        mine.len = len;
+        true
+    }
+
+    /// The remote half of reusing `src`'s first `len` positions — the local
+    /// half is [`Self::copy_prefix_from`] or [`Self::adopt_prefix`] — and
+    /// whether the reuse may go ahead at all.
+    ///
+    /// A cache whose later layers live on workers (`crate::workers`) holds
+    /// only its own layers' rows; the rest are on the workers, under `src`'s
+    /// session. They are not copied: the session itself moves here, rolled
+    /// back to `len`, and the session this cache was made with is released.
+    /// `src` is left without remote rows, and so can give no later request a
+    /// prefix — which suits its callers: the slot store's snapshot is
+    /// replaced when this request ends, and the prefix pool's entry was
+    /// removed to be handed over.
+    ///
+    /// `false`, and nothing moved, when this cache has remote rows and `src`
+    /// does not: a snapshot read back from disk, or one already handed on,
+    /// has nothing for the remote layers. A cache with no remote rows reuses
+    /// as ever.
+    pub fn take_remote_prefix(&mut self, src: &mut KvCache, len: usize) -> bool {
+        let Some(capacity) = self.remote.as_ref().map(|mine| mine.capacity) else {
+            return true;
+        };
+        // A conversation that went on here alone (W-60).
+        if self.takes_whole(src, len) {
+            self.whole = true;
+            return true;
+        }
+        let Some(mut theirs) = src.remote.take() else {
+            return false;
+        };
+        if len > theirs.len {
+            src.remote = Some(theirs);
+            return false;
+        }
+        if len < theirs.len {
+            theirs.len = len;
+            theirs.owner.truncate(theirs.id, len);
+        }
+        theirs.capacity = capacity;
+        self.remote = Some(theirs);
+        true
+    }
+
     /// Rolls every attention layer back to `new_len` positions (see
     /// [`LayerCache::truncate`]). Only valid for a cache with no recurrent
     /// (SSM / gated-delta-net) layers: those carry a single evolving state with
@@ -2942,6 +3164,12 @@ impl KvCache {
         );
         for layer in &mut self.layers {
             layer.truncate(new_len);
+        }
+        if let Some(remote) = self.remote.as_mut()
+            && new_len < remote.len
+        {
+            remote.len = new_len;
+            remote.owner.truncate(remote.id, new_len);
         }
     }
 
@@ -3000,6 +3228,7 @@ impl KvCache {
         self.layers
             .iter()
             .map(LayerCache::committed_tokens)
+            .chain(self.remote.as_ref().map(|remote| remote.len))
             .max()
             .unwrap_or(0)
     }
@@ -3038,6 +3267,11 @@ impl KvCache {
             // A copy takes only the rows that are home; the readback in
             // flight belongs to the cache it was staged for.
             deferred_fill: None,
+            // So do remote rows: a copy has no session of its own on the
+            // workers, and sharing this one would let either copy roll the
+            // other back.
+            remote: None,
+            whole: self.whole,
         }
     }
 
@@ -3199,6 +3433,8 @@ impl KvCache {
             recurrent,
             recent_tokens,
             deferred_fill: None,
+            remote: None,
+            whole: false,
         })
     }
 }

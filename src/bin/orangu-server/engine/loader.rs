@@ -676,6 +676,11 @@ pub struct LoadedModel {
     /// and set at the same moment (and for the same reason) as
     /// `layer_device`.
     expert_residency: HashMap<String, Arc<[bool]>>,
+    /// The address ranges of the file mappings the tensors were read from
+    /// — what [`Self::release_tensors`] checks a tensor's bytes against
+    /// before advising the kernel about them. A tensor rewritten into a
+    /// buffer of its own lies outside all of them.
+    mappings: Vec<(usize, usize)>,
 }
 
 /// Whether [`LoadedModel::matrix`] hands out a `PTQ1_0` tensor repacked
@@ -1545,6 +1550,56 @@ pub(crate) fn block_index(name: &str) -> Option<usize> {
 }
 
 impl LoadedModel {
+    /// Every tensor's name, `ggml_type` and shape, sorted by name — the
+    /// file's layout, independent of the order its directory lists them in
+    /// and of how it is sharded. What `crate::workers` fingerprints to tell
+    /// two quantizations of one model apart.
+    pub fn tensor_directory(&self) -> Vec<(&str, u32, &[u64])> {
+        let mut directory: Vec<_> = self
+            .tensors
+            .iter()
+            .map(|(name, loc)| (name.as_str(), loc.ggml_type, loc.dims.as_slice()))
+            .collect();
+        directory.sort_unstable_by_key(|entry| entry.0);
+        directory
+    }
+
+    /// Lets the kernel drop the resident pages of every mapped tensor
+    /// `keep` refuses, returning the bytes advised. For a node of a worker
+    /// tree whose plan moved layers elsewhere: their pages would otherwise
+    /// stay resident until memory pressure evicted them. Nothing breaks if
+    /// one is read again — a read-only file mapping simply faults it back —
+    /// and a tensor held in a buffer of its own (a rewritten repack) is
+    /// never touched, since `MADV_DONTNEED` would zero that.
+    pub fn release_tensors(&self, keep: impl Fn(&str) -> bool) -> u64 {
+        let mut released = 0u64;
+        for (name, loc) in &self.tensors {
+            if keep(name) {
+                continue;
+            }
+            let data = &loc.bytes[loc.start..loc.start + loc.len];
+            let addr = data.as_ptr() as usize;
+            let mapped = self
+                .mappings
+                .iter()
+                .any(|&(start, len)| addr >= start && addr + data.len() <= start + len);
+            if mapped {
+                release_mapped_range(data);
+                released += data.len() as u64;
+            }
+        }
+        released
+    }
+
+    /// A tensor's stored bytes, as the file holds them (after the one
+    /// load-time rewrite of repacked layouts). Touching them faults the
+    /// pages in; read only as much as is needed.
+    pub fn tensor_data(&self, name: &str) -> Option<&[u8]> {
+        self.tensors
+            .get(name)
+            .map(|loc| &loc.bytes[loc.start..loc.start + loc.len])
+    }
+
     /// A tensor's `ggml_type` and declared shape (ggml order, fastest-varying
     /// dimension first) without touching its data.
     ///
@@ -1902,6 +1957,7 @@ impl LoadedModel {
         // Every shard's tensor directory, merged. A single-file model is
         // just the one-shard case of this.
         let mut tensors = HashMap::with_capacity(gguf.tensors.len());
+        let mut mappings = Vec::with_capacity(shards.len());
         let mut total_tensors = 0usize;
         for (index, shard) in shards.iter().enumerate() {
             let shard_path = shard.path.as_path();
@@ -1930,6 +1986,7 @@ impl LoadedModel {
             // RAM, and evict it — the two halves of telling a cold run from a
             // warm one on a model too large to hold.
             super::page_cache::register_shard(shard_path, &mmap);
+            mappings.push((mmap.as_ptr() as usize, mmap.len()));
 
             for tensor in &shard_gguf.tensors {
                 let element_count: u64 = tensor.dims.iter().product();
@@ -2041,6 +2098,7 @@ impl LoadedModel {
             // `Self::set_layer_devices`.
             layer_device: Vec::new(),
             expert_residency: HashMap::new(),
+            mappings,
         })
     }
 
@@ -2964,6 +3022,7 @@ mod tests {
             tensors: HashMap::new(),
             layer_device: Vec::new(),
             expert_residency: HashMap::new(),
+            mappings: Vec::new(),
         };
         assert_eq!(model.metadata_f32("kda.gate_lower_bound"), Some(-5.0));
         assert_eq!(model.metadata_f32("situ_beta"), Some(4.0));
@@ -3037,6 +3096,7 @@ mod tests {
             tensors,
             layer_device: Vec::new(),
             expert_residency: HashMap::new(),
+            mappings: Vec::new(),
         };
 
         let names: Vec<String> = model.expert_tensors().into_iter().map(|t| t.0).collect();

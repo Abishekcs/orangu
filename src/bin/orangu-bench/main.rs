@@ -62,11 +62,12 @@ mod storage;
 mod sweep;
 mod table;
 mod web;
+mod workers;
 use orangu::shell_completions;
 
 /// Measure decode (token-generation) throughput of an OpenAI-compatible
 /// server over HTTP, at one or more context depths.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "orangu-bench",
     version = orangu::build_info::VERSION,
@@ -379,6 +380,13 @@ struct Args {
     /// Sampling temperature for the timed decode; `0` is greedy
     #[arg(long, default_value_t = 0.0, value_name = "T")]
     temperature: f32,
+
+    /// A `[workers]` tree (W-84): `off` measures its top-level node serving
+    /// alone, `on` through the tree, `compare` both, one after the other,
+    /// side by side. The server is switched through `POST /props` and put
+    /// back afterwards. A server without a tree runs the plain benchmark.
+    #[arg(long, value_name = "MODE", value_parser = ["on", "off", "compare"])]
+    workers: Option<String>,
 
     /// Print the shell completion script for the detected shell and exit.
     #[arg(short = 's', long = "shell-completions")]
@@ -1237,6 +1245,73 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(args.timeout))
         .build()?;
 
+    if let Some(mode) = &args.workers {
+        return run_workers(args, &client, mode);
+    }
+    measure_run(args, &client).map(|_| ())
+}
+
+/// `--workers on|off|compare` (W-84): the benchmark with the server's
+/// `[workers]` tree switched on, off, or each in turn, then put back as it
+/// was. A server without a tree runs the plain benchmark, and says so.
+fn run_workers(args: &Args, client: &reqwest::blocking::Client, mode: &str) -> anyhow::Result<()> {
+    let Some(state) = workers::state(client, &args.url)? else {
+        if !args.json {
+            println!("  workers  this server has no [workers] tree; running the plain benchmark");
+        }
+        return measure_run(args, client).map(|_| ());
+    };
+    if state.get("switchable").and_then(serde_json::Value::as_bool) != Some(true) {
+        anyhow::bail!(
+            "this server's [workers] tree cannot be switched: it is a worker serving a \
+             parent, has no workers of its own, or has only part of the model"
+        );
+    }
+    let was = state
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let base = args
+        .label
+        .clone()
+        .unwrap_or_else(|| server_label(client, args));
+    let arm = |enabled: bool| -> anyhow::Result<Vec<history::Record>> {
+        let way = if enabled { "on" } else { "off" };
+        workers::switch(client, &args.url, enabled)?;
+        if !args.json {
+            println!("== workers {way}");
+        }
+        let mut arm_args = args.clone();
+        arm_args.label = Some(format!("{base} · workers {way}"));
+        measure_run(&arm_args, client)
+    };
+    let result = match mode {
+        "on" => arm(true).map(|_| ()),
+        "off" => arm(false).map(|_| ()),
+        _ => arm(false).and_then(|off| {
+            let on = arm(true)?;
+            if args.json {
+                println!("{}", workers::json(&off, &on));
+            } else {
+                println!("== workers compared (tok/s)");
+                for line in workers::table(&off, &on) {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }),
+    };
+    let restored = workers::switch(client, &args.url, was);
+    result?;
+    restored
+}
+
+/// One benchmark against the server as it is: warmup, the header, the timed
+/// workload, and what is written from it. Its rows, for `--workers compare`.
+fn measure_run(
+    args: &Args,
+    client: &reqwest::blocking::Client,
+) -> anyhow::Result<Vec<history::Record>> {
     // `perf record -p` attaches to the threads that exist at that instant and
     // never picks up ones created later. A server builds its compute threads
     // lazily, on its first request — so profiling with no warmup samples almost
@@ -1266,39 +1341,39 @@ fn run(args: &Args) -> anyhow::Result<()> {
         if !args.image.is_empty() {
             // The picture pipeline has threads of its own, which a text
             // completion would not create — see `image::warmup`.
-            image::warmup(&client, &args.url, &args.model)?;
+            image::warmup(client, &args.url, &args.model)?;
         } else if args.embed.is_empty() {
-            run_once(&client, &args.url, &p, 8, &args.model, args.temperature)?;
-            settle_tail_probe(&client, args, &p)?;
+            run_once(client, &args.url, &p, 8, &args.model, args.temperature)?;
+            settle_tail_probe(client, args, &p)?;
         } else {
-            run_embed_once(&client, &args.url, &p, &args.model)?;
+            run_embed_once(client, &args.url, &p, &args.model)?;
         }
     }
 
     let label = args
         .label
         .clone()
-        .unwrap_or_else(|| server_label(&client, args));
+        .unwrap_or_else(|| server_label(client, args));
 
-    let env = report_environment(&client, args);
+    let env = report_environment(client, args);
 
     // Started here — after warmup, after the environment probe — so the profile
     // covers the timed workload and nothing else. Anything before this point is
     // load, allocation and HTTP that the reported rate already excludes, and a
     // flamegraph that included it would attribute time the number does not.
     let recorder = match &args.flamegraph {
-        Some(path) => Some(start_profile(&client, args, path, &label)?),
+        Some(path) => Some(start_profile(client, args, path, &label)?),
         None => None,
     };
 
     // Discarded: drains whatever the warmup accumulated, so what the second
     // read returns is the measured window and nothing else.
-    let _ = take_gpu_timings(&client, &args.url);
+    let _ = take_gpu_timings(client, &args.url);
     let clocks = ClockWatch::start();
-    let measured = measure(&client, args, &label);
+    let measured = measure(client, args, &label);
     report_clocks(&clocks.stop(), args);
     let mut env = env;
-    env.gpu_timings = take_gpu_timings(&client, &args.url);
+    env.gpu_timings = take_gpu_timings(client, &args.url);
     report_gpu_timings(&env.gpu_timings, args);
 
     // Kept, not just printed: `--report` folds the profile's own numbers
@@ -1321,7 +1396,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
     stamp_device(&mut measured, device_tag(&env.props).as_deref());
     write_bundle(args, args.bundle.as_deref(), &env, &measured)?;
     record_and_chart(args, &measured)?;
-    write_report(args, &env, &measured, profile.as_ref())
+    write_report(args, &env, &measured, profile.as_ref())?;
+    Ok(measured)
 }
 
 /// Record which device produced these measurements.
@@ -4941,6 +5017,42 @@ fn window_line(tokens: f64, rate: f64, reps: u32) -> Option<String> {
     })
 }
 
+/// The header line for a server heading a `[workers]` tree (its
+/// `/v1/workers`): the plan, and how many of its workers are connected.
+/// `None` for a server alone, a worker, or a server that does not say.
+fn format_workers(workers: &serde_json::Value) -> Option<String> {
+    if workers.get("role").and_then(|r| r.as_str()) != Some("top") {
+        return None;
+    }
+    let plan = workers.get("plan")?.as_array()?;
+    if plan.len() < 2 {
+        return None;
+    }
+    let parts: Vec<String> = plan
+        .iter()
+        .filter_map(|entry| {
+            let node = entry.get("node")?.as_str()?;
+            let layers = entry.get("layers")?.as_array()?;
+            Some(format!(
+                "{node} {}..{}",
+                layers.first()?.as_u64()?,
+                layers.get(1)?.as_u64()?
+            ))
+        })
+        .collect();
+    let listed = workers.get("workers").and_then(|w| w.as_array());
+    let connected = listed.map_or(0, |w| {
+        w.iter()
+            .filter(|w| w.get("connected").and_then(|c| c.as_bool()) == Some(true))
+            .count()
+    });
+    Some(format!(
+        "workers  tree: {} ({connected} of {} workers connected)",
+        parts.join(", "),
+        listed.map_or(0, |w| w.len())
+    ))
+}
+
 /// Below this, one repetition is short enough that its rate is not stable —
 /// see [`window_line`].
 const WINDOW_SHORT_MS: f64 = 500.0;
@@ -4989,6 +5101,9 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
     // from. Read after it, a streaming model would report itself warm no
     // matter how cold it began.
     let model_cache = moe::take_residency(client, &args.url);
+    // A server heading a `[workers]` tree says so, and how its layers are
+    // planned: every number below is then the tree's, not one machine's.
+    let workers = moe::get_json(client, &format!("{}/v1/workers", args.url));
 
     if args.json {
         println!(
@@ -5016,6 +5131,9 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
                 // two arms that otherwise look the same.
                 "adapt": adapt,
                 "model_cache": model_cache,
+                // Verbatim: a tree's plan, or `{"role": "none"}` for a
+                // server alone; `null` from a server that predates it.
+                "workers": workers,
             })
         );
     } else {
@@ -5047,6 +5165,9 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
         if pid.is_some() || uptime.is_some() {
             let show = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
             println!("  server   pid {} up {}s", show(pid), show(uptime));
+        }
+        if let Some(line) = format_workers(&workers) {
+            println!("  {line}");
         }
         // Beside the GPU clock, because it is the same class of evidence and
         // the more consequential of the two for anything CPU-bound. A MoE
@@ -5756,6 +5877,40 @@ fn run_curve(
 
 #[cfg(test)]
 mod tests {
+
+    /// A tree's top-level node gets a line naming its plan and its
+    /// connected workers; a server alone, a worker and an older server none.
+    #[test]
+    fn a_tree_is_named_in_the_header() {
+        let top = serde_json::json!({
+            "role": "top",
+            "plan": [
+                {"node": "alpha:8400", "layers": [0, 9]},
+                {"node": "beta:8400", "layers": [9, 18]},
+                {"node": "gamma:8400", "layers": [18, 28]},
+            ],
+            "workers": [
+                {"address": "beta:8400", "connected": true},
+                {"address": "gamma:8400", "connected": false},
+            ],
+        });
+        assert_eq!(
+            super::format_workers(&top).as_deref(),
+            Some(
+                "workers  tree: alpha:8400 0..9, beta:8400 9..18, gamma:8400 18..28 \
+                 (1 of 2 workers connected)"
+            )
+        );
+        let alone = serde_json::json!({"role": "none"});
+        let worker = serde_json::json!({"role": "worker", "plan": top["plan"]});
+        let serving_alone = serde_json::json!({
+            "role": "top",
+            "plan": [{"node": "alpha:8400", "layers": [0, 28]}],
+        });
+        for value in [alone, worker, serving_alone, serde_json::Value::Null] {
+            assert_eq!(super::format_workers(&value), None, "{value}");
+        }
+    }
 
     /// A short repetition must be flagged and a long one left alone. The
     /// numbers are the ones that prompted it: a 572-token prefill at ~3800

@@ -728,7 +728,77 @@ impl PhiModel {
             cfg.n_head_kv,
             head_dim,
             cfg.rms_eps,
-            self.layers.len(),
+            0..self.layers.len(),
+            |il| {
+                let layer = &self.layers[il];
+                let ((wq, wk, wv), (gate, up)) = &views[il];
+                super::ResidentLayer {
+                    attn_norm: &layer.attn_norm,
+                    wq,
+                    wk,
+                    wv,
+                    q_bias: None,
+                    k_bias: None,
+                    v_bias: None,
+                    pairing: tensor::RopeLayout::Neox,
+                    yarn,
+                    rope_dim: cfg.rope_dim,
+                    rope_freq_base: cfg.rope_freq_base,
+                    freq_factors: self.rope_freq_factors.as_deref(),
+                    n_swa: 0,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    wo: &layer.wo,
+                    ffn_norm: &layer.ffn_norm,
+                    ffn_gate: gate,
+                    ffn_up: up,
+                    ffn_down: &layer.w_down,
+                    activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                }
+            },
+        )
+    }
+
+    /// [`Self::run_layers_resident`] over `layers` only, from `x`, the
+    /// residual entering the first of them: the whole model's stream, or
+    /// one node's range in a tree of workers (`forward_layers`).
+    fn run_range_resident(
+        &self,
+        cache: &mut KvCache,
+        x: &[f32],
+        tokens: &[u32],
+        start_pos: usize,
+        layers: std::ops::Range<usize>,
+        want_x: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let cfg = &self.config;
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        // Rows a resident chunk parked are brought home before anything
+        // here pushes past them.
+        vulkan.fill_deferred_kv_rows(cache);
+        let n_embd = cfg.n_embd;
+        let kv_dim = self.kv_dim();
+        let head_dim = self.head_dim();
+        // The fused QKV and gate/up tensors as row views, once per chunk.
+        let views: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| (layer.qkv_views(n_embd, kv_dim), layer.ffn_gate_up()))
+            .collect();
+        let yarn = self.rope_yarn();
+        super::run_layers_resident(
+            vulkan,
+            cache,
+            tokens,
+            x,
+            start_pos,
+            want_x,
+            cfg.n_head,
+            cfg.n_head_kv,
+            head_dim,
+            cfg.rms_eps,
+            layers,
             |il| {
                 let layer = &self.layers[il];
                 let ((wq, wk, wv), (gate, up)) = &views[il];
@@ -764,25 +834,53 @@ impl PhiModel {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<f32>> {
-        // Rows a resident chunk parked for the chunk after it are brought
-        // home before anything here pushes past them.
-        if let Some(vulkan) = self.backend.as_wgpu() {
-            vulkan.fill_deferred_kv_rows(cache);
-        }
         let cfg = &self.config;
-        let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
-        let head_dim = self.head_dim();
-        let n_head = cfg.n_head;
-        let n_head_kv = cfg.n_head_kv;
-        let kv_dim = self.kv_dim();
-
-        let mut x = vec![0f32; n_tokens * n_embd];
+        // The embedding as it always was, row by row: this runs every CPU
+        // decode step of a server alone (`token_embeddings` fans out to the
+        // pool, which a single row does not pay for).
+        let mut x = vec![0f32; tokens.len() * n_embd];
         for (t, &tok) in tokens.iter().enumerate() {
             let tok = tok as usize;
             anyhow::ensure!(tok < cfg.n_vocab, "token id {tok} is out of vocab range");
             x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
+        self.run_layer_range(cache, x, tokens.len(), start_pos, 0..self.layers.len())
+    }
+
+    /// Layers `layers` of the host step path over `x`, the residual stream
+    /// of `n_tokens` rows entering the first of them, returning it as it
+    /// leaves the last: every layer for [`Self::run_layers`], one node's
+    /// range for `ModelForward::forward_layers` (see `crate::workers`).
+    fn run_layer_range(
+        &self,
+        cache: &mut KvCache,
+        mut x: Vec<f32>,
+        n_tokens: usize,
+        start_pos: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        anyhow::ensure!(
+            layers.end <= self.layers.len() && layers.start <= layers.end,
+            "layer range {layers:?} is outside this model's {} layers",
+            self.layers.len()
+        );
+        anyhow::ensure!(
+            x.len() == n_tokens * n_embd,
+            "hidden state holds {} values, expected {n_tokens} rows of {n_embd}",
+            x.len()
+        );
+        // Rows a resident chunk parked for the chunk after it are brought
+        // home before anything here pushes past them.
+        if let Some(vulkan) = self.backend.as_wgpu() {
+            vulkan.fill_deferred_kv_rows(cache);
+        }
+        let head_dim = self.head_dim();
+        let n_head = cfg.n_head;
+        let n_head_kv = cfg.n_head_kv;
+        let kv_dim = self.kv_dim();
 
         // Grown once and reused across layers rather than allocated per
         // layer: at prefill widths each of these is megabytes. The norm
@@ -800,7 +898,8 @@ impl PhiModel {
         let mut gate_up: Vec<f32> = Vec::new();
         let mut activated: Vec<f32> = Vec::new();
         let mut down: Vec<f32> = Vec::new();
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
+        for layer_idx in layers {
+            let layer = &self.layers[layer_idx];
             tensor::rmsnorm_into(
                 &mut normed,
                 &x,
@@ -1126,6 +1225,124 @@ impl ModelForward for PhiModel {
             return Ok(());
         }
         self.forward(cache, tokens, start_pos, slot_id).map(|_| ())
+    }
+
+    /// Every position's logits for a multi-token forward — a speculative
+    /// pair's verification pass: the host step path over every layer, then
+    /// the head on every row.
+    fn forward_all_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let x = self.run_layers(cache, tokens, start_pos)?;
+        self.head(&x, tokens.len())
+    }
+
+    /// Plain causal attention at every layer and nothing carried from one
+    /// layer to the next but the residual: any cut is exact.
+    fn supports_layer_split(&self) -> bool {
+        true
+    }
+
+    fn new_kv_cache_for_layers(&self, layers: std::ops::Range<usize>, capacity: usize) -> KvCache {
+        let kv_dim = self.kv_dim();
+        let dims: Vec<usize> = (0..self.config.n_layer)
+            .map(|il| if layers.contains(&il) { kv_dim } else { 0 })
+            .collect();
+        KvCache::new_with_dims(capacity, &dims)
+    }
+
+    fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.token_embeddings(tokens)
+    }
+
+    /// A decode step on a Vulkan device records the range as one chain
+    /// (`record_decode_run`, as the multi-device split decode does) and a
+    /// prompt chunk runs it on the device-resident stream
+    /// (`run_range_resident`); everything else takes the host step path
+    /// (`run_layer_range`). Like `arch::llama`'s: the chains share
+    /// [`super::RANGE_SLOT`] and take turns ([`super::RANGE_CHAINS`]).
+    fn forward_layers(
+        &self,
+        cache: &mut KvCache,
+        hidden: Vec<f32>,
+        tokens: &[u32],
+        layers: std::ops::Range<usize>,
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        if !layers.is_empty()
+            && super::range_chains()
+            && let Some(vulkan) = self.backend.as_wgpu()
+        {
+            let _turn = super::RANGE_CHAINS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if tokens.len() == 1
+                && let Some((encoder, buf, offset)) = self.record_decode_run(
+                    vulkan,
+                    cache,
+                    layers.clone(),
+                    &hidden,
+                    start_pos,
+                    super::RANGE_SLOT,
+                    false,
+                )
+            {
+                return Ok(vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd));
+            }
+            if self.resident_prefill_serves(tokens.len())
+                && let Some(x) = self.run_range_resident(
+                    cache,
+                    &hidden,
+                    tokens,
+                    start_pos,
+                    layers.clone(),
+                    true,
+                )?
+            {
+                return Ok(x);
+            }
+        }
+        self.run_layer_range(cache, hidden, tokens.len(), start_pos, layers)
+    }
+
+    fn final_norm(&self, hidden: &mut [f32], n_rows: usize) -> Result<()> {
+        tensor::rmsnorm_inplace(
+            hidden,
+            &self.output_norm,
+            n_rows,
+            self.config.n_embd,
+            self.config.rms_eps,
+        );
+        Ok(())
+    }
+
+    /// The final norm and the output projection, row by row — exactly what
+    /// `forward` does to its last row.
+    fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        let n_embd = self.config.n_embd;
+        anyhow::ensure!(
+            hidden.len() == n_rows * n_embd,
+            "hidden state holds {} values, expected {n_rows} rows of {n_embd}",
+            hidden.len()
+        );
+        Ok(hidden
+            .chunks_exact(n_embd)
+            .map(|row| {
+                let mut row = row.to_vec();
+                tensor::rmsnorm_inplace(
+                    &mut row,
+                    &self.output_norm,
+                    1,
+                    n_embd,
+                    self.config.rms_eps,
+                );
+                self.backend.matmul(&row, 1, &self.output_weight)
+            })
+            .collect())
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {

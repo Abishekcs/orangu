@@ -17,9 +17,11 @@
 
 use crate::config::{
     DEFAULT_DRAFT_TOKENS, DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, KvCache, PROMETHEUS_SECTION,
-    Role, WEB_SECTION, default_delete, default_host, default_npu_cache_gb, default_npu_precompile,
-    default_port, default_prometheus_port, default_reexec, default_web_port,
+    Role, WEB_SECTION, WORKERS_SECTION, WorkerAddress, default_delete, default_host,
+    default_npu_cache_gb, default_npu_precompile, default_port, default_prometheus_port,
+    default_reexec, default_web_port, default_workers_port, parse_workers_list,
 };
+use crate::workers::protocol::ActivationFormat;
 use anyhow::{Context, Result, anyhow};
 use orangu::logging::{LOG_TYPES, LogTarget, default_log_path};
 use rustyline::{
@@ -141,6 +143,44 @@ pub fn run_init() -> Result<()> {
         None
     };
 
+    // The same shape again: off by default, and declining writes no
+    // `[workers]` section at all.
+    let workers = if prompt_bool("Add workers", false)? {
+        let workers_host = prompt_host(&host)?;
+        let workers_port = prompt_line("port", &default_workers_port().to_string())?;
+        let workers_list = prompt_workers_list("workers", workers_port.trim())?;
+        // Spares for the workers above: never given layers until one of
+        // them is lost.
+        let standby = prompt_workers_list("standby, blank for none", workers_port.trim())?;
+        // The same warning the API key gives: a blank secret on a widened
+        // address lets anything that reaches the port take part.
+        let secret = if is_public_host(&workers_host) {
+            prompt_line(
+                "secret (blank = no authentication, and any machine that can reach this port can \
+                 join)",
+                "",
+            )?
+        } else {
+            prompt_line("secret (blank = no authentication)", "")?
+        };
+        let activations = prompt_choice(
+            "activations",
+            ActivationFormat::default().label(),
+            &ActivationFormat::NAMES,
+        )?;
+        let activations = ActivationFormat::parse(&activations).unwrap_or_default();
+        Some(WorkersAnswers {
+            host: workers_host,
+            port: workers_port,
+            workers: workers_list,
+            standby,
+            secret: Some(secret.trim().to_string()).filter(|s| !s.is_empty()),
+            activations,
+        })
+    } else {
+        None
+    };
+
     let mut contents = format!("[orangu-server]\nmodels = {models}\n");
     if !model.is_empty() {
         contents.push_str(&format!("model = {model}\n"));
@@ -201,6 +241,9 @@ pub fn run_init() -> Result<()> {
             "\n[{PROMETHEUS_SECTION}]\nhost = {metrics_host}\nport = {}\n",
             metrics_port.trim()
         ));
+    }
+    if let Some(workers) = &workers {
+        contents.push_str(&workers.render());
     }
 
     println!("\nConfiguration to write:\n");
@@ -1547,6 +1590,94 @@ fn prompt_checked(
     }
 }
 
+/// Prompts for `[workers].workers` — or `standby`, the same shape, named by
+/// `label` — a comma-separated list of `host:port`
+/// pairs, re-prompting until [`parse_workers_list`] — the loader's own
+/// parser — accepts it, so what is written is what loads. Empty is an
+/// empty list: workers can be added to the file later.
+///
+/// The file needs both halves of every pair, but the workers most likely
+/// all listen on the same port as `[workers].port`, so an entry typed as a
+/// bare host takes `port` here and is written out in full.
+fn prompt_workers_list(label: &str, port: &str) -> Result<Vec<WorkerAddress>> {
+    loop {
+        let value = prompt_line(
+            &format!("{label} (comma-separated host[:port], port defaults to {port})"),
+            "",
+        )?;
+        match parse_workers_list(&with_default_port(&value, port)) {
+            Ok(workers) => return Ok(workers),
+            Err(err) => println!("{err}"),
+        }
+    }
+}
+
+/// Appends `:port` to each entry of a `workers` answer that names only a
+/// host — a plain name or address, or a bracketed IPv6 address — leaving
+/// entries that already carry a port (and anything malformed, for
+/// [`parse_workers_list`] to refuse) as typed.
+fn with_default_port(value: &str, port: &str) -> String {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let bare_v6 = entry.starts_with('[') && entry.ends_with(']');
+            if bare_v6 || !entry.contains(':') {
+                format!("{entry}:{port}")
+            } else {
+                entry.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The `[workers]` answers.
+struct WorkersAnswers {
+    host: String,
+    port: String,
+    workers: Vec<WorkerAddress>,
+    standby: Vec<WorkerAddress>,
+    secret: Option<String>,
+    activations: ActivationFormat,
+}
+
+impl WorkersAnswers {
+    /// The section as `--init` writes it: the list normalized to
+    /// `host:port, host:port`, and `standby`, `secret` and `activations`
+    /// only when they are not the defaults.
+    fn render(&self) -> String {
+        let list = self
+            .workers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut section = format!(
+            "\n[{WORKERS_SECTION}]\nhost = {}\nport = {}\nworkers = {list}\n",
+            self.host,
+            self.port.trim()
+        );
+        if !self.standby.is_empty() {
+            let standby = self
+                .standby
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            section.push_str(&format!("standby = {standby}\n"));
+        }
+        if let Some(secret) = &self.secret {
+            section.push_str(&format!("secret = {secret}\n"));
+        }
+        if self.activations != ActivationFormat::default() {
+            section.push_str(&format!("activations = {}\n", self.activations.label()));
+        }
+        section
+    }
+}
+
 /// Prompts for a plain value (no filesystem completion), reusing `default`
 /// on an empty entry.
 fn prompt_line(label: &str, default: &str) -> Result<String> {
@@ -2013,6 +2144,66 @@ mod tests {
             changed("vulkan".to_string(), "auto"),
             Some("vulkan".to_string())
         );
+    }
+
+    /// A worker typed without a port takes `[workers].port`; one with a
+    /// port keeps its own.
+    #[test]
+    fn a_worker_without_a_port_takes_the_workers_port() {
+        assert_eq!(
+            with_default_port("node1, node2:9000,[::1], [::2]:9001,,", "8400"),
+            "node1:8400,node2:9000,[::1]:8400,[::2]:9001"
+        );
+        let workers = parse_workers_list(&with_default_port("node1,node2:9000", "8400")).unwrap();
+        let listed: Vec<String> = workers.iter().map(ToString::to_string).collect();
+        assert_eq!(listed, ["node1:8400", "node2:9000"]);
+        // Malformed entries still reach the parser to be refused.
+        assert!(parse_workers_list(&with_default_port("node1:", "8400")).is_err());
+    }
+
+    /// The `[workers]` section the wizard writes loads back as entered.
+    #[test]
+    fn the_workers_section_the_wizard_writes_loads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orangu-server.conf");
+        let models = dir.path().display().to_string();
+        let workers = crate::config::parse_workers_list("node1:8100,[::1]:8101").unwrap();
+        let mut answers = WorkersAnswers {
+            host: "127.0.0.1".to_string(),
+            port: " 9000 ".to_string(),
+            workers: workers.clone(),
+            standby: Vec::new(),
+            secret: None,
+            activations: ActivationFormat::default(),
+        };
+        let write = |answers: &WorkersAnswers| {
+            std::fs::write(
+                &path,
+                format!("[orangu-server]\nmodels = {models}\n{}", answers.render()),
+            )
+            .unwrap();
+            crate::config::load_server_configuration(&path, None, false).unwrap()
+        };
+        let conf = write(&answers);
+        let loaded = conf.workers.unwrap();
+        assert_eq!(loaded.host, "127.0.0.1");
+        assert_eq!(loaded.port, 9000);
+        assert_eq!(loaded.workers, workers);
+        assert_eq!(loaded.secret, None);
+        assert_eq!(loaded.activations, ActivationFormat::F16);
+        assert!(conf.mcp_servers.is_empty());
+        assert!(!answers.render().contains("secret"));
+        assert!(!answers.render().contains("activations"));
+        assert!(!answers.render().contains("standby"));
+        assert!(loaded.standby.is_empty());
+
+        answers.secret = Some("s3cret".to_string());
+        answers.activations = ActivationFormat::Q8_0;
+        answers.standby = crate::config::parse_workers_list("spare:8100").unwrap();
+        let loaded = write(&answers).workers.unwrap();
+        assert_eq!(loaded.standby, answers.standby);
+        assert_eq!(loaded.secret.as_deref(), Some("s3cret"));
+        assert_eq!(loaded.activations, ActivationFormat::Q8_0);
     }
 
     /// The defaults the prompts offer are the ones the loader applies, and

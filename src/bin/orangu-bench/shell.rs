@@ -56,7 +56,7 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
             return 0
             ;;
     esac
@@ -70,7 +70,7 @@ _orangu_bench() {
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png \
              --flamegraph-layers --flamegraph-duration --flamegraph-watch \
              --compare-profiles --bundle --read-bundle --sweep --sweep-cmd --sweep-env --sweep-start-timeout \
-             --render-profile --report --web --host --port --delay --temperature -s --shell-completions -h --help -V --version" -- "$cur") )
+             --render-profile --report --web --host --port --delay --temperature --workers -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
     fi
 }
@@ -153,6 +153,7 @@ _orangu_bench() {
         '--host[Address the web console binds: all (or *) for every interface]:host:(all 0.0.0.0 127.0.0.1)' \
         '--port[Port the web console listens on]:port:' \
         '--delay[Seconds to wait between measured points, for a card that heats up]:seconds:' \
+        '--workers[A [workers] tree: on, off, or compare both]:mode:(on off compare)' \
         '--temperature[Sampling temperature for the timed decode; 0 is greedy]:t:' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-h --help)'{-h,--help}'[Print help]' \
@@ -234,6 +235,7 @@ complete -c orangu-bench -l web                       -d 'Serve the web console 
 complete -c orangu-bench -l host                   -x -a 'all 0.0.0.0 127.0.0.1' -d 'Address the web console binds: all (or *) for every interface'
 complete -c orangu-bench -l port                   -x -d 'Port the web console listens on'
 complete -c orangu-bench -l delay                  -x -d 'Seconds to wait between measured points, for a card that heats up'
+complete -c orangu-bench -l workers                -x -a 'on off compare' -d 'A [workers] tree: on, off, or compare both'
 complete -c orangu-bench -l temperature            -x -d 'Sampling temperature for the timed decode; 0 is greedy'
 complete -c orangu-bench -s s -l shell-completions    -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu-bench -s h -l help                 -d 'Print help'
@@ -324,6 +326,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--host', 'Address the web console binds: all (or *) for every interface'),
         @('--port', 'Port the web console listens on'),
         @('--delay', 'Seconds to wait between measured points, for a card that heats up'),
+        @('--workers', 'A [workers] tree: on, off, or compare both'),
         @('--temperature', 'Sampling temperature for the timed decode; 0 is greedy'),
         @('-s', '--shell-completions', 'Print shell completion script for the detected shell and exit'),
         @('-h', '--help', 'Print help'),
@@ -343,7 +346,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         { $_ -in '--history', '--chart', '--table', '--storage-file', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

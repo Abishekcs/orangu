@@ -155,6 +155,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image` or `qwen_image_2_1` model; `501` on a language model |
 | `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
 | `GET /ready` | readiness: would a request sent now be served |
+| `GET /v1/workers` | this node's place in its `[workers]` tree: role, layers, plan, workers |
 | `GET /props` | model and server metadata: backend, devices, build, slot count, workspace |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache |
@@ -549,14 +550,20 @@ from generation, nor a cache hit from real work:
 - **`timings`** (the ecosystem's shape, field for field) — `prompt_n`,
   `prompt_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
   `predicted_per_second` and their per-token equivalents. These are the same
-  figures the per-request console log prints.
+  figures the per-request console log prints. On a top-level node of a
+  `[workers]` tree, `timings.workers` also lists the request's time at each
+  node of the pipeline, in order — `[{"node": "top:8400", "ms": 200.5},
+  {"node": "10.0.0.2:8400", "ms": 168.5}]` — where a worker's time is its
+  round trip, its own workers included.
 - **`prompt_progress`** (likewise) — `total`, `cache`, `processed`,
   `time_ms`, reported once per prefill chunk while the prompt is still being
   processed (see `return_progress` above).
 
 On a streaming response they ride on the final chunk (the one carrying
 `finish_reason`), immediately before `[DONE]`; on a non-streaming response
-they are top-level fields. `orangu-bench --pp` reads them to report prefill
+they are top-level fields, and the `Server-Timing` header carries the same
+times — `prompt;dur=…, generate;dur=…`, then one `node<i>;desc="…";dur=…`
+per node in a tree — for tools that read timings from headers. `orangu-bench --pp` reads them to report prefill
 throughput, and the orangu client reads them for its status-line rates.
 
 ### Native endpoints
@@ -589,7 +596,7 @@ Readiness: would a request sent now be served. That is what a load balancer
 needs, and it is a different question from `/health` — here "busy" is exactly
 the case worth reporting.
 
-Two things make it `503`, and the body names which, because a probe that only
+Four things make it `503`, and the body names which, because a probe that only
 flips a status code leaves an operator with the alert and none of the reason:
 
 - **`"queue full"`** — the admission queue is at `queue_limit`. A new unpinned
@@ -602,6 +609,11 @@ flips a status code leaves an operator with the alert and none of the reason:
   precisely the intended recovery, but nothing should be routed to it
   meanwhile. Checked first: a lost device makes every answer wrong, including
   a cheerful one about an empty queue.
+- **`"serving a parent orangu-server"`** — this node is a worker in a
+  `[workers]` tree, and its own API is off while it works for its parent.
+- **`"a worker was lost"`** — a worker this node's plan relies on stopped
+  answering, and the plan has not been repaired yet. The next request
+  repairs it, and so does the worker coming back.
 
 `200` with `"ok"` otherwise. Reachable without an `api_key`, like `/health` —
 a readiness probe that needed a credential would fail closed exactly when a
@@ -674,6 +686,16 @@ not in multiples of 16, zero steps, a guidance below 0, a strength outside
 **Settings › Image** pane is this endpoint, on the console's own port as
 `/api/props`; the change holds until the server restarts, when the
 configuration's values are back.
+
+A top-level `[workers]` node also takes `{"workers": {"enabled": false}}`:
+it serves alone — its model's own paths, with the prefix pool, paged KV
+and MTP head a tree turns off — and lets its workers go, which serve their
+own APIs again; `true` plans the tree again. `GET /props` has `workers`
+(`enabled`, `switchable`, `plan`; `null` without `[workers]`). The switch
+waits for no request: `409` while one runs or waits, on a worker or a node
+without workers, and on one with only part of the model. The slots' kept
+conversations are dropped by it. `orangu-bench --workers compare` is built
+on this.
 
 #### `GET /slots`
 
@@ -773,6 +795,20 @@ that carry a label, rather than one metric each. All of them are gauges.
 | `process_resident_memory_bytes`, `process_virtual_memory_bytes` | this process's memory |
 | `process_open_fds` | open file descriptors (Linux only) |
 | `orangu_server_host_memory_total_bytes`, `orangu_server_host_memory_available_bytes` | the host's physical memory |
+
+**About a tree of workers.** Present when the server has a `[workers]`
+section; the per-worker families carry a `worker` label, the address as
+`[workers].workers` lists it.
+
+| metric | notes |
+| :-- | :-- |
+| `orangu_server_workers_assigned` | gauge: `1` while this node works for a parent (its own API is off) |
+| `orangu_server_workers_plans_total` | times this node planned its layers over its workers |
+| `orangu_server_workers_recoveries_total` | times a lost worker made this node plan again mid-request |
+| `orangu_server_worker_up{worker}` | gauge: whether the connection to the worker is up |
+| `orangu_server_worker_forward_seconds{worker}` | histogram: one forward's round trip through the worker's subtree, network included |
+| `orangu_server_worker_sent_bytes_total{worker}`, `orangu_server_worker_received_bytes_total{worker}` | bytes each way |
+| `orangu_server_worker_failures_total{worker}` | requests to the worker that failed: unreachable, closed, or timed out |
 
 **A second, unauthenticated copy of this endpoint.** Adding a `[prometheus]`
 section (or passing `--metrics`) binds this exact response on a port of

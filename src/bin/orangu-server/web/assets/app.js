@@ -1369,6 +1369,7 @@
     mcps: document.getElementById("mcps-panel"),
     models: document.getElementById("models-panel"),
     image: document.getElementById("image-panel"),
+    workers: document.getElementById("workers-panel"),
   };
   const modelsOverlay = settingsOverlay;
   const modelsReloadBtn = document.getElementById("models-reload-btn");
@@ -2212,6 +2213,120 @@
     return inventory;
   }
 
+  // ------------------------------------------------------- workers --
+  // Settings › Workers: the tree this server heads or serves in, read-only —
+  // the `[workers]` section is the configuration file's.
+  const workersRole = document.getElementById("workers-role");
+  const workersSummary = document.getElementById("workers-summary");
+  const workersPlan = document.getElementById("workers-plan");
+  const workersList = document.getElementById("workers-list");
+  const workersHardware = document.getElementById("workers-hardware");
+  document.getElementById("workers-refresh-btn").addEventListener("click", () => {
+    openWorkers().catch((err) => { workersSummary.textContent = err.message; });
+  });
+
+  function workersTable(headings, rows) {
+    const table = document.createElement("table");
+    const head = document.createElement("tr");
+    for (const heading of headings) {
+      const cell = document.createElement("th");
+      cell.textContent = heading;
+      head.appendChild(cell);
+    }
+    table.createTHead().appendChild(head);
+    const body = table.createTBody();
+    for (const values of rows) {
+      const row = body.insertRow();
+      for (const value of values) row.insertCell().textContent = value;
+    }
+    return table;
+  }
+
+  function layerSpan(layers) {
+    return layers ? `${layers[0]}–${layers[1] - 1}` : "—";
+  }
+
+  function renderWorkers(status) {
+    workersPlan.replaceChildren();
+    workersList.replaceChildren();
+    workersHardware.replaceChildren();
+    if (status.role === "none") {
+      workersRole.textContent = "";
+      workersSummary.textContent = "This server has no [workers] section; it runs every layer itself.";
+      return;
+    }
+    const name = status.name ? `${status.name} (${status.node})` : status.node;
+    workersRole.textContent = status.role === "worker" ? `worker ${name}` : `top ${name}`;
+    const parts = [];
+    if (status.model) parts.push(status.quant ? `${status.model} · ${status.quant}` : status.model);
+    if (status.listen) parts.push(`listening on ${status.listen}`);
+    if (status.shares) parts.push(`shares by ${status.shares}`);
+    if (status.role === "worker") parts.push(`layers ${layerSpan(status.layers)} for a parent`);
+    if (status.lost && status.lost.length) parts.push(`lost: ${status.lost.join(", ")}`);
+    workersSummary.textContent = parts.join(" — ");
+    if (status.plan && status.plan.length) {
+      workersPlan.appendChild(workersTable(
+        ["Node", "Layers", "Count"],
+        status.plan.map((e) => [e.node, layerSpan(e.layers), String(e.layers[1] - e.layers[0])]),
+      ));
+    } else {
+      workersPlan.textContent = status.role === "worker"
+        ? "The parent plans the tree."
+        : "No plan — the model runs on this server alone.";
+    }
+    const standby = (status.standby || []).map((w) => [
+      w.address,
+      w.standing_in_for
+        ? `Standby, standing in for ${w.standing_in_for}`
+        : (w.connected ? "Standby, connected" : "Standby"),
+      "—",
+      "—",
+    ]);
+    if ((status.workers && status.workers.length) || standby.length) {
+      workersList.appendChild(workersTable(
+        ["Address", "Status", "Node id", "Nodes below"],
+        (status.workers || []).map((w) => [
+          w.address,
+          w.connected ? "Connected" : "Unreachable",
+          w.node || "—",
+          w.subtree_nodes == null ? "—" : String(w.subtree_nodes),
+        ]).concat(standby),
+      ));
+    } else {
+      workersList.textContent = "No workers are configured.";
+    }
+    // Every node's processors and measured speed: this one, then each
+    // worker's subtree.
+    const setups = (status.setup ? [status.setup] : [])
+      .concat(...(status.workers || []).map((w) => w.setups || []));
+    const device = (d) => {
+      const extra = [];
+      if (d.cores) extra.push(`${d.cores} cores`);
+      if (d.memory_bytes) extra.push(`${(d.memory_bytes / 2 ** 30).toFixed(0)} GiB`);
+      return extra.length ? `${d.name} (${extra.join(", ")})` : d.name;
+    };
+    const rate = (r) => (r == null ? "—" : r.toFixed(2));
+    if (setups.length) {
+      workersHardware.appendChild(workersTable(
+        ["Node", "Runs on", "Also has", "Decode GB/s", "Prompt GB/s"],
+        setups.map((s) => [
+          s.name,
+          s.devices.filter((d) => d.in_use).map(device).join(", ") || "—",
+          s.devices.filter((d) => !d.in_use).map(device).join(", ") || "—",
+          rate(s.decode_gb_per_s),
+          rate(s.prompt_gb_per_s),
+        ]),
+      ));
+    }
+  }
+
+  async function openWorkers() {
+    workersSummary.textContent = "Loading…";
+    const res = await fetch("/api/workers", { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    renderWorkers(await res.json());
+  }
+
   // -------------------------------------------------------- notice --
   // One pop-up with one button, for the word after a Save that wrote the
   // configuration file.
@@ -2451,6 +2566,9 @@
     if (name === "image" && !keepForm) {
       imageStatus.textContent = "";
       loadImageProps().catch((err) => { imageStatus.textContent = err.message; });
+    }
+    if (name === "workers") {
+      openWorkers().catch((err) => { workersSummary.textContent = err.message; });
     }
     try {
       localStorage.setItem("orangu-settings-pane", name);

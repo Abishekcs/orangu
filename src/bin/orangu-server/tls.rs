@@ -78,7 +78,7 @@ pub fn server_config(paths: &TlsPaths) -> Result<Arc<tokio_rustls::rustls::Serve
     Ok(Arc::new(config))
 }
 
-fn read_certs(
+pub(crate) fn read_certs(
     path: &Path,
 ) -> Result<Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>> {
     let pem = std::fs::read(path)

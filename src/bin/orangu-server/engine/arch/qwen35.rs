@@ -86,6 +86,39 @@ impl ModelForward for Qwen35Model {
     fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
         anyhow::bail!("embeddings are not yet supported for Qwen3.5 models")
     }
+
+    /// Each layer keeps its own state — an attention layer its KV rows, a
+    /// gated-DeltaNet layer its recurrent state — and passes on only the
+    /// residual stream, so any cut is exact.
+    fn supports_layer_split(&self) -> bool {
+        true
+    }
+
+    fn new_kv_cache_for_layers(&self, layers: std::ops::Range<usize>, capacity: usize) -> KvCache {
+        self.trunk.new_kv_cache_for_layers(layers, capacity)
+    }
+
+    fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.trunk.embed(tokens)
+    }
+
+    /// The host path over `layers`; the one-token device loop runs the
+    /// whole model and has no range to stop at.
+    fn forward_layers(
+        &self,
+        cache: &mut KvCache,
+        hidden: Vec<f32>,
+        tokens: &[u32],
+        layers: std::ops::Range<usize>,
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        self.trunk
+            .forward_range(cache, hidden, tokens.len(), start_pos, layers)
+    }
+
+    fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        self.trunk.head_rows(hidden, n_rows)
+    }
 }
 
 #[cfg(test)]

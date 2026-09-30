@@ -56,6 +56,11 @@ pub struct GenerateStats {
     pub prompt_time: Duration,
     pub generated_tokens: usize,
     pub generate_time: Duration,
+    /// Where the request's forwards spent their time in a tree of workers
+    /// (`crate::workers`): this node's own layers and each worker's round
+    /// trip, prefill and decode together, in pipeline order. Empty when the
+    /// model runs here alone, and until the request ends.
+    pub workers: Vec<(String, Duration)>,
 }
 
 impl GenerateStats {
@@ -325,6 +330,51 @@ pub struct Engine {
     /// generation endpoints answer with pictures rather than tokens. `None`
     /// for every language model, which is every other architecture.
     pub image: Option<Arc<super::image::Pipeline>>,
+    /// A `[workers]` top-level node's two ways of serving (W-84): through
+    /// its tree, or alone on the model's own paths, switched by `POST
+    /// /props`. [`Self::model`], [`Self::mtp`], [`Self::prefix_cache`] and
+    /// [`Self::paged_kv`] are the tree's then. `None` for every other
+    /// server, which serves by those fields and nothing else.
+    pub switch: Option<Arc<ServingSwitch>>,
+}
+
+/// What a request is served by: the model and what goes with it.
+#[derive(Clone)]
+pub struct Serving {
+    pub model: Arc<dyn ModelForward>,
+    pub mtp: Option<Arc<MtpDraft>>,
+    pub prefix_cache: Option<Arc<PrefixCache>>,
+    pub paged_kv: Option<(
+        Arc<super::kv_pool::KvPool>,
+        Arc<super::prefix_index::PrefixIndex>,
+    )>,
+}
+
+/// A top-level `[workers]` node's model alone — its own fused decode,
+/// resident prefill, prefix pool, paged KV and MTP head, as a server
+/// without `[workers]` has them — beside the tree the engine's own fields
+/// hold, and which of the two serves (W-84).
+pub struct ServingSwitch {
+    pub alone: Serving,
+    alone_now: std::sync::atomic::AtomicBool,
+}
+
+impl ServingSwitch {
+    pub fn new(alone: Serving) -> Self {
+        Self {
+            alone,
+            alone_now: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn is_alone(&self) -> bool {
+        self.alone_now.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_alone(&self, alone: bool) {
+        self.alone_now
+            .store(alone, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// What a caught generation panic is reported to the caller as: the panic's
@@ -402,6 +452,22 @@ impl Engine {
 pub const DEFAULT_REASONING_EFFORT: &str = "medium";
 
 impl Engine {
+    /// What the next request is served by: the engine's own model and pools,
+    /// or — on a `[workers]` node switched to serve alone — the model's.
+    pub fn serving(&self) -> Serving {
+        match &self.switch {
+            Some(switch) if switch.is_alone() => switch.alone.clone(),
+            _ => Serving {
+                model: self.model.clone(),
+                mtp: self.mtp.clone(),
+                prefix_cache: self.prefix_cache.clone(),
+                paged_kv: self.paged_kv.clone(),
+            },
+        }
+    }
+}
+
+impl Engine {
     /// Starts generating in the background (on tokio's blocking pool) and
     /// returns a channel of [`StreamEvent`]s — waits for a free slot first
     /// if every one is already busy.
@@ -418,15 +484,17 @@ impl Engine {
             ));
             return rx;
         }
-        let model = self.model.clone();
+        let Serving {
+            model,
+            mtp,
+            prefix_cache,
+            paged_kv,
+        } = self.serving();
         let decode_batcher = self.decode_batcher.clone();
         let tokenizer = self.tokenizer.clone();
         let slots = self.slots.clone();
         let draft = self.draft.clone();
-        let mtp = self.mtp.clone();
-        let prefix_cache = self.prefix_cache.clone();
         let slot_store = self.slot_store.clone();
-        let paged_kv = self.paged_kv.clone();
         // Whether a reasoning message reaches the client is the *serving*
         // role's call — this process's, unless a coordinator named another one
         // for this request (`GenerateRequest::role`). It has to be the same
@@ -707,8 +775,9 @@ fn run(
         && let Some(pool) = prefix_cache
         && let Some((matched, entry)) = pool.take_best_match(&req.prompt_tokens)
     {
+        let mut entry = entry;
         let matched = matched.min(req.prompt_tokens.len().saturating_sub(1));
-        if matched > 0 {
+        if matched > 0 && new_cache.take_remote_prefix(&mut entry.cache, matched) {
             // Moved, not copied: `take_best_match` removed this entry from the
             // pool, so nothing else can still be reading it and its buffers
             // can become this request's own. The slot store below cannot do
@@ -800,6 +869,13 @@ fn run(
     let total_prompt = req.prompt_tokens.len();
     let progress_tx = tx.clone();
     let mut on_chunk = |processed: usize| {
+        // A client that hung up mid-prompt stops the prefill at the next
+        // chunk, as one that hangs up mid-answer stops the decode at the
+        // next token: a long prompt otherwise holds the slot, and in a tree
+        // every worker, for the rest of its prefill.
+        if progress_tx.is_closed() {
+            return Err(anyhow::Error::new(PrefillCancelled));
+        }
         // Cached tokens never went through a forward pass, so they are
         // already "processed" as far as a progress bar is concerned —
         // otherwise a mostly-cached prompt appears to start at zero and jump.
@@ -809,6 +885,7 @@ fn run(
             processed: reused_len + processed,
             elapsed: prompt_start.elapsed(),
         });
+        Ok(())
     };
     // Committed after the whole prefill, not inside it. Prefill is
     // **layer-major** — `arch::gemma` pushes every token of layer 0, then every
@@ -826,6 +903,15 @@ fn run(
         &mut on_chunk,
     ) {
         Ok(l) => l,
+        Err(err) if err.is::<PrefillCancelled>() => {
+            outcome.finish(
+                super::metrics::Outcome::Cancelled,
+                req.prompt_tokens.len(),
+                reused_len,
+                0,
+            );
+            return Ok(());
+        }
         Err(err) => {
             // `{err:?}` (anyhow's chain-plus-backtrace Debug format, not
             // `{err}`'s bare top-level message) — `main`'s own unconditional
@@ -970,6 +1056,7 @@ fn run(
                 prompt_time,
                 generated_tokens: generated,
                 generate_time: generate_start.elapsed(),
+                workers: Vec::new(),
             }));
         }
         if live_stats && last_report.elapsed() >= Duration::from_secs(1) {
@@ -979,6 +1066,7 @@ fn run(
                 prompt_time,
                 generated_tokens: generated,
                 generate_time: generate_start.elapsed(),
+                workers: Vec::new(),
             };
             // \x1b[K ("erase to end of line") clears any leftover tail from
             // a longer previous update before the cursor returns to the
@@ -1163,7 +1251,9 @@ fn run(
     // so a later `save` can persist it; when both features are on, the pool
     // gets a `duplicate()` and the slot keeps the original, since each needs
     // to own its copy.
+    let mut workers = Vec::new();
     if let Some(final_cache) = cache.take() {
+        workers = final_cache.request_finished();
         let history = std::mem::take(&mut history);
         if let Some((pool, index)) = paged_kv {
             // Publish what this request sealed, so the next one with the same
@@ -1210,6 +1300,7 @@ fn run(
         prompt_time,
         generated_tokens: generated,
         generate_time,
+        workers,
     };
     // A prefix another request left in the cache, reused here: worth
     // prefilling again after a restart (`engine::warm_prefixes`).
@@ -2000,6 +2091,18 @@ fn chunk_policy() -> ChunkPolicy {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A prefill stopped between chunks because its client went away.
+#[derive(Debug)]
+struct PrefillCancelled;
+
+impl std::fmt::Display for PrefillCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the client went away during the prompt")
+    }
+}
+
+impl std::error::Error for PrefillCancelled {}
+
 fn prefill(
     model: &dyn ModelForward,
     cache: &mut KvCache,
@@ -2007,7 +2110,7 @@ fn prefill(
     start_pos: usize,
     slot_id: usize,
     drafter: Option<&mut Drafter<'_>>,
-    on_chunk: &mut dyn FnMut(usize),
+    on_chunk: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<Vec<f32>> {
     // Priced once and carried forward: see [`CHUNK_COST`].
     let mut cost = load_chunk_cost();
@@ -2087,7 +2190,7 @@ fn prefill_in_chunks(
     slot_id: usize,
     chunking: Chunking,
     mut drafter: Option<&mut Drafter<'_>>,
-    on_chunk: &mut dyn FnMut(usize),
+    on_chunk: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<Vec<f32>> {
     // One extra decoder block over the prompt, and only for the drafter that
     // reads it. Everything else takes the forward it always took: exporting
@@ -2159,7 +2262,7 @@ pub fn embedding_hidden_states(model: &dyn ModelForward, tokens: &[u32]) -> Resu
             })?);
             Ok(Vec::new())
         },
-        &mut |_| {},
+        &mut |_| Ok(()),
     );
     store_chunk_cost(cost);
     if let Some(vulkan) = model.vulkan_backend() {
@@ -2184,7 +2287,7 @@ fn run_in_chunks(
     start_pos: usize,
     chunking: Chunking,
     chunk: &mut ChunkPass<'_>,
-    on_chunk: &mut dyn FnMut(usize),
+    on_chunk: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<Vec<f32>> {
     let Chunking {
         width: batch,
@@ -2272,7 +2375,7 @@ fn run_in_chunks(
         // against.
         let logits = chunk(cache, tokens, start_pos, true)?;
         crate::engine::note_forward_pass();
-        on_chunk(tokens.len());
+        on_chunk(tokens.len())?;
         return Ok(logits);
     }
 
@@ -2329,7 +2432,7 @@ fn run_in_chunks(
         pos += n;
         done += n;
         // After the forward, not before: progress means work finished.
-        on_chunk(done);
+        on_chunk(done)?;
         if chunks_report {
             widths.push(n);
         }
@@ -4691,7 +4794,7 @@ mod tests {
                 policy: ChunkPolicy::Flat,
             },
             Some(&mut drafter),
-            &mut |_| {},
+            &mut |_| Ok(()),
         )
         .unwrap();
 
@@ -4735,7 +4838,7 @@ mod tests {
                 policy: ChunkPolicy::Flat,
             },
             Some(&mut drafter),
-            &mut |_| {},
+            &mut |_| Ok(()),
         )
         .unwrap();
 
@@ -4832,7 +4935,7 @@ mod tests {
                 policy: ChunkPolicy::Adaptive,
             },
             None,
-            &mut |_| {},
+            &mut |_| Ok(()),
         )
         .unwrap();
 
@@ -4873,7 +4976,7 @@ mod tests {
                 0,
                 Chunking { width: 32, policy },
                 None,
-                &mut |_| {},
+                &mut |_| Ok(()),
             )
             .unwrap();
             let calls = model.calls.lock().unwrap().clone();
@@ -4911,7 +5014,7 @@ mod tests {
                 policy: ChunkPolicy::Flat,
             },
             None,
-            &mut |_| {},
+            &mut |_| Ok(()),
         )
         .unwrap();
 
@@ -5011,7 +5114,7 @@ mod tests {
                 policy: ChunkPolicy::Adaptive,
             },
             None,
-            &mut |_| {},
+            &mut |_| Ok(()),
         )
         .unwrap();
 
@@ -5240,7 +5343,7 @@ mod tests {
                     policy: ChunkPolicy::Adaptive,
                 },
                 None,
-                &mut |_| {},
+                &mut |_| Ok(()),
             )
             .unwrap();
             let calls = model.calls.lock().unwrap().clone();
@@ -5345,7 +5448,7 @@ mod tests {
                 policy: ChunkPolicy::Adaptive,
             },
             None,
-            &mut |_| {},
+            &mut |_| Ok(()),
         )
         .unwrap();
 
@@ -5375,13 +5478,42 @@ mod tests {
                 policy: ChunkPolicy::Adaptive,
             },
             None,
-            &mut |done| seen.push((done, model.calls.lock().unwrap().len())),
+            &mut |done| {
+                seen.push((done, model.calls.lock().unwrap().len()));
+                Ok(())
+            },
         )
         .unwrap();
 
         // (tokens done, forwards completed) — the second element proves the
         // report follows the work rather than announcing it.
         assert_eq!(seen, vec![(10, 1), (20, 2), (25, 3)]);
+    }
+
+    /// A report that answers an error — the client is gone — stops the
+    /// prefill there: no further chunk runs, and the error says why.
+    #[test]
+    fn a_prefill_stops_at_the_chunk_its_client_left_during() {
+        let model = RecordingModel::new();
+        let mut cache = model.new_kv_cache(64);
+        let tokens: Vec<u32> = (0..25).collect();
+        let err = prefill_in_chunks(
+            &mut ChunkCost::new(),
+            &model,
+            &mut cache,
+            &tokens,
+            0,
+            0,
+            Chunking {
+                width: 10,
+                policy: ChunkPolicy::Adaptive,
+            },
+            None,
+            &mut |_| Err(anyhow::Error::new(PrefillCancelled)),
+        )
+        .unwrap_err();
+        assert!(err.is::<PrefillCancelled>(), "{err:#}");
+        assert_eq!(model.calls.lock().unwrap().len(), 1);
     }
 
     /// A one-chunk prompt still reports, once, at the total — otherwise a
@@ -5405,7 +5537,10 @@ mod tests {
                 policy: ChunkPolicy::Adaptive,
             },
             None,
-            &mut |done| seen.push(done),
+            &mut |done| {
+                seen.push(done);
+                Ok(())
+            },
         )
         .unwrap();
 
@@ -5486,7 +5621,7 @@ mod tests {
                     policy: ChunkPolicy::Adaptive,
                 },
                 None,
-                &mut |_| {},
+                &mut |_| Ok(()),
             )
             .unwrap();
 
@@ -5530,6 +5665,7 @@ mod tests {
             reasoning_effort: None,
             live_stats: false,
             image: None,
+            switch: None,
         };
 
         let mut rx = engine

@@ -2014,6 +2014,137 @@ impl<F: HybridFfn> Trunk<F> {
         Ok(logits)
     }
 
+    /// A cache for `layers` only, for one node of a tree of workers
+    /// (`crate::workers`): the whole model's layout — attention layers and
+    /// recurrent layers each indexed by their own count — with nothing
+    /// allocated for the layers outside `layers`.
+    pub(crate) fn new_kv_cache_for_layers(
+        &self,
+        layers: std::ops::Range<usize>,
+        capacity: usize,
+    ) -> KvCache {
+        let mut kv_dims = Vec::new();
+        let mut recurrent_specs = Vec::new();
+        for (il, layer) in self.layers.iter().enumerate() {
+            let own = layers.contains(&il);
+            match layer {
+                Layer::FullAttn(..) => {
+                    kv_dims.push(if own {
+                        self.dims.n_head_kv * self.dims.head_dim
+                    } else {
+                        0
+                    });
+                }
+                Layer::Recurrent(..) => recurrent_specs.push(if own {
+                    RecurrentSpec::delta_net(
+                        self.dims.conv_channels(),
+                        self.dims.ssm_d_conv,
+                        self.dims.ssm_dt_rank,
+                        self.dims.ssm_head_dim,
+                    )
+                } else {
+                    RecurrentSpec::delta_net(0, 0, 0, 0)
+                }),
+            }
+        }
+        KvCache::new_mixed(capacity, &kv_dims, &recurrent_specs)
+    }
+
+    /// The residual stream entering the first layer, for a tree of workers:
+    /// what [`Self::forward`] computes before its layer loop.
+    pub(crate) fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let n_embd = self.dims.n_embd;
+        let mut x = vec![0f32; tokens.len() * n_embd];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            anyhow::ensure!(
+                tok < self.config.n_vocab,
+                "token id {tok} is out of vocab range"
+            );
+            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+        }
+        if let Some(rot) = &self.embd_inverse {
+            rot.apply_inverse(&mut x, n_embd);
+        }
+        Ok(x)
+    }
+
+    /// Layers `layers` of [`Self::forward`]'s host loop over `x`, the
+    /// residual stream of `n_tokens` rows entering the first of them — one
+    /// node's range in a tree of workers. [`Self::forward`] keeps its own
+    /// loop: a server alone runs exactly what it always did. Indices past
+    /// the trunk (a multi-token-prediction block `block_count` counts) are
+    /// skipped.
+    pub(crate) fn forward_range(
+        &self,
+        cache: &mut KvCache,
+        mut x: Vec<f32>,
+        n_tokens: usize,
+        start_pos: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Vec<f32>> {
+        anyhow::ensure!(
+            x.len() == n_tokens * self.dims.n_embd,
+            "hidden state holds {} values, expected {n_tokens} rows of {}",
+            x.len(),
+            self.dims.n_embd
+        );
+        let mut scratch = LayerScratch::default();
+        let backend: &dyn Backend = match &self.prefill_backend {
+            Some(cpu) if n_tokens > 1 => cpu.as_ref(),
+            _ => self.backend.as_ref(),
+        };
+        for il in layers.start..layers.end.min(self.layers.len()) {
+            match &self.layers[il] {
+                Layer::FullAttn(weights, ffn) => self.forward_full_attn_layer(
+                    backend,
+                    il,
+                    weights,
+                    ffn,
+                    cache,
+                    &mut x,
+                    n_tokens,
+                    start_pos,
+                    &mut scratch,
+                )?,
+                Layer::Recurrent(weights, ffn) => self.forward_recurrent_layer(
+                    backend,
+                    il,
+                    weights,
+                    ffn,
+                    cache,
+                    &mut x,
+                    n_tokens,
+                    &mut scratch,
+                )?,
+            }
+        }
+        Ok(x)
+    }
+
+    /// [`Self::forward`]'s head over each of `n_rows` rows of the last
+    /// layer's residual stream: the final norm, a folded head's rotation,
+    /// the output projection.
+    pub(crate) fn head_rows(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        let n_embd = self.dims.n_embd;
+        anyhow::ensure!(
+            hidden.len() == n_rows * n_embd,
+            "hidden state holds {} values, expected {n_rows} rows of {n_embd}",
+            hidden.len()
+        );
+        Ok(hidden
+            .chunks_exact(n_embd)
+            .map(|row| {
+                let mut row = row.to_vec();
+                tensor::rmsnorm_inplace(&mut row, &self.output_norm, 1, n_embd, self.dims.rms_eps);
+                if let Some(rot) = &self.head_in {
+                    rot.apply(&mut row, n_embd);
+                }
+                self.backend.matmul(&row, 1, &self.output_weight)
+            })
+            .collect())
+    }
+
     /// One token's layer loop, the final norm and the output head as device
     /// submissions, the logits read back — see the call in
     /// [`Self::forward`]. `None` when a layer cannot be recorded (a

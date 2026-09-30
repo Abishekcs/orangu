@@ -836,8 +836,17 @@ gemma 4 checkpoint."
         for rep in 0..PROMPT_PROBE_PASSES {
             let mut cache = self.new_kv_cache(PROMPT_PROBE_TOKENS + 1);
             let started = std::time::Instant::now();
-            self.run_layers(Some(&mut cache), None, &x, &tokens, 0, true, layers.clone())
-                .ok()?;
+            self.run_layers(
+                Some(&mut cache),
+                None,
+                &x,
+                &tokens,
+                0,
+                true,
+                layers.clone(),
+                None,
+            )
+            .ok()?;
             if rep > 0 {
                 best = best.min(started.elapsed().as_secs_f64());
             }
@@ -935,6 +944,7 @@ gemma 4 checkpoint."
             timestamps.as_ref(),
             0..self.layers.len(),
             true,
+            None,
         );
 
         if let Some(t) = &timestamps {
@@ -1051,6 +1061,10 @@ gemma 4 checkpoint."
                         start_pos,
                         true,
                         layers.clone(),
+                        // The per-layer inputs come from the token's
+                        // embedding, not from the residual a run past the
+                        // first enters with.
+                        Some(x),
                     )
                     .ok()?;
                 continue;
@@ -1071,6 +1085,7 @@ gemma 4 checkpoint."
                 None,
                 layers.clone(),
                 with_tail,
+                None,
             );
             if with_tail {
                 return Some(vulkan.submit_and_readback_for(
@@ -1114,6 +1129,7 @@ gemma 4 checkpoint."
         timestamps: Option<&wgpu::QuerySet>,
         layers: std::ops::Range<usize>,
         with_tail: bool,
+        embd: Option<&[f32]>,
     ) -> (wgpu::Buffer, u64) {
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
@@ -1129,8 +1145,13 @@ gemma 4 checkpoint."
         // `Self::record_split_decode`), so this only ever guards the case
         // that cannot arise — cheaply, and in the one place a future
         // per-run PLE would have to change.
-        let has_ple =
-            per_layer > 0 && layers.start == 0 && (!crate::engine::env::flag_on("ORANGU_SKIP_PLE"));
+        //
+        // A range that starts later can still have its per-layer inputs,
+        // from the token's own embedding passed as `embd` — what a worker's
+        // share of the model does (`ModelForward::forward_layers`).
+        let has_ple = per_layer > 0
+            && (layers.start == 0 || embd.is_some())
+            && (!crate::engine::env::flag_on("ORANGU_SKIP_PLE"));
 
         let ple_buf = if has_ple {
             let gathered = self.gather_per_layer_tok_embd(&[token], 1);
@@ -1138,7 +1159,7 @@ gemma 4 checkpoint."
                 vulkan.record_ple_projection(
                     encoder,
                     crate::engine::backend::vulkan::PleProjectionInput {
-                        x: GpuInput::Cpu(x),
+                        x: GpuInput::Cpu(embd.unwrap_or(x)),
                         proj_w: self
                             .per_layer_model_proj
                             .as_ref()
@@ -1382,6 +1403,7 @@ gemma 4 checkpoint."
             start_pos,
             true,
             0..self.layers.len(),
+            None,
         )
     }
 
@@ -1402,6 +1424,12 @@ gemma 4 checkpoint."
     /// pass, or the host tier's run of a split decode whose device runs
     /// are recorded as chains (`Self::record_split_decode`), with `x0` the
     /// residual as the run before it left it.
+    ///
+    /// `embd`: the chunk's scaled token embeddings, which the per-layer
+    /// inputs are computed from — `None` when `x0` is them, which it is for
+    /// a pass that starts at layer 0. A pass that starts further in (a
+    /// worker's share of the model, `ModelForward::forward_layers`) enters
+    /// with a residual instead, and passes the embeddings separately.
     #[allow(clippy::too_many_arguments)]
     fn run_layers(
         &self,
@@ -1412,7 +1440,9 @@ gemma 4 checkpoint."
         start_pos: usize,
         want_x: bool,
         layers: std::ops::Range<usize>,
+        embd: Option<&[f32]>,
     ) -> Result<Vec<f32>> {
+        let embd = embd.unwrap_or(x0);
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
@@ -1492,7 +1522,7 @@ gemma 4 checkpoint."
             };
             let gathered = self.gather_per_layer_tok_embd(tokens, n_tokens);
             v.ple_inputs_prefill(
-                &x,
+                embd,
                 n_tokens,
                 proj_w,
                 proj_norm,
@@ -1505,7 +1535,7 @@ gemma 4 checkpoint."
             None
         };
         let mut inp_per_layer = if has_ple && inp_per_layer_dev.is_none() {
-            Some(self.compute_per_layer_inputs(backend.as_ref(), &x, tokens, n_tokens))
+            Some(self.compute_per_layer_inputs(backend.as_ref(), embd, tokens, n_tokens))
         } else {
             None
         };
@@ -1513,7 +1543,7 @@ gemma 4 checkpoint."
         // the device: a layer that lands on the host after that needs the
         // host form computed from *these*, not from the residual `x` has
         // become by then.
-        let x_embd: Option<Vec<f32>> = inp_per_layer_dev.is_some().then(|| x.clone());
+        let x_embd: Option<Vec<f32>> = inp_per_layer_dev.is_some().then(|| embd.to_vec());
         let host_inputs = |inp: &mut Option<Vec<f32>>| {
             if inp.is_none() {
                 let embd = x_embd
@@ -2803,6 +2833,150 @@ impl ModelForward for GemmaModel {
         Some(self.output_weight.clone())
     }
 
+    /// Gemma 4 runs a range of layers on its own (`run_layers` takes one):
+    /// the per-layer embeddings a layer adds are computed from the token
+    /// ids, which travel with every forward, so a worker recomputes them
+    /// rather than receiving them; and the layers that share a KV cache are
+    /// kept with their donors (`Self::split_allowed`). Verified bit for bit
+    /// on every E2B, E4B and 12B quantization (`workers::pipeline::tests::
+    /// gemma4_splits_where_it_may`). Gemma 2 and 3 take the same path but
+    /// have not been checked, so they are not split yet; neither is
+    /// `gemma-embedding`, which is bidirectional.
+    fn supports_layer_split(&self) -> bool {
+        self.causal && self.config.architecture == "gemma4"
+    }
+
+    /// A cut is allowed wherever no layer after it reads a KV cache owned
+    /// by a layer before it. Gemma 4's last layers share the KV of the last
+    /// KV-owning layer of their attention type (`GemmaLayer::kv_donor`) —
+    /// on E2B, 20 of 35 layers read layers 13 and 14 — so those readers and
+    /// their donors stay on one node.
+    fn split_allowed(&self, at: usize) -> bool {
+        self.layers
+            .iter()
+            .enumerate()
+            .skip(at)
+            .all(|(_, layer)| layer.has_kv || layer.kv_donor >= at)
+    }
+
+    fn new_kv_cache_for_layers(&self, layers: std::ops::Range<usize>, capacity: usize) -> KvCache {
+        let dims: Vec<usize> = self
+            .kv_dims()
+            .into_iter()
+            .enumerate()
+            .map(|(il, dim)| if layers.contains(&il) { dim } else { 0 })
+            .collect();
+        let mut cache = KvCache::new_with_dims(capacity, &dims);
+        if self.n_swa > 0 && !swa_full() {
+            let write = crate::engine::generate::prefill_chunk_ceiling();
+            for (il, layer) in self.layers.iter().enumerate() {
+                if layers.contains(&il) && layer.has_kv && layer.is_swa {
+                    cache.set_mirror_ring(il, self.n_swa, write);
+                }
+            }
+        }
+        cache
+    }
+
+    fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.scaled_token_embeddings(tokens)
+    }
+
+    /// The CPU-orchestrated path over `layers` (`run_layers`), whatever the
+    /// backend: the whole-step recordings run every layer and have no range
+    /// to stop at. A range that starts past layer 0 enters with a residual,
+    /// so the per-layer inputs are computed from the tokens' own
+    /// embeddings, looked up again here.
+    fn forward_layers(
+        &self,
+        cache: &mut KvCache,
+        hidden: Vec<f32>,
+        tokens: &[u32],
+        layers: std::ops::Range<usize>,
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        let embd = (layers.start > 0 && self.n_embd_per_layer > 0)
+            .then(|| self.scaled_token_embeddings(tokens))
+            .transpose()?;
+        // A decode step on one Vulkan device: the range as one recorded
+        // chain (`record_one_sequence_decode`, which the multi-device split
+        // decode runs per device), its residual read back — the dense
+        // model's own chain, at the cost of a readback at each end. Under
+        // the shared range slot, taking turns, as `LlamaModel`'s does.
+        if tokens.len() == 1
+            && !layers.is_empty()
+            && !self.is_moe
+            && super::range_chains()
+            && let Some(vulkan) = self.backend.as_wgpu()
+        {
+            let _turn = super::RANGE_CHAINS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut encoder = vulkan.new_encoder("orangu-server gemma range decode");
+            let (buf, offset) = self.record_one_sequence_decode(
+                vulkan,
+                &mut encoder,
+                cache,
+                tokens[0],
+                start_pos,
+                &hidden,
+                super::RANGE_SLOT,
+                None,
+                layers,
+                false,
+                embd.as_deref(),
+            );
+            return Ok(vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd));
+        }
+        self.run_layers(
+            Some(cache),
+            None,
+            &hidden,
+            tokens,
+            start_pos,
+            true,
+            layers,
+            embd.as_deref(),
+        )
+    }
+
+    fn final_norm(&self, hidden: &mut [f32], n_rows: usize) -> Result<()> {
+        tensor::rmsnorm_inplace(
+            hidden,
+            &self.output_norm,
+            n_rows,
+            self.config.n_embd,
+            self.rms_eps(),
+        );
+        Ok(())
+    }
+
+    fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        let n_embd = self.config.n_embd;
+        anyhow::ensure!(
+            hidden.len() == n_rows * n_embd,
+            "hidden state holds {} values, expected {n_rows} rows of {n_embd}",
+            hidden.len()
+        );
+        let eps = self.rms_eps();
+        Ok(hidden
+            .chunks_exact(n_embd)
+            .map(|row| {
+                let mut row = row.to_vec();
+                tensor::rmsnorm_inplace(&mut row, &self.output_norm, 1, n_embd, eps);
+                let mut logits = crate::engine::head_split::matmul(
+                    self.backend.as_ref(),
+                    &row,
+                    &self.output_weight,
+                );
+                if let Some(cap) = self.final_logit_softcapping {
+                    tensor::softcap_inplace(&mut logits, cap);
+                }
+                logits
+            })
+            .collect())
+    }
+
     fn new_kv_cache(&self, capacity: usize) -> KvCache {
         let mut cache = KvCache::new_with_dims(capacity, &self.kv_dims());
         // A sliding-window layer's attention never reaches past its window,
@@ -2841,6 +3015,7 @@ impl ModelForward for GemmaModel {
             start_pos,
             false,
             0..self.layers.len(),
+            None,
         )
         .map(|_| ())
     }
@@ -3005,7 +3180,16 @@ impl ModelForward for GemmaModel {
         for v in x.iter_mut() {
             *v *= (n_embd as f32).sqrt();
         }
-        let mut h = self.run_layers(None, Some(rows), &x, tokens, 0, true, 0..self.layers.len())?;
+        let mut h = self.run_layers(
+            None,
+            Some(rows),
+            &x,
+            tokens,
+            0,
+            true,
+            0..self.layers.len(),
+            None,
+        )?;
         tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_tokens, n_embd, eps);
         let flat = self.backend.matmul(&h, n_tokens, &self.output_weight);
         anyhow::ensure!(

@@ -1494,7 +1494,7 @@ impl LlamaModel {
             cfg.n_head_kv,
             self.head_dim(),
             cfg.rms_eps,
-            self.layers.len(),
+            0..self.layers.len(),
             |il| {
                 let layer = &self.layers[il];
                 let dense = layer
@@ -1528,15 +1528,125 @@ impl LlamaModel {
         )
     }
 
+    /// [`Self::run_layers_resident`] over `layers` only, from `x`, the
+    /// residual entering the first of them: the whole model's stream, or
+    /// one node's range in a tree of workers (`forward_layers`).
+    fn run_range_resident(
+        &self,
+        cache: &mut KvCache,
+        x: &[f32],
+        tokens: &[u32],
+        start_pos: usize,
+        layers: std::ops::Range<usize>,
+        want_x: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let cfg = &self.config;
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        let yarn = crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope);
+        super::run_layers_resident(
+            vulkan,
+            cache,
+            tokens,
+            x,
+            start_pos,
+            want_x,
+            cfg.n_head,
+            cfg.n_head_kv,
+            self.head_dim(),
+            cfg.rms_eps,
+            layers,
+            |il| {
+                let layer = &self.layers[il];
+                let dense = layer
+                    .dense()
+                    .expect("resident_prefill_serves admits dense models only");
+                super::ResidentLayer {
+                    attn_norm: &layer.attn_norm,
+                    wq: &layer.wq,
+                    wk: &layer.wk,
+                    wv: &layer.wv,
+                    q_bias: layer.q_bias.as_deref(),
+                    k_bias: layer.k_bias.as_deref(),
+                    v_bias: layer.v_bias.as_deref(),
+                    pairing: self.rope.layout,
+                    yarn,
+                    rope_dim: cfg.rope_dim,
+                    rope_freq_base: cfg.rope_freq_base,
+                    freq_factors: self.rope_freq_factors.as_deref(),
+                    n_swa: 0,
+                    scale: self.attn_scale(),
+                    wo: &layer.wo,
+                    ffn_norm: &layer.ffn_norm,
+                    // `resident_prefill_serves` admitted this model, so
+                    // every layer of it is dense.
+                    ffn_gate: dense.0,
+                    ffn_up: dense.1,
+                    ffn_down: dense.2,
+                    activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                }
+            },
+        )
+    }
+
+    /// One row of the last layer's residual stream through the final norm
+    /// and the output projection — normalized in place — as next-token
+    /// logits. One row whether this was a decode step or a thousand-token
+    /// prefill, so the same host-or-device rule applies here as to the
+    /// fused path's tail.
+    fn row_logits(&self, row: &mut [f32]) -> Vec<f32> {
+        let cfg = &self.config;
+        tensor::rmsnorm_inplace(row, &self.output_norm, 1, cfg.n_embd, cfg.rms_eps);
+        let mut logits = match self.backend.as_wgpu() {
+            Some(_) if self.tail_on_host() => self.host_tail(row),
+            _ => self.backend.matmul(row, 1, &self.output_weight),
+        };
+        // Granite divides; everything else has `logit == 1.0`.
+        if self.mul.logit != 1.0 {
+            for v in logits.iter_mut() {
+                *v /= self.mul.logit;
+            }
+        }
+        logits
+    }
+
     fn run_layers(
         &self,
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<f32>> {
+        // Embedding lookup: x[t, :] = tok_embeddings[token[t], :].
+        let x = self.scaled_token_embeddings(tokens)?;
+        self.run_layer_range(cache, x, tokens.len(), start_pos, 0..self.layers.len())
+    }
+
+    /// Layers `layers` of the host step path over `x`, the residual stream
+    /// of `n_tokens` rows entering the first of them, returning it as it
+    /// leaves the last. [`Self::run_layers`] is this over every layer after
+    /// the embedding; `ModelForward::forward_layers` is this over the range
+    /// one node of a worker tree owns (see `crate::workers`).
+    fn run_layer_range(
+        &self,
+        cache: &mut KvCache,
+        mut x: Vec<f32>,
+        n_tokens: usize,
+        start_pos: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Vec<f32>> {
         let cfg = &self.config;
-        let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
+        anyhow::ensure!(
+            layers.end <= self.layers.len() && layers.start <= layers.end,
+            "layer range {layers:?} is outside this model's {} layers",
+            self.layers.len()
+        );
+        anyhow::ensure!(
+            x.len() == n_tokens * n_embd,
+            "hidden state holds {} values, expected {n_tokens} rows of {n_embd}",
+            x.len()
+        );
         let head_dim = self.head_dim();
         let n_head = cfg.n_head;
         let n_head_kv = cfg.n_head_kv;
@@ -1552,8 +1662,6 @@ impl LlamaModel {
         if let Some(vulkan) = self.backend.as_wgpu() {
             vulkan.fill_deferred_kv_rows(cache);
         }
-        // Embedding lookup: x[t, :] = tok_embeddings[token[t], :].
-        let mut x = self.scaled_token_embeddings(tokens)?;
 
         // Grown once and reused across layers rather than allocated per layer:
         // at prefill widths this is megabytes a layer. The two norm scratch
@@ -1570,7 +1678,8 @@ impl LlamaModel {
         let mut ffn_device: Vec<f32> = Vec::new();
         let mut ffn_scratch = super::FfnScratch::default();
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
+        for layer_idx in layers {
+            let layer = &self.layers[layer_idx];
             // `Some` when attention left its output in a device buffer; the
             // post-attention chain then consumes it without a host bounce.
             let mut attn_on_device: Option<wgpu::Buffer> = None;
@@ -2190,22 +2299,8 @@ impl ModelForward for LlamaModel {
 
         // Only the last token's hidden state is needed for next-token
         // logits — a batched prefill doesn't need every position's output.
-        let last = &mut x[(n_tokens - 1) * n_embd..].to_vec();
-        tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, cfg.rms_eps);
-        // One row whether this was a decode step or a thousand-token
-        // prefill — only the last position's logits are ever wanted — so the
-        // same rule applies here as to the fused path's tail.
-        let mut logits = match self.backend.as_wgpu() {
-            Some(_) if self.tail_on_host() => self.host_tail(last),
-            _ => self.backend.matmul(last, 1, &self.output_weight),
-        };
-        // Granite divides; everything else has `logit == 1.0`.
-        if self.mul.logit != 1.0 {
-            for v in logits.iter_mut() {
-                *v /= self.mul.logit;
-            }
-        }
-        Ok(logits)
+        let mut last = x[(n_tokens - 1) * n_embd..].to_vec();
+        Ok(self.row_logits(&mut last))
     }
 
     fn forward_no_logits(
@@ -2225,6 +2320,123 @@ impl ModelForward for LlamaModel {
             return Ok(());
         }
         self.forward(cache, tokens, start_pos, slot_id).map(|_| ())
+    }
+
+    /// Every position's logits for a multi-token forward — what a
+    /// speculative pair's verification pass needs (a draft model's, a
+    /// prompt lookup's), and what lets a Llama-family model be either half
+    /// of the pair. The host step path over every layer, then one output
+    /// projection per row. A cache holding rows only the device wrote (a
+    /// fused decode step before this) is read where those rows are: a
+    /// layer's attention runs on its device while it has such rows
+    /// (`engine::attention`).
+    fn forward_all_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let x = self.run_layers(cache, tokens, start_pos)?;
+        self.head(&x, tokens.len())
+    }
+
+    fn supports_layer_split(&self) -> bool {
+        true
+    }
+
+    fn new_kv_cache_for_layers(&self, layers: std::ops::Range<usize>, capacity: usize) -> KvCache {
+        let kv_dim = self.config.n_head_kv * self.head_dim();
+        let dims: Vec<usize> = (0..self.config.n_layer)
+            .map(|il| if layers.contains(&il) { kv_dim } else { 0 })
+            .collect();
+        KvCache::new_with_dims(capacity, &dims)
+    }
+
+    fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.scaled_token_embeddings(tokens)
+    }
+
+    /// A decode step on a Vulkan device records the range as one chain
+    /// (`record_decode_run`, the same the multi-device split decode uses)
+    /// and reads the residual back. A prompt chunk runs the range on the
+    /// device-resident prefill stream (`run_range_resident`), the residual
+    /// uploaded once and read back once, as the whole model's does.
+    /// Everything else — the CPU, a mixture, a chain or a stream that
+    /// declines — takes the host step path (`run_layer_range`).
+    ///
+    /// The chain's per-sequence GPU resources are cached by slot, and a
+    /// worker runs several sequences' forwards at once without knowing
+    /// their slots: these chains share one slot of their own
+    /// ([`super::RANGE_SLOT`]) and take turns ([`super::RANGE_CHAINS`]) — which costs
+    /// nothing, since one device runs one submission at a time anyway.
+    fn forward_layers(
+        &self,
+        cache: &mut KvCache,
+        hidden: Vec<f32>,
+        tokens: &[u32],
+        layers: std::ops::Range<usize>,
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        if tokens.len() == 1
+            && !layers.is_empty()
+            && super::range_chains()
+            && let Some(vulkan) = self.backend.as_wgpu()
+        {
+            let _turn = super::RANGE_CHAINS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some((encoder, buf, offset)) = self.record_decode_run(
+                vulkan,
+                cache,
+                layers.clone(),
+                &hidden,
+                start_pos,
+                super::RANGE_SLOT,
+                Tail::None,
+            ) {
+                return Ok(vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd));
+            }
+        }
+        if tokens.len() > 1
+            && !layers.is_empty()
+            && super::range_chains()
+            && self.resident_prefill_serves(tokens.len())
+        {
+            let _turn = super::RANGE_CHAINS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(x) =
+                self.run_range_resident(cache, &hidden, tokens, start_pos, layers.clone(), true)?
+            {
+                return Ok(x);
+            }
+        }
+        self.run_layer_range(cache, hidden, tokens.len(), start_pos, layers)
+    }
+
+    fn final_norm(&self, hidden: &mut [f32], n_rows: usize) -> Result<()> {
+        tensor::rmsnorm_inplace(
+            hidden,
+            &self.output_norm,
+            n_rows,
+            self.config.n_embd,
+            self.config.rms_eps,
+        );
+        Ok(())
+    }
+
+    fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        let n_embd = self.config.n_embd;
+        anyhow::ensure!(
+            hidden.len() == n_rows * n_embd,
+            "hidden state holds {} values, expected {n_rows} rows of {n_embd}",
+            hidden.len()
+        );
+        Ok(hidden
+            .chunks_exact(n_embd)
+            .map(|row| self.row_logits(&mut row.to_vec()))
+            .collect())
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {

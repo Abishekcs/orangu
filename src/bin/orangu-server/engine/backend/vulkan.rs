@@ -1066,6 +1066,10 @@ pub struct VulkanBackend {
     /// decode-step-scoped delta of this (see `Self::submission_count`)
     /// reflects how many GPU round trips a decode step makes.
     submission_count: std::sync::atomic::AtomicU64,
+    /// [`Self::submit_intermediate`]'s submissions the device has finished
+    /// — what tells a readback waiting behind a long prompt pass that the
+    /// device is working through it, not wedged ([`ReadbackDeadline`]).
+    intermediate_done: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The last prefill group's submission (`end_prefill_group`), for a
     /// readback parked on it to wait for exactly that.
     last_group_submission: Mutex<Option<wgpu::SubmissionIndex>>,
@@ -1472,6 +1476,13 @@ pub struct VulkanBackend {
     /// query positions sat in the reduce path's linear-in-`n_tokens` cost even
     /// though the tile would amortize the weight read across them.
     coop_min_n_tokens: usize,
+    /// The widest token tile the prompt's integer-dot GEMM takes
+    /// ([`Self::mmq_toks_for`]): [`vulkan_shaders::MMQ_WIDE_TILE_TOKENS`], or
+    /// 32 on an ARM Mali. There the 128-token tile ran Llama-3.2-3B's FFN
+    /// gate and up at 149 ms a layer against 66 with 64-token tiles, and a
+    /// 494-token prompt at 14.5 tok/s against 42.8 with 32-token ones — B-5
+    /// in `doc/BUGS.md`. `ORANGU_MMQ_TOKS` still pins one.
+    mmq_toks_cap: u32,
     /// Adapter subgroup support — the dual-nibble `Q4_K`/`Q6_K` reduce kernels
     /// are built with `subgroupAdd` whenever this is true (an unconditional win
     /// for them, unlike the 64-thread kernels `subgroup_reduce` gates). Stored
@@ -2320,6 +2331,17 @@ fn expert_gemm_toks() -> u32 {
     })
 }
 
+/// [`VulkanBackend::mmq_toks_cap`] for an adapter named `name`: 32 on an ARM
+/// Mali, the widest tile elsewhere. Measured on a Mali-G720 only (B-5 in
+/// `doc/BUGS.md`); other devices keep the choice they were tuned with.
+fn mmq_toks_cap_for(name: &str) -> u32 {
+    if name.to_ascii_lowercase().contains("mali") {
+        32
+    } else {
+        vulkan_shaders::MMQ_WIDE_TILE_TOKENS
+    }
+}
+
 fn mmq_wide_min_workgroups() -> usize {
     static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
@@ -2867,11 +2889,108 @@ impl WaitPredictor {
 }
 
 /// How long [`VulkanBackend::wait_mapped`] keeps polling for a buffer's map
-/// callback before it treats the device as lost, rather than blocking a
-/// request forever. A real readback resolves in well under a millisecond;
-/// this only ever bounds a wedged or lost device, so it is set far above any
-/// legitimate wait.
+/// callback **while the device finishes nothing** before it treats the
+/// device as lost, rather than blocking a request forever. A readback waits
+/// for the work submitted before it, which a long prompt pass on a slow
+/// device can make longer than this; that is progress, and moves the
+/// deadline out ([`ReadbackDeadline`]). A wedged or lost device finishes
+/// nothing, and is still caught after this long.
 const READBACK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// When a readback stops waiting and calls the device lost: after
+/// [`READBACK_WAIT_TIMEOUT`] **in which the device finished nothing**.
+///
+/// A readback waits for everything submitted before it, and a prompt's pass
+/// on a slow device can take longer than the timeout all by itself — a
+/// ~500-token pass of Llama-3.2-3B on a Mali-G720 took 34 s (B-1 in
+/// `doc/BUGS.md`), and the server called a working device lost and exited.
+/// Such a pass is submitted in groups of layers, each finishing within
+/// seconds; each group finished moves the deadline out again. A device
+/// that finishes nothing for the whole timeout is still called lost, as
+/// before.
+struct ReadbackDeadline {
+    at: std::time::Instant,
+    seen: u64,
+    timeout: std::time::Duration,
+}
+
+impl ReadbackDeadline {
+    fn new(backend: &VulkanBackend) -> Self {
+        Self::counting(&backend.intermediate_done, READBACK_WAIT_TIMEOUT)
+    }
+
+    /// A deadline `timeout` away, moved out whenever `done` changes.
+    fn counting(done: &std::sync::atomic::AtomicU64, timeout: std::time::Duration) -> Self {
+        Self {
+            at: std::time::Instant::now() + timeout,
+            seen: done.load(std::sync::atomic::Ordering::Relaxed),
+            timeout,
+        }
+    }
+
+    /// Whether the wait has run out: past the deadline with no submission
+    /// finished since it was last set. One that finished sets it again.
+    fn expired(&mut self, backend: &VulkanBackend) -> bool {
+        self.expired_by(&backend.intermediate_done)
+    }
+
+    fn expired_by(&mut self, done: &std::sync::atomic::AtomicU64) -> bool {
+        let now = std::time::Instant::now();
+        if now < self.at {
+            return false;
+        }
+        let finished = done.load(std::sync::atomic::Ordering::Relaxed);
+        if finished != self.seen {
+            self.seen = finished;
+            self.at = now + self.timeout;
+            return false;
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod mmq_tile_tests {
+    /// An ARM Mali takes the prompt GEMM in 32-token tiles; every other
+    /// adapter keeps the widest (B-5 in `doc/BUGS.md`).
+    #[test]
+    fn a_mali_caps_the_gemm_token_tile() {
+        assert_eq!(super::mmq_toks_cap_for("Mali-G720-Immortalis"), 32);
+        assert_eq!(super::mmq_toks_cap_for("ARM Mali-G720-Immortalis"), 32);
+        let wide = super::vulkan_shaders::MMQ_WIDE_TILE_TOKENS;
+        for name in [
+            "AMD Radeon RX 5500M (RADV NAVI14)",
+            "Apple M2",
+            "NVIDIA GeForce RTX 3080",
+        ] {
+            assert_eq!(super::mmq_toks_cap_for(name), wide, "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod readback_deadline_tests {
+    use super::ReadbackDeadline;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// A wait runs out only after a whole timeout in which the device
+    /// finished nothing: each finished submission moves the deadline out.
+    #[test]
+    fn a_deadline_waits_while_the_device_makes_progress() {
+        let done = AtomicU64::new(0);
+        let timeout = Duration::from_millis(40);
+        let mut deadline = ReadbackDeadline::counting(&done, timeout);
+        assert!(!deadline.expired_by(&done), "not yet");
+        for _ in 0..3 {
+            std::thread::sleep(timeout + Duration::from_millis(10));
+            done.fetch_add(1, Ordering::Relaxed);
+            assert!(!deadline.expired_by(&done), "progress moves it out");
+        }
+        std::thread::sleep(timeout + Duration::from_millis(10));
+        assert!(deadline.expired_by(&done), "nothing finished for a timeout");
+    }
+}
 
 /// One pending `map_async`'s outcome, recorded for whoever is waiting on it
 /// ([`VulkanBackend::wait_mapped`], or a `poll` plus [`MapWait::check`] when
@@ -4059,6 +4178,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             },
             "tuning": {
                 "coop_min_n_tokens": self.coop_min_n_tokens,
+                "mmq_toks_cap": self.mmq_toks_cap,
                 // Weight bytes below which a decode matmul goes to the host
                 // instead of here. Reported because it is machine-dependent
                 // and silently changes which backend ran most of a decode
@@ -4121,7 +4241,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         let first = shown.next().unwrap_or_else(|| "none".to_string());
         let second = shown.next();
         format!(
-            "{} · kv {:?} · coop-tiles {} · attn {} · prefill≥{} tok",
+            "{} · kv {:?} · coop-tiles {} · attn {} · prefill≥{} tok{}",
             match &second {
                 Some(second) => format!("{first} · {second}"),
                 None => first,
@@ -4145,6 +4265,11 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 "single"
             },
             self.coop_min_n_tokens,
+            if self.mmq_toks_cap < vulkan_shaders::MMQ_WIDE_TILE_TOKENS {
+                format!(" · gemm tile ≤{} tok", self.mmq_toks_cap)
+            } else {
+                String::new()
+            },
         )
     }
 
@@ -4305,6 +4430,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             "an integer >= 1",
             |n| n >= 1,
         );
+        let mmq_toks_cap = mmq_toks_cap_for(&info.name);
         // Thin-tile multi-position reduce kernel (see `Self::thin_tile`).
         // Opt-in; tile width from
         // `ORANGU_THIN_TILE_SIZE` (default 8, clamped to `2..=16` so the
@@ -5745,6 +5871,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             subgroup_reduce,
             attn_split_reduce_pipeline,
             submission_count: std::sync::atomic::AtomicU64::new(0),
+            intermediate_done: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_group_submission: Mutex::new(None),
             rope_pipeline,
             perhead_rmsnorm_pipeline,
@@ -5801,6 +5928,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             q6_k_dual_pipeline,
             tiled_prefill,
             coop_min_n_tokens,
+            mmq_toks_cap,
             supports_subgroup,
             subgroup_lanes,
             thin_tile,
@@ -6723,14 +6851,14 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             half.buffer
                 .slice(..size)
                 .map_async(wgpu::MapMode::Write, wait.callback());
-            let deadline = std::time::Instant::now() + READBACK_WAIT_TIMEOUT;
+            let mut deadline = ReadbackDeadline::new(self);
             loop {
                 self.poll_blocking_with(wgpu::PollType::Poll, "mapping the upload staging");
                 wait.check("mapping the upload staging");
                 if wait.is_done() {
                     break;
                 }
-                if std::time::Instant::now() > deadline {
+                if deadline.expired(self) {
                     crate::device_lost::fail(
                         "mapping the upload staging",
                         "the map did not complete within the readback timeout",
@@ -10785,7 +10913,7 @@ impl VulkanBackend {
         // down projection at 512 tokens (48 tall tiles against 96 half
         // ones) the half tile was 1.4× faster on `Q6_K` and level on `Q4_K`.
         let floor = mmq_wide_min_workgroups();
-        let toks = Self::mmq_toks_for(n_tokens);
+        let toks = self.mmq_toks_for(n_tokens);
         // `ORANGU_MMQ_ROWS=64|128` pins the row tile for a sweep, the twin
         // of `ORANGU_MMQ_TOKS`: the two together fix the whole tile, so a
         // shape's geometry can be measured in situ rather than only in the
@@ -10894,7 +11022,7 @@ impl VulkanBackend {
     /// weight tile for fewer tokens, so it is only worth what the padding
     /// it removes costs. `ORANGU_MMQ_TOKS` fixes it (16–128) for a sweep;
     /// `0`/unset is this rule.
-    fn mmq_toks_for(n_tokens: usize) -> u32 {
+    fn mmq_toks_for(&self, n_tokens: usize) -> u32 {
         static FIXED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let fixed = *FIXED.get_or_init(|| {
             std::env::var("ORANGU_MMQ_TOKS")
@@ -10908,8 +11036,12 @@ impl VulkanBackend {
         }
         let full = vulkan_shaders::MMQ_WIDE_TILE_TOKENS;
         // Largest first: the tile that pads least is not the shortest one
-        // but the longest one that pads little enough.
-        for toks in [full, 64, 32] {
+        // but the longest one that pads little enough — up to the device's
+        // cap ([`Self::mmq_toks_cap`]).
+        for toks in [full, 64, 32]
+            .into_iter()
+            .filter(|t| *t <= self.mmq_toks_cap)
+        {
             let padded = (n_tokens as u32).div_ceil(toks) * toks;
             if padded * 4 <= n_tokens as u32 * 5 {
                 return toks;
@@ -13203,14 +13335,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// path polls non-blocking `PollType::Poll` to keep the calling core
     /// hot, and the default does the first for most of the wait and the
     /// second for its end (see [`wait_mode`]). Either way the loop is
-    /// bounded by [`READBACK_WAIT_TIMEOUT`], and every way out that isn't a
+    /// bounded by [`READBACK_WAIT_TIMEOUT`] without progress
+    /// ([`ReadbackDeadline`]), and every way out that isn't a
     /// completed map — a failed map, a failed poll, or that deadline —
     /// reports a lost device through [`crate::device_lost::fail`] rather
     /// than hanging the request forever.
     fn wait_mapped(&self, wait: &MapWait, context: &str) {
         let mode = wait_mode();
         let started = std::time::Instant::now();
-        let deadline = started + READBACK_WAIT_TIMEOUT;
+        let mut deadline = ReadbackDeadline::new(self);
         // Under `Predicted`, the moment the block gives way to the spin:
         // most of the last waits' length. Before the first wait of a kind
         // has been measured there is nothing to block through, and the
@@ -13271,7 +13404,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 return;
             }
-            if std::time::Instant::now() >= deadline {
+            if deadline.expired(self) {
                 crate::device_lost::fail(
                     context,
                     format_args!(
@@ -13304,7 +13437,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// `submission`: blocks until that submission is done and no longer —
     /// later submissions keep running.
     fn wait_mapped_for(&self, wait: &MapWait, submission: wgpu::SubmissionIndex, context: &str) {
-        let deadline = std::time::Instant::now() + READBACK_WAIT_TIMEOUT;
+        let mut deadline = ReadbackDeadline::new(self);
         loop {
             self.poll_blocking_with(
                 wgpu::PollType::Wait {
@@ -13317,7 +13450,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if wait.is_done() {
                 return;
             }
-            if std::time::Instant::now() >= deadline {
+            if deadline.expired(self) {
                 crate::device_lost::fail(
                     context,
                     format_args!(
@@ -20277,14 +20410,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// poll waits for the *latest* submission, and this readback's may not
     /// be it.
     fn wait_mapped_polling(&self, wait: &MapWait, context: &str) {
-        let deadline = std::time::Instant::now() + READBACK_WAIT_TIMEOUT;
+        let mut deadline = ReadbackDeadline::new(self);
         loop {
             self.poll_blocking_with(wgpu::PollType::Poll, context);
             wait.check(context);
             if wait.is_done() {
                 return;
             }
-            if std::time::Instant::now() > deadline {
+            if deadline.expired(self) {
                 crate::device_lost::fail(context, "the map did not complete within the timeout");
             }
             std::thread::yield_now();
@@ -24038,6 +24171,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::engine::decode_stages::record_submission();
+        let done = self.intermediate_done.clone();
+        self.queue.on_submitted_work_done(move || {
+            done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         index
     }
 

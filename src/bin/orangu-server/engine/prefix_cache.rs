@@ -78,6 +78,13 @@ impl CachedPrefill {
         } else {
             self.cache.host_committed_len()
         };
+        // And by what the workers hold, when the model is spread over a tree
+        // (`KvCache::remote`): a top-level node may run no layer itself.
+        let cached_len = match &self.cache.remote {
+            Some(remote) if self.cache.layers.iter().all(|l| l.len == 0) => remote.len,
+            Some(remote) => cached_len.min(remote.len),
+            None => cached_len,
+        };
         let prefix_len = common_prefix_len(&self.tokens, prompt).min(cached_len);
         if prefix_len == 0 {
             return 0;

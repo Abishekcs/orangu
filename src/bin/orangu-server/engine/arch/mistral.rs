@@ -642,7 +642,7 @@ impl MistralModel {
             cfg.n_head_kv,
             head_dim,
             cfg.rms_eps,
-            self.layers.len(),
+            0..self.layers.len(),
             |il| {
                 let layer = &self.layers[il];
                 super::ResidentLayer {

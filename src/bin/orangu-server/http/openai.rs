@@ -81,10 +81,15 @@ pub(crate) fn usage_json(stats: &GenerateStats) -> serde_json::Value {
 /// server. Rates come from [`GenerateStats`], which is also what the
 /// per-request console log prints — one source of truth for "how fast was
 /// that", rather than a wall-clock guess at the far end of an HTTP stream.
+///
+/// On a top-level node of a `[workers]` tree it also carries `workers`: the
+/// request's time at each node, `[{"node": ..., "ms": ...}]` in pipeline
+/// order — this node's own layers, then each worker's round trip, its
+/// subtree included. Absent without a tree.
 pub(crate) fn timings_json(stats: &GenerateStats) -> serde_json::Value {
     let prompt_ms = stats.prompt_time.as_secs_f64() * 1000.0;
     let predicted_ms = stats.generate_time.as_secs_f64() * 1000.0;
-    json!({
+    let mut timings = json!({
         "prompt_n": stats.prompt_tokens,
         "prompt_ms": prompt_ms,
         "prompt_per_token_ms": prompt_ms / (stats.prompt_tokens.max(1) as f64),
@@ -93,7 +98,51 @@ pub(crate) fn timings_json(stats: &GenerateStats) -> serde_json::Value {
         "predicted_ms": predicted_ms,
         "predicted_per_token_ms": predicted_ms / (stats.generated_tokens.max(1) as f64),
         "predicted_per_second": stats.generate_tokens_per_second(),
-    })
+    });
+    if !stats.workers.is_empty() {
+        timings["workers"] = stats
+            .workers
+            .iter()
+            .map(|(node, t)| json!({"node": node, "ms": t.as_secs_f64() * 1000.0}))
+            .collect();
+    }
+    timings
+}
+
+/// The `Server-Timing` header of a whole (not streamed) answer: `prompt`
+/// and `generate`, and in a `[workers]` tree one `node<i>` per part of the
+/// pipeline, named in its `desc`. A streamed answer's headers leave before
+/// any of this is known; its last event carries the same in `timings`.
+pub(crate) fn server_timing(stats: &GenerateStats) -> axum::http::HeaderValue {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let mut parts = vec![
+        format!("prompt;dur={:.1}", ms(stats.prompt_time)),
+        format!("generate;dur={:.1}", ms(stats.generate_time)),
+    ];
+    for (i, (node, t)) in stats.workers.iter().enumerate() {
+        // A quoted string may hold any visible character but `"` and `\`,
+        // which a node's name never needs.
+        let desc: String = node
+            .chars()
+            .filter(|c| c.is_ascii_graphic() && *c != '"' && *c != '\\')
+            .collect();
+        parts.push(format!("node{i};desc=\"{desc}\";dur={:.1}", ms(*t)));
+    }
+    axum::http::HeaderValue::from_str(&parts.join(", "))
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("total;dur=0"))
+}
+
+/// `response` with a [`server_timing`] header, when there are stats for it.
+pub(crate) fn with_server_timing(
+    mut response: axum::response::Response,
+    stats: Option<&GenerateStats>,
+) -> axum::response::Response {
+    if let Some(stats) = stats {
+        response
+            .headers_mut()
+            .insert("server-timing", server_timing(stats));
+    }
+    response
 }
 
 /// llama.cpp's `prompt_progress` object. llama-server emits it repeatedly
@@ -476,6 +525,7 @@ pub async fn chat_completions(
         let mut finish_reason = "stop";
         let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
         let mut timings = serde_json::Value::Null;
+        let mut done = None;
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::Token(text) => content.push_str(&text),
@@ -491,6 +541,7 @@ pub async fn chat_completions(
                     finish_reason = finish_reason_str(fr);
                     usage = usage_json(&stats);
                     timings = timings_json(&stats);
+                    done = Some(stats);
                     break;
                 }
                 StreamEvent::Overloaded => return crate::http::overloaded_response(),
@@ -527,7 +578,7 @@ pub async fn chat_completions(
             // `"stop"` would treat the calls as a finished answer.
             finish_reason = "tool_calls";
         }
-        return Json(json!({
+        let response = Json(json!({
             "id": format!("chatcmpl-{created}"),
             "object": "chat.completion",
             "created": created,
@@ -541,6 +592,7 @@ pub async fn chat_completions(
             "timings": timings,
         }))
         .into_response();
+        return with_server_timing(response, done.as_ref());
     }
 
     let return_progress = req.return_progress;
@@ -1025,6 +1077,7 @@ pub async fn completions(
     let mut finish_reason = "stop";
     let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
     let mut timings = serde_json::Value::Null;
+    let mut done = None;
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
@@ -1037,6 +1090,7 @@ pub async fn completions(
                 finish_reason = finish_reason_str(fr);
                 usage = usage_json(&stats);
                 timings = timings_json(&stats);
+                done = Some(stats);
                 break;
             }
             StreamEvent::Overloaded => return crate::http::overloaded_response(),
@@ -1046,7 +1100,7 @@ pub async fn completions(
         }
     }
     let text = state.engine.tokenizer.clean_up_tokenization_spaces(&text);
-    Json(json!({
+    let response = Json(json!({
         "id": format!("cmpl-{created}"),
         "object": "text_completion",
         "created": created,
@@ -1055,7 +1109,8 @@ pub async fn completions(
         "usage": usage,
         "timings": timings,
     }))
-    .into_response()
+    .into_response();
+    with_server_timing(response, done.as_ref())
 }
 
 #[derive(Deserialize)]
@@ -1147,7 +1202,7 @@ pub(crate) async fn pooled_embedding(
 ) -> Result<PooledEmbedding, String> {
     let tokens = state.engine.tokenizer.encode_for_embedding(text);
     let prompt_tokens = tokens.len();
-    let model = state.engine.model.clone();
+    let model = state.engine.serving().model;
     let n_embd = model.config().n_embd;
     let pooling_type = model.config().pooling_type;
     let hidden = tokio::task::spawn_blocking({
@@ -1204,6 +1259,7 @@ mod tests {
             prompt_time: Duration::from_millis(4000),
             generated_tokens: 30,
             generate_time: Duration::from_millis(1000),
+            workers: Vec::new(),
         }
     }
 
@@ -1343,6 +1399,32 @@ mod tests {
         assert_eq!(progress["time_ms"], 4000);
     }
 
+    /// `Server-Timing` names the prompt and the generation, and in a tree
+    /// each node of the pipeline, in order; `timings` carries the nodes too.
+    #[test]
+    fn server_timing_names_every_node() {
+        let alone = stats();
+        assert_eq!(
+            server_timing(&alone).to_str().unwrap(),
+            "prompt;dur=4000.0, generate;dur=1000.0"
+        );
+        assert!(timings_json(&alone).get("workers").is_none());
+
+        let mut tree = stats();
+        tree.workers = vec![
+            ("top:8400".to_string(), Duration::from_micros(12_340)),
+            ("10.0.0.2:8400".to_string(), Duration::from_millis(31)),
+        ];
+        assert_eq!(
+            server_timing(&tree).to_str().unwrap(),
+            "prompt;dur=4000.0, generate;dur=1000.0, node0;desc=\"top:8400\";dur=12.3, \
+             node1;desc=\"10.0.0.2:8400\";dur=31.0"
+        );
+        let workers = &timings_json(&tree)["workers"];
+        assert_eq!(workers[1]["node"], "10.0.0.2:8400");
+        assert_eq!(workers[1]["ms"], 31.0);
+    }
+
     /// Rate helpers divide by the token count; an empty generation (a prompt
     /// that stopped immediately) must not produce a division by zero.
     #[test]
@@ -1353,6 +1435,7 @@ mod tests {
             prompt_time: Duration::ZERO,
             generated_tokens: 0,
             generate_time: Duration::ZERO,
+            workers: Vec::new(),
         };
         let timings = timings_json(&empty);
         assert_eq!(timings["prompt_per_token_ms"], 0.0);

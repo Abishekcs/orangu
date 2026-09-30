@@ -1047,6 +1047,38 @@ cannot be compared against one recorded later. Under `--json` the same
 information is the first object emitted, tagged `"type": "env"`, so a stored
 result carries its own provenance.
 
+A server that heads a tree of workers (`[workers]`, the manual's *Workers*
+chapter) says so in a line of its own, from its `GET /v1/workers`: how its
+layers are planned and how many of its workers are connected. Every number
+in the run is then the tree's, not one machine's:
+
+```text
+  workers  tree: alpha:8400 0..9, beta:8400 9..18, gamma:8400 18..28 (2 of 2 workers connected)
+```
+
+A server alone, or a worker, gets no such line; `--json` carries the
+answer verbatim as `workers`.
+
+#### A tree against its node alone (`--workers`)
+
+`--workers compare` runs the same options twice against one top-level
+node: first serving alone — the model's own paths, as a server without
+`[workers]` runs them — then through its tree, and prints the two side by
+side. `off` or `on` runs one of them. The server is switched through
+`POST /props` between runs and put back as it was; each arm's rows are
+labelled `… · workers off`/`… · workers on`. A server without a tree says so
+and runs the plain benchmark; a worker, or a node with only part of the
+model, is refused.
+
+```text
+== workers compared (tok/s)
+    mode |       n |  alone best |  alone mean |   tree best |   tree mean |  tree/alone
+--------------------------------------------------------------------------------------
+      pp |     572 |       40.26 |       38.47 |       76.26 |       64.65 |       1.68x
+```
+
+Under `--json` the comparison is one more object, `workers_compare`.
+
 ### Options
 
 `orangu-bench --help`:

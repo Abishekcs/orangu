@@ -284,6 +284,9 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         // console's Settings › Image pane: `GET` reads the defaults, the
         // adapter and the measured rate, `POST` sets the defaults.
         .route("/api/props", get(props).post(set_props))
+        // The worker tree this server heads or serves in, for Settings ›
+        // Workers: the API's `/v1/workers`, on this port.
+        .route("/api/workers", get(workers))
         // `delete` on both: one row's cross, and History's **Clear all**
         // footer. Unconditional — unlike the model manager's own Delete
         // (`[web].delete`), which owns files on disk that nothing else put
@@ -388,6 +391,13 @@ async fn asset_version_handler() -> impl IntoResponse {
 /// see `http::images::props_json`.
 async fn props(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     Json(props_view(&state))
+}
+
+/// `GET /api/workers` — this node's place in a worker tree: its role, its
+/// layers, the plan and the workers it is connected to; `{"role":"none"}`
+/// without a `[workers]` section.
+async fn workers() -> impl IntoResponse {
+    Json(crate::workers::node::status_json())
 }
 
 /// `POST /api/props` — the picture defaults every chat turn on this

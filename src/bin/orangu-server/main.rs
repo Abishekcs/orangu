@@ -32,6 +32,7 @@
 
 mod bundle;
 mod config;
+mod daemon;
 mod device_lost;
 mod engine;
 mod http;
@@ -45,6 +46,7 @@ mod shell;
 mod suggest;
 mod tls;
 mod web;
+mod workers;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -696,6 +698,15 @@ fn main() -> ExitCode {
         web: args.listen.web,
         metrics: args.listen.metrics,
     };
+    // The fork, while this is still the only thread: everything `prepare`
+    // starts — thread pools, a `[workers]` node — must be the daemon's own
+    // (see `daemon`).
+    if args.daemon
+        && let Err(err) = daemon::begin()
+    {
+        eprintln!("error: failed to start as a daemon: {err:#}");
+        return ExitCode::FAILURE;
+    }
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
         Err(err) => {
@@ -920,6 +931,26 @@ fn resolve_model_spec(
     Ok((ModelSource::File(path), label))
 }
 
+/// [`resolve_model_spec`], except on a `[workers]` node with `download =
+/// range` whose model is not on disk: there it is fetched in part
+/// (`workers::fetch`), and the partial file is what runs.
+fn resolve_worker_model(
+    conf: &ServerConfiguration,
+    spec: &str,
+    bundled: Option<&'static bundle::Bundle>,
+) -> Result<(ModelSource, String)> {
+    if conf.workers.as_ref().is_some_and(|w| w.download_range)
+        && orangu::model_spec::resolve_show_target(&conf.models, spec).is_err()
+    {
+        let partial = workers::fetch::open(&conf.models, spec)
+            .with_context(|| format!("fetching '{spec}' in part ([workers].download = range)"))?;
+        let path = partial.path().to_path_buf();
+        workers::fetch::set(partial);
+        return Ok((ModelSource::File(path), spec.to_string()));
+    }
+    resolve_model_spec(&conf.models, spec, bundled)
+}
+
 /// Redirects a **draft sidecar** named as the model to the model it drafts
 /// for.
 ///
@@ -970,11 +1001,12 @@ fn auto_pair_dflash_target(
 
 /// Resolves the config and model, builds the engine, and binds both
 /// listeners — all synchronously (no tokio runtime yet) and, when
-/// `--daemon` is set, all *before* [`daemonize`] detaches from the
-/// terminal. Mirrors `orangu-coordinator --daemon`'s own reasoning: a bad
-/// config, an unresolvable model, or a "address already in use" bind error
-/// needs to reach the invoking terminal, not vanish into a detached daemon
-/// with its stdout/stderr redirected to `/dev/null`.
+/// `--daemon` is set, all *before* [`daemon::ready`] detaches from the
+/// terminal (the fork itself came first, in `main`). Mirrors
+/// `orangu-coordinator --daemon`'s own reasoning: a bad config, an
+/// unresolvable model, or a "address already in use" bind error needs to
+/// reach the invoking terminal, not vanish into a detached daemon with its
+/// stdout/stderr redirected to `/dev/null`.
 fn prepare(args: Args) -> Result<Prepared> {
     let cli_role = args.role();
     let config_path = args.config.clone();
@@ -1009,7 +1041,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // `--daemon` start with neither would otherwise have no way to be
         // pointed at a different model at all.
         match (args.model.clone().or_else(|| conf.model.clone()), bundled) {
-            (Some(spec), _) => resolve_model_spec(&conf.models, &spec, bundled)?,
+            (Some(spec), _) => resolve_worker_model(&conf, &spec, bundled)?,
             // A bundle answers the question `--daemon` otherwise has no way
             // to answer: which model, with no terminal to ask on and no
             // config file required to have been written.
@@ -1022,7 +1054,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         }
     } else {
         match args.model {
-            Some(spec) => resolve_model_spec(&conf.models, &spec, bundled)?,
+            Some(spec) => resolve_worker_model(&conf, &spec, bundled)?,
             // A bundled binary serves what it carries. There is nothing to
             // choose between — that is what was downloaded — so nothing is
             // asked, which is what lets a bundle start on a double-click.
@@ -1189,7 +1221,17 @@ fn prepare(args: Args) -> Result<Prepared> {
     // context at once is a race with a C library that has one global of
     // everything. Detecting here keeps it to the main thread before any of
     // that begins, and the line is held until the device report.
-    let npu_line = npu_inventory(if conf.npu_precompile {
+    // A node in a `[workers]` tree runs only the layers its plan gives it,
+    // and which those are is not known until it has planned — or a parent
+    // has assigned it some. So nothing here may run, read or place the
+    // whole model: the probes that time a decode step, the host preload,
+    // the NPU's precompile of every block, the automatic split of an
+    // oversized model between device and host, and the prefix warm-up are
+    // all skipped (`doc/WORKERS.md`, W-24). Weights are read, and uploaded
+    // to a device, on first use; what a node never runs it never holds.
+    let partial = conf.workers.is_some();
+    let npu_precompile = conf.npu_precompile && !partial;
+    let npu_line = npu_inventory(if npu_precompile {
         "— preparing feed-forward blocks"
     } else {
         "— not used (npu_precompile = off)"
@@ -1199,7 +1241,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     npu_tool::set_slots(conf.slots);
     npu_tool::prepare_in_background(
         weights_source.path(),
-        conf.npu_precompile,
+        npu_precompile,
         (conf.npu_cache_gb * (1u64 << 30) as f64) as u64,
     );
 
@@ -1447,7 +1489,11 @@ fn prepare(args: Args) -> Result<Prepared> {
             .unwrap_or((u64::MAX, 0));
         weights_device_bytes + kv + kv_pool_scratch_reserve_bytes() <= budget
     };
-    let split_mode = if requested.is_off()
+    let split_mode = if partial && requested.is_off() {
+        // Whether this node's share fits its device is the plan's question
+        // (`workers::plan`), not the whole model's.
+        requested
+    } else if requested.is_off()
         && split_flag.is_none()
         && conf.device_split.is_off()
         && overflows_selected_device(backend.as_ref(), weights_device_bytes)
@@ -1605,139 +1651,139 @@ fn prepare(args: Args) -> Result<Prepared> {
     // on each; the cores take decode only when clearly faster. Not where a
     // CPU build would copy the weights (the ternary repack), for a picture
     // model, or for a role that generates nothing.
-    let (backend, backend_label, model, decode_on_cpu, cpu_step) =
-        if matches!(conf.backend, config::BackendPreference::Auto)
-            && backend.as_wgpu().is_some()
-            && image_variant.is_none()
-            && role.allows_generation()
-            && !engine::loader::ternary_repack::on()
-            && engine::decode_backend::enabled()
-        {
-            let cpu: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
-            let probe_started = std::time::Instant::now();
-            let cpu_model = build_model(&loaded, &cpu).ok();
-            // **Both arms, alternating, best of two rounds each.**
-            //
-            // Measured one after the other, the two arms do not share their
-            // conditions: a server shutting down on the same machine, or
-            // anything else transient, lands on whichever window it happens
-            // to overlap. That is not hypothetical — the cores' reading has
-            // been seen to swing by half between starts of the same binary
-            // while the card's held steady, and since the decision turns on
-            // a ratio of the two, the placement went with it.
-            //
-            // Alternating shares the conditions the way
-            // `step_probe::ArmProbe` does for the vocabulary projection, and
-            // for the same stated reason. The *minimum* of each arm's rounds
-            // is taken rather than the mean: a contended round is slow, never
-            // fast, so the fastest round is the one least polluted by
-            // something that is not this model.
-            //
-            // Two rounds, not more: each is a settled probe of its own and
-            // the pair already costs a second or so of start-up.
-            let mut device_step: Option<f64> = None;
-            let mut cpu_step: Option<f64> = None;
-            let keep_faster = |slot: &mut Option<f64>, s: Option<f64>| {
-                if let Some(s) = s {
-                    *slot = Some(slot.map_or(s, |b: f64| b.min(s)));
-                }
-            };
-            for _ in 0..2 {
-                keep_faster(
-                    &mut device_step,
-                    engine::decode_backend::seconds_per_token(&model),
-                );
-                // The cores at their best: in each CPU pool when there are
-                // two (`engine::cpu_pools`), which also decides the decode
-                // pool.
-                keep_faster(
-                    &mut cpu_step,
-                    cpu_model.as_ref().and_then(decode_seconds_in_best_pool),
-                );
+    let (backend, backend_label, model, decode_on_cpu, cpu_step) = if !partial
+        && matches!(conf.backend, config::BackendPreference::Auto)
+        && backend.as_wgpu().is_some()
+        && image_variant.is_none()
+        && role.allows_generation()
+        && !engine::loader::ternary_repack::on()
+        && engine::decode_backend::enabled()
+    {
+        let cpu: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
+        let probe_started = std::time::Instant::now();
+        let cpu_model = build_model(&loaded, &cpu).ok();
+        // **Both arms, alternating, best of two rounds each.**
+        //
+        // Measured one after the other, the two arms do not share their
+        // conditions: a server shutting down on the same machine, or
+        // anything else transient, lands on whichever window it happens
+        // to overlap. That is not hypothetical — the cores' reading has
+        // been seen to swing by half between starts of the same binary
+        // while the card's held steady, and since the decision turns on
+        // a ratio of the two, the placement went with it.
+        //
+        // Alternating shares the conditions the way
+        // `step_probe::ArmProbe` does for the vocabulary projection, and
+        // for the same stated reason. The *minimum* of each arm's rounds
+        // is taken rather than the mean: a contended round is slow, never
+        // fast, so the fastest round is the one least polluted by
+        // something that is not this model.
+        //
+        // Two rounds, not more: each is a settled probe of its own and
+        // the pair already costs a second or so of start-up.
+        let mut device_step: Option<f64> = None;
+        let mut cpu_step: Option<f64> = None;
+        let keep_faster = |slot: &mut Option<f64>, s: Option<f64>| {
+            if let Some(s) = s {
+                *slot = Some(slot.map_or(s, |b: f64| b.min(s)));
             }
-            match (device_step, cpu_model, cpu_step) {
-                (Some(device_s), Some(cpu_model), Some(cpu_s)) => {
-                    let because = format!(
-                        "a one-token decode step takes {:.1} ms on the device, {:.1} ms on the \
-                         cpu (measured in {:.1} s)",
-                        device_s * 1e3,
-                        cpu_s * 1e3,
-                        probe_started.elapsed().as_secs_f64()
-                    );
-                    // **A decode probe cannot decide prompts.** Giving the
-                    // cores decode releases the device copy, and prompts go
-                    // with it — but the two run different kernels at
-                    // different widths and can point opposite ways: measured
-                    // on a delta-net mixture whose cores win decode by
-                    // 1.05–1.22× while the card wins prefill by 1.9×. So
-                    // before releasing anything, time a prompt-shaped pass on
-                    // each as well, and keep the device unless the cores win
-                    // that too. Only on this branch, because it is the only
-                    // one that would throw the device away, and a prompt pass
-                    // is not free.
-                    let prompt_pass =
-                        engine::decode_backend::cpu_wins(device_s, cpu_s).then(|| {
-                            (
-                                engine::prefill_backend::seconds_per_prompt_pass(&model),
-                                engine::prefill_backend::seconds_per_prompt_pass(&cpu_model),
-                            )
-                        });
-                    let cores_lose_prompts = matches!(
-                        prompt_pass,
-                        Some((Some(device_pp), Some(cpu_pp))) if cpu_pp > device_pp
-                    );
-                    let prompts_because = match prompt_pass {
-                        Some((Some(device_pp), Some(cpu_pp))) => format!(
-                            "; a prompt pass takes {:.0} ms on the device and {:.0} ms on the cpu",
-                            device_pp * 1e3,
-                            cpu_pp * 1e3
-                        ),
-                        _ => String::new(),
-                    };
-                    if cores_lose_prompts {
-                        engine::adapt::note(
-                            "decode",
-                            format!("on the device ({backend_label})"),
-                            format!(
-                                "{because}{prompts_because}, so the device keeps the model \
-                                 rather than give up the prompts with it"
-                            ),
-                        );
-                        (backend, backend_label, model, false, None)
-                    } else if engine::decode_backend::cpu_wins(device_s, cpu_s) {
-                        engine::adapt::note(
-                            "decode",
-                            "on the cpu",
-                            format!("{because}{prompts_because}; the device's copy released"),
-                        );
-                        drop(model);
-                        engine::prefill_backend::force_prompts_on_cpu();
-                        let label = if is_x86_feature_detected() {
-                            "CPU/AVX2"
-                        } else {
-                            "CPU"
-                        };
-                        (cpu, label.to_string(), cpu_model, true, Some(cpu_s))
-                    } else {
-                        engine::adapt::note(
-                            "decode",
-                            format!("on the device ({backend_label})"),
-                            format!(
-                                "{because}; the cores must be {}× faster",
-                                engine::decode_backend::min_gain()
-                            ),
-                        );
-                        (backend, backend_label, model, false, None)
-                    }
-                }
-                _ => (backend, backend_label, model, false, None),
-            }
-        } else {
-            (backend, backend_label, model, false, None)
         };
+        for _ in 0..2 {
+            keep_faster(
+                &mut device_step,
+                engine::decode_backend::seconds_per_token(&model),
+            );
+            // The cores at their best: in each CPU pool when there are
+            // two (`engine::cpu_pools`), which also decides the decode
+            // pool.
+            keep_faster(
+                &mut cpu_step,
+                cpu_model.as_ref().and_then(decode_seconds_in_best_pool),
+            );
+        }
+        match (device_step, cpu_model, cpu_step) {
+            (Some(device_s), Some(cpu_model), Some(cpu_s)) => {
+                let because = format!(
+                    "a one-token decode step takes {:.1} ms on the device, {:.1} ms on the \
+                         cpu (measured in {:.1} s)",
+                    device_s * 1e3,
+                    cpu_s * 1e3,
+                    probe_started.elapsed().as_secs_f64()
+                );
+                // **A decode probe cannot decide prompts.** Giving the
+                // cores decode releases the device copy, and prompts go
+                // with it — but the two run different kernels at
+                // different widths and can point opposite ways: measured
+                // on a delta-net mixture whose cores win decode by
+                // 1.05–1.22× while the card wins prefill by 1.9×. So
+                // before releasing anything, time a prompt-shaped pass on
+                // each as well, and keep the device unless the cores win
+                // that too. Only on this branch, because it is the only
+                // one that would throw the device away, and a prompt pass
+                // is not free.
+                let prompt_pass = engine::decode_backend::cpu_wins(device_s, cpu_s).then(|| {
+                    (
+                        engine::prefill_backend::seconds_per_prompt_pass(&model),
+                        engine::prefill_backend::seconds_per_prompt_pass(&cpu_model),
+                    )
+                });
+                let cores_lose_prompts = matches!(
+                    prompt_pass,
+                    Some((Some(device_pp), Some(cpu_pp))) if cpu_pp > device_pp
+                );
+                let prompts_because = match prompt_pass {
+                    Some((Some(device_pp), Some(cpu_pp))) => format!(
+                        "; a prompt pass takes {:.0} ms on the device and {:.0} ms on the cpu",
+                        device_pp * 1e3,
+                        cpu_pp * 1e3
+                    ),
+                    _ => String::new(),
+                };
+                if cores_lose_prompts {
+                    engine::adapt::note(
+                        "decode",
+                        format!("on the device ({backend_label})"),
+                        format!(
+                            "{because}{prompts_because}, so the device keeps the model \
+                                 rather than give up the prompts with it"
+                        ),
+                    );
+                    (backend, backend_label, model, false, None)
+                } else if engine::decode_backend::cpu_wins(device_s, cpu_s) {
+                    engine::adapt::note(
+                        "decode",
+                        "on the cpu",
+                        format!("{because}{prompts_because}; the device's copy released"),
+                    );
+                    drop(model);
+                    engine::prefill_backend::force_prompts_on_cpu();
+                    let label = if is_x86_feature_detected() {
+                        "CPU/AVX2"
+                    } else {
+                        "CPU"
+                    };
+                    (cpu, label.to_string(), cpu_model, true, Some(cpu_s))
+                } else {
+                    engine::adapt::note(
+                        "decode",
+                        format!("on the device ({backend_label})"),
+                        format!(
+                            "{because}; the cores must be {}× faster",
+                            engine::decode_backend::min_gain()
+                        ),
+                    );
+                    (backend, backend_label, model, false, None)
+                }
+            }
+            _ => (backend, backend_label, model, false, None),
+        }
+    } else {
+        (backend, backend_label, model, false, None)
+    };
     // A model that decodes on the cores from the start (`backend = cpu`, or
     // no GPU): its decode pool, measured the same way.
     if backend.is_cpu()
+        && !partial
         && !decode_on_cpu
         && image_variant.is_none()
         && role.allows_generation()
@@ -1803,7 +1849,11 @@ fn prepare(args: Args) -> Result<Prepared> {
         };
         engine::adapt::note("prompt attention", kernel.0, kernel.1);
     }
-    engine::prompt_weights::prepare(&loaded, conf.prompt_weights);
+    // A `[workers]` node copies only the layers a plan gives it, by its tree's
+    // top-level decision (`workers::node`, W-85).
+    if conf.workers.is_none() {
+        engine::prompt_weights::prepare(&loaded, conf.prompt_weights);
+    }
     // Prompts on the cores: the pool they run faster in, timed on the
     // model's widest FFN GEMM at a prompt chunk's width, through the same
     // path (its `int8` copy, when built) a prompt takes.
@@ -2037,7 +2087,10 @@ fn prepare(args: Args) -> Result<Prepared> {
                     "faulted in as it is used (ORANGU_EXPERT_WILLNEED=0)"
                 }
             );
-        } else if host_bytes > 0 && engine::env::flag_on_unless_disabled("ORANGU_HOST_PRELOAD") {
+        } else if host_bytes > 0
+            && !partial
+            && engine::env::flag_on_unless_disabled("ORANGU_HOST_PRELOAD")
+        {
             // A model that fits is read into the page cache now, before the
             // first request finds it by demand faults — see
             // `LoadedModel::touch_tensors`. `ORANGU_HOST_PRELOAD=0` leaves the
@@ -2399,7 +2452,8 @@ fn prepare(args: Args) -> Result<Prepared> {
         &model.new_kv_cache(1).structure_tag(),
     );
     // What earlier runs of this model reused, to warm after serving starts.
-    let warm_prefixes = (engine::warm_prefixes::enabled(conf.prefix_warmup)
+    let warm_prefixes = (!partial
+        && engine::warm_prefixes::enabled(conf.prefix_warmup)
         && role.allows_generation())
     .then(|| engine::warm_prefixes::path_for(&prefix_fingerprint))
     .flatten()
@@ -2515,6 +2569,104 @@ fn prepare(args: Args) -> Result<Prepared> {
         None => None,
     };
 
+    // `[workers]`: this process's place in a tree of nodes sharing one
+    // model (`crate::workers`). With the section it listens for a parent;
+    // with workers of its own, and a model that can be split, it plans the
+    // layers over them and serves through a `DelegatingModel`. The slot
+    // store stays: a slot's retained conversation hands its session on the
+    // workers to the slot's next request (`KvCache::take_remote_prefix`),
+    // so a chat's next turn prefills only what is new. The prefix pool and
+    // paged KV are off: the pool's entries would each keep a session on
+    // every worker, past the two per slot a worker makes room for, and the
+    // pages are this process's alone. A draft model stays: its rollbacks go
+    // through the cache, which reaches the workers.
+    let (model, prefix_cache, slot_store, paged_kv, mtp, draft, warm_prefixes, switch) =
+        match &conf.workers {
+            Some(workers_conf) => {
+                let quant = quantization
+                    .clone()
+                    .or_else(|| model_label.rsplit_once(':').map(|(_, tag)| tag.to_string()))
+                    .unwrap_or_else(|| workers::identity::quantization_of(weights_source.path()));
+                let n_ctx = requested_context(args.context, conf.context)
+                    .unwrap_or(model.config().n_ctx_train)
+                    .min(model.config().n_ctx_train);
+                let node = start_workers_node(
+                    workers_conf,
+                    &model,
+                    // The very mapping the model reads through: the node lets go
+                    // of the pages of layers its plan moves elsewhere, which a
+                    // second mapping of the same file could not do for this one.
+                    loaded,
+                    &backend,
+                    &model_label,
+                    &quant,
+                    n_ctx,
+                    slots.total(),
+                    conf.prompt_weights,
+                )?;
+                workers::node::set_global(node.clone());
+                match node.delegating_model() {
+                    // Generation and embeddings both; a picture model's text
+                    // encoder is not split.
+                    Some(delegating) if image.is_none() => {
+                        // A draft model runs here, beside the embedding and the
+                        // head, and its guesses are checked in one multi-position
+                        // forward through the tree, rolled back where they miss —
+                        // both of which reach the workers. An MTP head reads the
+                        // last layer's hidden state at every position, which a
+                        // tree does not bring back.
+                        if mtp.is_some() {
+                            log::warn!(
+                                "orangu-server: the multi-token-prediction head is not used while \
+                             [workers] spreads the model; a draft_model is"
+                            );
+                        }
+                        // The model alone, with what the tree turns off, for `POST
+                        // /props` to switch to (W-84).
+                        let switch = Arc::new(engine::generate::ServingSwitch::new(
+                            engine::generate::Serving {
+                                model,
+                                mtp,
+                                prefix_cache,
+                                paged_kv,
+                            },
+                        ));
+                        let delegating: Arc<dyn ModelForward> = delegating;
+                        (
+                            delegating,
+                            None,
+                            slot_store,
+                            None,
+                            None,
+                            draft,
+                            None,
+                            Some(switch),
+                        )
+                    }
+                    _ => (
+                        model,
+                        prefix_cache,
+                        slot_store,
+                        paged_kv,
+                        mtp,
+                        draft,
+                        warm_prefixes,
+                        None,
+                    ),
+                }
+            }
+            None => (
+                model,
+                prefix_cache,
+                slot_store,
+                paged_kv,
+                mtp,
+                draft,
+                warm_prefixes,
+                None,
+            ),
+        };
+
     let engine = Arc::new(Engine {
         paged_kv: paged_kv.clone(),
         metrics: Arc::new(engine::metrics::ServerMetrics::new()),
@@ -2534,6 +2686,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // the console has `/dev/null` for a stdout.
         live_stats: conf.log.is_console() && !args.daemon,
         image,
+        switch,
     });
 
     // `all` (the default) and its `*` alias become `0.0.0.0` here — see
@@ -2606,10 +2759,12 @@ fn prepare(args: Args) -> Result<Prepared> {
     };
 
     if args.daemon {
-        daemonize().context("failed to start as a daemon")?;
+        daemon::ready().context("failed to start as a daemon")?;
     }
 
-    if let ModelSource::File(path) = &source {
+    if let ModelSource::File(path) = &source
+        && workers::fetch::partial().is_none()
+    {
         // Only a completely prepared server counts as use. Resolution alone
         // (`show`, `plan`, shell completion), or a load that later fails to
         // build its backend or bind its listener, must not change the date.
@@ -2690,22 +2845,6 @@ fn label_carries_tag(label: &str) -> bool {
         .rsplit(['/', '\\'])
         .next()
         .is_some_and(|last| last.contains(':'))
-}
-
-/// Detach from the controlling terminal and continue running in the
-/// background. Only the final, fully-detached process returns `Ok(())`; the
-/// original (and an intermediate) process exit here and never return.
-/// Mirrors `orangu-coordinator`'s own `daemonize`.
-#[cfg(unix)]
-fn daemonize() -> Result<()> {
-    daemonize::Daemonize::new()
-        .start()
-        .map_err(|err| anyhow!(err))
-}
-
-#[cfg(not(unix))]
-fn daemonize() -> Result<()> {
-    Err(anyhow!("--daemon is only supported on Unix-like platforms"))
 }
 
 /// A bound listener's raw descriptor, for [`reexec::Handover`]. Zero on a
@@ -3095,6 +3234,139 @@ fn build_model(
         ),
     };
     Ok(model)
+}
+
+/// Starts this process's [`workers::node::Node`] from its `[workers]`
+/// section: its listener on `host:port`, and — when it has workers of its
+/// own — its plan over them.
+#[allow(clippy::too_many_arguments)]
+/// This machine's processors, as a `[workers]` node reports them to its
+/// parent (W-86): the CPU, every GPU, and an NPU — marked where this node's
+/// layers run. The NPU is listed, and not marked: a tree node does not
+/// prepare it (W-24).
+fn node_devices(backend: &Arc<dyn Backend>) -> Vec<workers::protocol::Device> {
+    use workers::protocol::Device;
+    let cpu = orangu::hardware::detect_cpu();
+    let in_use = backend
+        .as_wgpu()
+        .map(|wgpu| wgpu.device_in_use().name.clone());
+    let mut devices = vec![Device {
+        kind: "cpu".to_string(),
+        name: cpu.brand.trim().to_string(),
+        cores: cpu.logical_cores as u32,
+        memory_bytes: cpu.total_memory_bytes,
+        in_use: backend.is_cpu() || engine::prefill_backend::prompts_on_cpu() == Some(true),
+    }];
+    for gpu in orangu::hardware::detect_gpus(cpu.total_memory_bytes) {
+        devices.push(Device {
+            kind: "gpu".to_string(),
+            in_use: in_use.as_deref() == Some(gpu.name.as_str()),
+            name: gpu.name,
+            cores: 0,
+            memory_bytes: gpu.vram_total_bytes.unwrap_or(0),
+        });
+    }
+    if let Some(npu) = orangu::npu::detect_npu_inventory() {
+        devices.push(Device {
+            kind: "npu".to_string(),
+            name: format!("{} {}", npu.vendor, npu.target),
+            cores: npu.cores,
+            memory_bytes: 0,
+            in_use: false,
+        });
+    }
+    devices
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_workers_node(
+    workers_conf: &config::WorkersConfiguration,
+    model: &Arc<dyn ModelForward>,
+    loaded: engine::loader::LoadedModel,
+    backend: &Arc<dyn Backend>,
+    label: &str,
+    quant: &str,
+    n_ctx: usize,
+    slots: usize,
+    prompt_weights: engine::prompt_weights::PromptWeights,
+) -> Result<Arc<workers::node::Node>> {
+    let host = config::resolve_bind_host(&workers_conf.host);
+    if workers_conf.secret.is_none()
+        && host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| !ip.is_loopback())
+    {
+        log::warn!(
+            "orangu-server: the [workers] listener on {host}:{} has no secret: any machine that \
+             can reach it can use this node as a worker. Set [workers].secret on every node.",
+            workers_conf.port
+        );
+    }
+    let hostname = sysinfo::System::host_name().unwrap_or_else(|| "node".to_string());
+    let settings = workers::node::NodeSettings {
+        name: format!("{hostname}:{}", workers_conf.port),
+        listen: Some(format!("{host}:{}", workers_conf.port)),
+        workers: workers_conf
+            .workers
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        standby: workers_conf
+            .standby
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        secret: workers_conf.secret.clone(),
+        activations: workers_conf.activations,
+        timeout: workers_conf.timeout,
+        connect_timeout: workers_conf.connect_timeout,
+        local_layers: workers_conf.local_layers,
+        n_ctx,
+        slots,
+        label: label.to_string(),
+        quant: quant.to_string(),
+        capacity: {
+            let device_bytes = backend
+                .as_wgpu()
+                .and_then(|wgpu| wgpu.device_in_use().vram_total_bytes)
+                .unwrap_or(0);
+            let host_bytes = orangu::hardware::detect_cpu().total_memory_bytes;
+            workers::protocol::Capacity {
+                backend: if backend.is_cpu() { "cpu" } else { "gpu" }.to_string(),
+                device_bytes,
+                host_bytes,
+                budget_bytes: workers::plan::budget(device_bytes, host_bytes),
+                setups: vec![workers::protocol::NodeSetup {
+                    name: format!("{hostname}:{}", workers_conf.port),
+                    devices: node_devices(backend),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        },
+        shares: workers_conf.shares,
+        decode: workers_conf.decode,
+        head: workers_conf.head,
+        maintenance: std::time::Duration::from_secs(5),
+        readmit: std::time::Duration::from_secs(30),
+        tls: workers::transport::Tls::from_paths(
+            workers_conf
+                .tls
+                .as_ref()
+                .map(|(cert, key)| (cert.as_path(), key.as_path())),
+            workers_conf.tls_ca.as_deref(),
+        )
+        .context("setting up TLS for [workers]")?,
+        prompt_weights,
+    };
+    let held = workers::clock::start();
+    if held > 0 {
+        log::info!(
+            "orangu-server: [workers] {held} cores are held at full clock while a request runs \
+             (idle-priority spinners, ORANGU_WORKERS_CLOCK=1)"
+        );
+    }
+    workers::node::Node::start(settings, model.clone(), loaded)
 }
 
 async fn serve(prepared: Prepared) -> Result<()> {

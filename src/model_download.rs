@@ -66,7 +66,27 @@ use std::{
     },
 };
 
-const HUB_ENDPOINT: &str = "https://huggingface.co";
+/// Where the Hub is: `HF_ENDPOINT` when set — the variable the Hub's own
+/// clients read, for a mirror or a local server in tests — else
+/// huggingface.co. A constant that formats to the current value, so every
+/// URL built with `{HUB_ENDPOINT}` follows it.
+const HUB_ENDPOINT: HubEndpoint = HubEndpoint;
+
+struct HubEndpoint;
+
+impl std::fmt::Display for HubEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let configured = std::env::var("HF_ENDPOINT")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        f.write_str(
+            configured
+                .as_deref()
+                .map(|value| value.trim().trim_end_matches('/'))
+                .unwrap_or("https://huggingface.co"),
+        )
+    }
+}
 /// The same fallback preference order llama.cpp's own `find_best_model`
 /// uses when a `download` target names a repo but no `:quant` — asked for
 /// in that order, first match wins.
@@ -1735,8 +1755,434 @@ fn link_or_copy(blob: &Path, link: &Path, oid: &str, file_path: &str) -> Result<
         .with_context(|| format!("failed to place {}", link.display()))
 }
 
+/// A model file fetched in part (W-65): its header and whichever tensors a
+/// caller asks for, written where they belong in a sparse file of the full
+/// size, the rest left as holes. A worker of a `[workers]` tree runs a range
+/// of layers and needs little of the rest: it fetches what building the
+/// model reads, then its own layers when a parent assigns them.
+///
+/// The file is `<snapshot>/<name>.gguf.partial`, beside where the whole file
+/// would go and never mistaken for it — `list` and a plain start look for
+/// `.gguf`. Beside it, `<name>.gguf.partial.fetched` lists the tensors
+/// already in place, one name a line, so a restart fetches only the rest.
+/// One file only: a model split in shards is refused.
+pub struct PartialModel {
+    path: PathBuf,
+    record: PathBuf,
+    url: String,
+    client: reqwest::blocking::Client,
+    token: Option<String>,
+    /// Each tensor's absolute byte range in the file, padding included, and
+    /// its dimensions.
+    extents: Vec<(String, u64, u64, Vec<u64>)>,
+    fetched: Mutex<std::collections::HashSet<String>>,
+}
+
+impl PartialModel {
+    /// Opens `spec` (`<user>/<model>[:quant]`) in part: resolves it on the
+    /// Hub, and fetches its header into a new sparse file — or reopens the
+    /// one an earlier run left, keeping what it fetched.
+    pub fn open(models_dir: &Path, spec: &str) -> Result<Self> {
+        let (repo, tag) = split_repo_tag(spec)?;
+        let client = build_client(None)?;
+        let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
+        let commit = resolve_commit(&client, &repo, token.as_deref())?;
+        let files = list_repo_files(&client, &repo, &commit, token.as_deref())?;
+        let selected = select_files_to_download(&files, tag.as_deref())
+            .with_context(|| format!("no matching GGUF file in {repo}"))?;
+        if selected.len() != 1 {
+            bail!(
+                "{spec} is split in {} shards; a range download takes a single-file model",
+                selected.len()
+            );
+        }
+        let file = selected[0].clone();
+        let snapshot_dir = models_dir
+            .join(repo_folder_name(&repo))
+            .join("snapshots")
+            .join(&commit);
+        fs::create_dir_all(&snapshot_dir)
+            .with_context(|| format!("failed to create {}", snapshot_dir.display()))?;
+        let name = Path::new(&file.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.path.clone());
+        let path = snapshot_dir.join(format!("{name}.partial"));
+        let record = snapshot_dir.join(format!("{name}.partial.fetched"));
+        let url = format!(
+            "{HUB_ENDPOINT}/{repo}/resolve/{commit}/{}",
+            urlencode_path(&file.path)
+        );
+        Self::start(path, record, url, file.size, client, token)
+    }
+
+    /// [`Self::open`] once the file is known: `url` holds `size` bytes, to
+    /// be fetched in part into `path`.
+    fn start(
+        path: PathBuf,
+        record: PathBuf,
+        url: String,
+        size: u64,
+        client: reqwest::blocking::Client,
+        token: Option<String>,
+    ) -> Result<Self> {
+        let reuse = path.metadata().is_ok_and(|m| m.len() == size) && record.exists();
+        let header = if reuse {
+            GgufFile::open(&path)
+                .with_context(|| format!("failed to read the header of {}", path.display()))?
+        } else {
+            let _ = fs::remove_file(&record);
+            // The front of the file in growing slices until the tensor table
+            // parses — a large vocabulary makes a header of many megabytes —
+            // then written where it came from.
+            let mut want = (8u64 << 20).min(size);
+            let (header, front) = loop {
+                let mut front = Vec::new();
+                ranged(&client, &url, token.as_deref(), Some((0, want)))?
+                    .read_to_end(&mut front)
+                    .with_context(|| format!("failed reading {url}"))?;
+                match GgufFile::read_from(std::io::Cursor::new(&front)) {
+                    Ok(header) if header.data_offset <= front.len() as u64 => {
+                        break (header, front);
+                    }
+                    Ok(_) | Err(_) if want < size => want = (want * 4).min(size),
+                    Ok(_) => bail!("{url}: the tensor data starts past the end of the file"),
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("failed to parse the GGUF header of {url}"));
+                    }
+                }
+            };
+            let mut out = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+            out.set_len(size)
+                .with_context(|| format!("failed to size {}", path.display()))?;
+            out.write_all(&front[..header.data_offset as usize])
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            fs::write(&record, "")
+                .with_context(|| format!("failed to create {}", record.display()))?;
+            header
+        };
+        let mut by_offset: Vec<_> = header.tensors.iter().collect();
+        by_offset.sort_by_key(|t| t.offset);
+        let data_end = size;
+        let extents = by_offset
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let start = header.data_offset + t.offset;
+                let end = by_offset
+                    .get(i + 1)
+                    .map_or(data_end, |next| header.data_offset + next.offset);
+                (
+                    t.name.clone(),
+                    start,
+                    end.saturating_sub(start),
+                    t.dims.clone(),
+                )
+            })
+            .collect();
+        let fetched = fs::read_to_string(&record)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok(Self {
+            path,
+            record,
+            url,
+            client,
+            token,
+            extents,
+            fetched: Mutex::new(fetched),
+        })
+    }
+
+    /// The sparse file, to open as the model.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether every tensor is in place.
+    pub fn complete(&self) -> bool {
+        let fetched = self.fetched.lock().unwrap();
+        self.extents
+            .iter()
+            .all(|(name, _, len, _)| *len == 0 || fetched.contains(name))
+    }
+
+    /// Fetches every tensor `wanted` picks (by name and dimensions) that is
+    /// not in place yet, and answers how many bytes that took. Neighbouring
+    /// tensors go in one request. Each is recorded as fetched once its bytes
+    /// are written.
+    pub fn fetch(&self, wanted: impl Fn(&str, &[u64]) -> bool) -> Result<u64> {
+        let missing: Vec<(String, u64, u64)> = {
+            let fetched = self.fetched.lock().unwrap();
+            self.extents
+                .iter()
+                .filter(|(name, _, len, dims)| {
+                    *len > 0 && wanted(name, dims) && !fetched.contains(name)
+                })
+                .map(|(name, start, len, _)| (name.clone(), *start, *len))
+                .collect()
+        };
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        // Runs of tensors that follow one another in the file.
+        let mut runs: Vec<(u64, u64, Vec<String>)> = Vec::new();
+        for (name, start, len) in missing {
+            match runs.last_mut() {
+                Some((run_start, run_len, names)) if *run_start + *run_len == start => {
+                    *run_len += len;
+                    names.push(name);
+                }
+                _ => runs.push((start, len, vec![name])),
+            }
+        }
+        let out = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        let mut total = 0u64;
+        for (start, len, names) in runs {
+            copy_range(
+                &self.client,
+                &self.url,
+                self.token.as_deref(),
+                &out,
+                start,
+                len,
+            )?;
+            out.sync_data()
+                .with_context(|| format!("failed to write {}", self.path.display()))?;
+            total += len;
+            let mut record = OpenOptions::new()
+                .append(true)
+                .open(&self.record)
+                .with_context(|| format!("failed to open {}", self.record.display()))?;
+            let mut fetched = self.fetched.lock().unwrap();
+            for name in names {
+                writeln!(record, "{name}")
+                    .with_context(|| format!("failed to write {}", self.record.display()))?;
+                fetched.insert(name);
+            }
+        }
+        Ok(total)
+    }
+}
+
+/// `GET url`, of `bytes` when given, as a stream.
+fn ranged(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: Option<&str>,
+    bytes: Option<(u64, u64)>,
+) -> Result<reqwest::blocking::Response> {
+    let mut request = client.get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    if let Some((start, len)) = bytes {
+        request = request.header("Range", format!("bytes={start}-{}", start + len - 1));
+    }
+    let response = request
+        .send()
+        .with_context(|| format!("failed to fetch {url}"))?
+        .error_for_status()
+        .with_context(|| format!("failed to fetch {url}"))?;
+    if bytes.is_some() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        bail!("{url} does not answer range requests");
+    }
+    Ok(response)
+}
+
+/// Copies bytes `start..start + len` of `url` to the same place in `out`.
+fn copy_range(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: Option<&str>,
+    out: &fs::File,
+    start: u64,
+    len: u64,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    if len == 0 {
+        return Ok(());
+    }
+    let mut response = ranged(client, url, token, Some((start, len)))?;
+    let mut out = out;
+    out.seek(SeekFrom::Start(start))
+        .context("failed to seek in the partial model")?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        let n = response
+            .read(&mut buf)
+            .with_context(|| format!("failed reading {url}"))?;
+        if n == 0 {
+            bail!("{url} ended {left} bytes early");
+        }
+        let n = n.min(left as usize);
+        out.write_all(&buf[..n])
+            .context("failed to write a fetched range")?;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A GGUF of `tensors` (`name`, f32 values), `general.architecture`
+    /// only, data aligned to 32.
+    fn tiny_gguf(tensors: &[(&str, Vec<f32>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let string = |out: &mut Vec<u8>, s: &str| {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        };
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        string(&mut out, "general.architecture");
+        out.extend_from_slice(&8u32.to_le_bytes());
+        string(&mut out, "llama");
+        let mut offset = 0u64;
+        for (name, values) in tensors {
+            string(&mut out, name);
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+            offset += (values.len() as u64 * 4).div_ceil(32) * 32;
+        }
+        while out.len() % 32 != 0 {
+            out.push(0);
+        }
+        for (_, values) in tensors {
+            for v in values {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            while out.len() % 32 != 0 {
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    /// Serves `body` at any path, honouring `Range: bytes=a-b`, counting
+    /// the bytes it sends, until the test ends.
+    fn serve(body: Vec<u8>) -> (String, Arc<AtomicU64>) {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/m.gguf", listener.local_addr().unwrap());
+        let sent = Arc::new(AtomicU64::new(0));
+        let counted = sent.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        let (a, b) = value.trim().split_once('-').unwrap();
+                        range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
+                    }
+                }
+                let (status, slice) = match range {
+                    Some((a, b)) => ("206 Partial Content", &body[a..=b.min(body.len() - 1)]),
+                    None => ("200 OK", &body[..]),
+                };
+                counted.fetch_add(slice.len() as u64, Ordering::Relaxed);
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                let _ = stream.write_all(slice);
+            }
+        });
+        (url, sent)
+    }
+
+    /// A partial model fetches its header, then only the tensors asked
+    /// for — each where it belongs, the rest left as zeros — and a reopened
+    /// one keeps what was fetched.
+    #[test]
+    fn a_partial_model_fetches_only_what_is_asked_for() {
+        let tensors = [
+            ("token_embd.weight", vec![1.0f32; 100]),
+            ("blk.0.attn_norm.weight", vec![2.0; 8]),
+            ("blk.0.ffn_down.weight", vec![3.0; 200]),
+            ("blk.1.ffn_down.weight", vec![4.0; 200]),
+            ("output_norm.weight", vec![5.0; 8]),
+        ];
+        let body = tiny_gguf(&tensors);
+        let (url, sent) = serve(body.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.gguf.partial");
+        let record = dir.path().join("m.gguf.partial.fetched");
+        let open = || {
+            PartialModel::start(
+                path.clone(),
+                record.clone(),
+                url.clone(),
+                body.len() as u64,
+                build_client(None).unwrap(),
+                None,
+            )
+            .unwrap()
+        };
+        let partial = open();
+        assert!(!partial.complete());
+        let fetched = partial
+            .fetch(|name, _| !name.starts_with("blk.") || name.ends_with("_norm.weight"))
+            .unwrap();
+        assert!(fetched > 0 && fetched < body.len() as u64 / 2, "{fetched}");
+        let header = GgufFile::open(&path).unwrap();
+        let on_disk = fs::read(&path).unwrap();
+        assert_eq!(on_disk.len(), body.len());
+        for t in &header.tensors {
+            let at = (header.data_offset + t.offset) as usize;
+            let len = t.element_count() as usize * 4;
+            let expect_present = !t.name.starts_with("blk.") || t.name.ends_with("_norm.weight");
+            if expect_present {
+                assert_eq!(on_disk[at..at + len], body[at..at + len], "{}", t.name);
+            } else {
+                assert!(on_disk[at..at + len].iter().all(|b| *b == 0), "{}", t.name);
+            }
+        }
+        // Again: nothing more to fetch for the same names.
+        assert_eq!(
+            partial.fetch(|name, _| !name.starts_with("blk.")).unwrap(),
+            0
+        );
+
+        // Reopened, it knows what it has, and fetches a layer on demand.
+        drop(partial);
+        let before = sent.load(Ordering::Relaxed);
+        let partial = open();
+        assert_eq!(
+            sent.load(Ordering::Relaxed),
+            before,
+            "no header fetched again"
+        );
+        partial.fetch(|name, _| name.starts_with("blk.1.")).unwrap();
+        partial.fetch(|_, _| true).unwrap();
+        assert!(partial.complete());
+        assert_eq!(fs::read(&path).unwrap(), body);
+    }
     use super::*;
 
     const MIB: u64 = 1024 * 1024;

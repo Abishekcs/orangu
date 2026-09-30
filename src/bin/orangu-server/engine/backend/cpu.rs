@@ -937,6 +937,14 @@ impl Backend for CpuBackend {
             *out = copy.matmul(x, n_tokens);
             return;
         }
+        // A tree node's copies of its own layers (`prompt_weights::
+        // build_for_layers`); nothing to look up in a server alone.
+        if n_tokens >= crate::engine::prompt_weights::MIN_TOKENS
+            && let Some(y) = crate::engine::prompt_weights::ranged_matmul(w, x, n_tokens)
+        {
+            *out = y;
+            return;
+        }
         if self.matmul_fused_into(out, x, n_tokens, w) {
             return;
         }

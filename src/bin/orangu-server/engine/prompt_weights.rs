@@ -368,6 +368,210 @@ pub fn prepare(loaded: &LoadedModel, choice: PromptWeights) {
     }
 }
 
+/// Which kinds of copy a tree's prompts go through — decided once by its
+/// top-level node ([`decide`]) and handed to every worker with its layers,
+/// so every node of a tree rounds as the top does (W-85 in
+/// `doc/WORKERS.md`; B-2 in `doc/BUGS.md` was a tree whose nodes decided
+/// apart). A server alone keeps [`prepare`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Decision {
+    pub int8: bool,
+    pub bf16: bool,
+}
+
+impl Decision {
+    /// One byte on the wire: bit 0 `int8`, bit 1 `bf16`.
+    pub fn bits(self) -> u8 {
+        u8::from(self.int8) | (u8::from(self.bf16) << 1)
+    }
+
+    pub fn from_bits(bits: u8) -> Self {
+        Self {
+            int8: bits & 1 != 0,
+            bf16: bits & 2 != 0,
+        }
+    }
+
+    fn takes(self, kind: Kind) -> bool {
+        match kind {
+            Kind::Int8 => self.int8,
+            Kind::Bf16 => self.bf16,
+        }
+    }
+}
+
+/// [`prepare`]'s decision for a tree, measured the same way — the CPU's
+/// instructions, `prompt_weights`, the widest matrix timed through a copy
+/// against the file's weights — but building nothing: a node builds the
+/// copies of its own layers once a plan gives it some
+/// ([`build_for_layers`]). Whether the copies fit is asked there, of the
+/// layers the node runs.
+pub fn decide(loaded: &LoadedModel, choice: PromptWeights) -> Decision {
+    let choice = std::env::var("ORANGU_PROMPT_WEIGHTS")
+        .ok()
+        .and_then(|v| PromptWeights::parse(&v))
+        .unwrap_or(choice);
+    let mut decision = Decision::default();
+    if choice == PromptWeights::File
+        || crate::engine::prefill_backend::prompts_on_cpu() != Some(true)
+    {
+        return decision;
+    }
+    let all = prompt_matrices(loaded);
+    for kind in [Kind::Int8, Kind::Bf16] {
+        let mats: Vec<&(String, QuantMatrix, Kind)> =
+            all.iter().filter(|(_, _, k)| *k == kind).collect();
+        if mats.is_empty() || kind.available().is_err() {
+            continue;
+        }
+        let take = choice == PromptWeights::Copy || {
+            let size = |m: &&&(String, QuantMatrix, Kind)| m.1.in_dim * m.1.out_dim;
+            let probe = mats
+                .iter()
+                .filter(|(name, _, _)| kind == Kind::Bf16 || name.contains(".ffn_"))
+                .max_by_key(size)
+                .or_else(|| mats.iter().max_by_key(size));
+            probe.is_some_and(|(_, probe, _)| {
+                let x: Vec<f32> = (0..PROBE_TOKENS * probe.in_dim)
+                    .map(|i| ((i * 7919) % 257) as f32 / 257.0 - 0.5)
+                    .collect();
+                let copy = kind.build(probe);
+                let file = best_of(&mut || {
+                    let _ = CpuBackend.matmul(&x, PROBE_TOKENS, probe);
+                });
+                let fast = best_of(&mut || {
+                    let _ = copy.matmul(&x, PROBE_TOKENS);
+                });
+                file >= fast * MIN_GAIN
+            })
+        };
+        match kind {
+            Kind::Int8 => decision.int8 = take,
+            Kind::Bf16 => decision.bf16 = take,
+        }
+    }
+    decision
+}
+
+/// A tree node's copies: of its own layers, by one decision. Replaced
+/// whenever a plan moves the node's layers.
+static RANGED: std::sync::RwLock<Option<std::sync::Arc<HashMap<usize, PromptCopy>>>> =
+    std::sync::RwLock::new(None);
+
+/// Whether this process keeps [`RANGED`] — a tree node. A server alone
+/// never looks there.
+static RANGED_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Builds the copies `decision` names for the matrices of `layers` (and the
+/// per-layer embedding projection a Gemma 4 worker computes its inputs
+/// with), replacing any a previous plan built. A kind whose copies would
+/// take more than half the memory available is left on the file's weights.
+/// Returns how many matrices were copied.
+pub fn build_for_layers(
+    loaded: &LoadedModel,
+    decision: Decision,
+    layers: std::ops::Range<usize>,
+    n_layer: usize,
+    decided_by: &str,
+) -> usize {
+    use rayon::prelude::*;
+    RANGED_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+    let started = Instant::now();
+    let available = orangu::hardware::detect_cpu().available_memory_bytes;
+    let mut chosen: Vec<(QuantMatrix, Kind)> = Vec::new();
+    for kind in [Kind::Int8, Kind::Bf16] {
+        let mats: Vec<QuantMatrix> = prompt_matrices(loaded)
+            .into_iter()
+            .filter(|(name, _, k)| {
+                *k == kind
+                    && match crate::engine::loader::block_index(name).filter(|il| *il < n_layer) {
+                        Some(il) => layers.contains(&il),
+                        None => true,
+                    }
+            })
+            .map(|(_, w, _)| w)
+            .collect();
+        if !decision.takes(kind) || mats.is_empty() {
+            crate::engine::adapt::note(
+                kind.layer(),
+                "the file's",
+                format!("{decided_by}, for layers {}..{}", layers.start, layers.end),
+            );
+            continue;
+        }
+        // Decided on the top-level node's cores, which may have what these
+        // lack: this node then rounds as the file's weights do.
+        if let Err(missing) = kind.available() {
+            crate::engine::adapt::note(
+                kind.layer(),
+                "the file's",
+                format!("{decided_by}, but no {missing} on these cores"),
+            );
+            continue;
+        }
+        let bytes: u64 = mats.iter().map(|w| kind.copy_bytes(w)).sum();
+        if bytes > available / 2 {
+            crate::engine::adapt::note(
+                kind.layer(),
+                "the file's",
+                format!(
+                    "the {} copies of layers {}..{} would be {:.2} GB, past half of the {:.1} GB \
+                     available",
+                    kind.name(),
+                    layers.start,
+                    layers.end,
+                    bytes as f64 / 1e9,
+                    available as f64 / 1e9
+                ),
+            );
+            continue;
+        }
+        chosen.extend(mats.into_iter().map(|w| (w, kind)));
+    }
+    let copies: Vec<(usize, Kind, PromptCopy)> = chosen
+        .par_iter()
+        .map(|(w, kind)| (w.raw_bytes().as_ptr() as usize, *kind, kind.build(w)))
+        .collect();
+    for kind in [Kind::Int8, Kind::Bf16] {
+        let mine: Vec<&PromptCopy> = copies
+            .iter()
+            .filter(|(_, k, _)| *k == kind)
+            .map(|(_, _, c)| c)
+            .collect();
+        if !mine.is_empty() {
+            crate::engine::adapt::note(
+                kind.layer(),
+                format!(
+                    "{} copies of {} matrices of layers {}..{} ({:.2} GB; built in {:.1} s)",
+                    kind.name(),
+                    mine.len(),
+                    layers.start,
+                    layers.end,
+                    mine.iter().map(|c| c.bytes()).sum::<usize>() as f64 / 1e9,
+                    started.elapsed().as_secs_f64()
+                ),
+                decided_by.to_string(),
+            );
+        }
+    }
+    let n = copies.len();
+    let map: HashMap<usize, PromptCopy> = copies.into_iter().map(|(at, _, c)| (at, c)).collect();
+    *RANGED.write().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(map));
+    n
+}
+
+/// A multi-token product through a tree node's copy of `w`, when it has
+/// one ([`build_for_layers`]). `None` at once in a server alone.
+pub fn ranged_matmul(w: &QuantMatrix, x: &[f32], n_tokens: usize) -> Option<Vec<f32>> {
+    if !RANGED_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let copies = RANGED.read().unwrap_or_else(|p| p.into_inner()).clone()?;
+    copies
+        .get(&(w.raw_bytes().as_ptr() as usize))
+        .map(|copy| copy.matmul(x, n_tokens))
+}
+
 fn build(matrices: Vec<(String, QuantMatrix, Kind, String)>) {
     use rayon::prelude::*;
     let started = Instant::now();
@@ -410,6 +614,25 @@ fn build(matrices: Vec<(String, QuantMatrix, Kind, String)>) {
                 seconds
             ),
             because,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decision_fits_in_one_byte() {
+        for bits in 0..4 {
+            assert_eq!(Decision::from_bits(bits).bits(), bits);
+        }
+        assert_eq!(
+            Decision::from_bits(2),
+            Decision {
+                int8: false,
+                bf16: true
+            }
         );
     }
 }

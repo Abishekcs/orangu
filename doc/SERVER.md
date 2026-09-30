@@ -232,7 +232,8 @@ above typically finishes well before the main model. An interrupted download
 resumes from where it left off next time, and a file already fully present
 (matching the repository's own reported size) is skipped rather than
 re-fetched. Set `HF_TOKEN` in the environment for a private or gated
-repository.
+repository, and `HF_ENDPOINT` to download from a mirror instead of
+huggingface.co.
 
 Not supported (out of scope for a first version): downloading a `--mtp`
 companion file alongside the model, `preset.ini`-based repos, and Docker
@@ -1186,7 +1187,9 @@ port = 8300
   and 0.08 GB of `bf16` copies of the per-layer-embedding matrices,
   2.4–3.7× faster within 0.15%; all built in 0.9 s. `copy` builds them
   wherever the CPU has the instruction, unmeasured; `file` never does.
-  `ORANGU_PROMPT_WEIGHTS` overrides it for one run.
+  `ORANGU_PROMPT_WEIGHTS` overrides it for one run. In a `[workers]` tree the
+  top-level node decides, and each node builds the copies of its own layers
+  only, once a plan gives it some.
 - `prefix_warmup` — `on` (the default) or `off`: remember, per model, the
   prompt prefixes requests reuse from the cache (at least 256 tokens, the
   four most reused, as token ids in
@@ -1218,8 +1221,13 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   model guesses `draft_tokens` tokens (default 4) and the served model verifies
   them in one forward, keeping the longest prefix it would have produced
   itself. The output is unchanged; only the time taken differs. The pair must
-  share a vocabulary and both must have a multi-position forward (`gemma4`,
-  `deepseek4`, `glm-dsa`, `muse-glimmer`), both checked at startup. Greedy,
+  share a vocabulary and both must have a multi-position forward (the Llama
+  family — `llama`, `qwen2`, `qwen3`, `qwen3moe`, `mistral`, `granite`,
+  `qwen2vl`, `qwen3vl` — and `gemma4`, `deepseek4`, `glm-dsa`,
+  `muse-glimmer`), both checked at startup. Llama-3.1-8B with a
+  Llama-3.2-1B draft went from 4.06 to 4.48 tok/s on the development board's
+  CPU. A draft model also works on a `[workers]` tree: it runs on the
+  top-level node, and its guesses are verified through the tree. Greedy,
   unconstrained requests only. Whether it pays depends on the hardware — see
   **Speculative decoding** in the manual for a measurement where it does not.
 - `text_encoder` / `vae` — the two companions a `qwen_image` or
@@ -1444,6 +1452,261 @@ port = 8300
   serves a small static page linking to `/metrics`, so a browser doesn't
   land on a 404; nothing else is served.
 
+### The `[workers]` section
+
+Spreads one model's layers over several machines: a tree of
+`orangu-server` nodes, each running a contiguous range of layers and
+handing the rest to the workers it lists (which may list workers of their
+own). Clients talk to the top-level node, which tokenizes, samples and
+streams; the hidden states travel down the tree and back for every
+prefill chunk and every generated token. `doc/WORKERS.md` has the design
+and what is still to come.
+
+Like `[web]` and `[prometheus]`, a config with no `[workers]` section has
+none. `-i`/`--init` asks `Add workers` (default no), then `host`, `port`,
+`workers`, `secret` and `activations`, or writes no section at all.
+
+```ini
+[workers]
+host = all
+port = 8400
+workers = node1:8400, node2:8400, [fd00::3]:8400
+secret = a-long-random-string
+activations = f16
+```
+
+**Roles follow from the section.** A node with a `[workers]` section
+listens on `host`:`port` for a parent; a node whose `workers` list is not
+empty hands layers to those workers. The node clients talk to — the
+top-level node — is the one no other node lists. A worker in the middle of
+the tree does both. A listener on an address reachable from other
+machines without a `secret` is warned about at startup.
+
+- `host` — the address this server binds for its parent. **When the key
+  is absent it falls back to `[orangu-server].host`.**
+- `port` — the port it binds, alongside `[orangu-server].port`. Defaults to
+  `8400` when the section is present but says nothing.
+- `workers` — a comma-separated list of `host:port` pairs, one per worker,
+  in layer order: each worker's own `[workers]` address. An IPv6 address is
+  bracketed (`[fd00::3]:8400`); blank entries are ignored, and anything
+  else that isn't a `host:port` pair with a port of 1–65535 is rejected at
+  startup, naming the entry — every worker needs both its host and its
+  port. A worker listed twice, or this node's own `host`:`port` (including
+  a loopback address when `host` is `all`), is refused as a loop. Workers
+  usually share `[workers].port`, so `-i`/`--init` takes that port for any
+  entry typed as a bare host and writes it out in full; it re-prompts until
+  the list parses, and an empty answer writes an empty list to fill in
+  later.
+- `secret` — a shared secret that parent and worker prove to each other
+  when they connect (HMAC-SHA256 over fresh random nonces; the secret
+  itself never crosses the network). A node with a secret refuses a peer
+  that cannot prove it; blank or absent authenticates nobody, and
+  `-i`/`--init` says so when `host` is reachable off this machine. Use the
+  same value on every node of a tree.
+- `activations` — how hidden states travel between nodes: `f16` (the
+  default), `f32` (exact: a split model computes bit for bit what an
+  unsplit one does, at twice the traffic), or `q8_0` (a quarter of `f32`,
+  at a small accuracy cost). On a gigabit link the format hardly shows:
+  a 128-token part of Llama-3.2-3B is 7 ms of `f16` on the wire against
+  about a second of compute. Choose `q8_0` for slow links such as Wi-Fi.
+- `timeout` — seconds one forward may take on a worker, its whole subtree
+  included, before the worker counts as lost (default `60`).
+- `connect_timeout` — seconds reaching a worker may take (default `10`).
+- `download` — `full` (the default) or `range`. With `range`, on a node with
+  no workers of its own and no copy of the model, the model is fetched in
+  part: at start what building it reads, then the layers each assignment
+  hands it, into a sparse `<name>.gguf.partial`. Such a node serves only as
+  a worker. A model split in shards is refused.
+- `shares` — what a node divides its layers by between itself and its
+  workers: `decode` (the default), `prompt` or `memory`. With `decode` or
+  `prompt`, each node times the model's first layers at start, on the
+  processor its layers run on — a decode step, and a 128-token prompt
+  chunk — and every share is sized by that speed, as far as its memory
+  holds; with `memory`, by memory alone and nothing is timed. A node with
+  only part of the model on disk (`download = range`) does not time, and a
+  tree with such a node shares by memory. `GET /v1/workers` shows what a
+  plan followed, and each node's processors (CPU, GPUs, NPU) and speeds.
+- `decode` — where a top-level node's sequences decode once their prompt
+  is through the tree: `auto` (the default), `tree` or `top`. With `auto`
+  or `top`, the node takes every layer's rows back from the workers at the
+  first decode step and decodes alone on the model's own paths — with
+  `auto` only when its measured decode speed beats the tree's, and with
+  either only when it holds the whole model (it then keeps every layer's
+  weights). A chat's next turn goes on there from the kept rows, unless
+  less than half the prompt is reused. On one board, a Mali top-level node
+  with two CPU workers decoded Llama-3.2-3B at 15.2 tok/s this way, against
+  6.2 through the tree, with prompts still read 1.45× faster than alone.
+- `head` — which node applies the output head while a tree decodes
+  through its nodes: `auto` (the default), `top` or `last`. `last` has the
+  node with the final layer send logits back instead of its layers'
+  output, so the top-level node skips the model's largest matrix — worth
+  it for a weak top-level node and a large vocabulary; `auto` does so when
+  that node measured the faster decode. That node then keeps the output
+  head in memory.
+- `standby` — spare workers, `host:port` like `workers`, never given layers
+  until a worker is lost or does not answer when the node plans. Then one
+  takes that worker's layers, and each conversation is rebuilt on it from
+  what the node sent into them — the rest of the tree is untouched. The
+  node keeps those inputs while a standby is configured: `n_embd` values a
+  position per worker, 6 KiB for a 3072-wide model in `f16`.
+- `local_layers` — how many of this node's layers it runs itself rather
+  than handing to its workers: `auto` (the default, a share sized from its
+  own capacity like any worker's) or a number; `0` makes the node a pure
+  coordinator.
+- `tls_cert` / `tls_key` — PEM certificate and key the worker listener
+  serves TLS with. Both or neither. The certificate has to name the address
+  parents dial (a DNS name or an IP `subjectAltName`) and be a server
+  certificate (`basicConstraints=CA:FALSE`): rustls refuses a certificate
+  that is its own authority as a server's.
+- `tls_ca` — PEM certificates this node trusts when it dials its workers,
+  and so dials them with TLS. Without it, a node that has a `tls_cert`
+  trusts that, so a tree sharing one certificate needs only
+  `tls_cert`/`tls_key` on every node. With neither, it dials in the clear,
+  and a worker behind TLS is left out. TLS keeps what travels between nodes
+  private; who may take part is still `secret`'s job.
+
+**How a tree forms.**
+- **Every node runs its own model.** Start each one as usual, with the
+  same model. A parent checks, by content, that each child's copy is the
+  same file, quantization included (see below), and leaves out a child
+  that differs, cannot be reached, or fails the `secret`.
+- **A node with workers is top-level until claimed.** At startup it dials
+  them and divides the layers by memory (see **Memory** below).
+  `local_layers` overrides this node's own share. The plan is logged, e.g.
+  `workers plan: a:8400 0..8, b:8400 8..16, c:8400 16..24`.
+- **Claimed by a parent, a node becomes a worker.** When a parent assigns
+  it a range, it plans that range over itself and its own workers the same
+  way, and answers its parent's forwards. Meanwhile **its own API is off**:
+  every endpoint except `/health`, `/ready`, `/metrics` and `/v1/workers`
+  answers `503`, and `/ready` says `serving a parent orangu-server`. When
+  the parent disconnects, it serves its own API again.
+- **A worker serves one parent at a time.** A second parent is turned
+  away. Nodes that list each other (a loop) refuse the connection.
+
+**When a worker is lost.**
+- A request in flight is not lost with it. With a `standby` configured,
+  the node directly above the lost worker hands its layers to a standby
+  and rebuilds each sequence there from what it sent into them; nothing
+  above that node notices, and no other worker redoes anything
+  (`orangu_server_workers_takeovers_total`). Without one, the top-level
+  node plans again over the workers that answer, rebuilds the sequence on
+  the new plan by running its tokens through again, and carries on. Tokens
+  already sent stay sent.
+- The rebuilt cache comes from one prefill rather than token-by-token
+  decoding, so its rounding differs slightly: a greedy continuation can
+  pick a different near-tie from the one an uninterrupted run would have.
+- A worker that comes back is taken back by the node above it within
+  about 30 seconds, once no request has run for two seconds, and never in
+  the middle of one. A slot's conversation continued after that is
+  replayed through the new plan once.
+- Until the plan is repaired, `/ready` answers `503` with
+  `a worker was lost`.
+
+**A conversation's next turn reuses its rows on the workers.** Each slot
+keeps its last conversation, as a single server does. On a top-level node
+with workers, the rows of the workers' layers stay on the workers, under the
+conversation's session. The slot's next request takes that session over,
+rolled back to the part of the prompt that matches, so only the new tokens
+go through the tree. A worker drops a session nobody has used for ten
+minutes; a conversation taken up after that is rebuilt by replaying its
+tokens, as a lost worker's are.
+
+**Conversations share a prompt they have in common.** A request whose
+prompt another slot's conversation matches at least 64 tokens further than
+its own slot's — the same system prompt, most often — copies that prefix
+instead of computing it, and the other conversation keeps its own. In a
+tree every worker copies its own rows. A single server without paged KV
+shares the same way.
+
+**Off while delegating.** The prefix cache (`ORANGU_PREFIX_CACHE`), paged
+KV and MTP heads are switched off on a top-level node with workers. Slot
+save refuses a slot whose rows are on the workers, and a restored slot is
+not reused there: a file holds only this node's rows.
+
+`GET /v1/workers` shows a node's place in its tree: its role, the layers
+it runs, the plan below it and what its shares followed, each configured
+worker, the processors and measured speed of every node, and any worker
+the plan has lost; the web console shows the same under **Settings › Workers**.
+`/metrics` adds the `orangu_server_worker*` families: per worker,
+the round trip of a forward, bytes each way, failures, and whether it is
+up; per node, plans and mid-request recoveries. When a request finishes,
+the top-level node logs where its time went, locally and at each worker
+(network and subtree included), for prefill and decode separately, and
+tells the client too: `timings.workers` in the answer, and a
+`Server-Timing` header on a whole (not streamed) answer. With
+several slots, `ORANGU_DECODE_BATCH=1` sends one decode step of every slot
+as a single message per worker, at every level of the tree.
+
+A top-level node switches between its tree and serving alone through
+`POST /props` with `{"workers": {"enabled": false}}` (or `true`): alone is
+the model's own paths, as without `[workers]`, and the workers are let go
+meanwhile. Only between requests (`409` otherwise). `orangu-bench --workers
+compare` measures both ways.
+
+`doc/manual/en/49-workers.md` walks through setting up a tree.
+
+**Memory.** Each node holds only the layers it runs: weights are read, and
+uploaded to a GPU, the first time a layer runs. A node with a `[workers]`
+section never reads, uploads or times the whole model at startup. It skips:
+- the decode-speed probes;
+- the host preload;
+- the NPU precompile (`npu_precompile` is off);
+- the automatic device/host split of an oversized model;
+- the prefix warm-up.
+
+Shares are sized by each node's budget for weights (90% of GPU memory, or
+80% of RAM without one; a worker counts with its subtree's total, and the
+top-level node with what its embedding and head leave) and cut by the
+layers' own sizes. A share over budget is logged as a warning naming the
+node. When a new plan moves layers away, the node lets go of their host
+pages; a GPU keeps what it uploaded until the process ends.
+
+**Throughput.** A request's forwards run through the machines one after
+another, but a worker link carries many requests at once (protocol v2: each
+frame carries a request id), so with several `slots` each machine works on a
+different request at the same time. A prompt chunk before the last is
+answered as soon as a node's own layers are done and continues down the tree
+in the background, so a long prompt is pipelined: stage *k* works on chunk
+*i* while stage *k+1* works on chunk *i−1*. A failure there answers the
+sequence's next forward, where recovery takes over. The top cuts a prompt
+into 128-token parts for this (`ORANGU_WORKERS_CHUNK`; `0` keeps the
+engine's chunks). `ORANGU_WORKERS_PIPELINE=0` turns the pipelining off. `doc/PERF-WORKERS.md`
+has measurements.
+
+**Clock.** A node waits in bursts while the nodes below compute, and a
+frequency governor then clocks its cores down: on the development board a
+two-node tree on separate cores decoded at 163 ms a token against 103 ms
+with the clock held. On a machine that is only a node, use the
+`performance` governor. `ORANGU_WORKERS_CLOCK=1` holds the clock without
+root, with one idle-priority spinner per core while a request runs. Leave
+it off where nodes share a machine's cores: the spinners then take the cores
+another node computes on (118 ms a token without, 237 with).
+`ORANGU_WORKERS_TRACE=1` makes every worker log its own share of each
+request as the request ends.
+
+**Every node needs the same model installed, quantization included.**
+Each worker resolves the parent's model spec in its own `models`
+directory. When it connects, the parent compares the child's copy with its
+own by content, not by file name: the tensor types and shapes, and samples
+of the weights in the layers the child will run. A different quantization,
+or the same one from another release, is refused with a message naming
+both models.
+
+Llama-family models (`llama`, `qwen2`, `qwen3`, `qwen3moe`, `mistral`,
+`qwen2vl`, `qwen3vl`, `granite`), Phi-3 (`phi3`), Qwen3.5 dense (`qwen35`)
+and Gemma 4 (`gemma4`) can be split so far. A node with another architecture serves alone, with a warning, and
+refuses to work for a parent. Picture models are not delegated. The embedding role is: an embeddings
+request runs through the tree like a prompt, and the top applies the final
+norm and the pooling.
+
+**Gemma 4 cannot be cut everywhere.** Its last layers reuse the KV cache of
+the last KV-owning layer of their attention type, so the planner never
+separates them from those layers, and a node assigned such a cut refuses
+it. On E2B the only allowed cuts are before layers 1–13, which keeps layers
+13–34 on one node; on E4B they are 1–22; the 12B, the 31B and the 26B-A4B
+mixture share no KV and can be cut anywhere. Each worker recomputes a layer's per-layer embedding input from
+the token ids it is sent.
+
 Default lookup order for the config file: `-c`/`--config` picks one
 explicitly; without it, `./orangu-server.conf` then
 `~/.orangu/orangu-server.conf` are tried, in that order — the same order
@@ -1484,7 +1747,8 @@ attached terminal left to pass a CLI argument to or prompt on; the config
 and model are resolved, the log file opened, and both listeners bound,
 _before_ detaching, so a bad config, an unwritable `log_path` or a port
 already in use is still reported to the invoking terminal rather than
-silently lost. A daemon with the console as its log logs nothing at all —
+silently lost. The command returns once the server is listening, with
+status 0, or with the error and a non-zero status. A daemon with the console as its log logs nothing at all —
 set `log_type = file` to keep its output. `-h`/`--help` and
 `-V`/`--version` are also available.
 
@@ -1706,7 +1970,8 @@ manual's **Web UI** chapter for the full rules.
 While a reply is streaming in, the **Send** button becomes a **Stop** (×)
 button; clicking it cancels the request. This closes the connection the
 reply was streaming over, which the engine notices the next time it goes
-to send a token and stops generating right there. Whatever text had
+to send a token and stops generating right there — or, while the prompt is
+still being read, at the end of the prompt chunk in progress. Whatever text had
 already streamed in stays on screen, marked as stopped — but since the
 turn never reached completion, it isn't written to the session file, so a
 stopped reply (and the message that triggered it) won't reappear if you
@@ -2278,6 +2543,7 @@ reached; and `https` on the same port when `tls_cert`/`tls_key` are set.
 | `POST /v1/images/generations`         | OpenAI's Images API, on a `qwen_image` model: `prompt`, `n`, `size`, `output_format` (`png`/`jpeg`/`gif`/`webp`), plus `steps`, `cfg_scale`, `negative_prompt`, `seed`, an `image` to start from with a `strength`, and `stream`. `501` on a language model                                                                                                                                                     |
 | `GET /health`                         | liveness — stays `200` while the server is busy                                                                                                                                                                                                                                                                                                                                                                 |
 | `GET /ready`                          | readiness — `503` (with a reason) when the admission queue is full or the GPU device was lost. Open without an `api_key`, like `/health`                                                                                                                                                                                                                                                                        |
+| `GET /v1/workers`                     | this node's place in its `[workers]` tree: role, layers, plan, workers |
 | `GET /props`                          | model + server metadata                                                                                                                                                                                                                                                                                                                                                                                         |
 | `GET /slots`                          | per-slot busy/prompt/generated-token state                                                                                                                                                                                                                                                                                                                                                                      |
 | `GET /metrics`                        | Prometheus text: slot and queue gauges; latency histograms (`queue_wait`, `time_to_first_token`, `inter_token`, `request`); counters for requests by outcome and for prompt/cached/generated tokens                                                                                                                                                                                                             |
@@ -2295,6 +2561,7 @@ reached; and `https` on the same port when `tls_cert`/`tls_key` are set.
 | `POST /v1/embeddings`                 | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized                                                                                                                                                                                                                                                                                                                               |
 | `GET /health`                         | liveness — stays `200` while the server is busy                                                                                                                                                                                                                                                                                                                                                                 |
 | `GET /ready`                          | readiness — `503` (with a reason) when the admission queue is full or the GPU device was lost. Open without an `api_key`, like `/health`                                                                                                                                                                                                                                                                        |
+| `GET /v1/workers`                     | this node's place in its `[workers]` tree: role, layers, plan, workers |
 | `GET /props`                          | model + server metadata                                                                                                                                                                                                                                                                                                                                                                                         |
 | `GET /slots`                          | per-slot busy/prompt/generated-token state                                                                                                                                                                                                                                                                                                                                                                      |
 | `GET /metrics`                        | Prometheus text: slot and queue gauges; latency histograms (`queue_wait`, `time_to_first_token`, `inter_token`, `request`); counters for requests by outcome and for prompt/cached/generated tokens. The identical text is also served, **unauthenticated**, on `[prometheus].port`'s own port when that section is set (default off)                                                                           |

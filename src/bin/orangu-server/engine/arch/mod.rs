@@ -3202,7 +3202,10 @@ pub(crate) struct ResidentLayer<'a> {
 /// — two readbacks and a host turn per layer, with the device idle through
 /// each. Measured on a 1B file at 2238 tokens: 956 → 1690 tok/s.
 ///
-/// `layer(il)` describes layer `il`. `None` when the stream is not in place
+/// `layers` are the layers to run — every layer for a whole model, a node's
+/// own range in a tree of workers (`ModelForward::forward_layers`), where
+/// `x` is the residual entering the first of them. `layer(il)` describes
+/// layer `il`. `None` when the stream is not in place
 /// for this chunk (no stage for the rows, or a chain declined mid-chunk:
 /// what was recorded is submitted and its rows brought home first); the
 /// caller then takes its step-by-step path, whose result is the same.
@@ -3218,7 +3221,7 @@ pub(crate) fn run_layers_resident<'a>(
     n_head_kv: usize,
     head_dim: usize,
     eps: f32,
-    n_layer: usize,
+    layers: std::ops::Range<usize>,
     layer: impl Fn(usize) -> ResidentLayer<'a>,
 ) -> Result<Option<Vec<f32>>> {
     use crate::engine::backend::vulkan::{AttnOutSrc, FusedAttnPrefillInput, FusedAttnPrefillKv};
@@ -3228,7 +3231,7 @@ pub(crate) fn run_layers_resident<'a>(
     // The chunk's stage for every layer's K/V rows; declined when the
     // chain must wait per layer (`ORANGU_PREFILL_KV_WAIT`).
     let Some(mut kv_stage) = (!gemma::prefill_kv_wait())
-        .then(|| vulkan.kv_readback_stage((n_layer * n_tokens * kv_dim * 2 * 4) as u64))
+        .then(|| vulkan.kv_readback_stage((layers.len() * n_tokens * kv_dim * 2 * 4) as u64))
     else {
         return Ok(None);
     };
@@ -3257,7 +3260,7 @@ pub(crate) fn run_layers_resident<'a>(
             cache.discard_pending_rows();
         };
     vulkan.begin_prefill_group();
-    for il in 0..n_layer {
+    for il in layers {
         // This layer's device scratch, recycled from the last layer's
         // rather than allocated afresh — see `VulkanBackend::scratch_lease`.
         // Without it every layer of a chunk held its own intermediates
@@ -3363,6 +3366,23 @@ pub(crate) fn run_layers_resident<'a>(
     Ok(Some(x))
 }
 
+/// The slot a range's decode chain caches its GPU resources under
+/// (`ModelForward::forward_layers`): far above any request slot, so it
+/// never meets one.
+pub(crate) const RANGE_SLOT: usize = usize::MAX / 2;
+
+/// `ORANGU_WORKERS_RANGE_CHAIN=0`: a range's decode step takes the host
+/// step path instead of one recorded chain — the control arm the chain was
+/// measured against.
+pub(crate) fn range_chains() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_WORKERS_RANGE_CHAIN"))
+}
+
+/// Held while a range's decode chain is recorded and run, so two sequences
+/// on one worker never share [`RANGE_SLOT`]'s resources at once.
+pub(crate) static RANGE_CHAINS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub trait ModelForward: Send + Sync {
     fn config(&self) -> &ModelConfig;
 
@@ -3425,6 +3445,80 @@ pub trait ModelForward: Send + Sync {
 
     /// A fresh KV cache sized for `capacity` positions, for a new sequence.
     fn new_kv_cache(&self, capacity: usize) -> KvCache;
+
+    /// Whether this architecture can run as separate pieces — [`Self::embed`],
+    /// [`Self::forward_layers`] over any range of layers, then
+    /// [`Self::head`] — which is what spreading one model over a tree of
+    /// workers needs (`crate::workers`). `false` by default: an architecture
+    /// whose layers pass more than one `[n_tokens, n_embd]` residual stream
+    /// between them (hyper-connections, cross-layer residuals, per-layer
+    /// embeddings, recurrent state) cannot be cut at a layer boundary until
+    /// that extra state has a place on the wire.
+    fn supports_layer_split(&self) -> bool {
+        false
+    }
+
+    /// Whether the model may be cut before layer `at` — whether a node can
+    /// run the layers up to `at` and another the layers from it. Always,
+    /// unless a layer after the cut reads state a layer before it owns:
+    /// Gemma 4's layers that share another layer's KV cache.
+    fn split_allowed(&self, at: usize) -> bool {
+        let _ = at;
+        true
+    }
+
+    /// A KV cache for `capacity` positions that holds rows only for
+    /// `layers` — what a node running a slice of the model allocates. Layer
+    /// indices stay global; the layers outside the range are present but
+    /// hold nothing. The default is the whole model's cache, which is
+    /// correct and merely larger than it has to be.
+    fn new_kv_cache_for_layers(&self, layers: std::ops::Range<usize>, capacity: usize) -> KvCache {
+        let _ = layers;
+        self.new_kv_cache(capacity)
+    }
+
+    /// The residual stream entering layer 0 for `tokens`: `[n_tokens,
+    /// n_embd]`, row-major. Only valid when [`Self::supports_layer_split`].
+    fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let _ = tokens;
+        anyhow::bail!("this architecture cannot be split across layers")
+    }
+
+    /// Runs layers `layers` over `hidden` — the residual stream of
+    /// `tokens.len()` rows, at absolute positions starting at `start_pos`,
+    /// as it enters `layers.start` — appending those layers' keys and values
+    /// to `cache`, and returns the stream as it leaves `layers.end - 1`.
+    ///
+    /// Chaining [`Self::embed`], this over consecutive ranges covering every
+    /// layer, and [`Self::head`] computes exactly what [`Self::forward`]
+    /// does on the host path. `tokens` is passed for architectures whose
+    /// layers read the ids themselves.
+    fn forward_layers(
+        &self,
+        cache: &mut KvCache,
+        hidden: Vec<f32>,
+        tokens: &[u32],
+        layers: std::ops::Range<usize>,
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        let _ = (cache, hidden, tokens, layers, start_pos);
+        anyhow::bail!("this architecture cannot be split across layers")
+    }
+
+    /// The final norm alone, in place, over `n_rows` rows of the last
+    /// layer's residual stream: the hidden states an embeddings request
+    /// pools, for a model split across workers.
+    fn final_norm(&self, hidden: &mut [f32], n_rows: usize) -> Result<()> {
+        let _ = (hidden, n_rows);
+        anyhow::bail!("this architecture cannot be split across layers")
+    }
+
+    /// The final norm and output projection over `n_rows` rows of the last
+    /// layer's residual stream: one `[n_vocab]` logits row per input row.
+    fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        let _ = (hidden, n_rows);
+        anyhow::bail!("this architecture cannot be split across layers")
+    }
 
     /// Runs `tokens` (a contiguous chunk of one sequence, starting at
     /// absolute position `start_pos`) through the model, appending their

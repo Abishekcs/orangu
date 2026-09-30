@@ -104,6 +104,35 @@ pub struct AppState {
 /// been the wrong shape.
 const OPEN_PATHS: &[&str] = &["/health", "/ready"];
 
+/// What stays up on a node that is working for a parent (`crate::workers`):
+/// liveness, readiness (which says why it is not ready), the metrics, and
+/// the node's own view of its tree.
+const OPEN_WHILE_WORKING: &[&str] = &["/health", "/ready", "/metrics", "/v1/workers"];
+
+/// Turns the API away while this node's layers belong to a parent's
+/// requests — `doc/WORKERS.md`, "API off while assigned" — so the parent's
+/// work has the whole machine. 503 rather than a refusal: the node is
+/// unavailable for a while, not the wrong one.
+async fn pause_while_working_for_a_parent(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if crate::workers::node::api_paused() && !OPEN_WHILE_WORKING.contains(&request.uri().path()) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": "this orangu-server is working for a parent node; its own API \
+                                is off until the parent lets go",
+                    "type": "unavailable",
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 /// Establishes who is asking, and whether they may.
 ///
 /// No key configured means no check, which is the behaviour before this
@@ -265,10 +294,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/shutdown", post(shutdown))
+        .route("/v1/workers", get(native::workers))
         // The file-lifecycle API, mounted from the shared router
         // `orangu-coordinator` mounts too, so both front doors serve the
         // same eight endpoints over the same implementation.
         .merge(orangu::files_http::router::<AppState>())
+        .route_layer(axum::middleware::from_fn(pause_while_working_for_a_parent))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_api_key,

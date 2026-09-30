@@ -53,6 +53,12 @@ use sha2::{Digest, Sha256};
 use super::kv_cache::KvCache;
 use super::prefix_cache::CachedPrefill;
 
+/// How many positions more than a slot's own conversation another slot's
+/// must match before it is copied from ([`SlotStore::reuse_into`]): below
+/// this the copy — and on a tree, a message to every worker — is not worth
+/// what it saves.
+pub const SHARE_MIN: usize = 64;
+
 const SLOT_FILE_MAGIC: &[u8] = b"ORGUSLOT";
 const SLOT_FILE_VERSION: u32 = 1;
 
@@ -89,6 +95,45 @@ fn retained(
     cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// [`retained`] for a slot that may be busy: `None` rather than waiting.
+fn try_retained(
+    cell: &Mutex<Option<CachedPrefill>>,
+) -> Option<std::sync::MutexGuard<'_, Option<CachedPrefill>>> {
+    match cell.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// How many of `prompt`'s positions `entry` may give: its matching prefix,
+/// leaving at least one prompt token for a real forward pass. For a
+/// recurrent (SSM / gated-delta-net) architecture, whose state can only
+/// carry over whole, an exact full-prompt match cannot both carry the state
+/// and leave a fresh token, so it gives nothing — mirroring the
+/// all-or-nothing rule `CachedPrefill::reusable_prefix_len` enforces.
+fn usable_len(entry: &CachedPrefill, prompt: &[u32]) -> usize {
+    let raw = entry.reusable_prefix_len(prompt);
+    if raw == 0 {
+        0
+    } else if entry.cache.recurrent.is_empty() {
+        raw.min(prompt.len().saturating_sub(1))
+    } else if raw < prompt.len() {
+        raw
+    } else {
+        0
+    }
+}
+
+/// Whether reusing `len` positions of a conversation a tree's top-level node
+/// went on with alone (`KvCache::whole`, W-60) saves too little: the rest of
+/// the prompt would run here alone, and a tree reads a prompt faster than
+/// its top-level node — about 1.45 times on the board measured — so less
+/// than half the prompt reused is better sent through the tree whole.
+fn too_little_to_go_on_alone(src: &KvCache, dst: &KvCache, len: usize, prompt: &[u32]) -> bool {
+    src.whole && dst.remote.is_some() && len * 2 < prompt.len()
+}
+
 impl SlotStore {
     /// A stable hash of everything that must match for a saved KV cache to be
     /// safely reusable: the architecture, the model label (`general.name` /
@@ -121,7 +166,7 @@ impl SlotStore {
     /// Builds a store rooted at an explicit `dir` — used by [`Self::new`]
     /// (with the resolved `~/.orangu/server/<fingerprint>/slots` path) and by
     /// tests (with a scratch directory).
-    fn at(dir: PathBuf, fingerprint: String, n_slots: usize) -> Self {
+    pub(crate) fn at(dir: PathBuf, fingerprint: String, n_slots: usize) -> Self {
         Self {
             dir,
             fingerprint,
@@ -135,6 +180,15 @@ impl SlotStore {
     pub fn retain(&self, slot_id: usize, tokens: Vec<u32>, cache: KvCache) {
         if let Some(cell) = self.retained.get(slot_id) {
             *retained(cell) = Some(CachedPrefill { tokens, cache });
+        }
+    }
+
+    /// Drops every slot's retained snapshot: a `[workers]` node switching
+    /// between its tree and its model alone (W-84), whose caches do not
+    /// serve each other — one holds its rows on the workers.
+    pub fn clear(&self) {
+        for cell in &self.retained {
+            *retained(cell) = None;
         }
     }
 
@@ -152,26 +206,93 @@ impl SlotStore {
     /// skipped there rather than applied partially — mirroring the
     /// all-or-nothing rule `CachedPrefill::reusable_prefix_len` already
     /// enforces.
+    ///
+    /// On a model spread over workers, the rows of their layers are taken
+    /// over rather than copied ([`KvCache::take_remote_prefix`]), and the
+    /// snapshot is dropped: what is left of it could not serve again, and
+    /// this request's own cache replaces it when it ends.
+    ///
+    /// **In a tree of workers, another slot's conversation serves when it
+    /// matches clearly more** ([`SHARE_MIN`] positions past this slot's own
+    /// match) — the same system prompt under a different conversation, most
+    /// often. A server alone keeps to its own slot. Its rows
+    /// are copied and its snapshot kept, since it belongs to that slot: on a
+    /// model spread over workers, they copy their own rows
+    /// ([`KvCache::fork_remote_prefix`]), and a tree that cannot is not
+    /// shared from. Other slots are only looked at when free to, one at a
+    /// time, so two requests sharing from each other's slots never wait on
+    /// each other.
     pub fn reuse_into(&self, slot_id: usize, prompt: &[u32], dst: &mut KvCache) -> usize {
         let Some(cell) = self.retained.get(slot_id) else {
             return 0;
         };
-        let guard = retained(cell);
+        // Only in a tree of workers: a server alone reuses its own slot's
+        // conversation and nothing else, as it always has, and goes straight
+        // to it below.
+        let spread = dst.remote.is_some();
+        let own = match spread {
+            true => retained(cell)
+                .as_ref()
+                .map_or(0, |entry| usable_len(entry, prompt)),
+            false => 0,
+        };
+        let mut best: Option<(usize, usize)> = None;
+        for (other, cell) in self.retained.iter().enumerate() {
+            if other == slot_id || !spread {
+                continue;
+            }
+            let Some(guard) = try_retained(cell) else {
+                continue;
+            };
+            let len = guard.as_ref().map_or(0, |entry| usable_len(entry, prompt));
+            if len >= own + SHARE_MIN && best.is_none_or(|(_, longest)| len > longest) {
+                best = Some((other, len));
+            }
+        }
+        if let Some((other, _)) = best {
+            let shared = self.share_from(other, prompt, dst);
+            if shared > 0 {
+                log::debug!(
+                    "orangu-server: [slot {slot_id}] {shared} prompt positions shared from slot \
+                     {other}"
+                );
+                return shared;
+            }
+        }
+        let mut guard = retained(cell);
+        let Some(entry) = guard.as_mut() else {
+            return 0;
+        };
+        let len = usable_len(entry, prompt);
+        if len == 0 || too_little_to_go_on_alone(&entry.cache, dst, len, prompt) {
+            return 0;
+        }
+        let remote = dst.remote.is_some();
+        if !dst.take_remote_prefix(&mut entry.cache, len) {
+            return 0;
+        }
+        dst.copy_prefix_from(&entry.cache, len);
+        if remote {
+            *guard = None;
+        }
+        len
+    }
+
+    /// Copies slot `other`'s matching prefix into `dst`, keeping `other`'s
+    /// snapshot: see [`Self::reuse_into`]. `0` when that slot is busy, no
+    /// longer matches, or its workers cannot copy.
+    fn share_from(&self, other: usize, prompt: &[u32], dst: &mut KvCache) -> usize {
+        let Some(guard) = self.retained.get(other).and_then(try_retained) else {
+            return 0;
+        };
         let Some(entry) = guard.as_ref() else {
             return 0;
         };
-        let raw = entry.reusable_prefix_len(prompt);
-        if raw == 0 {
-            return 0;
-        }
-        let len = if entry.cache.recurrent.is_empty() {
-            raw.min(prompt.len().saturating_sub(1))
-        } else if raw < prompt.len() {
-            raw
-        } else {
-            0
-        };
-        if len == 0 {
+        let len = usable_len(entry, prompt);
+        if len == 0
+            || too_little_to_go_on_alone(&entry.cache, dst, len, prompt)
+            || !dst.fork_remote_prefix(&entry.cache, len)
+        {
             return 0;
         }
         dst.copy_prefix_from(&entry.cache, len);
@@ -192,6 +313,13 @@ impl SlotStore {
         let Some(entry) = guard.as_ref() else {
             return Ok(0);
         };
+        // A file holds the rows this process has. A model spread over
+        // workers keeps most of them there, and a file without them would
+        // restore into a server running the whole model as a cache with
+        // layers missing.
+        if entry.cache.remote.is_some() {
+            bail!("slot {slot_id} is spread over [workers]; its rows cannot be saved");
+        }
         let bytes = encode_file(&self.fingerprint, entry);
         // What the file actually carries, which is not `committed_len`: the
         // fused GPU decode path leaves the cache's `len` ahead of its host
@@ -527,6 +655,25 @@ mod tests {
         // No shared prefix: nothing reused.
         let mut dst = KvCache::new(1, 8, 4);
         assert_eq!(s.reuse_into(0, &[9, 9, 9], &mut dst), 0);
+    }
+
+    /// A server alone never copies another slot's conversation, however
+    /// much of the prompt it matches — its own slot's, as always. (In a
+    /// tree of workers it does: `workers::pipeline`'s
+    /// `another_slot_s_prefix_is_copied_on_every_worker`.)
+    #[test]
+    fn a_server_alone_keeps_to_its_own_slot() {
+        let tmp = TempDir::new();
+        let s = store(&tmp.0, 2);
+        let shared: Vec<u32> = (1..=100).collect();
+        s.retain(1, shared.clone(), filled_cache(2, 4, 100));
+        let mut prompt = shared[..90].to_vec();
+        prompt.push(999);
+        let mut dst = KvCache::new(2, 128, 4);
+        assert_eq!(s.reuse_into(0, &prompt, &mut dst), 0);
+        s.retain(0, shared[..60].to_vec(), filled_cache(2, 4, 60));
+        let mut own = KvCache::new(2, 128, 4);
+        assert_eq!(s.reuse_into(0, &prompt, &mut own), 60);
     }
 
     #[test]

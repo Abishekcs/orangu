@@ -70,6 +70,12 @@ pub const WEB_SECTION: &str = "web";
 /// `[prometheus]` section binds no third listener at all.
 pub const PROMETHEUS_SECTION: &str = "prometheus";
 
+/// The workers' own section: the address this server listens on for its
+/// workers (`host`/`port`) and the comma-separated `host:port` list of the
+/// workers themselves (`workers`). Like [`WEB_SECTION`] and
+/// [`PROMETHEUS_SECTION`], a config with no `[workers]` section has none.
+pub const WORKERS_SECTION: &str = "workers";
+
 /// The `host` value meaning "every network interface on this machine" —
 /// the default, and what `--init`'s `host` prompt offers first. `*` is
 /// accepted as an alias for it, since that is the spelling most other
@@ -125,6 +131,235 @@ pub fn default_metrics() -> u16 {
 /// as one server, and the value `-i`/`--init` has always offered.
 pub fn default_prometheus_port() -> u16 {
     8300
+}
+
+/// The port a `[workers]` section that doesn't name one gets. Next in the
+/// `8100`/`8101`/`8300` series, and clear of a bundle's `8200` console.
+pub fn default_workers_port() -> u16 {
+    8400
+}
+
+/// One entry of `[workers].workers`: where a worker is reached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerAddress {
+    pub host: String,
+    pub port: u16,
+}
+
+impl std::fmt::Display for WorkerAddress {
+    /// `host:port`, with an IPv6 literal bracketed so the pair parses back.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// The resolved `[workers]` section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkersConfiguration {
+    /// `[workers].host`: the address this server binds for its workers.
+    /// Falls back to `[orangu-server].host` when the key is absent, the same
+    /// as `[web].host` and `[prometheus].host`.
+    pub host: String,
+    /// `[workers].port`, [`default_workers_port`] when absent.
+    pub port: u16,
+    /// `[workers].workers`, in the order the file lists them.
+    pub workers: Vec<WorkerAddress>,
+    /// `[workers].standby`: spare workers, never planned into a share, one
+    /// of which takes over a lost worker's layers (`workers::guard`).
+    pub standby: Vec<WorkerAddress>,
+    /// `[workers].download = range`: a model not on disk is fetched in part —
+    /// what building it reads, then the layers a parent assigns — rather
+    /// than whole (`full`, the default). Only for a node with no workers of
+    /// its own, which never runs the whole model.
+    pub download_range: bool,
+    /// `[workers].shares`: `decode` (the default), `prompt` or `memory`.
+    pub shares: Shares,
+    /// `[workers].decode`: `auto` (the default), `tree` or `top`.
+    pub decode: DecodeOn,
+    /// `[workers].head`: `auto` (the default), `top` or `last`.
+    pub head: HeadOn,
+    /// `[workers].secret`: the shared secret parent and worker prove to
+    /// each other in the handshake (see `workers::auth`). `None` — the key
+    /// absent or blank — authenticates nobody.
+    pub secret: Option<String>,
+    /// `[workers].activations`: how hidden states travel to this node's
+    /// workers, `f16` by default.
+    pub activations: crate::workers::protocol::ActivationFormat,
+    /// `[workers].timeout`: how long one forward may take on a worker —
+    /// its whole subtree included — before the worker counts as lost.
+    pub timeout: std::time::Duration,
+    /// `[workers].connect_timeout`: how long reaching a worker may take.
+    pub connect_timeout: std::time::Duration,
+    /// `[workers].local_layers`: how many of this node's layers it runs
+    /// itself rather than handing to its workers.
+    pub local_layers: LocalLayers,
+    /// `[workers].tls_cert` / `tls_key`: the certificate and key this
+    /// node's worker listener serves TLS with. Both or neither.
+    pub tls: Option<(PathBuf, PathBuf)>,
+    /// `[workers].tls_ca`: the certificates this node trusts when it dials
+    /// its workers — defaulting to its own `tls_cert`, so a tree sharing one
+    /// certificate needs nothing more. With neither, it dials in the clear.
+    pub tls_ca: Option<PathBuf>,
+}
+
+/// `[workers].head`: which node applies the output head to a tree's
+/// last rows (W-61).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HeadOn {
+    /// The node running the final layer when its measured decode speed
+    /// beats the top-level node's; the top-level node otherwise.
+    #[default]
+    Auto,
+    /// Always the top-level node.
+    Top,
+    /// Always the node running the final layer.
+    Last,
+}
+
+/// `[workers].decode`: where a top-level node's sequences decode once their
+/// prompt is through the tree (W-60).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DecodeOn {
+    /// Here alone when this node holds the whole model and its measured
+    /// decode speed beats the tree's; through the tree otherwise.
+    #[default]
+    Auto,
+    /// Always through the tree.
+    Tree,
+    /// Here alone whenever this node holds the whole model.
+    Top,
+}
+
+/// `[workers].shares`: what a node divides its layers by between itself and
+/// its workers (W-86).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Shares {
+    /// Each node's speed through a decode step, as it measured it at
+    /// start, up to what its memory holds.
+    #[default]
+    Decode,
+    /// The same through a prompt chunk: for a tree that mostly reads long
+    /// prompts.
+    Prompt,
+    /// Memory alone; no node measures anything.
+    Memory,
+}
+
+/// `[workers].local_layers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LocalLayers {
+    /// A share sized like any worker's, from this node's own capacity.
+    #[default]
+    Auto,
+    /// Exactly this many — `0` makes the node a pure coordinator.
+    Count(usize),
+}
+
+/// `[workers].timeout` when absent: generous, because one forward of a
+/// long prefill chunk through a CPU-only subtree is measured in seconds.
+pub fn default_workers_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(60)
+}
+
+/// `[workers].connect_timeout` when absent.
+pub fn default_workers_connect_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(10)
+}
+
+/// A whole number of seconds, at least one.
+fn parse_seconds(key: &str, value: &str) -> Result<std::time::Duration> {
+    match value.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(std::time::Duration::from_secs(secs)),
+        _ => Err(anyhow!(
+            "invalid value for [{WORKERS_SECTION}].{key}: '{}' (expected a whole number of \
+             seconds, at least 1)",
+            value.trim()
+        )),
+    }
+}
+
+/// Whether `host` names this machine's loopback interface.
+fn is_loopback_name(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Refuses a `workers` list that names the same worker twice, or names this
+/// node's own `[workers]` address — a tree with a loop in it. A loop through
+/// another node, or through a spelling of this machine's address that isn't
+/// recognizable here, is caught in the handshake instead.
+///
+/// `workers` is `[workers].workers` followed by `[workers].standby`: a
+/// standby may not also be a worker.
+fn check_workers_list(host: &str, port: u16, workers: &[WorkerAddress]) -> Result<()> {
+    let listens_on_loopback =
+        host.eq_ignore_ascii_case(HOST_ALL) || host == HOST_ALL_ALIAS || is_loopback_name(host);
+    for (i, worker) in workers.iter().enumerate() {
+        if workers[..i].iter().any(|earlier| {
+            earlier.port == worker.port && earlier.host.eq_ignore_ascii_case(&worker.host)
+        }) {
+            bail!("[{WORKERS_SECTION}] lists '{worker}' twice (workers and standby together)");
+        }
+        if worker.port == port
+            && (worker.host.eq_ignore_ascii_case(host)
+                || (listens_on_loopback && is_loopback_name(&worker.host)))
+        {
+            bail!(
+                "[{WORKERS_SECTION}].workers lists '{worker}', which is this node's own \
+                 [{WORKERS_SECTION}] address"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parses `[workers].workers`: a comma-separated list of `host:port` pairs
+/// (an IPv6 host written `[::1]:8100`). Blank entries — a trailing comma, an
+/// empty value — are skipped; anything else that is not a `host:port` pair
+/// with a non-zero port is refused, naming the entry.
+pub fn parse_workers_list(value: &str) -> Result<Vec<WorkerAddress>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let invalid = |why: &str| {
+                anyhow!("invalid entry in [{WORKERS_SECTION}].workers: '{entry}' ({why})")
+            };
+            let (host, port) = entry
+                .rsplit_once(':')
+                .ok_or_else(|| invalid("expected host:port"))?;
+            let host = match host.strip_prefix('[') {
+                Some(rest) => rest
+                    .strip_suffix(']')
+                    .ok_or_else(|| invalid("unclosed '['"))?,
+                None if host.contains(':') => {
+                    return Err(invalid("an IPv6 address must be written [address]:port"));
+                }
+                None => host,
+            }
+            .trim();
+            if host.is_empty() {
+                return Err(invalid("missing host"));
+            }
+            let port = port
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| invalid("port must be 1-65535"))?;
+            Ok(WorkerAddress {
+                host: host.to_string(),
+                port,
+            })
+        })
+        .collect()
 }
 
 /// The address a bundled server binds when it was started with no config
@@ -278,6 +513,7 @@ pub fn bundled_configuration(
         // was started; a file log is a config-file decision like every other
         // deployment setting here.
         log: LogTarget::Console,
+        workers: None,
         mcp_servers: Vec::new(),
     }
 }
@@ -982,6 +1218,10 @@ pub struct ServerConfiguration {
     /// What a `--daemon` run needs: detached, its stdout is `/dev/null`, so
     /// without this a daemon serves in silence.
     pub log: LogTarget,
+    /// The `[workers]` section, or `None` when the file has none. Read and
+    /// validated at startup, but nothing serves it yet.
+    #[allow(dead_code)]
+    pub workers: Option<WorkersConfiguration>,
     /// Read-only HTTP MCP profiles exposed by the web console. Changing this
     /// list requires restarting `orangu-server`.
     pub mcp_servers: Vec<McpConfiguration>,
@@ -1162,6 +1402,166 @@ pub fn load_server_configuration(
             (port, metrics_host, explicit.is_some())
         }
         None => (default_metrics(), host.clone(), false),
+    };
+
+    let workers = match sections.remove(WORKERS_SECTION) {
+        Some(workers_section) => {
+            let port = match workers_section.get("port") {
+                Some(value) => value
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|err| anyhow!("invalid value for [{WORKERS_SECTION}].port: {err}"))?,
+                None => default_workers_port(),
+            };
+            let workers_host = workers_section
+                .get("host")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| host.clone());
+            let workers = match workers_section.get("workers") {
+                Some(value) => parse_workers_list(value)?,
+                None => Vec::new(),
+            };
+            let standby = match workers_section.get("standby") {
+                Some(value) => parse_workers_list(value)?,
+                None => Vec::new(),
+            };
+            check_workers_list(
+                &workers_host,
+                port,
+                &workers.iter().chain(&standby).cloned().collect::<Vec<_>>(),
+            )?;
+            let download_range = match workers_section.get("download").map(|v| v.trim()) {
+                None | Some("") => false,
+                Some(value) if value.eq_ignore_ascii_case("full") => false,
+                Some(value) if value.eq_ignore_ascii_case("range") => true,
+                Some(value) => bail!(
+                    "invalid value for [{WORKERS_SECTION}].download: '{value}' (expected full or \
+                     range)"
+                ),
+            };
+            if download_range && !workers.is_empty() {
+                bail!(
+                    "[{WORKERS_SECTION}].download = range needs a node with no workers of its \
+                     own: a node with workers may become top-level and run every layer"
+                );
+            }
+            let shares = match workers_section
+                .get("shares")
+                .map(|v| v.trim().to_ascii_lowercase())
+            {
+                None => Shares::Decode,
+                Some(v) if v.is_empty() || v == "decode" => Shares::Decode,
+                Some(v) if v == "prompt" => Shares::Prompt,
+                Some(v) if v == "memory" => Shares::Memory,
+                Some(value) => bail!(
+                    "invalid value for [{WORKERS_SECTION}].shares: '{value}' (expected decode, \
+                     prompt or memory)"
+                ),
+            };
+            let decode = match workers_section
+                .get("decode")
+                .map(|v| v.trim().to_ascii_lowercase())
+            {
+                None => DecodeOn::Auto,
+                Some(v) if v.is_empty() || v == "auto" => DecodeOn::Auto,
+                Some(v) if v == "tree" => DecodeOn::Tree,
+                Some(v) if v == "top" => DecodeOn::Top,
+                Some(value) => bail!(
+                    "invalid value for [{WORKERS_SECTION}].decode: '{value}' (expected auto, tree \
+                     or top)"
+                ),
+            };
+            let head = match workers_section
+                .get("head")
+                .map(|v| v.trim().to_ascii_lowercase())
+            {
+                None => HeadOn::Auto,
+                Some(v) if v.is_empty() || v == "auto" => HeadOn::Auto,
+                Some(v) if v == "top" => HeadOn::Top,
+                Some(v) if v == "last" => HeadOn::Last,
+                Some(value) => bail!(
+                    "invalid value for [{WORKERS_SECTION}].head: '{value}' (expected auto, top \
+                     or last)"
+                ),
+            };
+            let secret = workers_section
+                .get("secret")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let activations = match workers_section.get("activations") {
+                Some(value) => crate::workers::protocol::ActivationFormat::parse(value)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "invalid value for [{WORKERS_SECTION}].activations: '{}' (expected \
+                             one of {})",
+                            value.trim(),
+                            crate::workers::protocol::ActivationFormat::NAMES.join(", ")
+                        )
+                    })?,
+                None => crate::workers::protocol::ActivationFormat::default(),
+            };
+            let timeout = match workers_section.get("timeout") {
+                Some(value) => parse_seconds("timeout", value)?,
+                None => default_workers_timeout(),
+            };
+            let connect_timeout = match workers_section.get("connect_timeout") {
+                Some(value) => parse_seconds("connect_timeout", value)?,
+                None => default_workers_connect_timeout(),
+            };
+            let local_layers = match workers_section.get("local_layers").map(|v| v.trim()) {
+                None | Some("") => LocalLayers::Auto,
+                Some(value) if value.eq_ignore_ascii_case("auto") => LocalLayers::Auto,
+                Some(value) => LocalLayers::Count(value.parse::<usize>().map_err(|_| {
+                    anyhow!(
+                        "invalid value for [{WORKERS_SECTION}].local_layers: '{value}' \
+                         (expected auto or a number of layers)"
+                    )
+                })?),
+            };
+            Some(WorkersConfiguration {
+                host: workers_host,
+                port,
+                workers,
+                standby,
+                download_range,
+                shares,
+                decode,
+                head,
+                secret,
+                activations,
+                timeout,
+                connect_timeout,
+                local_layers,
+                tls: match (
+                    workers_section
+                        .get("tls_cert")
+                        .filter(|v| !v.trim().is_empty()),
+                    workers_section
+                        .get("tls_key")
+                        .filter(|v| !v.trim().is_empty()),
+                ) {
+                    (Some(cert), Some(key)) => {
+                        Some((expand_tilde(cert.trim()), expand_tilde(key.trim())))
+                    }
+                    (None, None) => None,
+                    (Some(_), None) => bail!(
+                        "[{WORKERS_SECTION}].tls_cert is set but tls_key is not — both are \
+                         needed, or neither"
+                    ),
+                    (None, Some(_)) => bail!(
+                        "[{WORKERS_SECTION}].tls_key is set but tls_cert is not — both are \
+                         needed, or neither"
+                    ),
+                },
+                tls_ca: workers_section
+                    .get("tls_ca")
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty())
+                    .map(expand_tilde),
+            })
+        }
+        None => None,
     };
 
     let model = section
@@ -1509,6 +1909,7 @@ pub fn load_server_configuration(
         reexec,
         delete,
         log,
+        workers,
         mcp_servers,
     })
 }
@@ -1667,7 +2068,7 @@ pub const MCP_APPROVAL_MODES: [&str; 4] = ["auto", "prompt", "writes", "deny"];
 
 impl McpConfiguration {
     /// Refuses what the file could not hold or the client could not read:
-    /// a section name that is empty, is one of the two reserved sections,
+    /// a section name that is empty, is one of the reserved sections,
     /// or would not survive the INI line it is written on; an empty
     /// endpoint; an approval mode orangu does not know.
     pub fn validate(&self) -> Result<()> {
@@ -1675,7 +2076,14 @@ impl McpConfiguration {
         if name.is_empty() {
             bail!("an MCP server needs a name");
         }
-        if name == SERVER_SECTION || name == WEB_SECTION {
+        if [
+            SERVER_SECTION,
+            WEB_SECTION,
+            PROMETHEUS_SECTION,
+            WORKERS_SECTION,
+        ]
+        .contains(&name)
+        {
             bail!("'{name}' is the server's own section, not an MCP server");
         }
         if name.contains(['[', ']', '\n', '\r', '=', '#', ';']) {
@@ -1794,6 +2202,8 @@ pub fn load_mcp_servers(path: &Path) -> Result<Vec<McpConfiguration>> {
     let mut sections = parse_ini_sections(&contents)?;
     sections.remove(SERVER_SECTION);
     sections.remove(WEB_SECTION);
+    sections.remove(PROMETHEUS_SECTION);
+    sections.remove(WORKERS_SECTION);
     let mut mcp_servers = sections
         .into_iter()
         .map(|(name, values)| parse_mcp_configuration(name, values))
@@ -1993,6 +2403,290 @@ mod tests {
         assert_eq!(conf.host, "all");
         assert_eq!(conf.metrics_host, "127.0.0.1");
         assert!(conf.metrics_host_explicit);
+    }
+
+    #[test]
+    fn no_workers_section_means_no_workers() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.workers, None);
+    }
+
+    /// A bare `[workers]` section takes the default port, the API's host,
+    /// and an empty list — and is not mistaken for an MCP server.
+    #[test]
+    fn a_bare_workers_section_takes_the_defaults() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nhost = 192.168.1.10\n\n[workers]\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        let workers = conf.workers.unwrap();
+        assert_eq!(workers.host, "192.168.1.10");
+        assert_eq!(workers.port, default_workers_port());
+        assert!(workers.workers.is_empty());
+        assert!(conf.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn the_workers_section_reads_host_port_and_the_worker_list() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[workers]\nhost = 127.0.0.1\nport = 9000\n\
+             workers = node1:8100, 10.0.0.2:8101,[::1]:8102,\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        let workers = conf.workers.unwrap();
+        assert_eq!(workers.host, "127.0.0.1");
+        assert_eq!(workers.port, 9000);
+        let listed: Vec<String> = workers.workers.iter().map(ToString::to_string).collect();
+        assert_eq!(listed, ["node1:8100", "10.0.0.2:8101", "[::1]:8102"]);
+        assert_eq!(workers.workers[2].host, "::1");
+    }
+
+    #[test]
+    fn rejects_a_malformed_worker_entry() {
+        for bad in [
+            "node1",
+            "node1:",
+            "node1:0",
+            "node1:70000",
+            ":8100",
+            "::1:8100",
+            "[::1:8100",
+        ] {
+            let err = parse_workers_list(&format!("node0:8100, {bad}")).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("'{bad}'")),
+                "{bad}: {err:#}"
+            );
+        }
+    }
+
+    fn workers_section(body: &str) -> Result<Option<WorkersConfiguration>> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nport = 8100\n\n[workers]\n{body}"
+        )
+        .unwrap();
+        load_server_configuration(file.path(), None, false).map(|conf| conf.workers)
+    }
+
+    #[test]
+    fn the_workers_tuning_keys_have_defaults() {
+        let workers = workers_section("").unwrap().unwrap();
+        assert_eq!(workers.secret, None);
+        assert_eq!(
+            workers.activations,
+            crate::workers::protocol::ActivationFormat::F16
+        );
+        assert_eq!(workers.timeout, default_workers_timeout());
+        assert_eq!(workers.connect_timeout, default_workers_connect_timeout());
+        assert_eq!(workers.local_layers, LocalLayers::Auto);
+        // A blank secret is no secret.
+        assert_eq!(
+            workers_section("secret =  \n").unwrap().unwrap().secret,
+            None
+        );
+    }
+
+    #[test]
+    fn the_workers_tuning_keys_are_read() {
+        let workers = workers_section(
+            "secret = s3cret\nactivations = Q8_0\ntimeout = 120\nconnect_timeout = 3\n\
+             local_layers = 0\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(workers.secret.as_deref(), Some("s3cret"));
+        assert_eq!(
+            workers.activations,
+            crate::workers::protocol::ActivationFormat::Q8_0
+        );
+        assert_eq!(workers.timeout, std::time::Duration::from_secs(120));
+        assert_eq!(workers.connect_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(workers.local_layers, LocalLayers::Count(0));
+        assert_eq!(
+            workers_section("local_layers = auto\n")
+                .unwrap()
+                .unwrap()
+                .local_layers,
+            LocalLayers::Auto
+        );
+    }
+
+    #[test]
+    fn the_workers_tls_keys_are_read_in_pairs() {
+        let workers = workers_section("").unwrap().unwrap();
+        assert_eq!((workers.tls, workers.tls_ca), (None, None));
+        let workers = workers_section("tls_cert = /c.pem\ntls_key = /k.pem\ntls_ca = /ca.pem\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            workers.tls,
+            Some((PathBuf::from("/c.pem"), PathBuf::from("/k.pem")))
+        );
+        assert_eq!(workers.tls_ca, Some(PathBuf::from("/ca.pem")));
+        for half in ["tls_cert = /c.pem\n", "tls_key = /k.pem\n"] {
+            let err = workers_section(half).unwrap_err();
+            assert!(err.to_string().contains("both are needed"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_workers_tuning_values() {
+        for (body, key) in [
+            ("activations = bf16\n", "activations"),
+            ("timeout = 0\n", "timeout"),
+            ("timeout = soon\n", "timeout"),
+            ("connect_timeout = -1\n", "connect_timeout"),
+            ("local_layers = some\n", "local_layers"),
+        ] {
+            let err = workers_section(body).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("[workers].{key}")),
+                "{body}: {err:#}"
+            );
+        }
+    }
+
+    /// A tree with a loop in it is refused where the config can see it: a
+    /// worker listed twice, or this node's own address.
+    #[test]
+    fn rejects_a_workers_list_that_loops() {
+        let err = workers_section("workers = a:8400, b:8400, A:8400\n").unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err:#}");
+        // `host` falls back to `all`, which answers on loopback too.
+        for own in ["127.0.0.1:8400", "localhost:8400", "[::1]:8400"] {
+            let err = workers_section(&format!("workers = a:8400, {own}\n")).unwrap_err();
+            assert!(err.to_string().contains("own"), "{own}: {err:#}");
+        }
+        let err =
+            workers_section("host = 10.0.0.5\nport = 9000\nworkers = 10.0.0.5:9000\n").unwrap_err();
+        assert!(err.to_string().contains("own"), "{err:#}");
+        // The same machine on another port is another node.
+        workers_section("workers = 127.0.0.1:8401\n").unwrap();
+        workers_section("host = 10.0.0.5\nworkers = 127.0.0.1:8400\n").unwrap();
+    }
+
+    /// `download` is `full` or `range`, and `range` only on a node with no
+    /// workers of its own.
+    /// `head` is `auto` (the default), `top` or `last`.
+    #[test]
+    fn the_head_key_reads_and_is_checked() {
+        assert_eq!(workers_section("").unwrap().unwrap().head, HeadOn::Auto);
+        assert_eq!(
+            workers_section("head = Last\n").unwrap().unwrap().head,
+            HeadOn::Last
+        );
+        assert_eq!(
+            workers_section("head = top\n").unwrap().unwrap().head,
+            HeadOn::Top
+        );
+        let err = workers_section("head = middle\n").unwrap_err();
+        assert!(err.to_string().contains("head"), "{err:#}");
+    }
+
+    /// `decode` is `auto` (the default), `tree` or `top`.
+    #[test]
+    fn the_decode_key_reads_and_is_checked() {
+        assert_eq!(workers_section("").unwrap().unwrap().decode, DecodeOn::Auto);
+        assert_eq!(
+            workers_section("decode = Top\n").unwrap().unwrap().decode,
+            DecodeOn::Top
+        );
+        assert_eq!(
+            workers_section("decode = tree\n").unwrap().unwrap().decode,
+            DecodeOn::Tree
+        );
+        let err = workers_section("decode = here\n").unwrap_err();
+        assert!(err.to_string().contains("decode"), "{err:#}");
+    }
+
+    /// `shares` is `decode` (the default), `prompt` or `memory`.
+    #[test]
+    fn the_shares_key_reads_and_is_checked() {
+        assert_eq!(workers_section("").unwrap().unwrap().shares, Shares::Decode);
+        assert_eq!(
+            workers_section("shares = Prompt\n")
+                .unwrap()
+                .unwrap()
+                .shares,
+            Shares::Prompt
+        );
+        assert_eq!(
+            workers_section("shares = memory\n")
+                .unwrap()
+                .unwrap()
+                .shares,
+            Shares::Memory
+        );
+        let err = workers_section("shares = speed\n").unwrap_err();
+        assert!(err.to_string().contains("shares"), "{err:#}");
+    }
+
+    #[test]
+    fn the_download_key_reads_and_is_checked() {
+        assert!(!workers_section("").unwrap().unwrap().download_range);
+        assert!(
+            !workers_section("download = full\n")
+                .unwrap()
+                .unwrap()
+                .download_range
+        );
+        assert!(
+            workers_section("download = Range\n")
+                .unwrap()
+                .unwrap()
+                .download_range
+        );
+        let err = workers_section("download = some\n").unwrap_err();
+        assert!(err.to_string().contains("full or range"), "{err:#}");
+        let err = workers_section("workers = a:8400\ndownload = range\n").unwrap_err();
+        assert!(err.to_string().contains("no workers of its own"), "{err:#}");
+    }
+
+    /// `standby` reads like `workers`, and a standby may not also be a
+    /// worker, nor this node.
+    #[test]
+    fn the_standby_list_reads_and_is_checked_with_the_workers() {
+        let conf = workers_section("workers = a:8400\nstandby = s:8400, t:8401\n")
+            .unwrap()
+            .unwrap();
+        let listed: Vec<String> = conf.standby.iter().map(ToString::to_string).collect();
+        assert_eq!(listed, ["s:8400", "t:8401"]);
+        assert!(
+            workers_section("workers = a:8400\n")
+                .unwrap()
+                .unwrap()
+                .standby
+                .is_empty()
+        );
+        let err = workers_section("workers = a:8400\nstandby = A:8400\n").unwrap_err();
+        assert!(err.to_string().contains("twice"), "{err:#}");
+        let err = workers_section("standby = 127.0.0.1:8400\n").unwrap_err();
+        assert!(err.to_string().contains("own"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_workers_port() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[workers]\nport = nope\n"
+        )
+        .unwrap();
+        let err = load_server_configuration(file.path(), None, false).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid value for [workers].port"),
+            "{err:#}"
+        );
     }
 
     /// The whole promise of a bundle: no config file, and it still comes up

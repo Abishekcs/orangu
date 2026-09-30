@@ -77,7 +77,13 @@ pub async fn health() -> impl IntoResponse {
 pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let queued = state.engine.slots.queued();
     let limit = state.engine.slots.queue_limit();
-    let (status, reason) = readiness(crate::device_lost::is_lost(), queued, limit);
+    let (status, reason) = match readiness(crate::device_lost::is_lost(), queued, limit) {
+        (StatusCode::OK, _) => match crate::workers::node::readiness() {
+            Some(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason),
+            None => (StatusCode::OK, "ok"),
+        },
+        unready => unready,
+    };
     (
         status,
         Json(serde_json::json!({
@@ -88,6 +94,12 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             "slots_total": state.engine.slots.total(),
         })),
     )
+}
+
+/// `GET /v1/workers`: this node's place in its tree of workers — its role,
+/// the layers it runs, the plan, and each configured worker.
+pub async fn workers() -> impl IntoResponse {
+    Json(crate::workers::node::status_json())
 }
 
 /// The readiness decision, apart from the state it reads.
@@ -120,12 +132,26 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 pub struct PropsUpdate {
     #[serde(default)]
     image: Option<super::images::ImageSettings>,
+    /// `{"enabled": false}` serves a `[workers]` tree's model alone, `true`
+    /// through the tree again (W-84).
+    #[serde(default)]
+    workers: Option<WorkersUpdate>,
+}
+
+#[derive(Deserialize)]
+pub struct WorkersUpdate {
+    enabled: bool,
 }
 
 pub async fn set_props(
     State(state): State<Arc<AppState>>,
     Json(update): Json<PropsUpdate>,
 ) -> impl IntoResponse {
+    if let Some(workers) = &update.workers
+        && let Err(why) = switch_workers(&state, workers.enabled).await
+    {
+        return (StatusCode::CONFLICT, why).into_response();
+    }
     if let Some(settings) = &update.image {
         let Some(pipeline) = state.engine.image.as_deref() else {
             return (StatusCode::NOT_IMPLEMENTED, "not an image model").into_response();
@@ -150,6 +176,40 @@ pub async fn set_props(
         );
     }
     Json(props_json(&state)).into_response()
+}
+
+/// `POST /props`' `workers`: switches a top-level `[workers]` node between
+/// its tree and its model alone. Only with no request running or queued —
+/// one mid-way keeps what it started on, and the slots' kept conversations
+/// are dropped, since neither way can reuse the other's. 409 when the node
+/// cannot switch.
+async fn switch_workers(state: &Arc<AppState>, enabled: bool) -> Result<(), String> {
+    let Some(switch) = state.engine.switch.clone() else {
+        return Err("this server does not serve through a [workers] tree".to_string());
+    };
+    if switch.is_alone() != enabled {
+        return Ok(());
+    }
+    if state.engine.slots.busy_count() > 0 || state.engine.slots.queued() > 0 {
+        return Err("requests are running; switch the workers between requests".to_string());
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        // Alone: requests go to the model before the workers are let go.
+        // Back: the tree is planned before requests go to it.
+        if !enabled {
+            switch.set_alone(true);
+        }
+        let result = crate::workers::node::set_alone(!enabled);
+        switch.set_alone(if result.is_ok() { !enabled } else { enabled });
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    if let Some(store) = &state.engine.slot_store {
+        store.clear();
+    }
+    result
 }
 
 fn props_json(state: &AppState) -> serde_json::Value {
@@ -183,6 +243,9 @@ fn props_json(state: &AppState) -> serde_json::Value {
             .is_some_and(crate::engine::backend::vulkan::VulkanBackend::op_timer_on),
         // `null` on a machine with no NPU — see `npu_tool::npu_props`.
         "npu": crate::npu_tool::npu_props(),
+        // `null` without a `[workers]` section; `enabled` is what `POST
+        // /props` switches (W-84).
+        "workers": crate::workers::node::props_json(),
         // What the server detected about this machine and chose because of
         // it — the `[adapt]` log lines, for a program: see `engine::adapt`.
         "adapt": crate::engine::adapt::decisions(),
@@ -530,6 +593,7 @@ pub fn render_metrics_text(state: &AppState) -> String {
     );
     body.push_str(&state.engine.metrics.render());
     body.push_str(&state.process_metrics.render(state.started_at.elapsed()));
+    body.push_str(&crate::workers::node::render_metrics());
     body
 }
 
@@ -675,6 +739,7 @@ pub async fn completion(
     if !req.stream {
         let mut content = String::new();
         let mut timings = serde_json::Value::Null;
+        let mut done = None;
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
@@ -685,6 +750,7 @@ pub async fn completion(
                 StreamEvent::Token(text) | StreamEvent::Reasoning(text) => content.push_str(&text),
                 StreamEvent::Done { stats, .. } => {
                     timings = super::openai::timings_json(&stats);
+                    done = Some(stats);
                     break;
                 }
                 StreamEvent::Overloaded => return crate::http::overloaded_response(),
@@ -697,8 +763,10 @@ pub async fn completion(
             .engine
             .tokenizer
             .clean_up_tokenization_spaces(&content);
-        return Json(serde_json::json!({"content": content, "stop": true, "timings": timings}))
-            .into_response();
+        let response =
+            Json(serde_json::json!({"content": content, "stop": true, "timings": timings}))
+                .into_response();
+        return super::openai::with_server_timing(response, done.as_ref());
     }
 
     let stream = async_stream::stream! {
