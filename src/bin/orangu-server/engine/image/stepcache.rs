@@ -38,8 +38,8 @@ impl Default for ImageCache {
 
 impl ImageCache {
     /// The default threshold of `easy`: on Qwen-Image 2.1 at 40 steps it
-    /// reuses 25 of the steps at ~31 dB against the uncached picture
-    /// (`doc/PERF-IMAGE.md`, task 4); 0.1 starts to ghost the lettering.
+    /// reuses 25 of the steps at ~31 dB against the uncached picture;
+    /// 0.1 starts to ghost the lettering.
     pub const EASY: f32 = 0.08;
 
     /// `off`, `easy`, or `easy:<threshold>`.

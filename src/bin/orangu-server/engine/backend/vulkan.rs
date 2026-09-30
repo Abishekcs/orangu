@@ -1480,8 +1480,8 @@ pub struct VulkanBackend {
     /// ([`Self::mmq_toks_for`]): [`vulkan_shaders::MMQ_WIDE_TILE_TOKENS`], or
     /// 32 on an ARM Mali. There the 128-token tile ran Llama-3.2-3B's FFN
     /// gate and up at 149 ms a layer against 66 with 64-token tiles, and a
-    /// 494-token prompt at 14.5 tok/s against 42.8 with 32-token ones — B-5
-    /// in `doc/BUGS.md`. `ORANGU_MMQ_TOKS` still pins one.
+    /// 494-token prompt at 14.5 tok/s against 42.8 with 32-token ones.
+    /// `ORANGU_MMQ_TOKS` still pins one.
     mmq_toks_cap: u32,
     /// Adapter subgroup support — the dual-nibble `Q4_K`/`Q6_K` reduce kernels
     /// are built with `subgroupAdd` whenever this is true (an unconditional win
@@ -1619,7 +1619,7 @@ pub struct VulkanBackend {
     /// whose subgroups are narrower (16 on the Mali-G720), where the
     /// 32-lane kernels are not built. Decode only — the cooperative prefill
     /// kernels keep their 32. `ORANGU_ATTN_COOP16=0` leaves such a device on
-    /// the classic split kernel (`doc/PERF-ALL.md`, task 6).
+    /// the classic split kernel.
     attn_coop_decode_lanes: u32,
     /// Effective decode-attention split-k factor (phase-1's `(n_head, k_num, 1)`
     /// grid + the partial-`(m,l,acc)` buffer sizes + phase-2's merge count).
@@ -2177,7 +2177,7 @@ impl CachedOpResources {
 /// this value and the old one the default was leaving a large fraction on the
 /// table for every narrow batch.
 ///
-/// Sweepable as `ORANGU_COOP_MIN_TOKENS`; `PERF-GAP.md` has the sweep.
+/// Sweepable as `ORANGU_COOP_MIN_TOKENS`.
 const COOP_MIN_N_TOKENS: usize = 24;
 
 /// Below this many 128 × 128 workgroups the wide integer-dot kernel leaves
@@ -2332,8 +2332,8 @@ fn expert_gemm_toks() -> u32 {
 }
 
 /// [`VulkanBackend::mmq_toks_cap`] for an adapter named `name`: 32 on an ARM
-/// Mali, the widest tile elsewhere. Measured on a Mali-G720 only (B-5 in
-/// `doc/BUGS.md`); other devices keep the choice they were tuned with.
+/// Mali, the widest tile elsewhere. Measured on a Mali-G720 only; other
+/// devices keep the choice they were tuned with.
 fn mmq_toks_cap_for(name: &str) -> u32 {
     if name.to_ascii_lowercase().contains("mali") {
         32
@@ -2607,7 +2607,7 @@ static TERNARY_IDOT_GROUPS: std::sync::LazyLock<usize> = std::sync::LazyLock::ne
 /// Rows per run of the integer-dot `Q4_K` decode kernel
 /// (`vulkan_shaders::shader_source_q4k_i8`): its activation words are
 /// loaded once per block and reused by every row. `ORANGU_Q4K_I8_ROWS`
-/// overrides it for measurement (`doc/PERF-ALL.md`, task 5). Measured on
+/// overrides it for measurement. Measured on
 /// the Mali-G720 in a decode step, with [`Q4K_I8_GROUPS`]: `ffn_gate`
 /// (1536 → 6144) at 4 × 4 265 µs, 4 × 8 274, 8 × 4 292, 8 × 2 308, 2 × 8
 /// 303, 8 × 1 399, 16 × 1 453, 1 × 16 453 — the float kernel's 368.
@@ -2902,8 +2902,8 @@ const READBACK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 ///
 /// A readback waits for everything submitted before it, and a prompt's pass
 /// on a slow device can take longer than the timeout all by itself — a
-/// ~500-token pass of Llama-3.2-3B on a Mali-G720 took 34 s (B-1 in
-/// `doc/BUGS.md`), and the server called a working device lost and exited.
+/// ~500-token pass of Llama-3.2-3B on a Mali-G720 took 34 s, and the server
+/// used to call a working device lost and exit.
 /// Such a pass is submitted in groups of layers, each finishing within
 /// seconds; each group finished moves the deadline out again. A device
 /// that finishes nothing for the whole timeout is still called lost, as
@@ -2952,7 +2952,7 @@ impl ReadbackDeadline {
 #[cfg(test)]
 mod mmq_tile_tests {
     /// An ARM Mali takes the prompt GEMM in 32-token tiles; every other
-    /// adapter keeps the widest (B-5 in `doc/BUGS.md`).
+    /// adapter keeps the widest.
     #[test]
     fn a_mali_caps_the_gemm_token_tile() {
         assert_eq!(super::mmq_toks_cap_for("Mali-G720-Immortalis"), 32);
@@ -4562,7 +4562,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // The decode kernel at the subgroup's own width where 32 is too
         // wide: a workgroup of one subgroup, so `subgroupAdd` is the whole
         // dot. On the Mali-G720 the classic split kernel took 27 ms a token
-        // of attention at depth 2048 (`doc/PERF-ALL.md`, task 6).
+        // of attention at depth 2048.
         let attn_coop_decode_lanes = if attn_coop {
             32
         } else if supports_subgroup
@@ -4605,8 +4605,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // so more splits are more parallelism: 32 where it is 32 lanes wide
         // (measured there), 64 at a narrower subgroup's width — on the
         // Mali-G720 at depth 2048, `attn.split` took 26.6 ms a token at 8
-        // splits, 14.3 at 16, 8.5 at 32 and 7.3 at 64 (`doc/PERF-ALL.md`,
-        // task 6).
+        // splits, 14.3 at 16, 8.5 at 32 and 7.3 at 64.
         let attn_split_k = attn_split_k_override.unwrap_or(match attn_coop_decode_lanes {
             0 => ATTN_SPLIT_K_DEFAULT,
             32.. => 32,
@@ -16083,8 +16082,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// this increment: it keeps every host-side reader of the state (slot
     /// persistence, prefix carry-over, the CPU path) correct with no mirror
     /// bookkeeping, at ~30 ms a token on the development board against the
-    /// ~170 ms of host work it replaces; `doc/PERF-BONSAI.md` task 1b says
-    /// where residency comes in.
+    /// ~170 ms of host work it replaces.
     ///
     /// `None` when the device declines — the integer-dot configuration, a
     /// head geometry the kernel does not cover, or a fold with a block the
@@ -21022,9 +21020,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// `engine::attention`'s decode path, and the cross-checks. A caller that is
     /// already building an encoder should use the recording form instead and
     /// keep the result on the device: on the generic decode path this call is
-    /// **one of the two GPU submissions per layer**, and `PERF-GAP.md` G3
-    /// measures that submission count as what decides whether concurrent
-    /// requests can fill the device at all.
+    /// **one of the two GPU submissions per layer**, and that submission count
+    /// decides whether concurrent requests can fill the device at all.
     pub fn gpu_attention_split(&self, input: GpuAttentionInput<'_>) -> Vec<f32> {
         // A paged cache with device pages goes to the paged kernel, which reads
         // the pool directly — so two sequences sharing a prefix read one copy
@@ -21119,8 +21116,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// reads it — removes one of the two waits per layer and the round trip of
     /// the vector with it.
     ///
-    /// Still one submission, so the `2·layers + 1` submission count
-    /// `PERF-GAP.md` G3 measures does not move; what moves is how much of each
+    /// Still one submission, so the `2·layers + 1` submission count does not
+    /// move; what moves is how much of each
     /// layer the host spends blocked.
     ///
     /// Two submissions on one queue execute in order, so the copy in the next

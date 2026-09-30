@@ -14,8 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Spreading one model's layers over a tree of `orangu-server` nodes —
-//! the `[workers]` section. See `doc/WORKERS.md` for the design and for
-//! what is built so far.
+//! the `[workers]` section.
 //!
 //! - [`protocol`]: the frames a parent and a worker exchange.
 //! - [`auth`]: proving `[workers].secret` without sending it.

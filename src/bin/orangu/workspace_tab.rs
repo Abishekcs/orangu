@@ -246,7 +246,7 @@ impl WorkspaceTab {
         // A fresh session's opening — the system prompt and the tools, the
         // ~1900 tokens every turn starts with — sent now, in the background,
         // so the server has prefilled it by the time the first prompt is
-        // typed (`doc/PERF-ALL.md`, task 4). A resumed session's server
+        // typed. A resumed session's server
         // cache is whatever it is; its history is not this opening.
         if prime
             && !is_resumed

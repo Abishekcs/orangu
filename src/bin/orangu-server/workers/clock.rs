@@ -21,7 +21,7 @@
 //! the CIX P1 from 2.5 GHz to 1.4–1.7 GHz — and every layer ran about 60%
 //! slower than on a server busy all the time: a two-node tree decoded at
 //! 160 ms a token where one server took 99. With the cores held at their
-//! clock, the same tree took 103 (`doc/PERF-WORKERS.md`).
+//! clock, the same tree took 103.
 //!
 //! What holds them is one spinning thread per core this process may run
 //! on, at `SCHED_IDLE` — below every other task, so it yields to any real

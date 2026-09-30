@@ -126,7 +126,7 @@ fn usable_len(entry: &CachedPrefill, prompt: &[u32]) -> usize {
 }
 
 /// Whether reusing `len` positions of a conversation a tree's top-level node
-/// went on with alone (`KvCache::whole`, W-60) saves too little: the rest of
+/// went on with alone (`KvCache::whole`) saves too little: the rest of
 /// the prompt would run here alone, and a tree reads a prompt faster than
 /// its top-level node — about 1.45 times on the board measured — so less
 /// than half the prompt reused is better sent through the tree whole.
@@ -184,7 +184,7 @@ impl SlotStore {
     }
 
     /// Drops every slot's retained snapshot: a `[workers]` node switching
-    /// between its tree and its model alone (W-84), whose caches do not
+    /// between its tree and its model alone, whose caches do not
     /// serve each other — one holds its rows on the workers.
     pub fn clear(&self) {
         for cell in &self.retained {

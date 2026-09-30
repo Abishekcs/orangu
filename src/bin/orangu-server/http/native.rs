@@ -133,7 +133,7 @@ pub struct PropsUpdate {
     #[serde(default)]
     image: Option<super::images::ImageSettings>,
     /// `{"enabled": false}` serves a `[workers]` tree's model alone, `true`
-    /// through the tree again (W-84).
+    /// through the tree again.
     #[serde(default)]
     workers: Option<WorkersUpdate>,
 }
@@ -187,7 +187,7 @@ async fn switch_workers(state: &Arc<AppState>, enabled: bool) -> Result<(), Stri
     let Some(switch) = state.engine.switch.clone() else {
         return Err("this server does not serve through a [workers] tree".to_string());
     };
-    if switch.is_alone() != enabled {
+    if switch.is_off() != enabled {
         return Ok(());
     }
     if state.engine.slots.busy_count() > 0 || state.engine.slots.queued() > 0 {
@@ -197,10 +197,10 @@ async fn switch_workers(state: &Arc<AppState>, enabled: bool) -> Result<(), Stri
         // Alone: requests go to the model before the workers are let go.
         // Back: the tree is planned before requests go to it.
         if !enabled {
-            switch.set_alone(true);
+            switch.set_off(true);
         }
         let result = crate::workers::node::set_alone(!enabled);
-        switch.set_alone(if result.is_ok() { !enabled } else { enabled });
+        switch.set_off(if result.is_ok() { !enabled } else { enabled });
         result
     })
     .await
@@ -244,7 +244,7 @@ fn props_json(state: &AppState) -> serde_json::Value {
         // `null` on a machine with no NPU — see `npu_tool::npu_props`.
         "npu": crate::npu_tool::npu_props(),
         // `null` without a `[workers]` section; `enabled` is what `POST
-        // /props` switches (W-84).
+        // /props` switches.
         "workers": crate::workers::node::props_json(),
         // What the server detected about this machine and chose because of
         // it — the `[adapt]` log lines, for a program: see `engine::adapt`.
@@ -869,7 +869,7 @@ pub struct ApplyTemplateRequest {
     /// A chat request's `tools`, rendered into the prompt as the chat
     /// endpoint renders them — without it this endpoint showed a tool
     /// request's prompt with every tool definition missing, which is most
-    /// of an `orangu` turn (`doc/PERF-ALL.md`, task 10).
+    /// of an `orangu` turn.
     #[serde(default)]
     tools: Option<serde_json::Value>,
 }

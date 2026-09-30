@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! A worker that downloads only what it runs (W-65, `[workers].download =
+//! A worker that downloads only what it runs (`[workers].download =
 //! range`).
 //!
 //! A worker runs a range of layers, and building the model reads only its

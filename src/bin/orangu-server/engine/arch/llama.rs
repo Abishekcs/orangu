@@ -491,7 +491,7 @@ pub fn no_fused_qkv() -> bool {
 /// RoPE and the KV write changes the trade — the saved round trips pay for GPU
 /// attention well before GPU attention pays for itself — so this threshold sits
 /// far below that one. Two thresholds because there are two crossovers, both
-/// swept; `PERF-GAP.md` has them.
+/// swept.
 ///
 /// A short continuation of a cached prompt is the shape that lands here, and it
 /// is the common one in multi-turn chat: everything but the newest message
@@ -683,11 +683,11 @@ impl LlamaModel {
     /// this step is not one the fused chain can describe.
     ///
     /// The hidden state never returns to the host: each layer's output buffer is
-    /// the next layer's input, so depth costs submissions nothing. `PERF-GAP.md`
-    /// G3 measures that as the difference between an engine that can fill the
-    /// device and one that cannot — the generic path costs one GPU round trip
-    /// per layer per chain and never passes 66% engine occupancy however many
-    /// concurrent requests it is given, while this form reaches 98% with two.
+    /// the next layer's input, so depth costs submissions nothing. That is the
+    /// difference between an engine that can fill the device and one that
+    /// cannot — the generic path costs one GPU round trip per layer per chain
+    /// and never passes 66% engine occupancy however many concurrent requests
+    /// it is given, while this form reaches 98% with two.
     ///
     /// `None` is the ordinary answer for anything the chain does not cover, and
     /// the caller then takes the step-by-step path unchanged.
@@ -1962,7 +1962,7 @@ impl LlamaModel {
             //
             // Unfused this is three blocking submit→fence→readback cycles
             // (`wo`, `gate`/`up`, `down`) out of the five a layer costs, and
-            // `PERF-GAP.md` prices a round trip on this stack at ~260 µs. The
+            // a round trip on this stack was measured at ~260 µs. The
             // fused chain is cross-checked against exactly the sequence in the
             // `else` branch below
             // (`fused_post_attention_prefill_matches_the_unfused_sequence_swiglu_*`).

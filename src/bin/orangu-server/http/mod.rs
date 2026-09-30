@@ -110,7 +110,7 @@ const OPEN_PATHS: &[&str] = &["/health", "/ready"];
 const OPEN_WHILE_WORKING: &[&str] = &["/health", "/ready", "/metrics", "/v1/workers"];
 
 /// Turns the API away while this node's layers belong to a parent's
-/// requests — `doc/WORKERS.md`, "API off while assigned" — so the parent's
+/// requests, so the parent's
 /// work has the whole machine. 503 rather than a refusal: the node is
 /// unavailable for a while, not the wrong one.
 async fn pause_while_working_for_a_parent(

@@ -697,6 +697,9 @@ fn main() -> ExitCode {
     let config_arg = args.config.clone();
     let workspace_arg = args.workspace.clone();
     let role_arg = args.role().unwrap_or_default();
+    // The model this start is for, named to the fallback when it fails to
+    // load (`reexec::REFUSED_MODEL_VAR`).
+    let model_arg = args.model.clone();
     let listen_arg = reexec::Listen {
         host: args.listen.host.clone(),
         api: args.listen.port,
@@ -738,7 +741,10 @@ fn main() -> ExitCode {
                 ) {
                     // `None` as the fallback of the fallback: one retry, so a
                     // pair of models that both fail can't loop forever.
-                    Ok(handover) => eprintln!("error: {:#}", handover.exec(fallback, role, None)),
+                    Ok(handover) => eprintln!(
+                        "error: {:#}",
+                        handover.exec_refusing(fallback, role, None, model_arg.as_deref())
+                    ),
                     Err(err) => eprintln!("error: {err:#}"),
                 }
             }
@@ -1232,7 +1238,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // whole model: the probes that time a decode step, the host preload,
     // the NPU's precompile of every block, the automatic split of an
     // oversized model between device and host, and the prefix warm-up are
-    // all skipped (`doc/WORKERS.md`, W-24). Weights are read, and uploaded
+    // all skipped. Weights are read, and uploaded
     // to a device, on first use; what a node never runs it never holds.
     let partial = conf.workers.is_some();
     let npu_precompile = conf.npu_precompile && !partial;
@@ -1855,7 +1861,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         engine::adapt::note("prompt attention", kernel.0, kernel.1);
     }
     // A `[workers]` node copies only the layers a plan gives it, by its tree's
-    // top-level decision (`workers::node`, W-85).
+    // top-level decision (`workers::node`).
     if conf.workers.is_none() {
         engine::prompt_weights::prepare(&loaded, conf.prompt_weights);
     }
@@ -2628,7 +2634,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                             );
                         }
                         // The model alone, with what the tree turns off, for `POST
-                        // /props` to switch to (W-84).
+                        // /props` to switch to.
                         let switch = Arc::new(engine::generate::ServingSwitch::new(
                             engine::generate::Serving {
                                 model,
@@ -2637,6 +2643,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                                 paged_kv,
                             },
                         ));
+                        workers::node::attach_serving(switch.clone());
                         let delegating: Arc<dyn ModelForward> = delegating;
                         (
                             delegating,
@@ -3247,13 +3254,13 @@ fn build_model(
 /// own — its plan over them.
 #[allow(clippy::too_many_arguments)]
 /// This machine's processors, as a `[workers]` node reports them to its
-/// parent (W-86): the CPU, every GPU, and an NPU — marked where this node's
+/// parent: the CPU, every GPU, and an NPU — marked where this node's
 /// layers run.
 fn node_devices(backend: &Arc<dyn Backend>, backend_label: &str) -> Vec<workers::protocol::Device> {
     use workers::protocol::Device;
     let cpu = orangu::hardware::detect_cpu();
     // Every kind of core, where they differ: a big.LITTLE part is not its
-    // first core's name (B-8).
+    // first core's name.
     let classes = orangu::hardware::core_classes();
     let cpu_name = if classes.len() > 1 && classes.iter().all(|c| c.name.is_some()) {
         classes
@@ -3377,6 +3384,7 @@ fn start_workers_node(
         shares: workers_conf.shares,
         decode: workers_conf.decode,
         head: workers_conf.head,
+        offload: workers_conf.offload,
         maintenance: std::time::Duration::from_secs(5),
         readmit: std::time::Duration::from_secs(30),
         tls: workers::transport::Tls::from_paths(
@@ -3617,6 +3625,44 @@ async fn serve(prepared: Prepared) -> Result<()> {
         }
     }
 
+    // How this process loads another model: the web console's model manager,
+    // and a [workers] node told by its parent to run the parent's model
+    // — which needs it with or without a console.
+    let handover = (reexec_allowed && reexec::supported())
+        .then(|| {
+            reexec::Handover::new(
+                config_path.clone(),
+                listen_override.clone(),
+                workspace.clone(),
+                role,
+                // The spec this process would be started with again. For
+                // an embedded model that is the reserved
+                // `bundle::EMBEDDED_SPEC`, not its label: the label names
+                // a Hugging Face repo, and a fallback that went to the
+                // network for a model already inside the file it is
+                // falling back into would fail exactly when the network
+                // is what's missing.
+                match bundle {
+                    Some(_) => bundle::EMBEDDED_SPEC.to_string(),
+                    None => model_label.clone(),
+                },
+                reexec::InheritedFds {
+                    api: Some(listener_fd(&listener)),
+                    web: web_listener.as_ref().map(listener_fd),
+                    metrics: metrics_listener.as_ref().map(listener_fd),
+                },
+            )
+            .map(Arc::new)
+            .map_err(|err| {
+                log::info!("Note       model loading from the web console is unavailable: {err:#}");
+            })
+            .ok()
+        })
+        .flatten();
+    if let Some(handover) = &handover {
+        workers::node::attach_handover(handover.clone());
+    }
+
     if let Some(web_listener) = web_listener {
         // Captured here because this is the last point where both listeners
         // and every resolved setting are in hand at once. Raw descriptor
@@ -3634,39 +3680,6 @@ async fn serve(prepared: Prepared) -> Result<()> {
             .clone()
             .or_else(default_server_config_path)
             .filter(|path| path.is_file());
-        let handover = (reexec_allowed && reexec::supported())
-            .then(|| {
-                reexec::Handover::new(
-                    config_path,
-                    listen_override.clone(),
-                    workspace.clone(),
-                    role,
-                    // The spec this process would be started with again. For
-                    // an embedded model that is the reserved
-                    // `bundle::EMBEDDED_SPEC`, not its label: the label names
-                    // a Hugging Face repo, and a fallback that went to the
-                    // network for a model already inside the file it is
-                    // falling back into would fail exactly when the network
-                    // is what's missing.
-                    match bundle {
-                        Some(_) => bundle::EMBEDDED_SPEC.to_string(),
-                        None => model_label.clone(),
-                    },
-                    reexec::InheritedFds {
-                        api: Some(listener_fd(&listener)),
-                        web: Some(listener_fd(&web_listener)),
-                        metrics: metrics_listener.as_ref().map(listener_fd),
-                    },
-                )
-                .map(Arc::new)
-                .map_err(|err| {
-                    log::info!(
-                        "Note       model loading from the web console is unavailable: {err:#}"
-                    );
-                })
-                .ok()
-            })
-            .flatten();
         // Resolved here, once, from the tree this server was rooted at: a
         // code block downloaded out of a reply is a file for *that* project,
         // so it carries that project's licence or none. See

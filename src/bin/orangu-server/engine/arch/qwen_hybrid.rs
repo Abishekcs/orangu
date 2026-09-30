@@ -1308,7 +1308,7 @@ impl DenseFfn {
     /// the backend is Vulkan/Metal and takes it. The generic path is two
     /// submissions with a readback between them, and on the development
     /// board a submission's round trip costs more than the FFN's own
-    /// kernels at decode; see `doc/PERF-BONSAI.md`. `normed` must already be
+    /// kernels at decode. `normed` must already be
     /// in `gate`/`up`'s basis (the caller rotates it on the host, which has
     /// the row anyway). `None` when the device declines — an integer-dot
     /// configuration, or a rotation the kernel does not do — and the caller

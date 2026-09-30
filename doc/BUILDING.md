@@ -160,7 +160,7 @@ not the problem: the Mali ICD (`/etc/vulkan/icd.d/mali.json`) reports
 `1.3.296`, and the `1.3.239` **loader** (`libvulkan1`) talks to it fine.
 Only the headers are old, and they are header-only. Two ways to get them:
 
-**Per build**, no root — what `doc/PERF-BONSAI.md`'s reference build does:
+**Per build**, no root:
 
 ```sh
 git clone --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers.git
@@ -203,8 +203,7 @@ The stock `/usr/local/bin/llama-*` on this board is a CPU-only build
 (`ldd llama-bench` shows no `libggml-vulkan`); a Vulkan build of the
 same tree installs beside it with `cmake --install build` after the
 headers above are in place, or runs from its `build/bin` — the fork under
-`/mnt/ai/pgmoneta/prism-llama.cpp` does the latter and is what
-`doc/PERF-BONSAI.md` compares against.
+`/mnt/ai/pgmoneta/prism-llama.cpp` does the latter.
 
 ## Test
 

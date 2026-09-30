@@ -16,7 +16,7 @@
 //! One `orangu-server` process's place in a tree of workers.
 //!
 //! A [`Node`] is both halves at once, and which one it is right now follows
-//! from what happens to it (`doc/WORKERS.md`, design decision 9):
+//! from what happens to it:
 //!
 //! - **Top-level.** With workers of its own and no parent, it dials them,
 //!   plans the model's layers over itself and them, and serves its own API
@@ -46,7 +46,7 @@ use super::protocol::{
 use super::session::SessionStore;
 use super::stage::{EncodedStage, MessageStage};
 use super::transport::{self, Tls};
-use crate::config::{DecodeOn, HeadOn, LocalLayers, Shares};
+use crate::config::{DecodeOn, HeadOn, LocalLayers, Offload, Shares};
 use crate::engine::arch::ModelForward;
 use crate::engine::loader::LoadedModel;
 use crate::engine::prompt_weights::{self, Decision};
@@ -100,10 +100,13 @@ pub struct NodeSettings {
     /// `[workers].shares`: what shares are sized by.
     pub shares: Shares,
     /// `[workers].decode`: where sequences decode once their prompt is
-    /// through the tree (W-60).
+    /// through the tree.
     pub decode: DecodeOn,
-    /// `[workers].head`: which node applies the output head (W-61).
+    /// `[workers].head`: which node applies the output head.
     pub head: HeadOn,
+    /// `[workers].offload`: whether the workers are used when this node
+    /// could serve alone.
+    pub offload: Offload,
     /// How often idle workers are pinged.
     pub maintenance: Duration,
     /// How often a top-level node missing a worker tries to take it back,
@@ -166,15 +169,25 @@ pub struct Node {
     this: OnceLock<Weak<Node>>,
     /// A top-level node's prompt-weight decision, measured at its first plan.
     decision: OnceLock<Decision>,
-    /// Switched to serve alone through `POST /props` (W-84): its workers
+    /// Switched to serve alone through `POST /props`: its workers
     /// let go, no plan made until switched back.
     alone: AtomicBool,
     /// Whether the current plan's sequences decode on this node alone once
-    /// their prompt is through the tree (W-60).
+    /// their prompt is through the tree.
     decode_alone: AtomicBool,
-    /// Whether the node running the final layer applies the output head
-    /// (W-61).
+    /// Whether the node running the final layer applies the output head.
     head_on_last: AtomicBool,
+    /// Why the last plan used no worker though there were some, or
+    /// `None` when it used them.
+    not_worth: Mutex<Option<String>>,
+    /// How this process loads another model — its own image again, with
+    /// that model — for a parent that assigns one. `None` where
+    /// `[web].reexec` is off or there is no `execve`.
+    handover: OnceLock<Arc<crate::reexec::Handover>>,
+    /// Set once a switch to the parent's model is under way.
+    switching: AtomicBool,
+    /// The engine's way of serving alone, told what this node decides.
+    serving: OnceLock<Arc<crate::engine::generate::ServingSwitch>>,
     /// What the last plan's shares followed: a speed, or memory.
     shares_by: Mutex<&'static str>,
     /// The layers and decision this node's prompt-weight copies were built
@@ -214,7 +227,7 @@ pub fn api_paused() -> bool {
     NODE.get().is_some_and(|node| node.is_assigned()) || super::fetch::incomplete()
 }
 
-/// Switches a top-level node between its tree and serving alone (W-84; the
+/// Switches a top-level node between its tree and serving alone (the
 /// engine's side is `engine::generate::ServingSwitch`). Refused on a node
 /// that is not top-level with workers, and on one that has only part of the
 /// model.
@@ -222,6 +235,22 @@ pub fn set_alone(alone: bool) -> Result<(), String> {
     match NODE.get() {
         Some(node) => node.set_alone(alone),
         None => Err("this server has no [workers] section".to_string()),
+    }
+}
+
+/// Hands the node the way this process loads another model.
+pub fn attach_handover(handover: Arc<crate::reexec::Handover>) {
+    if let Some(node) = NODE.get() {
+        let _ = node.handover.set(handover);
+    }
+}
+
+/// Hands the node the engine's way of serving alone, which it then keeps
+/// told whether its workers are worth it.
+pub fn attach_serving(switch: Arc<crate::engine::generate::ServingSwitch>) {
+    if let Some(node) = NODE.get() {
+        switch.set_chosen(node.not_worth.lock().unwrap().is_some());
+        let _ = node.serving.set(switch);
     }
 }
 
@@ -323,7 +352,7 @@ impl Node {
                 ..NodeSetup::default()
             });
         }
-        // Measured before a parent can ask (W-86): not for a node sharing by
+        // Measured before a parent can ask: not for a node sharing by
         // memory, nor for one that has only part of the model on disk and
         // does not know yet which layers it will have.
         if settings.shares != Shares::Memory
@@ -374,6 +403,10 @@ impl Node {
             alone: AtomicBool::new(false),
             decode_alone: AtomicBool::new(false),
             head_on_last: AtomicBool::new(false),
+            not_worth: Mutex::new(None),
+            handover: OnceLock::new(),
+            switching: AtomicBool::new(false),
+            serving: OnceLock::new(),
             copied: Mutex::new(None),
             top: RwLock::new((Arc::new(local), 0)),
             assignment: Mutex::new(None),
@@ -517,12 +550,14 @@ impl Node {
             "quant": self.settings.quant,
             "plan": plan,
             "workers": workers,
-            // This node's processors and speed (W-86), and what the last
+            // This node's processors and speed, and what the last
             // plan's shares followed.
             "setup": setups_json(&self.settings.capacity.setups[..1])[0],
             "shares": *self.shares_by.lock().unwrap(),
             // Where sequences decode once their prompt is through the tree.
             "decode": if self.decode_alone.load(Ordering::Acquire) { "here alone" } else { "through the tree" },
+            // Why the plan uses no worker though there are some.
+            "not_worth_offloading": self.not_worth.lock().unwrap().clone(),
             "head": if self.head_on_last.load(Ordering::Acquire) { "on the node with the final layer" } else { "here" },
             // Spare workers, and whom each stands in for since the last
             // plan, if anyone.
@@ -660,7 +695,7 @@ impl Node {
                 .iter()
                 .map(|(_, info)| plan::subtree_budget(&info.capacity))
                 .collect();
-            // By speed when every node below has measured it (W-86), each
+            // By speed when every node below has measured it, each
             // share up to what its memory holds; by memory otherwise.
             let mut weights = vec![own_budget];
             weights.extend(&budgets);
@@ -693,6 +728,27 @@ impl Node {
                 &weights[1..].iter().map(|b| (*b).max(1)).collect::<Vec<_>>(),
                 &|at| self.model.split_allowed(at),
             );
+            if top {
+                let why = self.not_worth_offloading(&range, &local, &shares, &candidates);
+                let alone = why.is_some();
+                *self.not_worth.lock().unwrap() = why;
+                if alone {
+                    return Ok(Planned {
+                        pipeline: Arc::new(LayerPipeline::new(
+                            self.model.clone(),
+                            range.clone(),
+                            Vec::new(),
+                        )?),
+                        entries: vec![PlanEntry {
+                            node: self.settings.name.clone(),
+                            layer_start: range.start as u32,
+                            layer_end: range.end as u32,
+                        }],
+                        used: Vec::new(),
+                        standing: Vec::new(),
+                    });
+                }
+            }
             let mut entries = vec![PlanEntry {
                 node: self.settings.name.clone(),
                 layer_start: local.start as u32,
@@ -986,12 +1042,27 @@ impl Node {
                 (Arc::new(local), vec![entry], Vec::new(), Vec::new())
             }
         };
-        if *self.plan.lock().unwrap() != entries {
-            log::info!("orangu-server: workers plan: {}", describe(&entries));
+        let why = self.not_worth.lock().unwrap().clone();
+        if let Some(switch) = self.serving.get() {
+            switch.set_chosen(why.is_some());
+        }
+        match &why {
+            Some(why) if *self.plan.lock().unwrap() != entries => log::info!(
+                "orangu-server: workers: serving alone, the workers are not worth it: {why}"
+            ),
+            _ if *self.plan.lock().unwrap() != entries => {
+                log::info!("orangu-server: workers plan: {}", describe(&entries))
+            }
+            _ => {}
         }
         let decode_alone = self.decides_to_decode_alone(&entries, &used);
-        if decode_alone != self.decode_alone.swap(decode_alone, Ordering::AcqRel)
-            || *self.plan.lock().unwrap() != entries
+        let working = entries
+            .iter()
+            .filter(|e| e.layer_start < e.layer_end)
+            .count();
+        if working > 1
+            && (decode_alone != self.decode_alone.swap(decode_alone, Ordering::AcqRel)
+                || *self.plan.lock().unwrap() != entries)
         {
             log::info!(
                 "orangu-server: workers: sequences decode {} once their prompt is through the tree",
@@ -1032,7 +1103,7 @@ impl Node {
     }
 
     /// Whether sequences decode on this node alone once their prompt is
-    /// through the tree (W-60), by `[workers].decode`: only when the plan
+    /// through the tree, by `[workers].decode`: only when the plan
     /// uses workers, every one of them can send rows back, and this node's
     /// budget holds the whole model — and, with `auto`, when its measured
     /// decode speed takes a token through every layer sooner than the plan's
@@ -1084,8 +1155,75 @@ impl Node {
         total as f64 / own < tree
     }
 
+    /// Why this node should serve alone rather than hand `shares` to its
+    /// workers, or `None` when the tree pays — or must be used: this
+    /// node cannot hold the model, `offload = always`, or a node did not
+    /// measure its speed. Predicted from the measured rates: a long
+    /// prompt runs at the pace of the tree's slowest stage (its parts
+    /// overlap), a decode step through every stage in turn — or here alone
+    /// after a handover. The tree must be at least 10% faster at one.
+    fn not_worth_offloading(
+        &self,
+        range: &Range<usize>,
+        local: &Range<usize>,
+        shares: &[Range<usize>],
+        candidates: &[(Arc<ChildLink>, ChildInfo)],
+    ) -> Option<String> {
+        if self.settings.offload == Offload::Always || shares.iter().all(Range::is_empty) {
+            return None;
+        }
+        let total = plan::bytes_of(range, &self.layer_bytes) as f64;
+        if (self.settings.capacity.budget_bytes as f64) < total + self.non_layer_bytes as f64 {
+            return None;
+        }
+        let own = self.settings.capacity.setups.first()?;
+        let (own_prompt, own_decode) = (own.prompt_rate as f64, own.decode_rate as f64);
+        if own_prompt <= 0.0 || own_decode <= 0.0 {
+            return None;
+        }
+        let bytes = |layers: &Range<usize>| plan::bytes_of(layers, &self.layer_bytes) as f64;
+        let mut prompt_stage = bytes(local) / own_prompt;
+        let mut decode_steps = bytes(local) / own_decode;
+        for ((_, info), share) in candidates.iter().zip(shares) {
+            if share.is_empty() {
+                continue;
+            }
+            let setups = &info.capacity.setups;
+            if setups.is_empty()
+                || setups
+                    .iter()
+                    .any(|s| s.prompt_rate <= 0.0 || s.decode_rate <= 0.0)
+            {
+                return None;
+            }
+            let prompt: f64 = setups.iter().map(|s| s.prompt_rate as f64).sum();
+            let decode: f64 = setups.iter().map(|s| s.decode_rate as f64).sum();
+            prompt_stage = prompt_stage.max(bytes(share) / prompt);
+            decode_steps += bytes(share) / decode;
+        }
+        let (alone_prompt, alone_decode) = (total / own_prompt, total / own_decode);
+        let tree_decode = if self.settings.decode == DecodeOn::Tree {
+            decode_steps
+        } else {
+            alone_decode
+        };
+        if prompt_stage < 0.9 * alone_prompt || tree_decode < 0.9 * alone_decode {
+            return None;
+        }
+        // Bytes over gigabytes a second: nanoseconds.
+        let ms = |ns: f64| ns / 1e6;
+        Some(format!(
+            "a 128-token prompt chunk takes {:.0} ms here alone and {:.0} at the tree's slowest \
+             stage; a decode step {:.1} ms alone and {:.1} through the tree",
+            ms(alone_prompt),
+            ms(prompt_stage),
+            ms(alone_decode),
+            ms(tree_decode)
+        ))
+    }
+
     /// Whether the node running the model's final layer applies the output
-    /// head (W-61), by `[workers].head`: only when that node is a worker of
+    /// head, by `[workers].head`: only when that node is a worker of
     /// this plan and every worker used can send logits back — and, with
     /// `auto`, when its measured decode speed beats this node's: the head is
     /// a matrix as wide as the vocabulary, read once a token.
@@ -1179,7 +1317,7 @@ impl Node {
 
     /// Lets go of the weights this node's plan no longer runs: every layer
     /// outside `local`, and — unless `keep_head`: the top-level node, which
-    /// embeds and samples, or the node with the final layer (W-61) — the
+    /// embeds and samples, or the node with the final layer — the
     /// embedding and output head. The kernel faults them
     /// back if a later plan wants them.
     fn release_unused(&self, local: &Range<usize>, keep_head: bool) {
@@ -1200,7 +1338,7 @@ impl Node {
     }
 
     /// Builds the prompt-weight copies of the layers this node runs, by the
-    /// top-level node's decision (W-85): a node copies only its own layers,
+    /// top-level node's decision: a node copies only its own layers,
     /// and every node rounds as the top does. Kept while a plan leaves the
     /// layers and the decision as they were.
     fn copy_prompt_weights(&self, local: &Range<usize>, weights: Decision) {
@@ -1218,10 +1356,70 @@ impl Node {
         *copied = Some((local.clone(), weights));
     }
 
+    /// A worker runs its parent's model: assigned another model than
+    /// the one loaded, it answers that it is switching, and replaces itself
+    /// with this binary serving `model` — found under `models` or fetched,
+    /// whole or in range, the way a start resolves it — once the answer is
+    /// on its way; the parent takes it back at a later plan. `None`, and the
+    /// assignment is refused as before, when the parent names the model this
+    /// node already serves (another file of it: switching would change
+    /// nothing), when a switch to `model` already failed here, or when this
+    /// process cannot load another model.
+    fn switch_to(&self, model: &str) -> Option<Message> {
+        if model.is_empty() || model == self.settings.label {
+            return None;
+        }
+        if crate::reexec::refused_model().as_deref() == Some(model) {
+            log::warn!(
+                "orangu-server: the parent serves {model}, which this node could not load; \
+                 serving {} and left out",
+                self.settings.label
+            );
+            return None;
+        }
+        let Some(handover) = self.handover.get().cloned() else {
+            log::warn!(
+                "orangu-server: the parent serves {model}; this node cannot switch to it \
+                 ([web].reexec is off)"
+            );
+            return None;
+        };
+        if !self.switching.swap(true, Ordering::AcqRel) {
+            log::info!(
+                "orangu-server: the parent serves {model}; switching to it from {}",
+                self.settings.label
+            );
+            let target = model.to_string();
+            let _ = std::thread::Builder::new()
+                .name("orangu-workers-switch".to_string())
+                .spawn(move || {
+                    // The answer below reaches the parent first.
+                    std::thread::sleep(Duration::from_millis(500));
+                    let previous = handover.current_model().to_string();
+                    let error = handover.exec(&target, handover.role(), Some(&previous));
+                    log::error!("orangu-server: could not switch to the parent's model: {error:#}");
+                });
+        }
+        Some(error(
+            ErrorCode::Busy,
+            format!(
+                "switching to {model}, the parent's model, from {}; ask again once it is loaded",
+                self.settings.label
+            ),
+        ))
+    }
+
     /// Answers a parent's `Assign`.
     fn handle_assign(&self, assign: Assign, parent_path: &[String]) -> Message {
         let n_layer = self.model.config().n_layer;
         let layers = assign.layer_start as usize..assign.layer_end as usize;
+        // Another model altogether: switch to it, before anything is
+        // asked of its layers here.
+        if !identity::same_layout(&self.loaded, &assign.identity)
+            && let Some(switching) = self.switch_to(&assign.model)
+        {
+            return switching;
+        }
         if !self.model.supports_layer_split() {
             return error(
                 ErrorCode::Unsupported,
@@ -1264,6 +1462,9 @@ impl Node {
             layers.clone(),
         );
         if let Err(error) = identity::check(&assign.identity, &own, &layers) {
+            if let Some(switch) = self.switch_to(&assign.model) {
+                return switch;
+            }
             log::warn!("orangu-server: refused an assignment: {error}");
             return Message::Error(error);
         }
@@ -1289,7 +1490,7 @@ impl Node {
             };
         self.set_standing(standing);
         // A node with the final layer keeps the output head, which it may be
-        // asked to apply (W-61).
+        // asked to apply.
         let local = pipeline.local_layers();
         self.release_unused(&local, !local.is_empty() && local.end == n_layer);
         self.copy_prompt_weights(&pipeline.local_layers(), terms.weights);
@@ -1751,6 +1952,7 @@ mod tests {
             shares: Shares::Memory,
             decode: DecodeOn::Tree,
             head: HeadOn::Top,
+            offload: Offload::Always,
             maintenance: Duration::from_millis(50),
             readmit: Duration::from_millis(200),
             tls: None,
@@ -2102,7 +2304,7 @@ mod tests {
 
     /// A worker that does not answer when the node plans is filled in for
     /// by a standby, which takes the share the worker would have had.
-    /// Switched alone (W-84), a node lets its workers go and plans nothing
+    /// Switched alone, a node lets its workers go and plans nothing
     /// while it stays so, even with them there to take back; switched back,
     /// it plans them in again.
     #[test]
@@ -2140,7 +2342,50 @@ mod tests {
         worker.stop();
     }
 
-    /// Shares follow the nodes' speeds when they differ (W-86), and each
+    /// A node that holds the model and would run it faster alone serves
+    /// alone and gives its workers nothing; one whose worker is much
+    /// faster uses it.
+    #[test]
+    fn a_node_uses_its_workers_only_when_they_pay() {
+        let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
+            let mut s = settings(name, workers, None);
+            s.shares = Shares::Decode;
+            s.offload = Offload::Auto;
+            s.decode = DecodeOn::Tree;
+            s.capacity.setups = vec![NodeSetup {
+                name: name.to_string(),
+                decode_rate: rate,
+                prompt_rate: rate,
+                ..NodeSetup::default()
+            }];
+            node_with(s, Variant::default())
+        };
+        let slow = with_rate("slow", vec![], 1.0);
+        let top = with_rate("top", vec![slow.local_addr().unwrap().to_string()], 10.0);
+        let _model = top.delegating_model().unwrap();
+        assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
+        assert!(!slow.is_assigned());
+        let why = top.status()["not_worth_offloading"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(why.contains("decode step"), "{why}");
+
+        let fast = with_rate("fast", vec![], 100.0);
+        let other = with_rate("other", vec![fast.local_addr().unwrap().to_string()], 10.0);
+        let _model = other.delegating_model().unwrap();
+        assert!(
+            other.plan().iter().any(|e| e.node == "fast"),
+            "{}",
+            describe(&other.plan())
+        );
+        assert!(other.status()["not_worth_offloading"].is_null());
+        for n in [&top, &slow, &other, &fast] {
+            n.stop();
+        }
+    }
+
+    /// Shares follow the nodes' speeds when they differ, and each
     /// node's setup reaches `/v1/workers`.
     #[test]
     fn a_faster_node_takes_more_layers() {
@@ -2208,7 +2453,7 @@ mod tests {
     }
 
     /// Every node of a tree copies the prompt weights of its own layers only,
-    /// by the top-level node's decision (B-6, W-85).
+    /// by the top-level node's decision.
     #[test]
     fn each_node_copies_its_own_layers_by_the_top_s_decision() {
         let a = node("a", &[], Variant::default());
@@ -2419,7 +2664,7 @@ mod tests {
         middle.stop();
     }
 
-    /// W-81: a two-level tree of a real model over TCP — top, middle, leaf,
+    /// A two-level tree of a real model over TCP — top, middle, leaf,
     /// each node with its own copy of the model (any architecture that
     /// splits; the prompt is Llama token ids, nonsense to another
     /// vocabulary, where `f16` and `q8_0` then drift apart on a chaotic

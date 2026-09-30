@@ -78,6 +78,12 @@ pub fn quantization_of(path: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Whether `loaded` has the hyperparameters and tensor directory `expected`
+/// names — the same model, at least in shape — without hashing any weights.
+pub fn same_layout(loaded: &LoadedModel, expected: &ModelIdentity) -> bool {
+    header_hash(loaded) == expected.header_hash
+}
+
 fn header_hash(loaded: &LoadedModel) -> [u8; 32] {
     let mut hash = Sha256::new();
     let prefix = format!("{}.", loaded.config.architecture);

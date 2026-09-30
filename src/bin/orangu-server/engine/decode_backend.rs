@@ -25,8 +25,7 @@
 //! each: the model's own forward pass, at the width a served token takes.
 //! The device keeps the model unless the cores are at least
 //! [`MIN_GAIN`] faster — at parity the device is the better place, since it
-//! leaves the cores to the prompts and to everything else (`doc/PERF-ALL.md`,
-//! task 7).
+//! leaves the cores to the prompts and to everything else.
 //!
 //! `ORANGU_DECODE_PROBE=0` skips the measurement and keeps the device, as
 //! before; an explicit `backend` is never second-guessed.

@@ -1953,8 +1953,8 @@ gemma 4 checkpoint."
                 // `pos`, not just up to it — see `Self::attention_window`.
                 let t0 = Instant::now();
                 // The GPU/CPU choice lives in `engine::attention`, not here.
-                // It used to live here, and that was the whole finding of
-                // `PERF-GAP.md`: this block was the only one in the engine, so
+                // It used to live here, and this block was the only one in the
+                // engine, so
                 // the four other architectures ran every prefill's attention on
                 // the CPU. Prefill attention is O(n_tokens²) and the largest CPU
                 // cost in the pass, so it is worth exactly one implementation of

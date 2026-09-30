@@ -50,11 +50,11 @@ pub const FEATURES: u64 = FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD;
 pub const FEATURE_FORK: u64 = 1;
 
 /// [`Message::Rows`]: a worker sends back one layer's keys and values for a
-/// session, so the top-level node can decode alone (W-60).
+/// session, so the top-level node can decode alone.
 pub const FEATURE_ROWS: u64 = 2;
 
 /// [`Rows::LastLogits`] and [`Rows::AllLogits`]: the node running the final
-/// layer sends back logits (W-61).
+/// layer sends back logits.
 pub const FEATURE_HEAD: u64 = 4;
 
 /// The largest frame either side accepts: a prefill chunk of 8192 tokens
@@ -249,7 +249,7 @@ pub struct Capacity {
     /// parent sizes this worker's share by.
     pub subtree_budget_bytes: u64,
     /// The processors and measured speed of the node and of every node
-    /// below it, the node's own first (W-86): what a parent sizes a
+    /// below it, the node's own first: what a parent sizes a
     /// worker's share by when its nodes differ, and what `/v1/workers`
     /// shows.
     pub setups: Vec<NodeSetup>,
@@ -318,7 +318,7 @@ pub enum Rows {
     /// through the tree.
     None,
     /// The last row's next-token logits: the node that runs the model's
-    /// final layer applies the output head to it (W-61). Only sent to a
+    /// final layer applies the output head to it. Only sent to a
     /// child that advertised [`FEATURE_HEAD`].
     LastLogits,
     /// Every row's logits, the same way: a multi-position verify.

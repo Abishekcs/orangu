@@ -2738,8 +2738,8 @@ pub fn install_ffn_service(model: &Path, budget_bytes: u64) {
     // run on is one timed block a side; whether its blocks are accurate
     // enough is five inferences against host-side `f32` references of
     // whole blocks, single-threaded — ~38% of the CIX P1's start-up samples
-    // for `gemma-4-E2B`, spent on a device the speed check then left out
-    // (`doc/PERF-ALL.md`, task 8). The cheap question decides whether the
+    // for `gemma-4-E2B`, spent on a device the speed check then left out.
+    // The cheap question decides whether the
     // expensive one is asked at all.
     if !beats_the_cpu(&gguf, model, &service, &widths) {
         return;
@@ -3082,7 +3082,7 @@ fn block_error(
 /// 11.7 ms against the CPU's 16.4 in one, 14.1 against 12.1 in another) —
 /// the CPU is a third less efficient at 128 tokens than at a chunk's 384,
 /// and the pass that took the NPU that start prefilled at 74 tok/s where
-/// the CPU alone does 150 (`doc/PERF-ALL.md`, task 12). Using the NPU also
+/// the CPU alone does 150. Using the NPU also
 /// holds every chunk of the pass to its width and leaves the cores idle
 /// while it runs, so it must win per token by [`NPU_MARGIN`].
 ///

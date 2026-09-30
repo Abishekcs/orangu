@@ -97,7 +97,7 @@ pub struct QwenImage21Transformer {
     proj_out: QuantMatrix,
     blocks: Vec<Block>,
     /// The blocks' linears requantized to per-row `int8` for the 8 × 8
-    /// `smmla` tile (`vecdot::RowI8`, `doc/PERF-IMAGE.md` task 10), keyed by
+    /// `smmla` tile (`vecdot::RowI8`), keyed by
     /// the weight's bytes — see [`ImageWeights`].
     rowi8: Option<std::collections::HashMap<usize, crate::engine::vecdot::RowI8>>,
 }

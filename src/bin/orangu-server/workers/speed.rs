@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! How fast a node runs its layers (W-86).
+//! How fast a node runs its layers.
 //!
 //! The nodes of a tree may be anything — a GPU, cores of one kind or
 //! another, prompts on an NPU — so a node times the model's first layers
@@ -34,7 +34,18 @@ use std::time::{Duration, Instant};
 pub const PROMPT_TOKENS: usize = 128;
 
 /// Decode steps timed, after two that are not.
-const DECODE_STEPS: usize = 8;
+const DECODE_STEPS: usize = 16;
+
+/// Times each range is timed, the two ranges in turn: the fastest of them is
+/// what counts, so a device still clocking up, or another process's burst,
+/// does not.
+const ROUNDS: usize = 3;
+
+/// The least part of the longer range's time the layers between the cuts
+/// must take for the difference to rate them. Below it the difference is
+/// noise divided by little (117 GB/s once, from a GPU that does 8), and the
+/// longer range is rated whole instead.
+const MIN_SHARE: f64 = 0.15;
 
 /// A node's measured speed: gigabytes of layer weights a second.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -54,7 +65,7 @@ const MEASURE_BYTES: u64 = 1 << 30;
 /// difference. A forward's fixed costs, whatever its range (Gemma 4's
 /// per-layer inputs for every layer, a device's submission and readback),
 /// cancel out: timing a short range alone made them the rate, and those
-/// costs differ from backend to backend (B-7 in `doc/BUGS.md`). A model too
+/// costs differ from backend to backend. A model too
 /// small for two cuts is rated over the one. Each range runs once untimed
 /// first: the first run reads the weights in, uploads them and builds a
 /// device's pipelines. Returns the speed, the layers rated and how long it
@@ -65,15 +76,28 @@ pub fn measure(
 ) -> Result<(Speed, Range<usize>, Duration)> {
     let started = Instant::now();
     let (short, long) = cuts(model, layer_bytes);
-    let (short_prompt, short_decode) = time_range(model, 0..short)?;
+    let fastest = |a: (Duration, Duration), b: (Duration, Duration)| (a.0.min(b.0), a.1.min(b.1));
+    let slowest = (Duration::MAX, Duration::MAX);
+    let (mut short_times, mut long_times) = (slowest, slowest);
+    for _ in 0..ROUNDS {
+        short_times = fastest(short_times, time_range(model, 0..short)?);
+        if let Some(long) = long {
+            long_times = fastest(long_times, time_range(model, 0..long)?);
+        }
+    }
+    let (short_prompt, short_decode) = short_times;
     let (layers, prompt, decode) = match long {
         Some(long) => {
-            let (long_prompt, long_decode) = time_range(model, 0..long)?;
+            let (long_prompt, long_decode) = long_times;
+            let between = |long: Duration, short: Duration| {
+                long.checked_sub(short)
+                    .filter(|d| d.as_secs_f64() >= MIN_SHARE * long.as_secs_f64())
+            };
             match (
-                long_prompt.checked_sub(short_prompt),
-                long_decode.checked_sub(short_decode),
+                between(long_prompt, short_prompt),
+                between(long_decode, short_decode),
             ) {
-                (Some(p), Some(d)) if !p.is_zero() && !d.is_zero() => (short..long, p, d),
+                (Some(p), Some(d)) => (short..long, p, d),
                 _ => (0..long, long_prompt, long_decode),
             }
         }
@@ -102,7 +126,7 @@ fn cuts(model: &dyn ModelForward, layer_bytes: &[u64]) -> (usize, Option<usize>)
     (short, long)
 }
 
-/// One 128-token prompt chunk's time and one decode step's (the mean of
+/// One 128-token prompt chunk's time and one decode step's (the fastest of
 /// [`DECODE_STEPS`]) through `layers`, each after an untimed run.
 fn time_range(model: &dyn ModelForward, layers: Range<usize>) -> Result<(Duration, Duration)> {
     let mut cache =
@@ -124,12 +148,12 @@ fn time_range(model: &dyn ModelForward, layers: Range<usize>) -> Result<(Duratio
         run(&tokens[..1], pos)?;
         pos += 1;
     }
-    let mut decode = Duration::ZERO;
+    let mut decode = Duration::MAX;
     for _ in 0..DECODE_STEPS {
-        decode += run(&tokens[..1], pos)?;
+        decode = decode.min(run(&tokens[..1], pos)?);
         pos += 1;
     }
-    Ok((prompt, decode / DECODE_STEPS as u32))
+    Ok((prompt, decode))
 }
 
 #[cfg(test)]

@@ -905,8 +905,7 @@ pub(crate) fn step_attention(
     attention_blocked(q, n_q, k, v, n_kv, n_head, head_dim, scale, limits, int8)
 }
 
-/// Where attention's value product `P · V` runs (`doc/PERF-IMAGE.md`,
-/// task 5), `ORANGU_IMAGE_PV` choosing for an A/B.
+/// Where attention's value product `P · V` runs, `ORANGU_IMAGE_PV` choosing for an A/B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueProduct {
     /// `bfmmla` on `bf16` probabilities and values, summed in `f32`

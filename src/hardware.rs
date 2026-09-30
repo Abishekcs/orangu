@@ -446,8 +446,8 @@ fn detect_power_source() -> (PowerSource, Option<u8>) {
 /// went the other way, 4.66 → 5.48 tok/s pinned. So the server keeps one
 /// worker per logical core for its global pool and offers the big cluster
 /// behind `ORANGU_EXPERT_BIG_CORES=1`; the per-phase pools a request runs
-/// in are chosen by measurement (`engine::cpu_pools` in `orangu-server`,
-/// `doc/PERF-ALL.md` task 9) — after the prompt path got faster the little
+/// in are chosen by measurement (`engine::cpu_pools` in `orangu-server`)
+/// — after the prompt path got faster the little
 /// cores stopped helping a prompt, and they still cost decode a third.
 ///
 /// Returns the cores at or above half the largest capacity — the big

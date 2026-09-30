@@ -12,8 +12,7 @@ conditions and streams the reply, exactly as a single server does.
 
 This chapter is the practical side: setting up a tree, securing it, and
 watching it. The *Inference server* chapter's **The `[workers]` section**
-has the reference for every key, and `doc/WORKERS.md` has the design and
-what is still to come.
+has the reference for every key.
 
 ## When it helps
 
@@ -136,7 +135,7 @@ secret = a-long-random-string
 `alpha` runs its share and hands the rest to `beta` and then `gamma`, in
 the order listed; a prompt's parts are pipelined through both, so the two
 workers work at the same time. On one board this shape read a 2041-token
-prompt as fast as the chain above (`doc/PERF-WORKERS.md`).
+prompt as fast as the chain above.
 
 To check a tree once it is up:
 
@@ -209,6 +208,14 @@ decoding through the tree gave 6.2. `decode = tree` keeps every step on the
 tree, `decode = top` hands over whenever the node holds the model, and
 `/v1/workers` says which applies.
 
+A node with workers does not have to use them. When it holds the whole
+model and its measured speeds say the tree would not be at least 10%
+faster, it serves alone and gives its workers nothing (`offload = auto`,
+the default; `always` uses them regardless). `/v1/workers` then says why
+under `not_worth_offloading`, and every later plan weighs it again. On a
+LAN of this board and two RK3588s with gemma-4-E2B, the node chose to
+serve alone: 261 tok/s on a long prompt, where its tree gave 28.
+
 When sequences decode through the tree, the output head — a matrix as wide
 as the vocabulary, read once a token — can run on the node with the final
 layer instead (`head = last`, or `auto` when that node measured the faster
@@ -238,13 +245,20 @@ A worker is left out, with a warning naming it and the reason, when it:
 - cannot be reached within `connect_timeout`;
 - does not know the `secret`. The secret is never sent: each side proves
   it with an HMAC over fresh random values;
-- has a **different model**. The parent compares, by content, the tensor
-  types and shapes and samples of the weights of the layers it would
-  run, so another quantization or another release is refused whatever
-  the file is called;
+- has a **different file of the same model spec**. The parent compares,
+  by content, the tensor types and shapes and samples of the weights of
+  the layers it would run, so another release of a spec is refused
+  whatever the file is called;
 - already works for another parent, or would close a loop in the configs.
 
 The tree then forms without it.
+
+A worker assigned **another model** than the one it serves switches to the
+lead's: it answers that it is switching, restarts itself on that model —
+found under its `models`, or downloaded — and the lead takes it back at its
+next plan. It keeps the model it had when the switch fails, or when its
+`[web].reexec` is `no`, and is then left out. A lead that loads a new model
+takes its workers with it the same way.
 
 ## Encryption
 
@@ -371,9 +385,8 @@ without. Nodes like that keep each other's cores busy anyway.
   next chunk. The top cuts the prompt into 128-token parts for this
   (`ORANGU_WORKERS_CHUNK`). `ORANGU_WORKERS_PIPELINE=0` turns the
   pipelining off.
-  `doc/PERF-WORKERS.md` has measurements: on one board, a pipelined tree
-  of three 4-thread nodes prefilled a 2041-token prompt 2.2× faster than
-  without pipelining.
+  On one board, a pipelined tree of three 4-thread nodes prefilled a
+  2041-token prompt 2.2× faster than without pipelining.
   `ORANGU_DECODE_BATCH=1` sends one decode step of every slot as a single
   message per worker.
 - On a GPU, a node runs its layers of a decode step as one recorded

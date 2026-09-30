@@ -24,7 +24,7 @@
 //! ceiling of ~40 for the whole CPU cluster — so no CPU kernel makes it
 //! faster. But that ceiling is the cluster's, not the memory's: with the
 //! Mali decoding at the same time the cores still read at 37–38 GB/s, so
-//! the two together reach ~60 (`doc/PERF-ALL.md`, task 14).
+//! the two together reach ~60.
 //!
 //! So when decode left a GPU idle, a fresh backend on that GPU is offered
 //! the head's last rows, and each token's head runs on both at once: the

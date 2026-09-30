@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! A worker's stage with a standby behind it (W-62).
+//! A worker's stage with a standby behind it.
 //!
 //! A lost worker otherwise costs the whole tree a new plan and every
 //! sequence a replay of all its tokens from the top. With `[workers].standby`

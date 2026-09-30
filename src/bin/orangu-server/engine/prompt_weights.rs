@@ -22,10 +22,9 @@
 //! GEMM (`vecdot::gemm_k_rows_mmla`) has to fold every one of them: per 32
 //! elements a multiply-accumulate and a re-zero per accumulator beside four
 //! `smmla`, and `Q4_K`'s min correction on top. On the CIX P1's A720s that
-//! holds the kernel to ~0.9 `smmla` a cycle where the core issues two
-//! (`doc/PERF-ALL.md`, task 12). A copy with one scale per *row*
-//! (`vecdot::RowI8`, built for the picture transformers — `doc/PERF-IMAGE.md`
-//! task 10) accumulates a whole 256-element super-block in `i32` on an
+//! holds the kernel to ~0.9 `smmla` a cycle where the core issues two. A
+//! copy with one scale per *row* (`vecdot::RowI8`, built for the picture
+//! transformers) accumulates a whole 256-element super-block in `i32` on an
 //! 8 × 8 tile and folds once.
 //!
 //! Weights the file stores as `F32`/`F16`/`BF16` (`gemma-4-E2B`'s per-layer
@@ -33,7 +32,7 @@
 //! widened to `f32` on every call; a `bf16` copy (`vecdot::Bf16Weights`)
 //! puts them on the 8 × 8 `bfmmla` tile at 2.4–3.7× — `int8` would be
 //! faster still but would quantize weights the file keeps exact, where
-//! `bf16` is within 0.15% of the `f32` product (`doc/PERF-ALL.md`, task 13).
+//! `bf16` is within 0.15% of the `f32` product.
 //!
 //! Whether either is worth its memory is the machine's question, so it is
 //! measured, not assumed, for each kind on its own. A kind's copies are
@@ -370,9 +369,9 @@ pub fn prepare(loaded: &LoadedModel, choice: PromptWeights) {
 
 /// Which kinds of copy a tree's prompts go through — decided once by its
 /// top-level node ([`decide`]) and handed to every worker with its layers,
-/// so every node of a tree rounds as the top does (W-85 in
-/// `doc/WORKERS.md`; B-2 in `doc/BUGS.md` was a tree whose nodes decided
-/// apart). A server alone keeps [`prepare`].
+/// so every node of a tree rounds as the top does: a tree whose nodes
+/// decided apart answered otherwise than one server. A server alone keeps
+/// [`prepare`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Decision {
     pub int8: bool,

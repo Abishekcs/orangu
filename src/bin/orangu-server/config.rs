@@ -182,6 +182,8 @@ pub struct WorkersConfiguration {
     pub decode: DecodeOn,
     /// `[workers].head`: `auto` (the default), `top` or `last`.
     pub head: HeadOn,
+    /// `[workers].offload`: `auto` (the default) or `always`.
+    pub offload: Offload,
     /// `[workers].secret`: the shared secret parent and worker prove to
     /// each other in the handshake (see `workers::auth`). `None` — the key
     /// absent or blank — authenticates nobody.
@@ -206,8 +208,20 @@ pub struct WorkersConfiguration {
     pub tls_ca: Option<PathBuf>,
 }
 
+/// `[workers].offload`: whether a top-level node uses its workers when it
+/// could serve alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Offload {
+    /// Only when the tree is predicted clearly faster than this node alone,
+    /// or this node cannot hold the model.
+    #[default]
+    Auto,
+    /// Whenever it has workers.
+    Always,
+}
+
 /// `[workers].head`: which node applies the output head to a tree's
-/// last rows (W-61).
+/// last rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum HeadOn {
     /// The node running the final layer when its measured decode speed
@@ -221,7 +235,7 @@ pub enum HeadOn {
 }
 
 /// `[workers].decode`: where a top-level node's sequences decode once their
-/// prompt is through the tree (W-60).
+/// prompt is through the tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DecodeOn {
     /// Here alone when this node holds the whole model and its measured
@@ -235,7 +249,7 @@ pub enum DecodeOn {
 }
 
 /// `[workers].shares`: what a node divides its layers by between itself and
-/// its workers (W-86).
+/// its workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Shares {
     /// Each node's speed through a decode step, as it measured it at
@@ -1485,6 +1499,18 @@ pub fn load_server_configuration(
                      or last)"
                 ),
             };
+            let offload = match workers_section
+                .get("offload")
+                .map(|v| v.trim().to_ascii_lowercase())
+            {
+                None => Offload::Auto,
+                Some(v) if v.is_empty() || v == "auto" => Offload::Auto,
+                Some(v) if v == "always" => Offload::Always,
+                Some(value) => bail!(
+                    "invalid value for [{WORKERS_SECTION}].offload: '{value}' (expected auto or \
+                     always)"
+                ),
+            };
             let secret = workers_section
                 .get("secret")
                 .map(|value| value.trim().to_string())
@@ -1528,6 +1554,7 @@ pub fn load_server_configuration(
                 shares,
                 decode,
                 head,
+                offload,
                 secret,
                 activations,
                 timeout,
@@ -2577,6 +2604,21 @@ mod tests {
 
     /// `download` is `full` or `range`, and `range` only on a node with no
     /// workers of its own.
+    /// `offload` is `auto` (the default) or `always`.
+    #[test]
+    fn the_offload_key_reads_and_is_checked() {
+        assert_eq!(workers_section("").unwrap().unwrap().offload, Offload::Auto);
+        assert_eq!(
+            workers_section("offload = Always\n")
+                .unwrap()
+                .unwrap()
+                .offload,
+            Offload::Always
+        );
+        let err = workers_section("offload = never\n").unwrap_err();
+        assert!(err.to_string().contains("offload"), "{err:#}");
+    }
+
     /// `head` is `auto` (the default), `top` or `last`.
     #[test]
     fn the_head_key_reads_and_is_checked() {

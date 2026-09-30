@@ -21,7 +21,7 @@
 //! time and walks its whole window, so a prompt of `T` tokens reads every
 //! cached K and V row about `T` times, and each read feeds one query's
 //! dot products. At 2048 tokens on `gemma-4-E2B` that was a quarter of the
-//! prefill (`doc/PERF-ALL.md`, task 3). Here a task owns `TILE_Q`
+//! prefill. Here a task owns `TILE_Q`
 //! consecutive queries and every head of one K/V group — `TILE_Q × group`
 //! rows sharing the same keys — and each K and V row is loaded once per
 //! four rows into registers (`qk_4x4`, `pv_4x16`) rather than once per
@@ -545,8 +545,8 @@ fn paired_i8_par(n: usize, dim: usize, rows: &[f32]) -> crate::engine::vecdot::P
 /// `bf16_tiles_at` for the value product.
 ///
 /// Within `int8`/`bf16` rounding of the `f32` loop, not float
-/// reassociation — the tests hold it to that, and the end-to-end check in
-/// `doc/PERF-ALL.md` (task 3) to the model's answers.
+/// reassociation — the tests hold it to that, and an end-to-end check held
+/// it to the model's answers.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_mixed(
     out: &mut [f32],

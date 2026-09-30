@@ -207,7 +207,7 @@ impl ToolExecutor {
 
     /// The tools offered to the model. Every definition is prefilled with
     /// every request's prompt — on a cold start ~1700 of a one-line
-    /// question's ~2040 tokens were these (`doc/PERF-ALL.md`, task 10) — so
+    /// question's ~2040 tokens were these — so
     /// a description says what the model cannot guess from the name and the
     /// parameters, and no more.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -1627,9 +1627,8 @@ mod file_lifecycle_tool_tests {
     }
 
     /// Every request's prompt carries the definitions, so they stay small:
-    /// 6982 characters of JSON (~1700 tokens) before `doc/PERF-ALL.md`
-    /// task 10, under 4700 until the `graph_explain`/`graph_path` tools,
-    /// under 5700 since.
+    /// 6982 characters of JSON (~1700 tokens) once, trimmed to under 4700
+    /// until the `graph_explain`/`graph_path` tools, under 5700 since.
     #[test]
     fn the_tool_definitions_stay_small() {
         let workspace = tempfile::tempdir().unwrap();

@@ -2079,7 +2079,7 @@ const Q6K_GROUPS: usize = SUPER_BLOCK / GROUP;
 /// [`dot_unpacked_pair`] prefill path instead, which is still fused; what it
 /// gives up is the per-256 integer accumulation, not the kernel. `Q2_K` is
 /// 11.5% of a `Q2_K` file against `Q3_K`'s 77.2%, so that trade is measured
-/// before it is paid for — see `doc/PERF-TINY.md`.
+/// before it is paid for.
 pub fn supports_k(ggml_type: u32, in_dim: usize) -> bool {
     // The Prism ternary types have no super-block of their own, but two of
     // their 128-blocks make one: `unpack_k_prism` turns the pair of `f16`
@@ -2852,7 +2852,7 @@ pub fn k_rows_per_task() -> usize {
 }
 
 /// The default for [`k_rows_per_task`]: measured on the board this was
-/// written on (see `doc/PERF-IMAGE.md`).
+/// written on.
 const K_ROWS_PER_TASK_DEFAULT: usize = 16;
 
 /// The widest `int8` matmul kernel this process will actually dispatch to,
@@ -3739,7 +3739,7 @@ impl PackedBf16 {
 /// `out[i][j] = a_i · b_j` for every row of `a` and of `b` (both packed
 /// over the same `k`), `out` row-major `[a.rows][b.rows]` — 8 × 8 tiles of
 /// sixteen `bfmmla` per eight loads, `f32` sums. The value product of the
-/// picture transformers' attention (`doc/PERF-IMAGE.md`, task 5b): `a` the
+/// picture transformers' attention: `a` the
 /// block's probabilities, `b` a head's values transposed.
 pub fn bf16_tiles(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
     debug_assert_eq!(a.chunks, b.chunks);
@@ -3825,7 +3825,7 @@ unsafe fn bf16_tiles_mmla(a: &PackedBf16, b: &PackedBf16, b_chunk: usize, out: &
 /// For weights the file stores unquantized (`F32`, `F16`, `BF16`), where an
 /// `int8` copy would add a quantization the file does not have: a `BF16`
 /// matrix is exact here, an `F32` one rounds each weight to 8 bits of
-/// mantissa (`doc/PERF-ALL.md`, task 13).
+/// mantissa.
 pub struct Bf16Weights {
     packed: PackedBf16,
     pub in_dim: usize,
@@ -3984,7 +3984,7 @@ pub const ROW_OCT: usize = 8;
 /// Weights as `int8` with **one `f32` scale per row**, packed eight rows at
 /// a time in [`ActQ8Mm`]'s block layout (`[group][block][pair][chunk][2][8]`,
 /// a pair's two rows side by side per 8-element chunk) — what
-/// [`matmul_rowi8`] multiplies (`doc/PERF-IMAGE.md`, task 10).
+/// [`matmul_rowi8`] multiplies.
 ///
 /// Unlike a K-quant row there is no per-block weight scale, so the tile
 /// accumulates in `i32` over a whole 256-element super-block and folds into
@@ -6313,7 +6313,7 @@ fn dot_k_row_q6_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
 ///
 /// Why it exists: the generic form ran at 5.0 GB/s of weights on one A720,
 /// a quarter of what one core can read, so eight cores could not reach the
-/// memory's rate however they were scheduled (`doc/PERF-ALL.md`, task 15).
+/// memory's rate however they were scheduled.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 unsafe fn dot_k_row_q4_k_sdot(row: &[u8], act: &ActQ8KRow) -> f32 {

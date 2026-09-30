@@ -330,7 +330,7 @@ pub struct Engine {
     /// generation endpoints answer with pictures rather than tokens. `None`
     /// for every language model, which is every other architecture.
     pub image: Option<Arc<super::image::Pipeline>>,
-    /// A `[workers]` top-level node's two ways of serving (W-84): through
+    /// A `[workers]` top-level node's two ways of serving: through
     /// its tree, or alone on the model's own paths, switched by `POST
     /// /props`. [`Self::model`], [`Self::mtp`], [`Self::prefix_cache`] and
     /// [`Self::paged_kv`] are the tree's then. `None` for every other
@@ -353,27 +353,64 @@ pub struct Serving {
 /// A top-level `[workers]` node's model alone — its own fused decode,
 /// resident prefill, prefix pool, paged KV and MTP head, as a server
 /// without `[workers]` has them — beside the tree the engine's own fields
-/// hold, and which of the two serves (W-84).
+/// hold, and which of the two serves.
 pub struct ServingSwitch {
     pub alone: Serving,
-    alone_now: std::sync::atomic::AtomicBool,
+    /// Switched off through `POST /props`.
+    off: std::sync::atomic::AtomicBool,
+    /// The node judged its workers not worth it.
+    chosen: std::sync::atomic::AtomicBool,
+    /// Which way serves changed since a request last looked: the slots'
+    /// kept conversations were made the other way, and cannot serve.
+    changed: std::sync::atomic::AtomicBool,
 }
 
 impl ServingSwitch {
     pub fn new(alone: Serving) -> Self {
         Self {
             alone,
-            alone_now: std::sync::atomic::AtomicBool::new(false),
+            off: std::sync::atomic::AtomicBool::new(false),
+            chosen: std::sync::atomic::AtomicBool::new(false),
+            changed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
+    /// Whether requests are served alone: switched off, or chosen.
     pub fn is_alone(&self) -> bool {
-        self.alone_now.load(std::sync::atomic::Ordering::Acquire)
+        self.off.load(std::sync::atomic::Ordering::Acquire)
+            || self.chosen.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub fn set_alone(&self, alone: bool) {
-        self.alone_now
+    /// Whether the workers were switched off through `POST /props`.
+    pub fn is_off(&self) -> bool {
+        self.off.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_off(&self, off: bool) {
+        let before = self.is_alone();
+        self.off.store(off, std::sync::atomic::Ordering::Release);
+        self.note_change(before);
+    }
+
+    /// The node's own judgement of its workers.
+    pub fn set_chosen(&self, alone: bool) {
+        let before = self.is_alone();
+        self.chosen
             .store(alone, std::sync::atomic::Ordering::Release);
+        self.note_change(before);
+    }
+
+    fn note_change(&self, before: bool) {
+        if before != self.is_alone() {
+            self.changed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Whether which way serves changed since the last call.
+    pub fn take_changed(&self) -> bool {
+        self.changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 }
 
@@ -483,6 +520,14 @@ impl Engine {
                 crate::device_lost::CLIENT_MESSAGE.to_string(),
             ));
             return rx;
+        }
+        // Served the other way than the slots' kept conversations were made
+        // (a `[workers]` node switching): they cannot serve.
+        if let Some(switch) = &self.switch
+            && switch.take_changed()
+            && let Some(store) = &self.slot_store
+        {
+            store.clear();
         }
         let Serving {
             model,
@@ -1147,10 +1192,10 @@ fn run(
             // reports is *the* difference between the two decode paths and
             // cannot be compared across architectures from inside one of them.
             // A decode step that is one submission lets concurrent requests
-            // interleave on the GPU; one that is two hundred does not, and
-            // `PERF-GAP.md` G3 measures that as a 2x aggregate-throughput
-            // ceiling. Costs a cached env read and one atomic load when the
-            // flag is on, nothing when it is off.
+            // interleave on the GPU; one that is two hundred does not, which
+            // was measured as a 2x aggregate-throughput ceiling. Costs a cached
+            // env read and one atomic load when the flag is on, nothing when it is
+            // off.
             let submissions_before = gpu_trace()
                 .then(|| model.vulkan_backend())
                 .flatten()

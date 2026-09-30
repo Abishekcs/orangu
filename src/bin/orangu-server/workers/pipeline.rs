@@ -68,7 +68,7 @@ pub trait Stage: Send + Sync {
     }
 
     /// Layer `layer`'s first `len` positions of `session` — `kv_dim`, keys,
-    /// values — from whichever node at or below this stage runs it (W-60). A
+    /// values — from whichever node at or below this stage runs it. A
     /// stage that cannot says so.
     fn layer_rows(
         &self,
@@ -142,8 +142,7 @@ pub struct LayerPipeline {
 }
 
 /// `ORANGU_WORKERS_PIPELINE=0`: every forward waits for the whole tree, as
-/// before prefill was pipelined — the comparison `doc/PERF-WORKERS.md` is
-/// measured against.
+/// before prefill was pipelined, for comparison.
 fn pipelining() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_WORKERS_PIPELINE"))
@@ -164,7 +163,7 @@ fn sub_chunk() -> usize {
 
 /// [`sub_chunk`] when unset. Measured on a three-node tree of
 /// Llama-3.2-3B, a 2041-token prompt: 54.1 s as the engine chunked it,
-/// 48.3 s at 64, **47.8 s at 128**, 48.7 s at 256 (`doc/PERF-WORKERS.md`).
+/// 48.3 s at 64, **47.8 s at 128**, 48.7 s at 256.
 const DEFAULT_SUB_CHUNK: usize = 128;
 
 type Reply = mpsc::SyncSender<Result<Vec<f32>, WorkerError>>;
@@ -216,7 +215,7 @@ impl Tail {
         // workers of a node taking turns — a flat tree of a top and two
         // workers read a prompt at 27 tok/s where a pyramid of the same
         // three nodes, whose middle node overlaps with its own worker, read
-        // it at 43 (`doc/PERF-WORKERS.md`).
+        // it at 43.
         let last = stages.len().saturating_sub(1);
         let mut inbox = Some(inbox);
         for (i, stage) in stages.into_iter().enumerate() {
@@ -572,7 +571,7 @@ impl LayerPipeline {
     /// What `rows` asks for out of `x`, the stream leaving this node's last
     /// layer: every row, the last, none — or, for the logits variants, those
     /// rows through the model's output head, which only the node running the
-    /// final layer may apply (W-61).
+    /// final layer may apply.
     fn finish(&self, mut x: Vec<f32>, rows: Rows) -> Result<Vec<f32>> {
         let n_embd = self.model.config().n_embd;
         match rows {
@@ -750,7 +749,7 @@ impl LayerPipeline {
     }
 
     /// Layer `layer`'s first `len` positions of `session`, from the stage
-    /// that runs it, once what the sequence has queued is through (W-60).
+    /// that runs it, once what the sequence has queued is through.
     pub fn stage_rows(
         &self,
         session: u64,
@@ -808,7 +807,7 @@ pub trait PipelineSource: Send + Sync {
     fn recover(&self, generation: u64) -> bool;
 
     /// Whether a sequence decodes on this node alone once its prompt is
-    /// through the tree (W-60): its rows come back from the workers at the
+    /// through the tree: its rows come back from the workers at the
     /// first decode step, and the model runs every later forward here.
     fn decode_alone(&self) -> bool {
         false
@@ -819,7 +818,7 @@ pub trait PipelineSource: Send + Sync {
     fn handover_failed(&self) {}
 
     /// Whether the node running the model's final layer applies the output
-    /// head and sends logits back, rather than this node (W-61).
+    /// head and sends logits back, rather than this node.
     fn head_on_last(&self) -> bool {
         false
     }
@@ -1096,7 +1095,7 @@ impl DelegatingModel {
     }
 
     /// Whether `cache` is served by the model here alone rather than through
-    /// the tree (W-60):
+    /// the tree:
     /// - its rows came back from the workers already ([`Self::hand_over`]);
     /// - it is a slot's conversation that was, taken up again: every layer
     ///   holds it here and the workers hold none of it;
@@ -1765,8 +1764,8 @@ mod tests {
     /// Whether `copies` copies of the model at `path` fit the memory
     /// available now — a GPU that shares the host's memory holds its own copy
     /// of the weights beside the mapped file. Says why when they do not, so a
-    /// test stops there instead of being killed for memory (T-1 in
-    /// `doc/BUGS.md`: gemma-4-31B on a 30 GiB board).
+    /// test stops there instead of being killed for memory (gemma-4-31B on a
+    /// 30 GiB board).
     fn fits_in_memory(path: &str, copies: u64) -> bool {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let mut system = sysinfo::System::new();
@@ -2067,7 +2066,7 @@ mod tests {
         assert_eq!(leaf.len(), 0);
     }
 
-    /// A source that decodes on the top-level node alone (W-60).
+    /// A source that decodes on the top-level node alone.
     struct HandingOver(Arc<LayerPipeline>);
 
     impl PipelineSource for HandingOver {
@@ -2084,7 +2083,7 @@ mod tests {
         }
     }
 
-    /// A source whose last node applies the output head (W-61).
+    /// A source whose last node applies the output head.
     struct HeadThere(Arc<LayerPipeline>);
 
     impl PipelineSource for HeadThere {
@@ -2101,8 +2100,8 @@ mod tests {
         }
     }
 
-    /// The output head on the node with the final layer, two levels down
-    /// (W-61): logits come back instead of the stream, exactly the model's
+    /// The output head on the node with the final layer, two levels down:
+    /// logits come back instead of the stream, exactly the model's
     /// own — for a prompt, each decode step and a multi-position forward. A
     /// node without the final layer refuses to apply it.
     #[test]
@@ -2156,7 +2155,7 @@ mod tests {
         assert!(err.to_string().contains("do not end the model"), "{err:#}");
     }
 
-    /// Decoding alone (W-60): the prompt runs through a two-level tree, the
+    /// Decoding alone: the prompt runs through a two-level tree, the
     /// first decode step brings every layer's rows back from the workers —
     /// the one below the worker too — and lets them go, and every logit is
     /// the model's alone. The slot's next turn goes on here, from its rows.
@@ -2411,7 +2410,7 @@ mod tests {
         assert_eq!(greedy(&split), greedy(model.as_ref()));
     }
 
-    /// What each activation format costs and changes, for W-58: bytes per
+    /// What each activation format costs and changes: bytes per
     /// token, encode and decode time for a 128-token part, what a byte
     /// coder could still take off (order-0 entropy), and against `f32` the
     /// largest logit error and how often the greedy token agrees over a
@@ -3070,7 +3069,7 @@ mod tests {
         println!("pieces / forward = {:.2}", pieces / whole);
     }
 
-    /// W-21 on the GPU: a model built on Vulkan, split in three, answers
+    /// On the GPU: a model built on Vulkan, split in three, answers
     /// what the same layers answer unsplit on the same layer-by-layer path
     /// — and that path answers what the fused whole-step path does, to the
     /// token. Their logits are reported: the two paths round differently.
@@ -3173,8 +3172,8 @@ mod tests {
     /// Which of a model's two GPU paths strays from the CPU: the model's own
     /// step (fused where it has one) and the per-layer path a tree's ranges
     /// take, each fed the CPU's greedy tokens and compared with the CPU's
-    /// logits, step by step — relative to each step's largest logit. What
-    /// B-3 in `doc/BUGS.md` is measured by. `ORANGU_TEST_VULKAN_MODEL=…
+    /// logits, step by step — relative to each step's largest logit.
+    /// `ORANGU_TEST_VULKAN_MODEL=…
     /// cargo test --release --bin orangu-server gpu_paths_against_the_cpu --
     /// --ignored --nocapture`.
     #[test]
@@ -3274,7 +3273,7 @@ mod tests {
 
     /// A decode step's cost on Vulkan, three ways: the model's own fused
     /// whole step, the same layers through `forward_layers`, and split in
-    /// three over in-process workers. What W-55 is measured by.
+    /// three over in-process workers.
     /// `ORANGU_TEST_VULKAN_MODEL=… cargo test --release --bin orangu-server
     /// vulkan_decode_step_costs -- --ignored --nocapture`.
     #[test]
@@ -3346,7 +3345,7 @@ mod tests {
     /// driver's timeout on the Mali, as the engine's chunk sizer knows —
     /// and split in three
     /// over in-process workers (the tree's 128-token parts, each range on
-    /// its own stream since W-55), with the last position's logits of the
+    /// its own stream), with the last position's logits of the
     /// split against the whole. Run with `ORANGU_WORKERS_RANGE_CHAIN=0` for
     /// the ranges' host step path instead. `ORANGU_TEST_VULKAN_MODEL=…
     /// cargo test --release --bin orangu-server vulkan_prefill_costs --

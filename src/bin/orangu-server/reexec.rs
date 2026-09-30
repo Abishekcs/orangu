@@ -71,6 +71,18 @@ pub const INHERIT_FDS_VAR: &str = "ORANGU_INHERIT_FDS";
 /// bounds the retry to one.
 pub const FALLBACK_MODEL_VAR: &str = "ORANGU_FALLBACK_MODEL";
 
+/// The model spec a handover could not load, set on the fallback image: a
+/// `[workers]` node told to switch to it (`crate::workers`) does not
+/// try again, and says why.
+pub const REFUSED_MODEL_VAR: &str = "ORANGU_REFUSED_MODEL";
+
+/// [`REFUSED_MODEL_VAR`], as this process started with it.
+pub fn refused_model() -> Option<String> {
+    std::env::var(REFUSED_MODEL_VAR)
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 /// The role the fallback model is served in, beside [`FALLBACK_MODEL_VAR`]
 /// — the role of the image that set it, which is the role that model was
 /// working in. Needed because the role is the model's own for a picture
@@ -354,6 +366,19 @@ impl Handover {
     /// itself, which is what stops the retry from looping.
     #[cfg(unix)]
     pub fn exec(&self, model: &str, role: Role, fallback: Option<&str>) -> anyhow::Error {
+        self.exec_refusing(model, role, fallback, None)
+    }
+
+    /// [`Self::exec`], telling the new image that `refused` could not be
+    /// loaded ([`REFUSED_MODEL_VAR`]).
+    #[cfg(unix)]
+    pub fn exec_refusing(
+        &self,
+        model: &str,
+        role: Role,
+        fallback: Option<&str>,
+        refused: Option<&str>,
+    ) -> anyhow::Error {
         use std::os::unix::process::CommandExt;
 
         // Rust opens every socket with `SOCK_CLOEXEC`, so without this the
@@ -387,6 +412,10 @@ impl Handover {
                 .env_remove(FALLBACK_MODEL_VAR)
                 .env_remove(FALLBACK_ROLE_VAR),
         };
+        match refused {
+            Some(refused) => command.env(REFUSED_MODEL_VAR, refused),
+            None => command.env_remove(REFUSED_MODEL_VAR),
+        };
 
         // `exec` replaces this image; anything it returns is the reason it
         // could not.
@@ -405,6 +434,17 @@ impl Handover {
             "cannot load '{model}': replacing {} needs execve, which this platform does not have",
             self.exe.display()
         )
+    }
+
+    #[cfg(not(unix))]
+    pub fn exec_refusing(
+        &self,
+        model: &str,
+        role: Role,
+        fallback: Option<&str>,
+        _refused: Option<&str>,
+    ) -> anyhow::Error {
+        self.exec(model, role, fallback)
     }
 }
 

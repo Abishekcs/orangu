@@ -136,7 +136,7 @@ impl ChatSession {
     /// one token asked for. The rendered prompt then matches the first real
     /// turn's up to where the user's words begin, so the server's shared KV
     /// pages hold all of it when that turn arrives. On the CIX P1 that opening
-    /// is ~1900 tokens and ~9 s of prefill (`doc/PERF-ALL.md`, task 4).
+    /// is ~1900 tokens and ~9 s of prefill.
     ///
     /// Returned as a future owning everything it needs, for the caller to
     /// spawn while the user types; its answer is dropped, and it touches

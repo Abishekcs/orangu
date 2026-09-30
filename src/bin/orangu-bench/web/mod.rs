@@ -260,21 +260,20 @@ struct Preset {
 ///
 /// - **decode `0 to 2048`** and **prefill `128 to 3072`** are the two series
 ///   `perf-history.tsv` has tracked from the beginning — the same points
-///   `PERF-GAP.md`'s standard harness runs (`--depths 0,512,1024 --gen 128
+///   the standard harness runs (`--depths 0,512,1024 --gen 128
 ///   --reps 3`, `--pp 128,512,1024 --reps 3`, best of 3), extended to the
 ///   longest depth already in the file. Run them and the numbers land beside
 ///   every historical row rather than beside nothing.
-/// - **continuation prefill `10 to 130 added`** is `PERF-GAP.md` increment
-///   7's table exactly. That sweep found a **2× cliff between 50 and 66
-///   tokens** — `COOP_MIN_N_TOKENS`, the width at which matmul switches to
-///   the tiled cooperative GEMM — and the widths on either side of it are
-///   what make the cliff visible. `--pp` cannot reach this regime at all: a
-///   whole prompt carries a chat template, so every `--pp` row is a wide
-///   batch.
+/// - **continuation prefill `10 to 130 added`** is the sweep that found a
+///   **2× cliff between 50 and 66 tokens** — `COOP_MIN_N_TOKENS`, the width
+///   at which matmul switches to the tiled cooperative GEMM — and the widths
+///   on either side of it are what make the cliff visible. `--pp` cannot
+///   reach this regime at all: a whole prompt carries a chat template, so
+///   every `--pp` row is a wide batch.
 /// - **concurrency `1 to 8 streams`** is the sweep behind "gemma pins the
 ///   engine at 99% with two streams where the generic path never passes 66%
-///   with eight" (`PERF-GAP.md` item 7, re-measured through this tool), and
-///   the one `RESEARCH.md` names for re-testing cross-sequence batching.
+///   with eight" (re-measured through this tool), and the one to re-test
+///   cross-sequence batching with.
 /// - **decode CPU `0 to 1024`** is the depth set that separated a claimed
 ///   +58% growth in CPU per token from the real +8.8% — the 58% was the
 ///   prefill's, charged to the generated tokens.

@@ -155,8 +155,8 @@ pub fn cpu_for_prompts(device: &Arc<dyn Backend>, w: &QuantMatrix) -> Option<Arc
 /// seconds; `pass` says what it runs, for the log. One GEMM put the cores
 /// 1.5–3× ahead on the CIX P1 where a whole prompt is 4.5×, and read the
 /// device anywhere from 4.7 to 39.8 ms as its clock ramped — right by a
-/// wide margin there, not a measurement to trust where the two are close
-/// (`doc/PERF-ALL.md`, task 8). The GEMM stays as the fallback for a pass
+/// wide margin there, not a measurement to trust where the two are close.
+/// The GEMM stays as the fallback for a pass
 /// that cannot be timed.
 pub fn cpu_for_prompts_by(
     device: &Arc<dyn Backend>,

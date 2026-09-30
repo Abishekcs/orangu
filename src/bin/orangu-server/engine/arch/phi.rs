@@ -925,7 +925,7 @@ impl PhiModel {
             // Deliberately *not* `fused_attention_prefill`, which this shape is
             // eligible for and which `arch::llama` does use: measured neutral
             // here (−0.6% on Phi-4-mini) and a clear loss on the sibling this
-            // was ported alongside. See PERF-GAP.md item 10.
+            // was ported alongside.
             let (mut q, mut k, v) = {
                 let mut out = self.backend.matmul_batch(&[
                     MatmulOp {

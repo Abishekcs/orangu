@@ -2538,7 +2538,7 @@ pub struct KvCache {
     /// carries the slot.
     pub remote: Option<Box<RemoteSession>>,
     /// Every layer's rows are here: a tree's top-level node took them over
-    /// from its workers to decode alone (`crate::workers`, W-60), and the
+    /// from its workers to decode alone (`crate::workers`), and the
     /// sequence goes on here. `false` for every other cache.
     pub whole: bool,
 }
@@ -3005,7 +3005,7 @@ impl KvCache {
 
     /// Layer `layer`'s first `len` positions as the host holds them — its
     /// `kv_dim`, keys and values — for a tree's top-level node taking a
-    /// sequence's rows over from its workers (`crate::workers`, W-60). `None`
+    /// sequence's rows over from its workers (`crate::workers`). `None`
     /// when the host does not hold them all, or the layer keeps more than one
     /// position a row. A layer that stores nothing (`kv_dim` 0) gives nothing.
     pub fn layer_rows(&self, layer: usize, len: usize) -> Option<(usize, Vec<f32>, Vec<f32>)> {
@@ -3130,7 +3130,7 @@ impl KvCache {
         let Some(capacity) = self.remote.as_ref().map(|mine| mine.capacity) else {
             return true;
         };
-        // A conversation that went on here alone (W-60).
+        // A conversation that went on here alone.
         if self.takes_whole(src, len) {
             self.whole = true;
             return true;

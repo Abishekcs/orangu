@@ -219,12 +219,12 @@ beside nothing:
 
 | Measurement | Scaling test | Where it comes from |
 | :-- | :-- | :-- |
-| Decode | `0 to 2048` | the tracked series in `perf-history.tsv`; `PERF-GAP.md`'s standard harness, best of 3 |
+| Decode | `0 to 2048` | the tracked series in `perf-history.tsv`, best of 3 |
 | Prefill | `128 to 3072` | the tracked `pp` series — every recorded prefill row came from these lengths |
 | Combined | `128 to 3072` | the tracked prefill lengths with the tracked decode length, timed as one turn |
-| Continuation prefill | `10 to 130 added` | `PERF-GAP.md` increment 7, the sweep that found the 2× cooperative-GEMM cliff between 50 and 66 tokens |
+| Continuation prefill | `10 to 130 added` | the sweep that found the 2× cooperative-GEMM cliff between 50 and 66 tokens |
 | Decode curve | `0 to 3072 in one pass` | the curve invocation this manual documents below |
-| Concurrency | `1 to 8 streams` | `PERF-GAP.md` item 7 — 99% engine occupancy at two streams against a generic path stuck at 66% with eight |
+| Concurrency | `1 to 8 streams` | 99% engine occupancy at two streams against a generic path stuck at 66% with eight |
 | Embeddings | `64 to 256` | `embeddinggemma-300M`'s own sweep, 15 reps |
 | Decode CPU | `0 to 1024` | the depths that separated a claimed +58% CPU-per-token growth from the real +8.8% |
 
@@ -560,9 +560,6 @@ orangu-bench --image 1024 --image-steps 1 --reps 1 \
     --flamegraph /mnt/fast/edit.svg --flamegraph-freq 199
 ```
 
-`doc/PERF-IMAGE.md` is where these measurements are kept and turned into
-tasks.
-
 `tokens` is the transformer's sequence: one latent token per 16×16 pixels
 (the VAE's 8× compression times the transformer's 2×2 patch), so a 256-pixel
 square is 256 tokens and a 1024-pixel one is 4096. `steps` says how many
@@ -630,13 +627,13 @@ The reproducible case: a 130-token prefill measured 360 tok/s on a fresh server
 and on a server that had only seen wide widths, but **94 tok/s** on a server
 that had just been swept across eight narrow widths — the identical request,
 four runs out of four. The cause is not established (an arena-pressure
-hypothesis was implemented and measured neutral, see `PERF-GAP.md`).
+hypothesis was implemented and measured neutral).
 
 What to do about it:
 
 - **Comparisons within one sweep order are still valid.** If both arms of an
   A/B sweep the same widths in the same order, whatever the effect is applies
-  to both, and the ratio survives. This is why the A/Bs in `PERF-GAP.md` pin
+  to both, and the ratio survives. This is why an A/B should pin
   the width list across arms.
 - **A single absolute number is not.** If a specific width's rate is the
   result, measure that width on a fresh server rather than reading it off the

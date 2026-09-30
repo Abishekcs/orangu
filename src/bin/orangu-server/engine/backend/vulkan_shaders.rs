@@ -4084,7 +4084,7 @@ pub fn shader_source_ternary_i8(
 /// fused decode chain already quantizes to `int8` per 32 (binding 1,
 /// [`PRELUDE_Q8`]'s layout) — the skeleton of [`shader_source_ternary_i8`],
 /// which took the ternary types to 34–44 GB/s on the Mali-G720 where the
-/// float kernels read at 14–17 (`doc/PERF-ALL.md`, task 5).
+/// float kernels read at 14–17.
 ///
 /// 64 lanes, eight to a 256-element super-block and eight super-blocks in
 /// flight. Lane `sub` of a block takes sixteen bytes of `qs` — bytes
@@ -13093,7 +13093,7 @@ fn owned_dim_dot(q_prefix: &str, k_prefix: &str, count: u32) -> String {
 /// subgroup's own width where they are narrower (16 on the Mali-G720), so
 /// the one `subgroupAdd` still covers the whole dot. At 16 a lane owns
 /// `head_dim / 16` dims — 16 for `gemma-4-E2B`'s sliding layers, 32 for its
-/// full ones (`doc/PERF-ALL.md`, task 6).
+/// full ones.
 pub fn shader_source_attention_split_coop(
     kv_storage: KvStorage,
     head_dim: u32,

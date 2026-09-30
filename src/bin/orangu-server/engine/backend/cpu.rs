@@ -1035,7 +1035,7 @@ mod tests {
     /// first layers at prompt-chunk widths — printing each matrix's type,
     /// shape, time and `int8` ops per second. Run with
     /// `ORANGU_TEST_MODEL=<gguf> cargo test … -- --ignored --nocapture
-    /// k_gemm_timing`; `doc/PERF-ALL.md` task 12.
+    /// k_gemm_timing`.
     #[test]
     #[ignore = "a timing, not a check"]
     fn k_gemm_timing_on_a_real_model() {
@@ -1058,8 +1058,7 @@ mod tests {
             "blk.0.ffn_down.weight",
             "blk.20.ffn_gate.weight",
             "blk.20.ffn_down.weight",
-            // `gemma-4-E2B`'s unquantized per-layer-embedding matrices
-            // (`doc/PERF-ALL.md`, task 13).
+            // `gemma-4-E2B`'s unquantized per-layer-embedding matrices.
             "blk.0.inp_gate.weight",
             "blk.0.proj.weight",
             "per_layer_model_proj.weight",
@@ -1143,8 +1142,7 @@ mod tests {
     /// against a plain parallel read of the same bytes in the same pool —
     /// the ceiling the kernel could reach. Run pinned to the cores decode
     /// uses, e.g. `taskset -c 0,1,6-11` with `ORANGU_TEST_THREADS=8` and
-    /// `ORANGU_TEST_MODEL=<gguf> … -- --ignored --nocapture decode_matvec`;
-    /// `doc/PERF-ALL.md` task 15.
+    /// `ORANGU_TEST_MODEL=<gguf> … -- --ignored --nocapture decode_matvec`.
     #[test]
     #[ignore = "a timing, not a check"]
     fn decode_matvec_timing_on_a_real_model() {

@@ -20,8 +20,8 @@
 //! per core, and a compute-bound step split evenly across them finishes
 //! when the slowest core does. Whether that costs or pays is the
 //! workload's and the machine's question: on the CIX P1 (8 × A720 + 4 ×
-//! A520) the little cores once helped a prompt, and after `doc/PERF-ALL.md`
-//! tasks 3, 12 and 13 they no longer do (prompts 231 tok/s at 2048 tokens
+//! A520) the little cores once helped a prompt, and since the tiled
+//! attention and the prompt-weight copies they no longer do (prompts 231 tok/s at 2048 tokens
 //! on twelve workers, 229 on the eight big cores), while they cost the CPU
 //! backend's decode a third of its rate (8.2 tok/s on twelve, 12.6 on the
 //! eight — task 9).
@@ -70,7 +70,7 @@ impl Pool {
 /// hundreds of parallel regions to the global pool from outside (queue,
 /// wake, latch), and one on a pool worker splits them from its own deque.
 /// On the CIX P1 that alone took the CPU backend's decode from 12.6 to
-/// 17.5 tok/s on the same eight cores (`doc/PERF-ALL.md`, task 9).
+/// 17.5 tok/s on the same eight cores.
 static ALL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 /// The big-core pool, when this machine has one.

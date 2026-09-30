@@ -1636,8 +1636,7 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   the device's copy is released. The `[adapt] decode:` line says what was
   measured, with the cores timed in their best worker pool. On the CIX
   P1 the eight big cores now out-decode the Mali (`gemma-4-E2B`: ~46 against
-  ~64 ms a step, and faster at every depth to 4096 — see
-  `doc/PERF-ALL.md`, tasks 7, 9 and 15), so decode moves to them;
+  ~64 ms a step, and faster at every depth to 4096), so decode moves to them;
   `backend = vulkan` keeps the GPU. `ORANGU_DECODE_PROBE=0` skips it and keeps the
   device.
   When decode leaves a GPU idle, **the output head may be shared with it**
@@ -1648,7 +1647,7 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   and the `[adapt] output head:` line says which. On the CIX P1 it is not
   kept: the Mali's clock governor holds it at 72 MHz at decode's duty cycle,
   and the split made a step twice as slow. The check costs ~1.1 s at
-  start-up (`doc/PERF-ALL.md`, task 14). `ORANGU_HEAD_SPLIT=0` skips it.
+  start-up. `ORANGU_HEAD_SPLIT=0` skips it.
 - `device` — _which card_, when `backend` finds more than one: `auto` (the
   default — every device on the machine, best first, one of which runs the
   model), an index as printed at startup, or any part of the device's name.
@@ -2069,6 +2068,8 @@ delete = yes
   `127.0.0.1`.
 - `reexec` — whether the console's model manager may load a different model
   (default `yes`; `no`/`true`/`false`/`on`/`off`/`1`/`0` are all accepted).
+  On a `[workers]` node it is also whether the node may switch to its
+  parent's model.
   Loading one restarts this process on it, so a deployment that needs the
   server it started to stay the server it started — behind a supervisor, or
   where one specific model is the point of the process — sets `no`, and every
@@ -2125,8 +2126,7 @@ Spreads one model's layers over several machines: a tree of
 handing the rest to the workers it lists (which may list workers of their
 own). Clients talk to the top-level node, which tokenizes, samples and
 streams; the hidden states travel down the tree and back for every
-prefill chunk and every generated token. `doc/WORKERS.md` has the design
-and what is still to come.
+prefill chunk and every generated token.
 
 Like `[web]` and `[prometheus]`, a config with no `[workers]` section has
 none. `-i`/`--init` asks `Add workers` (default yes), then `host`, `port`,
@@ -2209,6 +2209,13 @@ machines without a `secret` is warned about at startup.
   it for a weak top-level node and a large vocabulary; `auto` does so when
   that node measured the faster decode. That node then keeps the output
   head in memory.
+- `offload` — `auto` (the default) or `always`. With `auto` a top-level
+  node that holds the whole model uses its workers only when its measured
+  speeds say the tree is at least 10% faster — at a long prompt (its
+  slowest stage) or a decode step — and otherwise serves alone on the
+  model's own paths, its workers connected but given nothing;
+  `/v1/workers` says why (`not_worth_offloading`). `always` uses them
+  whenever it has any.
 - `standby` — spare workers, `host:port` like `workers`, never given layers
   until a worker is lost or does not answer when the node plans. Then one
   takes that worker's layers, and each conversation is rebuilt on it from
@@ -2336,8 +2343,7 @@ in the background, so a long prompt is pipelined: stage *k* works on chunk
 *i* while stage *k+1* works on chunk *i−1*. A failure there answers the
 sequence's next forward, where recovery takes over. The top cuts a prompt
 into 128-token parts for this (`ORANGU_WORKERS_CHUNK`; `0` keeps the
-engine's chunks). `ORANGU_WORKERS_PIPELINE=0` turns the pipelining off. `doc/PERF-WORKERS.md`
-has measurements.
+engine's chunks). `ORANGU_WORKERS_PIPELINE=0` turns the pipelining off.
 
 **Clock.** A node waits in bursts while the nodes below compute, and a
 frequency governor then clocks its cores down: on the development board a
@@ -4156,8 +4162,7 @@ device, one readback for the head — and the kernels are ~80% of it.
 less: one long wait a token lets the core clock down for the head and
 the sampling that follow. Prefill on the device is
 bounded at ~150 GFLOP/s by its GEMMs, so for prompts the CPU backend is
-the faster one on this board. `doc/PERF-BONSAI.md` has the profiles, the
-numbers behind each step and the task list. On a big.LITTLE board set
+the faster one on this board. On a big.LITTLE board set
 `threads` to the number of big cores for this model: the little cores are
 4.5× slower on the kernel and finish their rows last.
 

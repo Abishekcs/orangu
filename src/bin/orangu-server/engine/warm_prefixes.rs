@@ -22,7 +22,7 @@
 //! requests, so within one server's life only the first request pays for
 //! them. That first request is the one a user notices: on the CIX P1 a
 //! one-line prompt to a fresh server took 12.8 s where the same prompt once
-//! the prefix is cached takes 4.3 (`doc/PERF-ALL.md`, task 4).
+//! the prefix is cached takes 4.3.
 //!
 //! So the server keeps, per model, the prefixes requests actually *reused*
 //! — the cached span of a prompt the prefix cache served, [`MIN_TOKENS`] or

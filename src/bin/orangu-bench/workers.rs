@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! `--workers on|off|compare` (W-84): one orangu-server `[workers]` tree
+//! `--workers on|off|compare`: one orangu-server `[workers]` tree
 //! measured through its tree and with its top-level node alone, switched
 //! through `POST /props`.
 

@@ -542,7 +542,7 @@ impl VaePrecision {
 
 /// `rows` (`[cout][cols]`, `f32`) as per-row `int8` for the 8 × 8 `smmla`
 /// tile, padded as [`conv_matrix`] pads them — about four times the
-/// `Q6_K` kernel's rate at the VAE's shapes (`doc/PERF-IMAGE.md`, task 12).
+/// `Q6_K` kernel's rate at the VAE's shapes.
 /// `None` under `F32`, on a CPU without `i8mm`, or with
 /// `ORANGU_IMAGE_ROWI8_CONV=off` (an A/B against `Q6_K`).
 pub(super) fn row_matrix(

@@ -155,7 +155,7 @@ pub fn plan_shares(
     }
 }
 
-/// Shares by speed (W-86): the bytes each node — or worker subtree — should
+/// Shares by speed: the bytes each node — or worker subtree — should
 /// take for every part of a pipeline to take about as long, its `rate`
 /// (bytes of weights a second, `super::speed`) over the sum, but never more
 /// than its `budget` holds; what a budget turns away goes to the others the

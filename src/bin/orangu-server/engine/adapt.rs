@@ -21,8 +21,8 @@
 //! its hand-offs, which attention and weight kernels the cores can run, how
 //! much memory there is for a faster copy of the weights. Each of those is
 //! decided in its own layer — `prefill_backend`, `npu_tool`, `attention`,
-//! `prompt_weights` — and most of them by *measuring* rather than assuming
-//! (`doc/PERF-ALL.md`). This is where they write down what they measured
+//! `prompt_weights` — and most of them by *measuring* rather than assuming.
+//! This is where they write down what they measured
 //! and what they chose, so an operator reads one set of lines
 //!
 //! ```text

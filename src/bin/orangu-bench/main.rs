@@ -381,7 +381,7 @@ struct Args {
     #[arg(long, default_value_t = 0.0, value_name = "T")]
     temperature: f32,
 
-    /// A `[workers]` tree (W-84): `off` measures its top-level node serving
+    /// A `[workers]` tree: `off` measures its top-level node serving
     /// alone, `on` through the tree, `compare` both, one after the other,
     /// side by side. The server is switched through `POST /props` and put
     /// back afterwards. A server without a tree runs the plain benchmark.
@@ -1251,7 +1251,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
     measure_run(args, &client).map(|_| ())
 }
 
-/// `--workers on|off|compare` (W-84): the benchmark with the server's
+/// `--workers on|off|compare`: the benchmark with the server's
 /// `[workers]` tree switched on, off, or each in turn, then put back as it
 /// was. A server without a tree runs the plain benchmark, and says so.
 fn run_workers(args: &Args, client: &reqwest::blocking::Client, mode: &str) -> anyhow::Result<()> {
@@ -3767,7 +3767,7 @@ fn resolve_call_graph(client: &reqwest::blocking::Client, args: &Args) -> String
 /// something else — a real `orangu`, a script — drives it, the way
 /// `--flamegraph` brackets this tool's own requests. For the requests this
 /// tool cannot make itself: a client's first turn after a restart, with its
-/// own system prompt and tools, is what `doc/PERF-ALL.md` task 4 measures.
+/// own system prompt and tools.
 fn profile_watch(args: &Args) -> anyhow::Result<()> {
     let Some(svg) = &args.flamegraph else {
         anyhow::bail!("--flamegraph-watch needs --flamegraph <PATH> for the picture");

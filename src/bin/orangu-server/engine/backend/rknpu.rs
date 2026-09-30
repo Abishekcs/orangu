@@ -459,7 +459,7 @@ impl Residency {
         if self.exhausted.swap(true, Ordering::Relaxed) {
             return;
         }
-        if error.raw_os_error() == Some(libc::EMFILE) {
+        if out_of_descriptors(&error) {
             let limit = orangu::os::open_files_limit();
             eprintln!(
                 "orangu-server: [npu] out of file descriptors (limit {}): the runtime \
@@ -1700,6 +1700,20 @@ fn open_runtime() -> Option<(Arc<Library>, Api, PathBuf)> {
         }
     }
     None
+}
+
+/// Whether `error` is the process running out of file descriptors
+/// (`EMFILE`), which the NPU runtime's one descriptor per buffer can reach.
+/// A Unix error: `libc` is a Unix dependency, and Windows has no such limit
+/// to report.
+#[cfg(unix)]
+fn out_of_descriptors(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EMFILE)
+}
+
+#[cfg(not(unix))]
+fn out_of_descriptors(_error: &std::io::Error) -> bool {
+    false
 }
 
 #[cfg(test)]

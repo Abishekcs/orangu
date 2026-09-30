@@ -87,7 +87,7 @@ pub struct Params<'a> {
 /// A caller that fuses attention into a longer chain has a different crossover
 /// and does not consult this — see `arch::llama`'s own fusion width.
 ///
-/// Sweepable as `ORANGU_ATTENTION_MIN_TOKENS`; `PERF-GAP.md` has the sweep.
+/// Sweepable as `ORANGU_ATTENTION_MIN_TOKENS`.
 const DEFAULT_MIN_GPU_TOKENS: usize = 64;
 
 /// Window length at or above which a **single-token** (decode) attention call
@@ -113,7 +113,7 @@ const DEFAULT_MIN_GPU_TOKENS: usize = 64;
 /// So this threshold is genuinely model-dependent, and 256 is the value that is
 /// no worse than the alternative on a large model and clearly better on a small
 /// one. Sweepable as `ORANGU_DECODE_ATTENTION_MIN_POS` for a deployment that
-/// wants to tune it per model; `PERF-GAP.md` has both sweeps.
+/// wants to tune it per model.
 const DEFAULT_MIN_GPU_DECODE_POS: usize = 256;
 
 pub fn min_gpu_tokens() -> usize {
@@ -400,7 +400,7 @@ fn attention_timed(
     // this needs, and after the first layer it grows by nothing.
     out.resize(n_tokens * n_head * head_dim, 0.0);
     // A prompt wide enough to spread over the pool in query blocks takes
-    // a blocked kernel (`attention_tiled`, `doc/PERF-ALL.md` task 3): the
+    // a blocked kernel (`attention_tiled`): the
     // `int8` scores / `bf16` values one where the CPU has `i8mm` and
     // `bf16`, the `f32` tiles elsewhere. Narrower passes — and decode —
     // keep the one-query loop.

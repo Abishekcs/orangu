@@ -727,7 +727,7 @@ impl MistralModel {
             //
             // Deliberately *not* `fused_attention_prefill`, which this shape is
             // otherwise eligible for: measured at −3.4% on Ministral-3-3B,
-            // losing all three paired reps. See PERF-GAP.md item 10.
+            // losing all three paired reps.
             let mut qkv = self.backend.matmul_batch(&[
                 MatmulOp {
                     x: &normed,

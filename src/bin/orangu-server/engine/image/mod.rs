@@ -361,7 +361,7 @@ impl Calibration {
     /// A first guess at the pipeline's rate in latent-token passes per
     /// second, from the winner's time on the calibration linear. A pass
     /// over one image token is about 6.8 G multiply-adds through the
-    /// token-wide linears (`doc/PERF-IMAGE.md`, *Arithmetic*), and the
+    /// token-wide linears, and the
     /// calibration linear is `in_dim × out_dim` of them per token — so the
     /// ratio scales the measured time up to a whole pass. Attention adds
     /// to it at larger pictures, so this is a floor on the time, refined
@@ -627,8 +627,8 @@ pub struct RateModel {
 }
 
 /// The share of steps expected to run the transformer before a picture
-/// has measured it under `image_cache = easy`: 15–17 of 40 on this board
-/// (`doc/PERF-IMAGE.md`, task 4), rounded up.
+/// has measured it under `image_cache = easy`: 15–17 of 40 on this board,
+/// rounded up.
 const RUN_SHARE_SEED: f64 = 0.45;
 
 /// The fewest latent tokens a picture may have to teach the [`RateModel`]:
@@ -816,7 +816,7 @@ pub enum ReferenceCap {
     Output,
     /// The picture's area, but no more than the attached picture's own —
     /// the default: upsampling a reference adds no information, only
-    /// prefix tokens and keys in every step (`doc/PERF-IMAGE.md`, task 8).
+    /// prefix tokens and keys in every step.
     #[default]
     Source,
     /// The picture's area, but no more than this many pixels.

@@ -1755,7 +1755,7 @@ fn link_or_copy(blob: &Path, link: &Path, oid: &str, file_path: &str) -> Result<
         .with_context(|| format!("failed to place {}", link.display()))
 }
 
-/// A model file fetched in part (W-65): its header and whichever tensors a
+/// A model file fetched in part: its header and whichever tensors a
 /// caller asks for, written where they belong in a sparse file of the full
 /// size, the rest left as holes. A worker of a `[workers]` tree runs a range
 /// of layers and needs little of the rest: it fetches what building the
