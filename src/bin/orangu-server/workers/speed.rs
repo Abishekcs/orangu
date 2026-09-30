@@ -64,12 +64,7 @@ pub fn measure(
     layer_bytes: &[u64],
 ) -> Result<(Speed, Range<usize>, Duration)> {
     let started = Instant::now();
-    let n = model.config().n_layer;
-    let cut = |at: usize| at == n || model.split_allowed(at);
-    let short = (2.min(n)..=n).find(|at| cut(*at)).unwrap_or(n);
-    let long = (short + 1..=(n / 4).max(short + 1).min(n))
-        .rev()
-        .find(|at| cut(*at) && plan::bytes_of(&(0..*at), layer_bytes) <= MEASURE_BYTES);
+    let (short, long) = cuts(model, layer_bytes);
     let (short_prompt, short_decode) = time_range(model, 0..short)?;
     let (layers, prompt, decode) = match long {
         Some(long) => {
@@ -91,6 +86,20 @@ pub fn measure(
         prompt: rate(prompt),
     };
     Ok((speed, layers, started.elapsed()))
+}
+
+/// The ends of the two ranges [`measure`] times from layer 0: the first cut
+/// the model allows from the second layer on, and the longest cut past it
+/// within a quarter of the layers and [`MEASURE_BYTES`] — none when the
+/// model is too small for a second.
+fn cuts(model: &dyn ModelForward, layer_bytes: &[u64]) -> (usize, Option<usize>) {
+    let n = model.config().n_layer;
+    let cut = |at: usize| at == n || model.split_allowed(at);
+    let short = (2.min(n)..=n).find(|at| cut(*at)).unwrap_or(n);
+    let long = (short + 1..=(n / 4).max(short + 1).min(n))
+        .rev()
+        .find(|at| cut(*at) && plan::bytes_of(&(0..*at), layer_bytes) <= MEASURE_BYTES);
+    (short, long)
 }
 
 /// One 128-token prompt chunk's time and one decode step's (the mean of
@@ -128,9 +137,7 @@ mod tests {
     use super::*;
     use crate::workers::pipeline::fixture::{self, Variant};
 
-    #[test]
-    fn a_node_measures_its_first_layers() {
-        let model = fixture::model();
+    fn layer_bytes(model: &dyn ModelForward) -> Vec<u64> {
         let loaded = fixture::loaded(Variant::default());
         let n = model.config().n_layer;
         let mut layer_bytes = vec![0u64; n];
@@ -139,9 +146,28 @@ mod tests {
                 layer_bytes[il] += bytes;
             }
         }
-        let (speed, layers, _) = measure(model.as_ref(), &layer_bytes).unwrap();
-        // The layers between the first cut (2) and the longer range (3).
-        assert_eq!(layers, 2..3);
+        layer_bytes
+    }
+
+    /// The first cut is layer 2 and the longer range ends at layer 3; with
+    /// every layer past the first over the byte budget, there is no second.
+    #[test]
+    fn the_timed_ranges_end_at_the_first_and_the_longest_cut() {
+        let model = fixture::model();
+        let bytes = layer_bytes(model.as_ref());
+        assert_eq!(cuts(model.as_ref(), &bytes), (2, Some(3)));
+        let heavy = vec![MEASURE_BYTES; bytes.len()];
+        assert_eq!(cuts(model.as_ref(), &heavy), (2, None));
+    }
+
+    /// A node rates the layers between the two cuts — or, when its clock
+    /// cannot tell a layer from noise (the longer range timed no slower),
+    /// the whole longer range.
+    #[test]
+    fn a_node_measures_its_first_layers() {
+        let model = fixture::model();
+        let (speed, layers, _) = measure(model.as_ref(), &layer_bytes(model.as_ref())).unwrap();
+        assert!(layers == (2..3) || layers == (0..3), "{layers:?}");
         assert!(speed.decode > 0.0 && speed.prompt > 0.0, "{speed:?}");
     }
 }
