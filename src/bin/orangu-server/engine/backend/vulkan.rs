@@ -776,7 +776,7 @@ pub struct VulkanBackend {
     elem4_pipeline_layout: wgpu::PipelineLayout,
     /// `vulkan_shaders::shader_source_gated_delta`, one per `(head_dim,
     /// n_k, n_v, sigmoid gate)`, built on first use.
-    gated_delta_pipelines: Mutex<HashMap<(u32, u32, u32, bool), wgpu::ComputePipeline>>,
+    gated_delta_pipelines: Mutex<HashMap<GatedDeltaKey, wgpu::ComputePipeline>>,
     /// Per recurrent layer (keyed by its `ssm_out` weight), the buffers
     /// [`Self::fused_recurrent_tail`] uploads into and reads back from.
     gated_delta_resources: Mutex<HashMap<(usize, usize), GatedDeltaResources>>,
@@ -9592,6 +9592,9 @@ pub struct GatedDeltaInput<'a> {
     pub sigmoid_gate: bool,
     pub n_k: usize,
     pub n_v: usize,
+    /// Value heads read their key head in a row, not tiled
+    /// (`qwen_hybrid::Dims::grouped_v_heads`).
+    pub grouped: bool,
     pub head_dim: usize,
     /// The fold on `ssm_out`'s input, permutation included — the kernel
     /// stores in grouped order when the rotation asks for it.
@@ -9603,6 +9606,11 @@ pub struct GatedDeltaInput<'a> {
 /// [`VulkanBackend::fused_recurrent_layer`]'s parameters — a recurrent
 /// layer's whole decode step from its normed input: the projections, the
 /// conv step, the norms, the delta rule and `ssm_out`, one submission.
+/// A gated-delta kernel's shape: head dimension, key heads, value heads,
+/// sigmoid (not SiLU) output gate, and value heads reading their key head in
+/// a row (not tiled).
+type GatedDeltaKey = (u32, u32, u32, bool, bool);
+
 pub struct RecurrentLayerInput<'a> {
     /// The layer's normed input, `[n_embd]`, in the unrotated basis.
     pub normed: &'a [f32],
@@ -9629,6 +9637,9 @@ pub struct RecurrentLayerInput<'a> {
     pub ssm_norm: &'a [f32],
     pub eps: f32,
     pub sigmoid_gate: bool,
+    /// Value heads read their key head in a row, not tiled
+    /// (`qwen_hybrid::Dims::grouped_v_heads`).
+    pub grouped: bool,
     pub n_k: usize,
     pub n_v: usize,
     pub head_dim: usize,
@@ -9637,7 +9648,7 @@ pub struct RecurrentLayerInput<'a> {
     pub batch_slot: usize,
 }
 
-/// [`VulkanBackend::fused_attention_layer`]'s parameters — a full-attention
+/// [`VulkanBackend::fused_attention_layer`])'s parameters — a full-attention
 /// sub-layer's whole decode step from its (already rotated) normed input,
 /// for the Qwen hybrid trunk: `record_fused_attention` with the sigmoid
 /// gate, then the output fold and `wo`.
@@ -9814,6 +9825,7 @@ struct RecurrentCore<'a> {
     ssm_norm: &'a [f32],
     eps: f32,
     sigmoid_gate: bool,
+    grouped: bool,
     n_k: usize,
     n_v: usize,
     head_dim: usize,
@@ -17256,6 +17268,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ssm_norm,
             eps,
             sigmoid_gate,
+            grouped,
             n_k,
             n_v,
             head_dim,
@@ -17275,6 +17288,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ssm_norm,
             eps,
             sigmoid_gate,
+            grouped,
             n_k,
             n_v,
             head_dim,
@@ -17346,6 +17360,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ssm_norm,
             eps,
             sigmoid_gate,
+            grouped,
             n_k,
             n_v,
             head_dim,
@@ -17400,6 +17415,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ssm_norm,
             eps,
             sigmoid_gate,
+            grouped,
             n_k,
             n_v,
             head_dim,
@@ -17673,6 +17689,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ssm_norm,
             eps,
             sigmoid_gate,
+            grouped,
             n_k,
             n_v,
             head_dim,
@@ -17705,7 +17722,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         };
 
         let pipeline = {
-            let key = (hd as u32, n_k as u32, n_v as u32, sigmoid_gate);
+            let key = (hd as u32, n_k as u32, n_v as u32, sigmoid_gate, grouped);
             let mut pipelines = self
                 .gated_delta_pipelines
                 .lock()
@@ -17723,6 +17740,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                     key.1,
                                     key.2,
                                     sigmoid_gate,
+                                    grouped,
                                 )
                                 .into(),
                             ),

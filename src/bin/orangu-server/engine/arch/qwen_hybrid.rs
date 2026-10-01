@@ -125,11 +125,18 @@ pub(crate) struct Dims {
     pub ssm_head_dim: usize,
     /// Number of K/V "groups" the causal conv1d/Q/K live in
     /// (`ssm.group_count`) — smaller than `ssm_dt_rank` (the number of
-    /// value heads); a K/V group is reused (tiled, not block-grouped —
-    /// confirmed against `ggml_compute_forward_repeat_f32`) across
-    /// `ssm_dt_rank / ssm_n_group` value heads.
+    /// value heads); a K/V group is reused across `ssm_dt_rank /
+    /// ssm_n_group` value heads, tiled or in a row by architecture
+    /// ([`Self::grouped_v_heads`]).
     pub ssm_n_group: usize,
     pub ssm_dt_rank: usize,
+    /// Which key head a value head reads: `qwen3next` repeats each key head
+    /// for its `ssm_dt_rank / ssm_n_group` value heads in a row (value head
+    /// `h` reads key head `h / rep`, `llama.cpp`'s repeat-interleave), where
+    /// `qwen35` and `qwen35moe` tile them (`h % ssm_n_group`). Getting it
+    /// wrong pairs most value heads with another head's keys, and the model
+    /// drifts off after a few right tokens.
+    pub grouped_v_heads: bool,
 }
 
 impl Dims {
@@ -181,6 +188,7 @@ impl Dims {
             ssm_head_dim,
             ssm_n_group,
             ssm_dt_rank,
+            grouped_v_heads: loaded.config.architecture == "qwen3next",
         })
     }
 
@@ -664,7 +672,10 @@ impl Recurrent {
             )
         } else {
             // One fused projection carrying the QKV mix and the output gate
-            // `z` back to back.
+            // `z`, packed per key head — `[q, k, v, z]` for each, `v` and `z`
+            // that head's value heads in a row (`llama.cpp`'s
+            // `build_qkvz`) — regrouped here into the `[q | k | v]` the conv
+            // reads and `z` on its own.
             let mixed = t.matrix("ssm_in.weight")?;
             anyhow::ensure!(
                 mixed.out_dim == qkv_out_dim + value_dim,
@@ -674,9 +685,19 @@ impl Recurrent {
                 qkv_out_dim + value_dim,
             );
             let qkv_in = fold.input(&t.name("ssm_in.weight"), n_embd, None)?;
+            let hd = dims.ssm_head_dim;
+            let n_k = dims.ssm_n_group;
+            let rep_rows = hd * (dims.ssm_dt_rank / n_k);
+            let block = 2 * hd + 2 * rep_rows;
+            let runs = |offset: usize, count: usize| -> Vec<(usize, usize)> {
+                (0..n_k).map(|kh| (kh * block + offset, count)).collect()
+            };
+            let mut qkv = runs(0, hd);
+            qkv.extend(runs(hd, hd));
+            qkv.extend(runs(2 * hd, rep_rows));
             (
-                mixed.rows(0, qkv_out_dim),
-                mixed.rows(qkv_out_dim, value_dim),
+                mixed.gather_rows(&qkv),
+                mixed.gather_rows(&runs(2 * hd + rep_rows, rep_rows)),
                 qkv_in,
             )
         };
@@ -782,6 +803,7 @@ impl Recurrent {
                     ssm_norm: &self.ssm_norm,
                     eps,
                     sigmoid_gate: gate == OutputGate::Sigmoid,
+                    grouped: dims.grouped_v_heads,
                     n_k: n_k_heads,
                     n_v: n_v_heads,
                     head_dim,
@@ -953,6 +975,7 @@ impl Recurrent {
                         ssm_norm: &self.ssm_norm,
                         eps,
                         sigmoid_gate: gate == OutputGate::Sigmoid,
+                        grouped: dims.grouped_v_heads,
                         n_k: n_k_heads,
                         n_v: n_v_heads,
                         head_dim,
@@ -1014,13 +1037,14 @@ impl Recurrent {
         // `for_each_init` rather than an allocation per head: `sk` and `d`
         // are `head_dim` long and are refilled every head, so one buffer per
         // worker is reused across every head that worker takes.
+        let grouped = dims.grouped_v_heads;
+        let rep = dims.ssm_dt_rank / dims.ssm_n_group;
         let head_step =
             |scratch: &mut Vec<f32>, (vh, (state, out)): (usize, (&mut [f32], &mut [f32]))| {
-                // Tiled (not block-grouped) broadcast — matches
-                // `ggml_compute_forward_repeat_f32`'s tiling semantics for this
-                // specific mismatched-head-count repeat, distinct from standard
-                // attention's block-grouped GQA.
-                let kh = vh % n_k_heads;
+                // Tiled (`qwen35`: `ggml_repeat`) or repeated in a row
+                // (`qwen3next`: repeat-interleave) — see
+                // [`Dims::grouped_v_heads`].
+                let kh = if grouped { vh / rep } else { vh % n_k_heads };
                 let (sk, d) = scratch.split_at_mut(head_dim);
                 delta_head_step(
                     state,
@@ -2303,6 +2327,7 @@ impl<F: HybridFfn> Trunk<F> {
                                 ssm_norm: &r.ssm_norm,
                                 eps,
                                 sigmoid_gate: false,
+                                grouped: self.dims.grouped_v_heads,
                                 n_k: dims.ssm_n_group,
                                 n_v: dims.ssm_dt_rank,
                                 head_dim: dims.ssm_head_dim,
@@ -2566,6 +2591,7 @@ mod tests {
             ssm_head_dim: 1,
             ssm_n_group: 1,
             ssm_dt_rank: 1,
+            grouped_v_heads: false,
         }
     }
 

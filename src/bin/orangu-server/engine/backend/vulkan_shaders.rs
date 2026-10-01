@@ -10239,15 +10239,31 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// tiled position (`h`) or, for a `gdn_v_grouped` fold, the grouped one
 /// (`h % NK · REP + h / NK`), so the Hadamard kernel that follows needs no
 /// permutation of its own. `q`/`k` are per key head and shared by the
-/// `REP` value heads tiled from it (`h % NK`), exactly as the host's
-/// `kh = vh % n_k_heads`.
+/// `REP` value heads tiled from it (`h % NK`) or in a row (`h / REP`),
+/// exactly as the host does.
 ///
+/// Which key head `q`/`k` come from for value head `h`: tiled (`h % NK`,
+/// `qwen35`) or, `grouped`, repeated in a row (`h / (NV / NK)`, `qwen3next`) —
+/// `qwen_hybrid::Dims::grouped_v_heads`.
 /// `elem4` bindings: `a` = the token's inputs packed as `q | k | v | beta |
 /// decay | z`, `b` = the norm weight, `y` = the layer's scratch — the state
 /// at `0`, the output at `NV·HD` — and the meta, whose `extra` is `eps`
 /// and whose `aux & 1` selects the grouped store.
-pub fn shader_source_gated_delta(hd: u32, n_k: u32, n_v: u32, sigmoid_gate: bool) -> String {
+/// The WGSL expression for the key head of value head `h` — see
+/// [`shader_source_gated_delta`].
+fn key_head_of(grouped: bool) -> &'static str {
+    if grouped { "h / (NV / NK)" } else { "h % NK" }
+}
+
+pub fn shader_source_gated_delta(
+    hd: u32,
+    n_k: u32,
+    n_v: u32,
+    sigmoid_gate: bool,
+    grouped: bool,
+) -> String {
     assert!(hd <= 256 && hd.is_power_of_two() && n_v.is_multiple_of(n_k));
+    let key_head = key_head_of(grouped);
     let gate = if sigmoid_gate {
         "1.0 / (1.0 + exp(-zv))"
     } else {
@@ -10340,7 +10356,7 @@ fn part_sum(j: u32, part: u32, v: f32) -> f32 {{
 @compute @workgroup_size({wg})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
     let h = wid.x;
-    let kh = h % NK;
+    let kh = {key_head};
     let j = lid.x % HD;
     let part = lid.x / HD;
     let base = h * HD * HD;
@@ -10417,7 +10433,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// the A/B. Probe-only: measured no faster than the single workgroup
 /// (see there).
 #[cfg(test)]
-pub fn shader_source_gated_delta_split(hd: u32, n_k: u32, n_v: u32, cols: u32) -> String {
+pub fn shader_source_gated_delta_split(
+    hd: u32,
+    n_k: u32,
+    n_v: u32,
+    cols: u32,
+    grouped: bool,
+) -> String {
+    let key_head = key_head_of(grouped);
     assert!(hd <= 256 && hd.is_power_of_two() && n_v.is_multiple_of(n_k));
     assert!(cols.is_power_of_two() && cols <= hd && hd.is_multiple_of(4));
     format!(
@@ -10465,7 +10488,7 @@ fn wg_sum(t: u32, v: f32) -> f32 {{
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
     let h = wid.x / CS;
     let c = wid.x % CS;
-    let kh = h % NK;
+    let kh = {key_head};
     let t = lid.x;
     let j = c * COLS + t;
     let base = h * HD * HD;

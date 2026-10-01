@@ -862,6 +862,36 @@ impl QuantMatrix {
         }
     }
 
+    /// A **copy** of the rows `runs` name — `(first, count)` each, in the
+    /// order given: the rows of one projection out of a tensor that packs
+    /// several per group in runs of different lengths, the way `qwen3next`'s
+    /// `ssm_in.weight` holds `[q, k, v, z]` for every key head. A row gather,
+    /// as for [`Self::deinterleave`].
+    pub fn gather_rows(&self, runs: &[(usize, usize)]) -> QuantMatrix {
+        let src = self.raw_bytes();
+        let rows: usize = runs.iter().map(|(_, count)| count).sum();
+        let mut bytes = Vec::with_capacity(rows * self.row_bytes);
+        for &(first, count) in runs {
+            assert!(
+                first + count <= self.out_dim,
+                "row range {first}..{} exceeds out_dim {}",
+                first + count,
+                self.out_dim
+            );
+            bytes.extend_from_slice(&src[first * self.row_bytes..(first + count) * self.row_bytes]);
+        }
+        QuantMatrix {
+            bytes: Arc::new(bytes) as TensorBytes,
+            ggml_type: self.ggml_type,
+            start: 0,
+            row_bytes: self.row_bytes,
+            in_dim: self.in_dim,
+            out_dim: rows,
+            device: self.device,
+            layer: self.layer,
+        }
+    }
+
     /// This `PTQ1_0` matrix as a `PQ2_0` one — the same weights, two bits
     /// an element (`quant::repack_ptq1_0_to_pq2_0`), a copy in memory
     /// rather than a view of the file. Rows are repacked in parallel; the
@@ -2482,6 +2512,22 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
 
 #[cfg(test)]
 mod tests {
+    /// Rows come out in the order the runs name them, each run whole —
+    /// what regroups `qwen3next`'s per-head `[q, k, v, z]` projection.
+    #[test]
+    fn gathered_rows_follow_the_runs() {
+        let rows: Vec<f32> = (0..8).flat_map(|r| [r as f32, r as f32 + 0.5]).collect();
+        let m = QuantMatrix::from_f32_rows(rows, 2, 8);
+        let g = m.gather_rows(&[(4, 2), (0, 1), (7, 1)]);
+        assert_eq!(g.out_dim, 4);
+        let firsts: Vec<f32> = g
+            .raw_bytes()
+            .chunks(8)
+            .map(|row| f32::from_le_bytes([row[0], row[1], row[2], row[3]]))
+            .collect();
+        assert_eq!(firsts, [4.0, 5.0, 0.0, 7.0]);
+    }
+
     use super::*;
 
     /// The device seam: an expert viewed as a `QuantMatrix` must dequantize

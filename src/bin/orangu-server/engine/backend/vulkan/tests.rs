@@ -11189,7 +11189,8 @@ fn fused_recurrent_tail_matches_the_host_delta_rule_and_projection() {
     ];
 
     for (case, rot) in rotations.iter().enumerate() {
-        for sigmoid_gate in [false, true] {
+        for (sigmoid_gate, in_a_row) in [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut host_state: Vec<f32> = (0..n_v * hd * hd).map(|_| rnd(0.05)).collect();
             // The device side as the cache hands it over: the host copy
             // current before the first token (uploaded), the device's
@@ -11210,7 +11211,7 @@ fn fused_recurrent_tail_matches_the_host_delta_rule_and_projection() {
                 let mut attn = vec![0f32; value_dim];
                 let mut scratch = vec![0f32; 2 * hd];
                 for vh in 0..n_v {
-                    let kh = vh % n_k;
+                    let kh = if in_a_row { vh / (n_v / n_k) } else { vh % n_k };
                     let (sk, d) = scratch.split_at_mut(hd);
                     let out = &mut attn[vh * hd..(vh + 1) * hd];
                     delta_head_step(
@@ -11255,6 +11256,7 @@ fn fused_recurrent_tail_matches_the_host_delta_rule_and_projection() {
                         ssm_norm: &ssm_norm,
                         eps,
                         sigmoid_gate,
+                        grouped: in_a_row,
                         n_k,
                         n_v,
                         head_dim: hd,
@@ -12167,7 +12169,7 @@ fn gated_delta_kernel_time() {
             label: Some("probe gated delta"),
             source: wgpu::ShaderSource::Wgsl(
                 crate::engine::backend::vulkan_shaders::shader_source_gated_delta(
-                    hd as u32, n_k as u32, n_v as u32, false,
+                    hd as u32, n_k as u32, n_v as u32, false, false,
                 )
                 .into(),
             ),
@@ -12219,7 +12221,7 @@ fn gated_delta_kernel_time() {
         let split = build(
             "probe gated delta split",
             crate::engine::backend::vulkan_shaders::shader_source_gated_delta_split(
-                hd as u32, n_k as u32, n_v as u32, cols,
+                hd as u32, n_k as u32, n_v as u32, cols, false,
             ),
         );
         let workgroups = n_v as u32 * hd as u32 / cols;
@@ -12747,7 +12749,8 @@ fn fused_recurrent_layer_check(ggml_type: u32) {
     .into_iter()
     .enumerate()
     {
-        for sigmoid_gate in [false, true] {
+        for (sigmoid_gate, in_a_row) in [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut host_state: Vec<f32> = (0..n_v * hd * hd).map(|_| rnd(0.05)).collect();
             let mut host_conv: Vec<f32> = (0..conv_channels * (d_conv - 1))
                 .map(|_| rnd(0.5))
@@ -12800,7 +12803,7 @@ fn fused_recurrent_layer_check(ggml_type: u32) {
                 let mut attn = vec![0f32; value_dim];
                 let mut scratch = vec![0f32; 2 * hd];
                 for vh in 0..n_v {
-                    let kh = vh % n_k;
+                    let kh = if in_a_row { vh / (n_v / n_k) } else { vh % n_k };
                     let (sk, d) = scratch.split_at_mut(hd);
                     let out = &mut attn[vh * hd..(vh + 1) * hd];
                     delta_head_step(
@@ -12850,6 +12853,7 @@ fn fused_recurrent_layer_check(ggml_type: u32) {
                         ssm_norm: &ssm_norm,
                         eps,
                         sigmoid_gate,
+                        grouped: in_a_row,
                         n_k,
                         n_v,
                         head_dim: hd,
