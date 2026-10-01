@@ -1906,10 +1906,35 @@ fn prepare(args: Args) -> Result<Prepared> {
     // the first picture.
     let image = match &image_companions {
         Some(companions) => {
-            let transformer = match transformer_opened.take() {
+            let mut transformer = match transformer_opened.take() {
                 Some(transformer) => transformer,
                 None => LoadedModel::open(&path).context("loading the picture model's weights")?,
             };
+            let device_is_auto = matches!(
+                requested_device(device_flag.as_deref(), &conf.device),
+                engine::backend::device::DeviceRequest::Auto
+            );
+            // On a split the transformer goes whole to the device that runs
+            // its linears fastest, measured now on each of the split's GPUs
+            // and the CPU. The split itself was planned for the text
+            // encoder, which runs once a picture; the transformer runs every
+            // step, and which device serves it best is a property of this
+            // machine — not of the device order, and not of which one it
+            // fits on (a device it overflows can still be the fastest).
+            let mut transformer_on_cpu = false;
+            if device_is_auto
+                && matches!(conf.backend, config::BackendPreference::Auto)
+                && let Some(split) = &split
+            {
+                let choice = choose_image_device(&transformer, backend.as_ref(), split)?;
+                match choice.device {
+                    Some(index) => transformer.set_default_device(index),
+                    None => transformer_on_cpu = true,
+                }
+                image_rate = Some(engine::image::RateModel::from_calibration(
+                    choice.token_passes_per_second,
+                ));
+            }
             let unsupported =
                 engine::backend::unsupported_tensor_types(transformer.tensor_types(), &*backend);
             if !unsupported.is_empty() {
@@ -1932,11 +1957,10 @@ fn prepare(args: Args) -> Result<Prepared> {
                 .as_wgpu()
                 .and_then(|wgpu| wgpu.device_in_use().vram_total_bytes)
                 .is_some_and(|total| weights_device_bytes + transformer_device_bytes > total)
-                && matches!(
-                    requested_device(device_flag.as_deref(), &conf.device),
-                    engine::backend::device::DeviceRequest::Auto
-                );
-            let image_backend: Arc<dyn Backend> = if too_large_for_device {
+                && device_is_auto;
+            let image_backend: Arc<dyn Backend> = if transformer_on_cpu {
+                Arc::new(engine::backend::CpuBackend)
+            } else if too_large_for_device {
                 log::warn!(
                     "orangu-server: the picture transformer ({}) and its text encoder ({}) \
                      together exceed the selected device — the transformer and VAE run on the \
@@ -5306,6 +5330,93 @@ fn overflows_selected_device(backend: &dyn Backend, weights_bytes: u64) -> bool 
         .as_wgpu()
         .and_then(|wgpu| wgpu.device_in_use().vram_total_bytes)
         .is_some_and(|total| weights_bytes > total)
+}
+
+/// Where [`choose_image_device`] sends a split's picture transformer.
+struct ImageDeviceChoice {
+    /// The split device that ran the transformer's linear fastest, or
+    /// `None` when the CPU beat every one of them.
+    device: Option<usize>,
+    /// The winner's calibrated rate, for the wait estimate.
+    token_passes_per_second: f64,
+}
+
+/// Times one of the picture transformer's linears on every GPU of `split`
+/// and on the CPU ([`engine::image::calibrate`]), and picks the fastest —
+/// logging each, so the choice can be read off the startup log. A device
+/// with no kernel for one of the transformer's tensor types is skipped.
+fn choose_image_device(
+    transformer: &LoadedModel,
+    backend: &dyn Backend,
+    split: &SplitReport,
+) -> Result<ImageDeviceChoice> {
+    let mut best: Option<(usize, engine::image::Calibration)> = None;
+    let mut cpu: Option<engine::image::Calibration> = None;
+    let mut timings = Vec::new();
+    for index in 0..split.plan.per_device_layers.len() {
+        let Some(device) = backend.split_device(index) else {
+            continue;
+        };
+        let Some(wgpu) = device.as_wgpu() else {
+            continue;
+        };
+        if !engine::backend::unsupported_tensor_types(transformer.tensor_types(), device).is_empty()
+        {
+            continue;
+        }
+        let cal = engine::image::calibrate(transformer, Some(device))?;
+        let time = cal.device.expect("a device was offered");
+        timings.push(format!(
+            "{} {:.0} ms",
+            wgpu.device_in_use().name,
+            time.as_secs_f64() * 1e3
+        ));
+        if cpu.is_none() {
+            cpu = Some(cal);
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(_, b)| time < b.device.expect("a device was offered"))
+        {
+            best = Some((index, cal));
+        }
+    }
+    let cpu = match cpu {
+        Some(cal) => cal,
+        None => engine::image::calibrate(transformer, None)?,
+    };
+    timings.push(format!("cpu {:.0} ms", cpu.cpu.as_secs_f64() * 1e3));
+    let choice = match best {
+        Some((index, cal)) if cal.device.is_some_and(|device| device < cpu.cpu) => {
+            ImageDeviceChoice {
+                device: Some(index),
+                token_passes_per_second: cal.token_passes_per_second(),
+            }
+        }
+        _ => {
+            let mut cpu_only = cpu;
+            cpu_only.device = None;
+            ImageDeviceChoice {
+                device: None,
+                token_passes_per_second: cpu_only.token_passes_per_second(),
+            }
+        }
+    };
+    let winner = match choice.device {
+        Some(index) => backend
+            .split_device(index)
+            .and_then(|device| device.as_wgpu())
+            .map_or_else(
+                || format!("device {index}"),
+                |w| w.device_in_use().name.clone(),
+            ),
+        None => "the CPU".to_string(),
+    };
+    log::info!(
+        "orangu-server: [image] transformer placement: {} — {winner}",
+        timings.join(", ")
+    );
+    Ok(choice)
 }
 
 fn apply_device_split(

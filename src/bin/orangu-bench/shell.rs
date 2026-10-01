@@ -67,7 +67,7 @@ _orangu_bench() {
              --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
-             --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png \
+             --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png --flamegraph-keep-data \
              --flamegraph-layers --flamegraph-duration --flamegraph-watch \
              --compare-profiles --bundle --read-bundle --sweep --sweep-cmd --sweep-env --sweep-start-timeout \
              --render-profile --report --web --host --port --delay --temperature --workers -s --shell-completions -h --help -V --version" -- "$cur") )
@@ -137,6 +137,7 @@ _orangu_bench() {
         '--flamegraph-freq[Sampling frequency in Hz for --flamegraph]:hz:' \
         '--flamegraph-call-graph[Call-graph mode for --flamegraph]:mode:(auto fp dwarf)' \
         '--flamegraph-png[Also render a PNG beside the flamegraph SVG]' \
+        '--flamegraph-keep-data[Keep the raw perf.data beside the flamegraph instead of deleting it]' \
         '--flamegraph-layers[Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR]:dir:_files -/' \
         '--flamegraph-duration[Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch]:seconds:' \
         '--flamegraph-watch[With --flamegraph, profile the server while something else drives it]' \
@@ -219,6 +220,7 @@ complete -c orangu-bench -l flamegraph-pid         -x -d 'Process to profile (de
 complete -c orangu-bench -l flamegraph-freq        -x -d 'Sampling frequency in Hz for --flamegraph'
 complete -c orangu-bench -l flamegraph-call-graph  -x -a 'auto fp dwarf' -d 'Call-graph mode for --flamegraph'
 complete -c orangu-bench -l flamegraph-png            -d 'Also render a PNG beside the flamegraph SVG'
+complete -c orangu-bench -l flamegraph-keep-data      -d 'Keep the raw perf.data beside the flamegraph instead of deleting it'
 complete -c orangu-bench -l flamegraph-layers      -r -d 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'
 complete -c orangu-bench -l flamegraph-duration    -x -d 'Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch'
 complete -c orangu-bench -l flamegraph-watch          -d 'With --flamegraph, profile the server while something else drives it'
@@ -310,6 +312,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--flamegraph-freq', 'Sampling frequency in Hz for --flamegraph'),
         @('--flamegraph-call-graph', 'Call-graph mode for --flamegraph: fp or dwarf'),
         @('--flamegraph-png', 'Also render a PNG beside the flamegraph SVG'),
+        @('--flamegraph-keep-data', 'Keep the raw perf.data beside the flamegraph instead of deleting it'),
         @('--flamegraph-layers', 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'),
         @('--flamegraph-duration', 'Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch'),
         @('--flamegraph-watch', 'With --flamegraph, profile the server while something else drives it'),

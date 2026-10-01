@@ -2705,7 +2705,7 @@ impl PairedI8 {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn pair(&self, p: usize) -> &[i8] {
         &self.data[p * 2 * self.dim..(p + 1) * 2 * self.dim]
     }
@@ -2821,6 +2821,12 @@ pub fn i8_scores_4rows_in(
         }
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // Safety: `AVX2` was detected.
+        unsafe { i8_scores_4rows_avx2(q, qa, qb, k, pairs, out) };
+        return;
+    }
     let unpaired = |m: &PairedI8, row: usize, c: usize| -> i32 {
         m.data[(row / 2) * 2 * dim + (c / 8) * 16 + (row % 2) * 8 + c % 8] as i32
     };
@@ -2831,6 +2837,149 @@ pub fn i8_scores_4rows_in(
                 .map(|c| unpaired(q, r, c) * unpaired(k, 2 * p0 + j, c))
                 .sum();
         }
+    }
+}
+
+/// Whether [`i8_scores_4rows`] has a fast kernel here: `smmla` on `aarch64`
+/// ([`have_i8mm`]), `AVX2` on `x86_64` — what the picture attention asks
+/// before it scores in `int8`.
+pub fn have_i8_scores() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        have_i8mm()
+    }
+}
+
+/// [`i8_scores_4rows_in`] on `AVX2`, exact: the same `i32` products as the
+/// scalar definition. The pair layout is the `smmla` one (per 8-element
+/// chunk, the pair's two rows' 8 bytes side by side), so a 32-byte load is
+/// two chunks of both rows, and — as in [`rowi8_tiles_avx2`] —
+/// `vpmaddubsw(|q|, sign(k, q))` with a `vpmaddwd` by ones gives row 0 ·
+/// key 0 and row 1 · key 1 ("direct"), the keys' halves swapped by a
+/// `vpshufd` row 0 · key 1 and row 1 · key 0 ("cross"). The query rows'
+/// `|q|` is taken once per chunk for every key pair; two key pairs at a
+/// time keep eight accumulators. A trailing chunk (`dim` an odd multiple of
+/// 8) goes through the 128-bit forms. Both operands are within ±127.
+///
+/// # Safety
+/// `AVX2` must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::needless_range_loop)]
+unsafe fn i8_scores_4rows_avx2(
+    q: &PairedI8,
+    qa: usize,
+    qb: usize,
+    k: &PairedI8,
+    pairs: std::ops::Range<usize>,
+    out: [&mut [i32]; 4],
+) {
+    use std::arch::x86_64::*;
+    let dim = q.dim;
+    let bytes = 2 * dim;
+    let wide = bytes / 32 * 32;
+    let qrows = [q.pair(qa), q.pair(qb)];
+    let ones = _mm256_set1_epi16(1);
+    let ones128 = _mm_set1_epi16(1);
+    let [o0, o1, o2, o3] = out;
+    let p0 = pairs.start;
+    let n_pairs = pairs.len();
+    // `acc[query pair][key][direct, cross]` for one or two key pairs.
+    let score = |keys: &[&[i8]], acc: &mut [[[__m256i; 2]; 2]; 2]| {
+        let mut c = 0;
+        while c < wide {
+            // Safety (the block): every load is 32 bytes at `c + 32 <= 2 *
+            // dim` inside a pair.
+            unsafe {
+                let qv = [
+                    _mm256_loadu_si256(qrows[0].as_ptr().add(c) as *const __m256i),
+                    _mm256_loadu_si256(qrows[1].as_ptr().add(c) as *const __m256i),
+                ];
+                let qa_abs = [_mm256_abs_epi8(qv[0]), _mm256_abs_epi8(qv[1])];
+                for (j, key) in keys.iter().enumerate() {
+                    let kv = _mm256_loadu_si256(key.as_ptr().add(c) as *const __m256i);
+                    let ks = _mm256_shuffle_epi32(kv, 0b01_00_11_10);
+                    for i in 0..2 {
+                        let direct = _mm256_madd_epi16(
+                            _mm256_maddubs_epi16(qa_abs[i], _mm256_sign_epi8(kv, qv[i])),
+                            ones,
+                        );
+                        let cross = _mm256_madd_epi16(
+                            _mm256_maddubs_epi16(qa_abs[i], _mm256_sign_epi8(ks, qv[i])),
+                            ones,
+                        );
+                        acc[i][j][0] = _mm256_add_epi32(acc[i][j][0], direct);
+                        acc[i][j][1] = _mm256_add_epi32(acc[i][j][1], cross);
+                    }
+                }
+            }
+            c += 32;
+        }
+    };
+    // The 16-byte trailing chunk, as 128-bit lanes added to the low half.
+    let tail = |keys: &[&[i8]], acc: &mut [[[__m256i; 2]; 2]; 2]| {
+        if wide == bytes {
+            return;
+        }
+        // Safety: the loads are 16 bytes at `wide + 16 == 2 * dim`.
+        unsafe {
+            for i in 0..2 {
+                let qv = _mm_loadu_si128(qrows[i].as_ptr().add(wide) as *const __m128i);
+                let qa_abs = _mm_abs_epi8(qv);
+                for (j, key) in keys.iter().enumerate() {
+                    let kv = _mm_loadu_si128(key.as_ptr().add(wide) as *const __m128i);
+                    let ks = _mm_shuffle_epi32(kv, 0b01_00_11_10);
+                    let direct =
+                        _mm_madd_epi16(_mm_maddubs_epi16(qa_abs, _mm_sign_epi8(kv, qv)), ones128);
+                    let cross =
+                        _mm_madd_epi16(_mm_maddubs_epi16(qa_abs, _mm_sign_epi8(ks, qv)), ones128);
+                    acc[i][j][0] = _mm256_add_epi32(acc[i][j][0], _mm256_zextsi128_si256(direct));
+                    acc[i][j][1] = _mm256_add_epi32(acc[i][j][1], _mm256_zextsi128_si256(cross));
+                }
+            }
+        }
+    };
+    // Lanes 0–1 / 4–5 of `direct` are row 0 · key 0, 2–3 / 6–7 row 1 · key
+    // 1; of `cross`, row 0 · key 1 and row 1 · key 0.
+    let sums = |direct: __m256i, cross: __m256i| -> [i32; 4] {
+        let fold =
+            |v: __m256i| _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+        let mut s4 = [0i32; 4];
+        // Safety: `s4` is 16 bytes.
+        unsafe {
+            _mm_storeu_si128(
+                s4.as_mut_ptr() as *mut __m128i,
+                _mm_hadd_epi32(fold(direct), fold(cross)),
+            )
+        };
+        s4
+    };
+    let mut p = 0;
+    while p < n_pairs {
+        let take = (n_pairs - p).min(2);
+        let both = [k.pair(p0 + p), k.pair(p0 + p + take - 1)];
+        let keys = &both[..take];
+        let mut acc = [[[_mm256_setzero_si256(); 2]; 2]; 2];
+        score(keys, &mut acc);
+        tail(keys, &mut acc);
+        for j in 0..take {
+            let at = 2 * (p + j);
+            let [a00, a11, a01, a10] = sums(acc[0][j][0], acc[0][j][1]);
+            o0[at] = a00;
+            o0[at + 1] = a01;
+            o1[at] = a10;
+            o1[at + 1] = a11;
+            let [b00, b11, b01, b10] = sums(acc[1][j][0], acc[1][j][1]);
+            o2[at] = b00;
+            o2[at + 1] = b01;
+            o3[at] = b10;
+            o3[at + 1] = b11;
+        }
+        p += take;
     }
 }
 
@@ -4148,7 +4297,161 @@ pub fn rowi8_tiles(
         unsafe { rowi8_tiles_mmla(w, g, a, tiles, yt) };
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // Safety: `AVX2` was detected.
+        unsafe { rowi8_tiles_avx2(w, g, a, tiles, yt) };
+        return;
+    }
     rowi8_tiles_portable(w, g, a, tiles, yt)
+}
+
+/// Whether this process has a fast per-row `int8` tile for [`rowi8_tiles`]:
+/// `smmla` on `aarch64` ([`have_i8mm`]), `AVX2` on `x86_64`. Without one
+/// the tile is [`rowi8_tiles_portable`], the scalar definition — what the
+/// callers choosing an `int8` layout (`image_weights = auto`, the VAE's
+/// per-row convolutions) ask before they choose it.
+pub fn have_rowi8_tile() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        have_i8mm()
+    }
+}
+
+/// [`rowi8_tiles_portable`] on `AVX2`, to the bit: the same `i32` sum per
+/// (row, token, super-block) — exact — folded in the same order.
+///
+/// The layout is `smmla`'s: per 32-element block, row pairs (and token
+/// pairs) interleaved in 8-byte chunks, `[pair][chunk][half][8]`. A pair's
+/// 64 bytes are two 32-byte loads, each two chunks of both members. Per
+/// load, `vpmaddubsw(|w|, sign(x, w))` and a `vpmaddwd` by ones give the
+/// pair-by-pair products row 0 · token 0 and row 1 · token 1 in eight `i32`
+/// lanes ("direct"); the same with the token halves swapped (one
+/// `vpshufd`) gives row 0 · token 1 and row 1 · token 0 ("cross"). Both
+/// operands are within ±127 (the quantizers clamp), so `|w|` is a valid
+/// unsigned byte and a `vpmaddubsw` pair sum (≤ 2 · 127²) cannot saturate.
+///
+/// A pass covers 4 rows × 4 tokens — two row pairs by two token pairs,
+/// eight accumulators — and four passes make the 8 × 8 tile. At the end of
+/// each super-block one `vphaddd` per pair-by-pair turns a direct and a
+/// cross accumulator into its four exact sums.
+///
+/// # Safety
+/// `AVX2` must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::needless_range_loop)]
+unsafe fn rowi8_tiles_avx2(
+    w: &RowI8,
+    g: usize,
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    yt: &mut [&mut [f32]],
+) {
+    use std::arch::x86_64::*;
+    let wq = w.group(g);
+    let ones = _mm256_set1_epi16(1);
+    let block_bytes = ROW_OCT * 32;
+    for tl in tiles {
+        let qtile = &a.q[tl * a.n_block * MM_TILE * 32..][..a.n_block * MM_TILE * 32];
+        let dtile = &a.d[tl * a.n_super * MM_TILE..][..a.n_super * MM_TILE];
+        for row_half in 0..2 {
+            for token_half in 0..2 {
+                // `acc[r][k]`: rows `row_half * 4 + r`, tokens
+                // `token_half * 4 + k` of the tile.
+                let mut acc = [[0f32; 4]; 4];
+                for s in 0..a.n_super {
+                    // `[row pair][token pair][direct, cross]`.
+                    let mut iacc = [[[_mm256_setzero_si256(); 2]; 2]; 2];
+                    for j in 0..SUBS {
+                        let b = s * SUBS + j;
+                        let wb = b * block_bytes;
+                        let xb = b * MM_TILE * 32;
+                        for half in 0..2 {
+                            // Safety (the block): every load is 32 bytes
+                            // inside a pair's 64 of block `b`, which the
+                            // group and the tile hold whole.
+                            unsafe {
+                                let mut wv = [_mm256_setzero_si256(); 2];
+                                let mut wa = [_mm256_setzero_si256(); 2];
+                                for (pi, (v, abs)) in wv.iter_mut().zip(wa.iter_mut()).enumerate() {
+                                    let p = row_half * 2 + pi;
+                                    *v = _mm256_loadu_si256(
+                                        wq.as_ptr().add(wb + p * 64 + half * 32) as *const __m256i,
+                                    );
+                                    *abs = _mm256_abs_epi8(*v);
+                                }
+                                for qi in 0..2 {
+                                    let q = token_half * 2 + qi;
+                                    let xv = _mm256_loadu_si256(
+                                        qtile.as_ptr().add(xb + q * 64 + half * 32)
+                                            as *const __m256i,
+                                    );
+                                    let xs = _mm256_shuffle_epi32(xv, 0b01_00_11_10);
+                                    for pi in 0..2 {
+                                        let direct = _mm256_madd_epi16(
+                                            _mm256_maddubs_epi16(
+                                                wa[pi],
+                                                _mm256_sign_epi8(xv, wv[pi]),
+                                            ),
+                                            ones,
+                                        );
+                                        let cross = _mm256_madd_epi16(
+                                            _mm256_maddubs_epi16(
+                                                wa[pi],
+                                                _mm256_sign_epi8(xs, wv[pi]),
+                                            ),
+                                            ones,
+                                        );
+                                        iacc[pi][qi][0] = _mm256_add_epi32(iacc[pi][qi][0], direct);
+                                        iacc[pi][qi][1] = _mm256_add_epi32(iacc[pi][qi][1], cross);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (pi, by_token) in iacc.iter().enumerate() {
+                        for (qi, [direct, cross]) in by_token.iter().enumerate() {
+                            // Lanes 0–1 and 4–5 of `direct` are row 0 · token
+                            // 0, lanes 2–3 and 6–7 row 1 · token 1; of
+                            // `cross`, row 0 · token 1 and row 1 · token 0.
+                            let fold = |v: __m256i| {
+                                _mm_add_epi32(
+                                    _mm256_castsi256_si128(v),
+                                    _mm256_extracti128_si256(v, 1),
+                                )
+                            };
+                            let sums = _mm_hadd_epi32(fold(*direct), fold(*cross));
+                            let mut s4 = [0i32; 4];
+                            // Safety: `s4` is 16 bytes.
+                            unsafe { _mm_storeu_si128(s4.as_mut_ptr() as *mut __m128i, sums) };
+                            let (r0, r1) = (pi * 2, pi * 2 + 1);
+                            let (k0, k1) = (qi * 2, qi * 2 + 1);
+                            let d = |k: usize| dtile[s * MM_TILE + token_half * 4 + k];
+                            acc[r0][k0] += s4[0] as f32 * d(k0);
+                            acc[r1][k1] += s4[1] as f32 * d(k1);
+                            acc[r0][k1] += s4[2] as f32 * d(k1);
+                            acc[r1][k0] += s4[3] as f32 * d(k0);
+                        }
+                    }
+                }
+                for (r, by_token) in acc.iter().enumerate() {
+                    let row = row_half * 4 + r;
+                    let scale = w.scale[g * ROW_OCT + row];
+                    for (k, v) in by_token.iter().enumerate() {
+                        let t = tl * MM_TILE + token_half * 4 + k;
+                        if t < a.n_tokens {
+                            yt[row][t] = v * scale;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The definition [`rowi8_tiles_mmla`] is held to: `i32` sums per
@@ -4916,10 +5219,10 @@ pub const F32_ROWS: usize = 4;
 /// Tokens per [`gemm_f32_rows`] tile: 4 × 6 accumulators plus four weight
 /// vectors and one activation vector is 29 of the 32 NEON registers — the
 /// largest tile that does not spill. (4 × 8 needs 37 and spilled every
-/// accumulator: 79 vector stores per 32 multiply-adds.) The portable tile
-/// keeps the same shape: 24 eight-lane accumulators is within `AVX2`'s
-/// sixteen registers only with spills, but the tile's shape is what the
-/// callers' splits are sized to, and the same shape keeps them one code.
+/// accumulator: 79 vector stores per 32 multiply-adds.) `AVX2` has sixteen
+/// registers, so [`f32_tile_avx2`] runs the same 4 × 6 as two 2 × 6 halves;
+/// the portable tile keeps the shape as written, the callers' splits being
+/// sized to it.
 const F32_TOKENS: usize = 6;
 
 /// Four `f32` rows against every token — the prefill kernel for the float
@@ -4931,36 +5234,37 @@ const F32_TOKENS: usize = 6;
 /// A Qwen-Image VAE decode — 3×3 convolutions as `im2col` matmuls of 96 to
 /// 384 output rows against tens of thousands of pixels — ran it at under
 /// 2 G MAC/s per core. This holds a 4-row × 6-token tile of accumulators in
-/// registers and walks `in_dim` four lanes at a time: 10 loads per 96
-/// multiply-adds, each `vfmaq_f32` independent of the others, the lane sums
-/// reduced once at the end. The tile is a separate function with every
-/// loop bound a constant, which is what keeps the accumulators in registers
-/// — a tile whose token count is a runtime value indexes them through
-/// memory.
+/// registers and walks `in_dim` a vector at a time, the lane sums reduced
+/// once at the end: on NEON four lanes, 10 loads per 96 multiply-adds, each
+/// `vfmaq_f32` independent of the others; on `x86_64` with `AVX2` + `FMA`
+/// ([`f32_tile_avx2`]) eight lanes as two 2 × 6 halves that fit its sixteen
+/// registers. The tile is a separate function with every loop bound a
+/// constant, which is what keeps the accumulators in registers — a tile
+/// whose token count is a runtime value indexes them through memory. It is
+/// also the query-by-key score product of the picture models' attention.
 ///
-/// The `f32` result differs from [`dot_row_f32`]'s only in summation order
-/// (four interleaved partial sums against eight), which is `f32` rounding
-/// noise — the same seeded picture came out byte-identical through both.
-pub fn gemm_f32_rows(w: [&[f32]; F32_ROWS], x: &[f32], in_dim: usize, out: [&mut [f32]; F32_ROWS]) {
+/// The `f32` result differs from [`dot_row_f32`]'s only in summation order,
+/// which is `f32` rounding noise. A token's result is the same bits whether
+/// it falls in a whole tile or in the short last one.
+pub fn gemm_f32_rows(
+    w: [&[f32]; F32_ROWS],
+    x: &[f32],
+    in_dim: usize,
+    mut out: [&mut [f32]; F32_ROWS],
+) {
     let n_tokens = out[0].len();
     debug_assert!(w.iter().all(|r| r.len() >= in_dim));
     debug_assert!(x.len() >= n_tokens * in_dim);
     debug_assert!(out.iter().all(|o| o.len() == n_tokens));
     let full = n_tokens / F32_TOKENS * F32_TOKENS;
-    let mut t0 = 0;
-    while t0 < full {
-        // Safety: the tile reads `in_dim` floats from each of the four rows
-        // and from tokens `t0..t0 + F32_TOKENS`, all inside the slices
+    #[cfg(target_arch = "x86_64")]
+    if have_avx2_fma() {
+        // Safety: the features were detected; the bounds are the ones
         // checked above.
-        #[cfg(target_arch = "aarch64")]
-        let tile = unsafe { f32_tile(&w, x.as_ptr().add(t0 * in_dim), in_dim) };
-        #[cfg(not(target_arch = "aarch64"))]
-        let tile = f32_tile_portable(&w, &x[t0 * in_dim..], in_dim);
-        for (r, row) in tile.iter().enumerate() {
-            out[r][t0..t0 + F32_TOKENS].copy_from_slice(row);
-        }
-        t0 += F32_TOKENS;
+        unsafe { gemm_f32_rows_many_avx2(&w, x, in_dim, full, &mut out) };
+        return;
     }
+    gemm_f32_tiles_portable(&w, x, in_dim, full, &mut out);
     // The last, short tile: one token at a time, four rows.
     for t in full..n_tokens {
         let xt = &x[t * in_dim..(t + 1) * in_dim];
@@ -4972,6 +5276,261 @@ pub fn gemm_f32_rows(w: [&[f32]; F32_ROWS], x: &[f32], in_dim: usize, out: [&mut
 
 /// One 4 × [`F32_TOKENS`] tile of [`gemm_f32_rows`]. `x` points at the
 /// first of the tile's tokens, each `in_dim` floats long.
+/// The whole tiles of [`gemm_f32_rows`], tokens `0..full`, on the NEON tile
+/// on `aarch64` and the portable one elsewhere.
+fn gemm_f32_tiles_portable(
+    w: &[&[f32]; F32_ROWS],
+    x: &[f32],
+    in_dim: usize,
+    full: usize,
+    out: &mut [&mut [f32]; F32_ROWS],
+) {
+    let mut t0 = 0;
+    while t0 < full {
+        // Safety: the tile reads `in_dim` floats from each of the four rows
+        // and from tokens `t0..t0 + F32_TOKENS`, all inside the slices
+        // `gemm_f32_rows` checked.
+        #[cfg(target_arch = "aarch64")]
+        let tile = unsafe { f32_tile(w, x.as_ptr().add(t0 * in_dim), in_dim) };
+        #[cfg(not(target_arch = "aarch64"))]
+        let tile = f32_tile_portable(w, &x[t0 * in_dim..], in_dim);
+        for (r, row) in tile.iter().enumerate() {
+            out[r][t0..t0 + F32_TOKENS].copy_from_slice(row);
+        }
+        t0 += F32_TOKENS;
+    }
+}
+
+/// [`gemm_f32_rows`] for any multiple of [`F32_ROWS`] rows at once, the
+/// token tile outermost: each tile of [`F32_TOKENS`] tokens is read into L1
+/// once and every quad of rows passes over it, where one
+/// [`gemm_f32_rows`] call per quad streams all of `x` once per quad. This
+/// is the picture attention's score product — a block of queries (the
+/// rows) against a head's keys (the tokens), whose key set is larger than
+/// L2: per block the keys are read once, not once per four queries.
+///
+/// Each output is computed exactly as [`gemm_f32_rows`] computes it — the
+/// same tile and the same short-tile tail — so the two agree bit for bit.
+/// `out[r]` is row `r`'s `n_tokens`-long output.
+pub fn gemm_f32_rows_many(w: &[&[f32]], x: &[f32], in_dim: usize, out: &mut [&mut [f32]]) {
+    assert!(w.len().is_multiple_of(F32_ROWS) && w.len() == out.len());
+    let Some(first) = out.first() else {
+        return;
+    };
+    let n_tokens = first.len();
+    debug_assert!(w.iter().all(|r| r.len() >= in_dim));
+    debug_assert!(x.len() >= n_tokens * in_dim);
+    debug_assert!(out.iter().all(|o| o.len() == n_tokens));
+    let full = n_tokens / F32_TOKENS * F32_TOKENS;
+    #[cfg(target_arch = "x86_64")]
+    if have_avx2_fma() {
+        // Safety: the features were detected; the bounds are the ones
+        // checked above.
+        unsafe { gemm_f32_rows_many_avx2(w, x, in_dim, full, out) };
+        return;
+    }
+    let mut t0 = 0;
+    while t0 < full {
+        for (quad, outs) in w
+            .as_chunks::<F32_ROWS>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<F32_ROWS>().0)
+        {
+            // Safety: the tile reads `in_dim` floats from each of the four
+            // rows and from tokens `t0..t0 + F32_TOKENS`, all inside the
+            // slices checked above.
+            #[cfg(target_arch = "aarch64")]
+            let tile = unsafe { f32_tile(quad, x.as_ptr().add(t0 * in_dim), in_dim) };
+            #[cfg(not(target_arch = "aarch64"))]
+            let tile = f32_tile_portable(quad, &x[t0 * in_dim..], in_dim);
+            for (row, o) in tile.iter().zip(outs.iter_mut()) {
+                o[t0..t0 + F32_TOKENS].copy_from_slice(row);
+            }
+        }
+        t0 += F32_TOKENS;
+    }
+    for t in full..n_tokens {
+        let xt = &x[t * in_dim..(t + 1) * in_dim];
+        for (row, o) in w.iter().zip(out.iter_mut()) {
+            o[t] = dot_f32_slices(&row[..in_dim], xt);
+        }
+    }
+}
+
+/// [`gemm_f32_rows_many`] — and [`gemm_f32_rows`], one quad of it — on
+/// [`f32_tile_avx2`] and [`dot_f32_avx2`], the loops inside the
+/// `target_feature` function so both inline: this is the tile's one
+/// caller. The short last tile is the tile's arithmetic for one output, so
+/// a token's result does not depend on where the token count put it — a
+/// sequence split across calls matches the unsplit one bit for bit.
+///
+/// # Safety
+/// `AVX2` and `FMA` must be available ([`have_avx2_fma`]); the slices as
+/// [`gemm_f32_rows_many`] checks them, `full` the whole tiles' token count.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_f32_rows_many_avx2(
+    w: &[&[f32]],
+    x: &[f32],
+    in_dim: usize,
+    full: usize,
+    out: &mut [&mut [f32]],
+) {
+    let n_tokens = out[0].len();
+    let mut t0 = 0;
+    while t0 < full {
+        for (quad, outs) in w
+            .as_chunks::<F32_ROWS>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<F32_ROWS>().0)
+        {
+            // Safety: as the caller's contract; the tile reads tokens
+            // `t0..t0 + F32_TOKENS`, all below `full`.
+            let tile = unsafe { f32_tile_avx2(quad, x.as_ptr().add(t0 * in_dim), in_dim) };
+            for (row, o) in tile.iter().zip(outs.iter_mut()) {
+                o[t0..t0 + F32_TOKENS].copy_from_slice(row);
+            }
+        }
+        t0 += F32_TOKENS;
+    }
+    for t in full..n_tokens {
+        let xt = &x[t * in_dim..(t + 1) * in_dim];
+        for (row, o) in w.iter().zip(out.iter_mut()) {
+            // Safety: as the caller's contract.
+            o[t] = unsafe { dot_f32_avx2(&row[..in_dim], xt) };
+        }
+    }
+}
+
+/// Whether [`f32_tile_avx2`] may run: `AVX2` for the loads and `FMA` for the
+/// multiply-adds.
+#[cfg(target_arch = "x86_64")]
+fn have_avx2_fma() -> bool {
+    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+}
+
+/// One output of [`f32_tile_avx2`] alone: the same eight-lane `vfmadd231ps`
+/// over `k` in the same order, the same `vhaddps` reduction (a lane of
+/// [`hsum4_ps`]) and the same scalar tail.
+///
+/// # Safety
+/// `AVX2` and `FMA` must be available; `w` and `x` the same length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn dot_f32_avx2(w: &[f32], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(w.len(), x.len());
+    let k8 = w.len() / 8 * 8;
+    // Safety: every load is below `k8 <= len` in both slices.
+    let mut sum = unsafe {
+        let mut acc = _mm256_setzero_ps();
+        let mut k = 0;
+        while k < k8 {
+            acc = _mm256_fmadd_ps(
+                _mm256_loadu_ps(w.as_ptr().add(k)),
+                _mm256_loadu_ps(x.as_ptr().add(k)),
+                acc,
+            );
+            k += 8;
+        }
+        let zero = _mm256_setzero_ps();
+        _mm_cvtss_f32(hsum4_ps(acc, zero, zero, zero))
+    };
+    for kk in k8..w.len() {
+        sum += w[kk] * x[kk];
+    }
+    sum
+}
+
+/// The 4 × [`F32_TOKENS`] tile on `AVX2` + `FMA`, as two 2 × 6 halves:
+/// twelve eight-lane accumulators, two weight vectors and one activation
+/// vector are fifteen of the sixteen `ymm` registers — the 4 × 6 of the
+/// NEON tile would need 29 and spill. Per eight elements a half loads two
+/// weight vectors and six activation vectors for twelve `vfmadd231ps`,
+/// under the two loads a cycle the core issues. Each half's twelve lane
+/// sums are reduced by `vhaddps` trees, four outputs at a time.
+///
+/// Same product as [`f32_tile_portable`] in another summation order.
+///
+/// # Safety
+/// `AVX2` and `FMA` must be available; every row of `w` must hold at least
+/// `in_dim` floats and `x` must point at `F32_TOKENS * in_dim` readable
+/// floats.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+#[allow(clippy::needless_range_loop)]
+unsafe fn f32_tile_avx2(
+    w: &[&[f32]; F32_ROWS],
+    x: *const f32,
+    in_dim: usize,
+) -> [[f32; F32_TOKENS]; F32_ROWS] {
+    use std::arch::x86_64::*;
+    const HALF: usize = 2;
+    // Where each (row of the half, token) lands in the three reductions:
+    // row 0's tokens 0..4, then both rows' tokens 4 and 5, then row 1's
+    // tokens 0..4.
+    const SLOT: [[usize; F32_TOKENS]; HALF] = [[0, 1, 2, 3, 4, 5], [8, 9, 10, 11, 6, 7]];
+    let k8 = in_dim / 8 * 8;
+    let mut out = [[0f32; F32_TOKENS]; F32_ROWS];
+    for h in 0..F32_ROWS / HALF {
+        let rows = [w[h * HALF].as_ptr(), w[h * HALF + 1].as_ptr()];
+        // Safety (the whole block): every load is below `k8 <= in_dim` in a
+        // row, or below `F32_TOKENS * in_dim` from `x`.
+        unsafe {
+            let mut a0 = [_mm256_setzero_ps(); F32_TOKENS];
+            let mut a1 = [_mm256_setzero_ps(); F32_TOKENS];
+            let mut k = 0;
+            while k < k8 {
+                let w0 = _mm256_loadu_ps(rows[0].add(k));
+                let w1 = _mm256_loadu_ps(rows[1].add(k));
+                for t in 0..F32_TOKENS {
+                    let xv = _mm256_loadu_ps(x.add(t * in_dim + k));
+                    a0[t] = _mm256_fmadd_ps(w0, xv, a0[t]);
+                    a1[t] = _mm256_fmadd_ps(w1, xv, a1[t]);
+                }
+                k += 8;
+            }
+            let mut sums = [0f32; HALF * F32_TOKENS];
+            let p = sums.as_mut_ptr();
+            _mm_storeu_ps(p, hsum4_ps(a0[0], a0[1], a0[2], a0[3]));
+            _mm_storeu_ps(p.add(4), hsum4_ps(a0[4], a0[5], a1[4], a1[5]));
+            _mm_storeu_ps(p.add(8), hsum4_ps(a1[0], a1[1], a1[2], a1[3]));
+            for r in 0..HALF {
+                for t in 0..F32_TOKENS {
+                    let mut sum = sums[SLOT[r][t]];
+                    for kk in k8..in_dim {
+                        sum += *rows[r].add(kk) * *x.add(t * in_dim + kk);
+                    }
+                    out[h * HALF + r][t] = sum;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The lane sums of four `ymm` vectors, `[Σa, Σb, Σc, Σd]`: three `vhaddps`
+/// and one cross-lane add rather than four separate reductions.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+#[inline]
+fn hsum4_ps(
+    a: std::arch::x86_64::__m256,
+    b: std::arch::x86_64::__m256,
+    c: std::arch::x86_64::__m256,
+    d: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m128 {
+    use std::arch::x86_64::*;
+    let ab = _mm256_hadd_ps(a, b);
+    let cd = _mm256_hadd_ps(c, d);
+    let abcd = _mm256_hadd_ps(ab, cd);
+    _mm_add_ps(_mm256_castps256_ps128(abcd), _mm256_extractf128_ps(abcd, 1))
+}
+
 // Index loops rather than iterators, deliberately: with every bound a
 // constant, LLVM unrolls them and keeps all 24 accumulators in registers
 // (checked in the disassembly: 24 `fmla` per 10 loads and no spill); the
@@ -5065,7 +5624,8 @@ fn f32_tile_portable(
 }
 
 /// `sum_i w[i] * x[i]` over two `f32` slices of equal length, four lanes at
-/// a time — the short-tile tail of [`gemm_f32_rows`].
+/// a time — the short-tile tail of [`gemm_f32_rows`] where the tile is not
+/// the `AVX2` one.
 #[cfg(target_arch = "aarch64")]
 pub fn dot_f32_slices(w: &[f32], x: &[f32]) -> f32 {
     use std::arch::aarch64::*;
@@ -8016,6 +8576,128 @@ mod tests {
         assert_eq!(a.q[4], -2, "-1.5 must round away from zero");
     }
 
+    /// `gemm_f32_rows` at the picture attention's score shape — four query
+    /// rows against `n` keys of 128 — one thread, keys in and out of L2:
+    /// the G MAC/s of the tile against the rate its key stream allows.
+    /// `cargo test --release --bin orangu-server f32_gemm_rate -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn f32_gemm_rate_at_the_attention_shape() {
+        let head_dim = 128usize;
+        for n in [512usize, 4096] {
+            let value = |i: usize| ((i * 37 % 29) as f32 - 14.0) * 0.01;
+            let q: Vec<Vec<f32>> = (0..F32_ROWS)
+                .map(|r| (0..head_dim).map(|i| value(r * head_dim + i)).collect())
+                .collect();
+            let keys: Vec<f32> = (0..n * head_dim).map(|i| value(i + 7)).collect();
+            let mut out = vec![0f32; F32_ROWS * n];
+            let mut pass = || {
+                let (o0, rest) = out.split_at_mut(n);
+                let (o1, rest) = rest.split_at_mut(n);
+                let (o2, o3) = rest.split_at_mut(n);
+                gemm_f32_rows(
+                    [&q[0], &q[1], &q[2], &q[3]],
+                    &keys,
+                    head_dim,
+                    [o0, o1, o2, o3],
+                );
+            };
+            pass();
+            let reps = (1usize << 26) / (n * head_dim * F32_ROWS);
+            let started = std::time::Instant::now();
+            for _ in 0..reps {
+                pass();
+            }
+            let secs = started.elapsed().as_secs_f64() / reps as f64;
+            let macs = (F32_ROWS * n * head_dim) as f64;
+            eprintln!(
+                "gemm_f32_rows 4 x {n} keys x {head_dim}: {:.1} us, {:.1} G MAC/s, keys {} KiB",
+                secs * 1e6,
+                macs / secs / 1e9,
+                (n * head_dim * 4) >> 10
+            );
+        }
+    }
+
+    /// [`gemm_f32_rows_many`] is [`gemm_f32_rows`] per quad of rows, bit
+    /// for bit: three quads against a token count with a short last tile
+    /// and an `in_dim` with a scalar tail.
+    #[test]
+    fn many_rows_match_the_quad_gemm_bit_for_bit() {
+        let (in_dim, n_tokens, n_rows) = (133usize, 23usize, 3 * F32_ROWS);
+        let value = |i: usize| ((i * 37 % 29) as f32 - 14.0) * 0.07;
+        let rows: Vec<Vec<f32>> = (0..n_rows)
+            .map(|r| (0..in_dim).map(|i| value(r * in_dim + i + 3)).collect())
+            .collect();
+        let x: Vec<f32> = (0..n_tokens * in_dim)
+            .map(|i| value(i * 5 + i / in_dim))
+            .collect();
+        let w: Vec<&[f32]> = rows.iter().map(|r| &r[..]).collect();
+        let mut many = vec![0f32; n_rows * n_tokens];
+        let mut outs: Vec<&mut [f32]> = many.chunks_mut(n_tokens).collect();
+        gemm_f32_rows_many(&w, &x, in_dim, &mut outs);
+        for quad in 0..n_rows / F32_ROWS {
+            let mut one = vec![0f32; F32_ROWS * n_tokens];
+            let (o0, rest) = one.split_at_mut(n_tokens);
+            let (o1, rest) = rest.split_at_mut(n_tokens);
+            let (o2, o3) = rest.split_at_mut(n_tokens);
+            let q = quad * F32_ROWS;
+            gemm_f32_rows(
+                [w[q], w[q + 1], w[q + 2], w[q + 3]],
+                &x,
+                in_dim,
+                [o0, o1, o2, o3],
+            );
+            for r in 0..F32_ROWS {
+                for t in 0..n_tokens {
+                    assert_eq!(
+                        many[(q + r) * n_tokens + t].to_bits(),
+                        one[r * n_tokens + t].to_bits(),
+                        "row {} token {t}",
+                        q + r
+                    );
+                }
+            }
+        }
+    }
+
+    /// A token's output does not depend on the token count: through a
+    /// whole tile (six tokens) and through the short last tile (one at a
+    /// time) it is the same bits — what lets a sequence split across calls
+    /// (a pipeline's workers, a chunked prefill) match the unsplit one.
+    #[test]
+    fn a_float_gemm_output_does_not_depend_on_the_token_count() {
+        let in_dim = 131usize;
+        let value = |i: usize| ((i * 37 % 29) as f32 - 14.0) * 0.07;
+        let rows: Vec<Vec<f32>> = (0..F32_ROWS)
+            .map(|r| (0..in_dim).map(|i| value(r * in_dim + i + 3)).collect())
+            .collect();
+        let w = [&rows[0][..], &rows[1], &rows[2], &rows[3]];
+        let x: Vec<f32> = (0..F32_TOKENS * in_dim)
+            .map(|i| value(i * 5 + i / in_dim))
+            .collect();
+        let run = |x: &[f32], n: usize| {
+            let mut got = vec![0f32; F32_ROWS * n];
+            let (g0, rest) = got.split_at_mut(n);
+            let (g1, rest) = rest.split_at_mut(n);
+            let (g2, g3) = rest.split_at_mut(n);
+            gemm_f32_rows(w, x, in_dim, [g0, g1, g2, g3]);
+            got
+        };
+        let whole = run(&x, F32_TOKENS);
+        for t in 0..F32_TOKENS {
+            let alone = run(&x[t * in_dim..(t + 1) * in_dim], 1);
+            for r in 0..F32_ROWS {
+                assert_eq!(
+                    whole[r * F32_TOKENS + t].to_bits(),
+                    alone[r].to_bits(),
+                    "row {r} token {t}"
+                );
+            }
+        }
+    }
+
     /// The tiled float kernel is `dot_row_f32` in a different summation
     /// order: every output within `f32` rounding of the per-token dot, at an
     /// `in_dim` that is not a multiple of four (a scalar tail), a token
@@ -8044,7 +8726,12 @@ mod tests {
                 }
             }
             let row_bytes = in_dim * stride;
-            let x: Vec<f32> = (0..n_tokens * in_dim).map(|i| value(i + 5) * 0.5).collect();
+            // Offset by the token too: `in_dim` is a multiple of `value`'s
+            // period, so `value(i)` alone gives every token the same row and
+            // a tile that swapped tokens would pass.
+            let x: Vec<f32> = (0..n_tokens * in_dim)
+                .map(|i| value(i + 5 + i / in_dim) * 0.5)
+                .collect();
             let mut rows: Vec<Vec<f32>> = vec![Vec::new(); F32_ROWS];
             for (o, row) in rows.iter_mut().enumerate() {
                 widen_float_row(
@@ -8097,6 +8784,28 @@ mod tests {
                         "portable tile, type {ggml_type} row {o} token {t}: {} vs {want}",
                         tile[o][t]
                     );
+                }
+            }
+            // The `AVX2` tile, where the core has it: two 2 × 6 halves and
+            // a `vhaddps` reduction, the same product again.
+            #[cfg(target_arch = "x86_64")]
+            if have_avx2_fma() {
+                // Safety: the features were detected; every row is `in_dim`
+                // long and `x` holds `n_tokens >= F32_TOKENS` tokens.
+                let tile = unsafe { f32_tile_avx2(&wr, x.as_ptr(), in_dim) };
+                for o in 0..F32_ROWS {
+                    for t in 0..F32_TOKENS {
+                        let want = dot_row_f32(
+                            ggml_type,
+                            &raw[o * row_bytes..(o + 1) * row_bytes],
+                            &x[t * in_dim..(t + 1) * in_dim],
+                        );
+                        assert!(
+                            (tile[o][t] - want).abs() <= 1e-4 * want.abs().max(1.0),
+                            "AVX2 tile, type {ggml_type} row {o} token {t}: {} vs {want}",
+                            tile[o][t]
+                        );
+                    }
                 }
             }
         }
@@ -8700,6 +9409,46 @@ mod rowi8_tests {
         assert!(worst_twin < 1e-4, "tile vs portable {worst_twin}");
         assert!(rel < 0.01, "the weights' own relative RMS error {rel}");
         assert!(rel_full < 0.05, "against exact f32 {rel_full}");
+    }
+
+    /// The `AVX2` tile is the portable definition to the bit — exact `i32`
+    /// sums, the same fold — over rows not a multiple of eight, tokens not
+    /// of the tile, and several super-blocks.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_avx2_rowi8_tile_is_the_portable_one_to_the_bit() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let (in_dim, out_dim, n) = (768usize, 21usize, 19usize);
+        let w = data(in_dim * out_dim, 5);
+        let x = data(n * in_dim, 6);
+        let rows = RowI8::quantize(out_dim, in_dim, |o| {
+            w[o * in_dim..(o + 1) * in_dim].to_vec()
+        });
+        let acts = ActQ8Mm::quantize(&x, in_dim, n);
+        for g in 0..rows.groups {
+            let mut want = vec![0f32; ROW_OCT * n];
+            let mut got = vec![0f32; ROW_OCT * n];
+            {
+                let mut slices: Vec<&mut [f32]> = want.chunks_mut(n).collect();
+                rowi8_tiles_portable(&rows, g, &acts, 0..acts.n_tiles(), &mut slices);
+            }
+            {
+                let mut slices: Vec<&mut [f32]> = got.chunks_mut(n).collect();
+                // Safety: `AVX2` was detected.
+                unsafe { rowi8_tiles_avx2(&rows, g, &acts, 0..acts.n_tiles(), &mut slices) };
+            }
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "group {g} row {} token {}",
+                    i / n,
+                    i % n
+                );
+            }
+        }
     }
 
     /// `matmul_rowi8` at a Qwen-Image 2.1 step's shapes, against

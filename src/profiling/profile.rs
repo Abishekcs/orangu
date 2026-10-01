@@ -78,6 +78,10 @@ pub struct Options {
     pub png: bool,
     /// Title drawn on the flamegraph.
     pub title: String,
+    /// Keep the raw `perf.data` (and `perf record`'s log) beside the SVG
+    /// instead of deleting them once collapsed — for `perf report`, `perf
+    /// annotate` or a re-symbolization the collapsed file cannot give.
+    pub keep_data: bool,
 }
 
 /// A running `perf record`. Dropping one without calling [`Recorder::finish`]
@@ -105,6 +109,8 @@ pub struct Summary {
     pub svg: PathBuf,
     pub folded: PathBuf,
     pub png: Option<PathBuf>,
+    /// The raw `perf.data`, when [`Options::keep_data`] kept it.
+    pub data: Option<PathBuf>,
     pub samples: u64,
     pub seconds: f64,
     /// Mean number of the server's threads that were **on a CPU** during the
@@ -250,9 +256,15 @@ impl Recorder {
 
         // The raw `perf.data` is the largest artifact by an order of magnitude
         // and nothing downstream reads it; the collapsed file is the one worth
-        // keeping (it diffs, and it re-renders without a re-run).
-        let _ = std::fs::remove_file(&self.data);
-        let _ = std::fs::remove_file(&self.stderr_log);
+        // keeping (it diffs, and it re-renders without a re-run) — unless the
+        // caller asked for the raw data too.
+        let data = if self.opts.keep_data {
+            Some(self.data.clone())
+        } else {
+            let _ = std::fs::remove_file(&self.data);
+            let _ = std::fs::remove_file(&self.stderr_log);
+            None
+        };
 
         let attribution = summarize(&folded);
         let cores_busy = attribution.samples as f64 / (f64::from(self.opts.freq) * seconds);
@@ -313,6 +325,7 @@ impl Recorder {
             svg,
             folded: folded_path,
             png,
+            data,
             samples: attribution.samples,
             seconds,
             cores_busy,
@@ -351,6 +364,7 @@ pub struct SystemRecorder {
     freq: u32,
     call_graph: String,
     png: bool,
+    keep_data: bool,
     started: Instant,
 }
 
@@ -364,7 +378,13 @@ pub struct ProcessProfile {
 
 impl SystemRecorder {
     /// Start sampling every CPU. `dir` is where the per-process profiles go.
-    pub fn start(dir: &Path, freq: u32, call_graph: &str, png: bool) -> anyhow::Result<Self> {
+    pub fn start(
+        dir: &Path,
+        freq: u32,
+        call_graph: &str,
+        png: bool,
+        keep_data: bool,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let data = dir.join("system.perf.data");
         let stderr_log = dir.join("system.perf.log");
@@ -395,6 +415,7 @@ impl SystemRecorder {
             freq,
             call_graph: call_graph.to_string(),
             png,
+            keep_data,
             started: Instant::now(),
         };
         std::thread::sleep(std::time::Duration::from_millis(400));
@@ -470,8 +491,10 @@ impl SystemRecorder {
                 buf.push('\n');
             }
         }
-        let _ = std::fs::remove_file(&self.data);
-        let _ = std::fs::remove_file(&self.stderr_log);
+        if !self.keep_data {
+            let _ = std::fs::remove_file(&self.data);
+            let _ = std::fs::remove_file(&self.stderr_log);
+        }
 
         let mut out = Vec::new();
         for ((layer, pid), script) in per_process {
@@ -486,6 +509,7 @@ impl SystemRecorder {
                 call_graph: self.call_graph.clone(),
                 png: self.png,
                 title: format!("{layer} (pid {pid})"),
+                keep_data: self.keep_data,
             };
             let folded_path = sibling(&opts.svg, "folded");
             std::fs::write(&folded_path, &folded)?;
@@ -517,6 +541,8 @@ impl SystemRecorder {
                     svg,
                     folded: folded_path,
                     png,
+                    // One capture for every process: the shared file.
+                    data: self.keep_data.then(|| self.data.clone()),
                     samples: attribution.samples,
                     seconds,
                     cores_busy,
@@ -797,6 +823,7 @@ pub fn rerender(
         freq: num("freq_hz").unwrap_or(0.0) as u32,
         call_graph: text("call_graph").unwrap_or_else(|| "?".to_string()),
         png,
+        keep_data: false,
         title: title
             .map(str::to_string)
             .or_else(|| text("title"))

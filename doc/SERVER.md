@@ -1234,8 +1234,9 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   `qwen_image_2_1` model needs (and `vision`, the projector a
   `qwen_image_2_1` model edits attached pictures with, or `none`);
   `image_weights`, `auto`/`int8`/`file`, how that transformer's linears
-  are held (per-row `int8` is ~1.4–1.9× a step for 7 GB on a core with
-  `i8mm`; `auto` takes it only there);
+  are held when the transformer runs on the CPU (per-row `int8`, ~1.4–1.9×
+  a step for 7 GB; `auto` takes it on a core with an `int8` tile, `i8mm`
+  or `AVX2`; a transformer on a GPU keeps the file's weights);
   `image_reference_size`, `source`/`output`/`WIDTHxHEIGHT`, the area an
   edit reads its reference at (`source`, the default: never above the
   attached picture's own);

@@ -153,6 +153,63 @@ pub struct QwenImage21Vae {
 }
 
 impl QwenImage21Vae {
+    /// Keeps the VAE on its backend, or moves it to the CPU, whichever runs
+    /// one of the decoder's full-resolution convolutions faster — timed
+    /// now, on a 128 × 128 feature map (a band's worth of pixels), each side
+    /// warmed once. A GPU takes the `im2col` band over the bus; the CPU,
+    /// with an `int8` tile (`vecdot::have_rowi8_tile`), gathers each
+    /// pixel's window straight into its quantizer and builds no band at
+    /// all — which wins is the machine's to say. A CPU backend is kept as
+    /// it is.
+    pub fn choose_backend(&mut self) {
+        if self.backend.is_cpu() {
+            return;
+        }
+        let Some(conv) = self
+            .decoder
+            .stages
+            .last()
+            .and_then(|stage| stage.resnets.first())
+            .map(|block| &block.conv1)
+        else {
+            return;
+        };
+        let side = 128usize;
+        let x = Feature::new(
+            side,
+            side,
+            conv.cin,
+            (0..side * side * conv.cin)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+                .collect(),
+        );
+        let cpu: Arc<dyn Backend> = Arc::new(crate::engine::backend::CpuBackend);
+        let time = |backend: &dyn Backend| {
+            let _ = run_conv(backend, conv, &x);
+            let started = std::time::Instant::now();
+            let _ = run_conv(backend, conv, &x);
+            started.elapsed()
+        };
+        let device = time(&*self.backend);
+        let host = time(&*cpu);
+        let _ = super::vae::take_conv_clock();
+        let cpu_wins = host < device;
+        log::info!(
+            "orangu-server: [image] VAE placement: one {}x{} convolution, {}->{} channels: \
+             device {:.0} ms, cpu {:.0} ms — {}",
+            side,
+            side,
+            conv.cin,
+            conv.cout,
+            device.as_secs_f64() * 1e3,
+            host.as_secs_f64() * 1e3,
+            if cpu_wins { "the CPU" } else { "the device" }
+        );
+        if cpu_wins {
+            self.backend = cpu;
+        }
+    }
+
     pub fn load(path: &Path, backend: Arc<dyn Backend>, precision: VaePrecision) -> Result<Self> {
         let file = SafeTensors::open(path)?;
         Self::from_safetensors(&file, backend, precision)

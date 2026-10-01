@@ -671,6 +671,9 @@ pub struct LoadedModel {
     /// model, because [`Self::matrix`] is what stamps it onto each tensor
     /// and every architecture calls that during construction.
     layer_device: Vec<usize>,
+    /// The device of every tensor when `layer_device` is empty — see
+    /// [`Self::set_default_device`].
+    default_device: usize,
     /// Which experts of each `*_exps.weight` tensor a device tier holds —
     /// see `ExpertQuantMatrix::residency`. Empty when no tier is active,
     /// and set at the same moment (and for the same reason) as
@@ -1639,6 +1642,14 @@ impl LoadedModel {
         self.layer_device = layer_device;
     }
 
+    /// The device every tensor is tagged with when the model has no layer
+    /// plan — a picture transformer sent whole to one device of a split.
+    /// Must be called before the model is constructed, as
+    /// [`Self::set_layer_devices`] must.
+    pub fn set_default_device(&mut self, device: usize) {
+        self.default_device = device;
+    }
+
     /// Records which experts a device tier holds, per `*_exps.weight`
     /// tensor. Must be called before the model is built, for the same
     /// reason [`Self::set_layer_devices`] must.
@@ -1696,7 +1707,7 @@ impl LoadedModel {
     /// the first device is the largest by construction (the set is ranked).
     pub fn device_for_tensor(&self, name: &str) -> usize {
         if self.layer_device.is_empty() {
-            return 0;
+            return self.default_device;
         }
         let Some(layer) = name
             .strip_prefix("blk.")
@@ -2097,6 +2108,7 @@ impl LoadedModel {
             // A model is single-device until `main` says otherwise; see
             // `Self::set_layer_devices`.
             layer_device: Vec::new(),
+            default_device: 0,
             expert_residency: HashMap::new(),
             mappings,
         })
@@ -2928,6 +2940,30 @@ mod tests {
         buf
     }
 
+    /// A model with no layer plan tags every tensor with its default device
+    /// — 0 until `set_default_device` says otherwise (a picture transformer
+    /// sent whole to one device of a split); a layer plan still decides
+    /// `blk.<n>.` tensors.
+    #[test]
+    fn a_model_without_a_layer_plan_tags_its_default_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.gguf");
+        std::fs::write(&path, minimal_llama_gguf()).expect("write model");
+        let mut model = LoadedModel::open(&path).expect("load");
+        assert_eq!(
+            model.device_for_tensor("transformer_blocks.0.attn.to_q.weight"),
+            0
+        );
+        model.set_default_device(2);
+        assert_eq!(
+            model.device_for_tensor("transformer_blocks.0.attn.to_q.weight"),
+            2
+        );
+        assert_eq!(model.device_for_tensor("blk.0.attn_q.weight"), 2);
+        model.set_layer_devices(vec![1]);
+        assert_eq!(model.device_for_tensor("blk.0.attn_q.weight"), 1);
+    }
+
     /// The load path a bundled `orangu-server` takes has to produce exactly
     /// what the ordinary one does — same hyperparameters, same tensor, same
     /// bytes — from the same model sitting at a non-zero offset inside a
@@ -3021,6 +3057,7 @@ mod tests {
             ],
             tensors: HashMap::new(),
             layer_device: Vec::new(),
+            default_device: 0,
             expert_residency: HashMap::new(),
             mappings: Vec::new(),
         };
@@ -3095,6 +3132,7 @@ mod tests {
             metadata: Vec::new(),
             tensors,
             layer_device: Vec::new(),
+            default_device: 0,
             expert_residency: HashMap::new(),
             mappings: Vec::new(),
         };

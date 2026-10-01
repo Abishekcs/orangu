@@ -590,6 +590,14 @@ pub struct VulkanBackend {
     /// best-fit: `map_read` maps the whole buffer, so a larger one would
     /// hand back more bytes than the caller asked for.
     readback_pool: std::sync::Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
+    /// Mappable upload buffers kept for reuse by a wide matmul's staging,
+    /// keyed by exact byte length as [`Self::readback_pool`] is. Both pools
+    /// together are held under [`HOST_POOL_BYTES`].
+    staging_pool: std::sync::Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
+    /// This device's seconds per multiply-add in a striped matmul's last
+    /// submission, which sizes the next one's to
+    /// [`STRIPED_SUBMISSION_BUDGET`]; `None` until the first.
+    striped_secs_per_mac: std::sync::Mutex<Option<f64>>,
     /// Chunk-sized K/V readback stages ([`KvReadbackStage`]), at most two.
     kv_stage_pool: std::sync::Mutex<Vec<wgpu::Buffer>>,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -3047,6 +3055,45 @@ impl Drop for ScratchLease {
                 }
             }
         });
+    }
+}
+
+/// The longest one submission of [`VulkanBackend`]'s striped matmul is
+/// sized to run: well inside the shortest GPU watchdog a desktop driver
+/// sets (a couple of seconds on some platforms, about ten on `amdgpu`),
+/// since one submission that outlives it resets the device.
+const STRIPED_SUBMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The most host-visible memory [`VulkanBackend`]'s readback and staging
+/// pools keep between calls, each: a wide prefill's buffers are hundreds of
+/// MiB, and pinned host memory is not the page cache's to reclaim.
+const HOST_POOL_BYTES: u64 = 1 << 30;
+
+/// Result vectors handed back through [`Backend::recycle`], for the next
+/// wide readback to fill instead of a fresh allocation whose every page the
+/// kernel would fault in and zero. One pool for the process, not one per
+/// device: on a split a result read back from one card is as good a buffer
+/// for the other's next one.
+static RESULT_POOL: std::sync::Mutex<Vec<Vec<f32>>> = std::sync::Mutex::new(Vec::new());
+
+/// The most memory [`RESULT_POOL`] keeps.
+const RESULT_POOL_BYTES: usize = 1 << 30;
+
+/// Keeps `buffer` for the next caller of `byte_len`: at most four per size,
+/// the concurrency one device sees, and none past [`HOST_POOL_BYTES`] in
+/// all — a buffer that would cross it is dropped instead.
+fn put_pooled(
+    pool: &std::sync::Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
+    byte_len: u64,
+    buffer: wgpu::Buffer,
+) {
+    const KEPT_PER_SIZE: usize = 4;
+    if let Ok(mut pool) = pool.lock() {
+        let held: u64 = pool.iter().map(|(len, kept)| len * kept.len() as u64).sum();
+        let kept = pool.entry(byte_len).or_default();
+        if kept.len() < KEPT_PER_SIZE && held + byte_len <= HOST_POOL_BYTES {
+            kept.push(buffer);
+        }
     }
 }
 
@@ -5743,6 +5790,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
 
         let mut backend = Self {
             readback_pool: std::sync::Mutex::new(HashMap::new()),
+            staging_pool: std::sync::Mutex::new(HashMap::new()),
+            striped_secs_per_mac: std::sync::Mutex::new(None),
             kv_stage_pool: std::sync::Mutex::new(Vec::new()),
             device,
             queue,
@@ -7370,6 +7419,19 @@ impl Backend for VulkanBackend {
         self.matmul_batch_striped(ops, n_tokens)
     }
 
+    fn take_scratch(&self, len: usize) -> Vec<f32> {
+        self.take_result(len)
+    }
+
+    fn recycle(&self, buffer: Vec<f32>) {
+        if let Ok(mut pool) = RESULT_POOL.lock() {
+            let held: usize = pool.iter().map(|v| v.capacity() * 4).sum();
+            if held + buffer.capacity() * 4 <= RESULT_POOL_BYTES {
+                pool.push(buffer);
+            }
+        }
+    }
+
     fn as_wgpu(&self) -> Option<&VulkanBackend> {
         Some(self)
     }
@@ -7650,146 +7712,201 @@ impl VulkanBackend {
                 })
                 .collect();
 
-        // Each op's full-length result, assembled on the GPU from the stripes
-        // and read back once at the end.
-        let outs: Vec<(wgpu::Buffer, wgpu::Buffer, usize)> = ops
+        // Each distinct input staged once, whole, in a pooled mappable buffer
+        // the host writes directly — every stripe is then a device copy out
+        // of it, padding rows included (zeroed here). Allocating host-visible
+        // memory per call is what this avoids: the kernel zeroes every page
+        // of a fresh one, and a wide prefill's activations are hundreds of
+        // MiB.
+        let rows_staged = plan
+            .last()
+            .map_or(0, |&(stripe_start, _, padded)| stripe_start + padded);
+        let staged_ops = if shares_one_input { 1 } else { ops.len() };
+        let stagings: Vec<(u64, wgpu::Buffer)> = ops[..staged_ops]
+            .iter()
+            .map(|op| {
+                let bytes = (rows_staged * op.w.in_dim) as u64 * 4;
+                (bytes, self.take_staging(bytes))
+            })
+            .collect();
+        {
+            const CONTEXT: &str = "staging a striped matmul's activations";
+            let wait = MapWait::new();
+            for (_, staging) in &stagings {
+                staging
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Write, wait.callback());
+            }
+            self.poll_blocking(CONTEXT);
+            wait.check(CONTEXT);
+            for (op, (_, staging)) in ops.iter().zip(&stagings) {
+                let real: &[u8] = bytemuck::cast_slice(&op.x[..n_tokens * op.w.in_dim]);
+                let mut view = staging
+                    .slice(..)
+                    .get_mapped_range_mut()
+                    .unwrap_or_else(|err| crate::device_lost::fail(CONTEXT, err));
+                fill_staging(view.slice(..real.len()), real);
+                view.slice(real.len()..).fill(0);
+                drop(view);
+                staging.unmap();
+            }
+        }
+
+        // Each op's full-length result, assembled from the stripes straight
+        // into a pooled readback buffer.
+        let outs: Vec<(wgpu::Buffer, usize)> = ops
             .iter()
             .map(|op| {
                 let len = n_tokens * op.w.out_dim;
-                let bytes = (len as u64) * 4;
-                let gpu = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("orangu-server striped matmul result"),
-                    size: bytes,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                });
-                let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("orangu-server striped matmul readback"),
-                    size: bytes,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                (gpu, readback, len)
+                (self.take_readback((len as u64) * 4), len)
             })
             .collect();
 
-        let mut encoder = self.new_encoder("orangu-server striped matmul batch encoder");
-        for &(stripe_start, len, padded) in &plan {
-            let guards = &guards_by_width
-                .iter()
-                .find(|(w, _)| *w == padded)
-                .expect("width planned above")
-                .1;
-
-            // Stage this stripe's activations, padded rows included.
-            let stagings: Vec<wgpu::Buffer> = if shares_one_input {
-                let in_dim = ops[0].w.in_dim;
-                let rows = pad_rows(
-                    &ops[0].x[stripe_start * in_dim..(stripe_start + len) * in_dim],
-                    len,
-                    padded,
-                    in_dim,
-                );
-                vec![self.upload_new(&rows)]
-            } else {
-                ops.iter()
-                    .map(|op| {
-                        let in_dim = op.w.in_dim;
-                        let rows = pad_rows(
-                            &op.x[stripe_start * in_dim..(stripe_start + len) * in_dim],
-                            len,
-                            padded,
-                            in_dim,
-                        );
-                        self.upload_new(&rows)
-                    })
-                    .collect()
-            };
-            for (i, (op, guard)) in ops.iter().zip(guards.iter()).enumerate() {
-                let staging = if shares_one_input {
-                    &stagings[0]
-                } else {
-                    &stagings[i]
-                };
-                encoder.copy_buffer_to_buffer(
-                    staging,
-                    0,
-                    &guard.x_buffer,
-                    guard.x_offset,
-                    (padded * op.w.in_dim) as u64 * 4,
-                );
-            }
-            // An op on the integer dot quantizes its activation in a pass of
-            // its own first, then dispatches through its MMVQ resources.
-            if guards.iter().any(|g| g.mmvq.is_some()) {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("orangu-server striped matmul quantize pass"),
-                    timestamp_writes: None,
-                });
-                for guard in guards.iter() {
-                    self.record_mmvq_quantize(&mut pass, guard);
-                }
-            }
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("orangu-server striped matmul pass"),
-                    timestamp_writes: None,
-                });
-                for (op, guard) in ops.iter().zip(guards.iter()) {
-                    if let Some(mmvq) = &guard.mmvq
-                        && let Some((pipeline, _)) = self.mmvq_pipeline_for(op.w, padded)
-                    {
-                        pass.set_pipeline(pipeline);
-                        pass.set_bind_group(0, &mmvq.mmvq_bind_group, &[]);
-                        let (wx, wy, wz) = mmvq.mmvq_workgroups;
-                        pass.dispatch_workgroups(wx, wy, wz);
-                        continue;
+        // Stripes go out in submissions sized to a time budget, not all in
+        // one: a wide op on a slow device (an integrated GPU under a
+        // 1024-pixel picture's MLP) held the ring past the driver's timeout
+        // as a single submission, and the driver reset the device. Each
+        // submission takes as many stripes as this device's measured rate
+        // ([`Self::striped_secs_per_mac`], from its earlier striped calls)
+        // fits in [`STRIPED_SUBMISSION_BUDGET`], at least one; before the
+        // device has a rate, the first stripe goes alone and sets it. A fast
+        // device sends a whole op in one submission.
+        let stripe_macs = |padded: usize| -> f64 {
+            ops.iter()
+                .map(|op| (padded * op.w.in_dim * op.w.out_dim) as f64)
+                .sum()
+        };
+        let mut rate = self.striped_secs_per_mac.lock().map_or(None, |rate| *rate);
+        let mut last: Option<(std::time::Instant, f64)> = None;
+        let mut at = 0;
+        while at < plan.len() {
+            let take = match rate {
+                None => 1,
+                Some(secs_per_mac) => {
+                    let budget = STRIPED_SUBMISSION_BUDGET.as_secs_f64();
+                    let mut take = 0;
+                    let mut secs = 0.0;
+                    while at + take < plan.len() {
+                        let stripe = stripe_macs(plan[at + take].2) * secs_per_mac;
+                        if take > 0 && secs + stripe > budget {
+                            break;
+                        }
+                        secs += stripe;
+                        take += 1;
                     }
-                    pass.set_pipeline(self.matmul_pipeline_for(op.w, padded));
-                    pass.set_bind_group(0, &guard.bind_group, &[]);
-                    let (wx, wy, wz) = guard.workgroups;
-                    pass.dispatch_workgroups(wx, wy, wz);
+                    take
+                }
+            };
+            let macs: f64 = plan[at..at + take]
+                .iter()
+                .map(|&(_, _, padded)| stripe_macs(padded))
+                .sum();
+            let mut encoder = self.new_encoder("orangu-server striped matmul batch encoder");
+            for &(stripe_start, len, padded) in &plan[at..at + take] {
+                let guards = &guards_by_width
+                    .iter()
+                    .find(|(w, _)| *w == padded)
+                    .expect("width planned above")
+                    .1;
+
+                for (i, (op, guard)) in ops.iter().zip(guards.iter()).enumerate() {
+                    let staging = &stagings[if shares_one_input { 0 } else { i }].1;
+                    encoder.copy_buffer_to_buffer(
+                        staging,
+                        (stripe_start * op.w.in_dim) as u64 * 4,
+                        &guard.x_buffer,
+                        guard.x_offset,
+                        (padded * op.w.in_dim) as u64 * 4,
+                    );
+                }
+                // An op on the integer dot quantizes its activation in a pass of
+                // its own first, then dispatches through its MMVQ resources.
+                if guards.iter().any(|g| g.mmvq.is_some()) {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("orangu-server striped matmul quantize pass"),
+                        timestamp_writes: None,
+                    });
+                    for guard in guards.iter() {
+                        self.record_mmvq_quantize(&mut pass, guard);
+                    }
+                }
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("orangu-server striped matmul pass"),
+                        timestamp_writes: None,
+                    });
+                    for (op, guard) in ops.iter().zip(guards.iter()) {
+                        if let Some(mmvq) = &guard.mmvq
+                            && let Some((pipeline, _)) = self.mmvq_pipeline_for(op.w, padded)
+                        {
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(0, &mmvq.mmvq_bind_group, &[]);
+                            let (wx, wy, wz) = mmvq.mmvq_workgroups;
+                            pass.dispatch_workgroups(wx, wy, wz);
+                            continue;
+                        }
+                        pass.set_pipeline(self.matmul_pipeline_for(op.w, padded));
+                        pass.set_bind_group(0, &guard.bind_group, &[]);
+                        let (wx, wy, wz) = guard.workgroups;
+                        pass.dispatch_workgroups(wx, wy, wz);
+                    }
+                }
+                // Cut the padding off here rather than after readback: only this
+                // stripe's real rows are copied into the assembled result.
+                for ((op, guard), (readback, _)) in ops.iter().zip(guards.iter()).zip(outs.iter()) {
+                    encoder.copy_buffer_to_buffer(
+                        &guard.output_buffer,
+                        guard.output_offset,
+                        readback,
+                        (stripe_start * op.w.out_dim) as u64 * 4,
+                        (len * op.w.out_dim) as u64 * 4,
+                    );
                 }
             }
-            // Cut the padding off here rather than after readback: only this
-            // stripe's real rows are copied into the assembled result.
-            for ((op, guard), (gpu, _, _)) in ops.iter().zip(guards.iter()).zip(outs.iter()) {
-                encoder.copy_buffer_to_buffer(
-                    &guard.output_buffer,
-                    guard.output_offset,
-                    gpu,
-                    (stripe_start * op.w.out_dim) as u64 * 4,
-                    (len * op.w.out_dim) as u64 * 4,
-                );
+            let submitted = std::time::Instant::now();
+            self.queue.submit(Some(encoder.finish()));
+            self.submission_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::engine::decode_stages::record_submission();
+            at += take;
+            if at < plan.len() {
+                self.poll_blocking("running a striped matmul's stripes");
+                rate = Some(submitted.elapsed().as_secs_f64() / macs.max(1.0));
+            } else {
+                last = Some((submitted, macs));
             }
         }
-        for (gpu, readback, len) in &outs {
-            encoder.copy_buffer_to_buffer(gpu, 0, readback, 0, (*len as u64) * 4);
-        }
-        self.queue.submit(Some(encoder.finish()));
-        self.submission_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::engine::decode_stages::record_submission();
 
         const CONTEXT: &str = "reading back a striped matmul";
         // Every buffer's map is recorded into one shared `MapWait` — a
         // single `check` after the single poll then covers all of them, so
-        // a device that dies partway through the set is still reported
-        // (the callbacks here used to discard their result outright).
+        // a device that dies partway through the set is still reported.
         let wait = MapWait::new();
-        for (_, readback, _) in &outs {
+        for (readback, _) in &outs {
             readback
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, wait.callback());
         }
         self.poll_blocking(CONTEXT);
         wait.check(CONTEXT);
-        outs.iter()
-            .map(|(_, readback, len)| {
-                let data = self.mapped_bytes(readback, CONTEXT);
-                let out = bytemuck::cast_slice::<u8, f32>(&data)[..*len].to_vec();
+        // The last submission's rate, its readback's map included — an
+        // over-estimate, which errs toward smaller submissions.
+        if let Some((submitted, macs)) = last
+            && let Ok(mut rate) = self.striped_secs_per_mac.lock()
+        {
+            *rate = Some(submitted.elapsed().as_secs_f64() / macs.max(1.0));
+        }
+        for (bytes, staging) in stagings {
+            self.put_staging(bytes, staging);
+        }
+        outs.into_iter()
+            .map(|(readback, len)| {
+                let data = self.mapped_bytes(&readback, CONTEXT);
+                let mut out = self.take_result(len);
+                out.extend_from_slice(&bytemuck::cast_slice::<u8, f32>(&data)[..len]);
                 drop(data);
                 readback.unmap();
+                self.put_readback((len as u64) * 4, readback);
                 out
             })
             .collect()
@@ -13236,13 +13353,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// buffer alive for each. Four per size covers the concurrency a single
     /// device sees here and drops the rest.
     fn put_readback(&self, byte_len: u64, buffer: wgpu::Buffer) {
-        const KEPT_PER_SIZE: usize = 4;
-        if let Ok(mut pool) = self.readback_pool.lock() {
-            let kept = pool.entry(byte_len).or_default();
-            if kept.len() < KEPT_PER_SIZE {
-                kept.push(buffer);
-            }
+        put_pooled(&self.readback_pool, byte_len, buffer);
+    }
+
+    /// A mappable upload buffer of exactly `byte_len`, from
+    /// [`Self::staging_pool`] when one is there and freshly created when
+    /// not. Unmapped: the caller maps it for writing.
+    fn take_staging(&self, byte_len: u64) -> wgpu::Buffer {
+        if let Ok(mut pool) = self.staging_pool.lock()
+            && let Some(buffer) = pool.get_mut(&byte_len).and_then(Vec::pop)
+        {
+            return buffer;
         }
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server striped matmul staging"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Returns an unmapped upload buffer for the next caller of the same
+    /// size — see [`Self::put_readback`].
+    fn put_staging(&self, byte_len: u64, buffer: wgpu::Buffer) {
+        put_pooled(&self.staging_pool, byte_len, buffer);
+    }
+
+    /// An empty vector with room for `len` floats: the smallest recycled
+    /// one large enough, else a fresh allocation.
+    fn take_result(&self, len: usize) -> Vec<f32> {
+        if let Ok(mut pool) = RESULT_POOL.lock()
+            && let Some((at, _)) = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.capacity() >= len)
+                .min_by_key(|(_, v)| v.capacity())
+        {
+            let mut v = pool.swap_remove(at);
+            v.clear();
+            return v;
+        }
+        Vec::with_capacity(len)
     }
 
     fn submit_and_readback_split(

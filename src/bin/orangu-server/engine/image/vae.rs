@@ -448,6 +448,57 @@ pub(super) fn load_conv(
 }
 
 /// One convolution, as a matmul over unrolled neighbourhoods, on `backend`.
+/// Wall time [`run_conv`] spent in each of its phases since the last
+/// [`take_conv_clock`] — what a decode's convolutions are made of, for the
+/// `[image] decode` line. Nanoseconds; one decode at a time per pipeline.
+static CONV_IM2COL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONV_MATMUL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONV_REST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The bytes of `im2col` bands [`run_conv`] built, and the multiply-adds
+/// its matmuls ran — the volume behind the phases above.
+static CONV_BAND_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONV_MACS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A decode's convolutions by phase: the `im2col` band (or the gathered
+/// `int8` window), the matmul, and the bias and copy into the output.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConvClock {
+    pub im2col: std::time::Duration,
+    pub matmul: std::time::Duration,
+    pub rest: std::time::Duration,
+    /// Bytes of `f32` `im2col` bands built (zero on the gathered path).
+    pub band_bytes: u64,
+    /// Multiply-adds of the convolutions' matmuls.
+    pub macs: u64,
+}
+
+impl ConvClock {
+    pub fn total(&self) -> std::time::Duration {
+        self.im2col + self.matmul + self.rest
+    }
+}
+
+/// The phases [`run_conv`] has accumulated, and a fresh start.
+pub fn take_conv_clock() -> ConvClock {
+    use std::sync::atomic::Ordering::Relaxed;
+    let take =
+        |a: &std::sync::atomic::AtomicU64| std::time::Duration::from_nanos(a.swap(0, Relaxed));
+    ConvClock {
+        im2col: take(&CONV_IM2COL_NS),
+        matmul: take(&CONV_MATMUL_NS),
+        rest: take(&CONV_REST_NS),
+        band_bytes: CONV_BAND_BYTES.swap(0, Relaxed),
+        macs: CONV_MACS.swap(0, Relaxed),
+    }
+}
+
+fn add_conv_time(clock: &std::sync::atomic::AtomicU64, since: std::time::Instant) {
+    clock.fetch_add(
+        since.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 pub(super) fn run_conv(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Feature {
     debug_assert_eq!(x.channels, conv.cin);
     let (out_h, out_w) = match conv.padding {
@@ -463,19 +514,29 @@ pub(super) fn run_conv(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Featu
     // `int8` kernel run on the result — the `f32` `im2col` band (9× the
     // feature map, 268 MiB at full resolution) never exists. Any other
     // backend, or `f32` weights, get the band through `matmul_batch`.
+    // The per-row weights take the `int8` tile wherever one exists
+    // (`have_rowi8_tile`); the `Q6_K` ones the K-quant tile, `i8mm` only.
     let gathered = backend.is_cpu()
-        && crate::engine::vecdot::have_i8mm()
-        && (conv.rowi8.is_some() || crate::engine::vecdot::supports_k(conv.w.ggml_type(), cols));
+        && ((conv.rowi8.is_some() && crate::engine::vecdot::have_rowi8_tile())
+            || (crate::engine::vecdot::have_i8mm()
+                && crate::engine::vecdot::supports_k(conv.w.ggml_type(), cols)));
     let mut patches = Vec::new();
     let mut y = Vec::new();
     let mut start = 0;
     while start < out_h {
         let end = (start + band_rows).min(out_h);
         let n = (end - start) * out_w;
+        CONV_MACS.fetch_add(
+            (n * cols * conv.cout) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let phase = std::time::Instant::now();
         if gathered {
             let acts = crate::engine::vecdot::ActQ8Mm::quantize_with(cols, n, |t, row| {
                 gather_window(x, conv, start + t / out_w, t % out_w, row);
             });
+            add_conv_time(&CONV_IM2COL_NS, phase);
+            let phase = std::time::Instant::now();
             if let Some(rows) = &conv.rowi8 {
                 y = crate::engine::vecdot::matmul_rowi8_acts(&acts, n, rows);
             } else {
@@ -490,8 +551,15 @@ pub(super) fn run_conv(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Featu
                     conv.cout,
                 );
             }
+            add_conv_time(&CONV_MATMUL_NS, phase);
         } else {
             unroll(x, conv, start, end, out_w, &mut patches);
+            add_conv_time(&CONV_IM2COL_NS, phase);
+            CONV_BAND_BYTES.fetch_add(
+                (patches.len() * 4) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let phase = std::time::Instant::now();
             y = backend
                 .matmul_batch(&[MatmulOp {
                     x: &patches,
@@ -500,9 +568,12 @@ pub(super) fn run_conv(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Featu
                 }])
                 .pop()
                 .expect("one op in, one result out");
+            add_conv_time(&CONV_MATMUL_NS, phase);
         }
+        let phase = std::time::Instant::now();
         tensor::add_bias_per_row(&mut y, &conv.bias, n);
         out[start * out_w * conv.cout..end * out_w * conv.cout].copy_from_slice(&y);
+        add_conv_time(&CONV_REST_NS, phase);
         start = end;
     }
     Feature::new(out_h, out_w, conv.cout, out)
@@ -540,11 +611,12 @@ impl VaePrecision {
     }
 }
 
-/// `rows` (`[cout][cols]`, `f32`) as per-row `int8` for the 8 × 8 `smmla`
-/// tile, padded as [`conv_matrix`] pads them — about four times the
-/// `Q6_K` kernel's rate at the VAE's shapes.
-/// `None` under `F32`, on a CPU without `i8mm`, or with
-/// `ORANGU_IMAGE_ROWI8_CONV=off` (an A/B against `Q6_K`).
+/// `rows` (`[cout][cols]`, `f32`) as per-row `int8` for the 8 × 8 `int8`
+/// tile (`smmla`, or `AVX2`), padded as [`conv_matrix`] pads them — about
+/// four times the `Q6_K` kernel's rate at the VAE's shapes.
+/// `None` under `F32`, on a CPU without an `int8` tile
+/// (`vecdot::have_rowi8_tile`), or with `ORANGU_IMAGE_ROWI8_CONV=off` (an
+/// A/B against `Q6_K`).
 pub(super) fn row_matrix(
     rows: &[f32],
     cols: usize,
@@ -552,7 +624,7 @@ pub(super) fn row_matrix(
     precision: VaePrecision,
 ) -> Option<crate::engine::vecdot::RowI8> {
     if precision != VaePrecision::Int8
-        || !crate::engine::vecdot::have_i8mm()
+        || !crate::engine::vecdot::have_rowi8_tile()
         || std::env::var("ORANGU_IMAGE_ROWI8_CONV").is_ok_and(|v| v == "off")
     {
         return None;
@@ -797,8 +869,8 @@ mod tests {
     /// channel count that is nothing like a multiple of anything.
     #[test]
     fn an_int8_convolution_matches_the_f32_one_within_quantization() {
-        if !crate::engine::vecdot::have_i8mm() {
-            eprintln!("no i8mm on this core; skipped");
+        if !crate::engine::vecdot::have_rowi8_tile() {
+            eprintln!("no int8 tile on this core; skipped");
             return;
         }
         let (cin, cout, k) = (5usize, 6usize, 3usize);
@@ -808,8 +880,8 @@ mod tests {
         let vae = vae_shell();
         for padding in [Padding::Same, Padding::HalveDownRight] {
             let exact = vae.conv(&conv_with(rows.clone(), cin, cout, k, padding), &x);
-            // `Q6_K` on the K-quant kernel, and per-row `int8` on the
-            // `smmla` tile.
+            // `Q6_K` on the K-quant kernel (the band, off `i8mm`), and
+            // per-row `int8` on the `int8` tile, gathered.
             for rowi8 in [false, true] {
                 let int8 = Conv {
                     rowi8: rowi8

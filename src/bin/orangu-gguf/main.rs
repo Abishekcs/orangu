@@ -317,6 +317,7 @@ fn start_profile(args: &Args, label: &str) -> Result<Option<profile::Recorder>> 
         call_graph: args.flamegraph_call_graph.clone(),
         png: args.flamegraph_png,
         title: format!("orangu-gguf · {label}"),
+        keep_data: false,
     })?;
     Ok(Some(recorder))
 }

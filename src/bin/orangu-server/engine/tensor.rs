@@ -821,7 +821,8 @@ pub fn softmax_inplace(x: &mut [f32]) {
 }
 
 /// The largest element of `x` (`-inf` for an empty slice), four lanes at a
-/// time on aarch64 — a softmax's first pass over an attention row.
+/// time on aarch64 and eight under `AVX2` — a softmax's first pass over an
+/// attention row.
 pub fn max_f32(x: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: NEON is baseline on aarch64; the loop reads only within `x`.
@@ -843,8 +844,45 @@ pub fn max_f32(x: &[f32]) -> f32 {
         }
         max
     }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: guarded by the check above.
+        return unsafe { max_f32_avx2(x) };
+    }
     #[cfg(not(target_arch = "aarch64"))]
     x.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// [`max_f32`] on `AVX2`: four eight-lane running maxima, so the loop is
+/// not one dependency chain.
+///
+/// # Safety
+/// `AVX2` must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn max_f32_avx2(x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    let mut i = 0;
+    // SAFETY: every load is below `i + 32 <= n`.
+    let mut max = unsafe {
+        let mut acc = [_mm256_set1_ps(f32::NEG_INFINITY); 4];
+        while i + 32 <= n {
+            for (l, a) in acc.iter_mut().enumerate() {
+                *a = _mm256_max_ps(*a, _mm256_loadu_ps(x.as_ptr().add(i + 8 * l)));
+            }
+            i += 32;
+        }
+        let v = _mm256_max_ps(_mm256_max_ps(acc[0], acc[1]), _mm256_max_ps(acc[2], acc[3]));
+        let h = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+        let h = _mm_max_ps(h, _mm_movehl_ps(h, h));
+        let h = _mm_max_ss(h, _mm_shuffle_ps(h, h, 1));
+        _mm_cvtss_f32(h)
+    };
+    for &e in &x[i..] {
+        max = max.max(e);
+    }
+    max
 }
 
 /// `x = e^(x − shift)` in place, returning the sum — a softmax's
@@ -876,6 +914,11 @@ pub fn exp_shifted_sum(x: &mut [f32], shift: f32) -> f32 {
         }
         sum
     }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: guarded by the checks above.
+        return unsafe { exp_shifted_sum_avx2(x, shift) };
+    }
     #[cfg(not(target_arch = "aarch64"))]
     {
         for v in x.iter_mut() {
@@ -884,6 +927,43 @@ pub fn exp_shifted_sum(x: &mut [f32], shift: f32) -> f32 {
         exp_inplace(x);
         x.iter().sum()
     }
+}
+
+/// [`exp_shifted_sum`] on `AVX2` + `FMA`: subtract, [`exp_avx2`], store and
+/// sum in one pass, two eight-lane partial sums.
+///
+/// # Safety
+/// `AVX2` and `FMA` must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_shifted_sum_avx2(x: &mut [f32], shift: f32) -> f32 {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    let mut i = 0;
+    // SAFETY: every load and store is below `i + 16 <= n`; `exp_avx2`'s
+    // features are this function's.
+    let mut sum = unsafe {
+        let s = _mm256_set1_ps(shift);
+        let mut acc = [_mm256_setzero_ps(); 2];
+        while i + 16 <= n {
+            for (l, a) in acc.iter_mut().enumerate() {
+                let p = x.as_mut_ptr().add(i + 8 * l);
+                let e = exp_avx2(_mm256_sub_ps(_mm256_loadu_ps(p), s));
+                _mm256_storeu_ps(p, e);
+                *a = _mm256_add_ps(*a, e);
+            }
+            i += 16;
+        }
+        let v = _mm256_add_ps(acc[0], acc[1]);
+        let h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps(h, h, 1)))
+    };
+    for v in x[i..].iter_mut() {
+        *v = (*v - shift).exp();
+        sum += *v;
+    }
+    sum
 }
 
 /// Elementwise `e^x` in place, four or eight lanes at a time where the

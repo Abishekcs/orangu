@@ -808,6 +808,27 @@ pub trait Backend: Send + Sync {
         *outs = self.matmul_batch(ops);
     }
 
+    /// Hands back a result of [`Backend::matmul_batch`] the caller is done
+    /// with, so the next wide result can reuse its memory rather than fault
+    /// in and zero fresh pages. The default drops it.
+    fn recycle(&self, buffer: Vec<f32>) {
+        drop(buffer);
+    }
+
+    /// Device `index` of a split, as a backend of its own — what a caller
+    /// that must choose among a split's devices times and compares. `None`
+    /// for a backend that is not a split, and past the split's last device.
+    fn split_device(&self, _index: usize) -> Option<&dyn Backend> {
+        None
+    }
+
+    /// An empty vector with room for `len` floats, from what
+    /// [`Backend::recycle`] kept when it can — scratch that would otherwise
+    /// be a fresh allocation. The default allocates.
+    fn take_scratch(&self, len: usize) -> Vec<f32> {
+        Vec::with_capacity(len)
+    }
+
     /// [`Backend::matmul_batch`]'s decode counterpart — see
     /// [`Backend::matmul_decode`] for why decode needs its own entry point.
     /// Defaults to `matmul_batch` so a backend that overrode *that* for

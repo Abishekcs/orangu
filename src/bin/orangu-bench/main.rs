@@ -308,6 +308,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     flamegraph_png: bool,
 
+    /// Keep the raw perf.data beside the flamegraph instead of deleting it.
+    #[arg(long, default_value_t = false)]
+    flamegraph_keep_data: bool,
+
     /// Profile every running orangu, orangu-coordinator and orangu-server for `--flamegraph-duration` while you drive the workload; one flamegraph per process in DIR. Measures nothing itself.
     #[arg(long, value_name = "DIR")]
     flamegraph_layers: Option<String>,
@@ -3666,8 +3670,13 @@ fn profile_layers(args: &Args, dir: &std::path::Path) -> anyhow::Result<()> {
     } else {
         &args.flamegraph_call_graph
     };
-    let recorder =
-        profile::SystemRecorder::start(dir, args.flamegraph_freq, call_graph, args.flamegraph_png)?;
+    let recorder = profile::SystemRecorder::start(
+        dir,
+        args.flamegraph_freq,
+        call_graph,
+        args.flamegraph_png,
+        args.flamegraph_keep_data,
+    )?;
     std::thread::sleep(std::time::Duration::from_secs(args.flamegraph_duration));
     let mut profiles = recorder.finish(layer_of_comm)?;
     if profiles.is_empty() {
@@ -3817,6 +3826,7 @@ fn start_profile(
         call_graph,
         png: args.flamegraph_png,
         title: format!("{label} · {}", workload_name(args)),
+        keep_data: args.flamegraph_keep_data,
     })
 }
 
@@ -3939,6 +3949,9 @@ fn report_profile(s: &profile::Summary, args: &Args) {
         s.cores_busy * (100.0 - s.gpu_wait - s.pool_idle) / 100.0,
     );
     println!("           {}", s.folded.display());
+    if let Some(data) = &s.data {
+        println!("           {}", data.display());
+    }
     if let Some(png) = &s.png {
         println!("           {}", png.display());
     }

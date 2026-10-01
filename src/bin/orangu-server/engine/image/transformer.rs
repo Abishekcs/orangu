@@ -828,10 +828,11 @@ impl RopeTable {
 /// whole key set and whole value set from cache or memory — at 1024 pixels
 /// that is 2 MiB of keys and 2 MiB of values per query per head, 4,126
 /// queries and 24 heads a pass, and attention was on its way to being most
-/// of the step (13% of a pass at 256 pixels, 36% at 512). A block of 24
-/// queries reads the keys six times per block (four queries per
-/// [`vecdot::gemm_f32_rows`] tile) and the transposed values once, each
-/// product a register-tiled GEMM rather than a dot per row.
+/// of the step (13% of a pass at 256 pixels, 36% at 512). A block of
+/// [`ATTN_QUERIES`] queries reads the keys once
+/// ([`vecdot::gemm_f32_rows_many`], the key tile outermost) and the
+/// transposed values once, each product a register-tiled GEMM rather than a
+/// dot per row.
 ///
 /// Same arithmetic as the direct form to `f32` rounding: the scores are
 /// the same dot products in a different summation order, the softmax is
@@ -877,8 +878,9 @@ pub(crate) fn attention(
 /// [`attention`] for a denoising step's picture tokens, where attention is
 /// the part of a pass that grows with the square of the picture (39% of a
 /// Qwen-Image 2.1 step at 1024 x 1024, against 14% at 512): the scores
-/// `q · k` are computed in `int8` on the `smmla` kernel — eight times the
-/// multiply-adds per instruction of the `f32` path — while the softmax and
+/// `q · k` are computed in `int8` on the `smmla` kernel (`aarch64`) or
+/// `vpmaddubsw` (`x86_64`) — several times the multiply-adds per
+/// instruction of the `f32` path — while the softmax and
 /// the value product stay `f32`. Each query and key row is quantized with
 /// its own scale after the keys' per-channel mean over the sequence is
 /// taken out (which moves every score of a query by the same amount, so the
@@ -886,9 +888,10 @@ pub(crate) fn attention(
 /// SageAttention recipe. The heads are RMS-normed before this, so their
 /// rows are well-conditioned.
 ///
-/// The `f32` path runs instead without `i8mm`, for a head width that is not
-/// a multiple of 8, or with `ORANGU_IMAGE_ATTENTION=f32`, which is the
-/// switch for comparing the two on one binary.
+/// The `f32` path runs instead without an `int8` score kernel
+/// (`vecdot::have_i8_scores`), for a head width that is not a multiple of
+/// 8, or with `ORANGU_IMAGE_ATTENTION=f32`, which is the switch for
+/// comparing the two on one binary.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_attention(
     q: &[f32],
@@ -939,7 +942,7 @@ pub(crate) fn value_product() -> ValueProduct {
 pub(crate) fn int8_step_attention() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        crate::engine::vecdot::have_i8mm()
+        crate::engine::vecdot::have_i8_scores()
             && !std::env::var("ORANGU_IMAGE_ATTENTION")
                 .is_ok_and(|v| v.trim().eq_ignore_ascii_case("f32"))
     })
@@ -951,15 +954,42 @@ pub(crate) fn causal_limits(n: usize) -> Vec<usize> {
     (1..=n).collect()
 }
 
-/// Queries per [`joint_attention_blocked`] task: six tiles of four, so a
-/// block's score rows (`24 × n` floats — 400 KiB at 1024 pixels) stay in
-/// L2 through the softmax and the value product.
+/// Queries per [`joint_attention_blocked`] task. Every block reads a head's
+/// keys and values once, so more queries a block is less of that traffic;
+/// fewer keep the block's score rows (`queries × n` floats) closer to the
+/// core. On `aarch64` six tiles of four, the score rows in L2 through the
+/// softmax and the value product (400 KiB at 1024 pixels); on `x86_64`,
+/// whose score product is the `f32` tile against keys that do not fit L2,
+/// twelve — the traffic is the larger cost there.
+#[cfg(target_arch = "aarch64")]
 const ATTN_QUERIES: usize = 24;
+#[cfg(not(target_arch = "aarch64"))]
+const ATTN_QUERIES: usize = 48;
+
+/// The queries per [`attention_blocked`] task: [`ATTN_QUERIES`], or
+/// `ORANGU_IMAGE_ATTN_QUERIES` (a multiple of four from 4 to 96) for an A/B
+/// of the block size — more queries a block read the keys and values fewer
+/// times, fewer keep its score rows in L2.
+fn attn_queries() -> usize {
+    static QUERIES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *QUERIES.get_or_init(|| {
+        std::env::var("ORANGU_IMAGE_ATTN_QUERIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|q| (4..=96).contains(q) && q.is_multiple_of(4))
+            .unwrap_or(ATTN_QUERIES)
+    })
+}
 
 /// `scores[j] = ints[j] × sq × key_scales[j]`, returning the largest — the
 /// `int8` scores to `f32` and the softmax's max in one pass.
 fn convert_scores(scores: &mut [f32], ints: &[i32], key_scales: &[f32], sq: f32) -> f32 {
     debug_assert!(ints.len() == scores.len() && key_scales.len() == scores.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // Safety: `AVX2` was detected; the lengths were checked above.
+        return unsafe { convert_scores_avx2(scores, ints, key_scales, sq) };
+    }
     let n = scores.len();
     #[cfg(not(target_arch = "aarch64"))]
     let i = 0;
@@ -995,6 +1025,57 @@ fn convert_scores(scores: &mut [f32], ints: &[i32], key_scales: &[f32], sq: f32)
     max
 }
 
+/// [`convert_scores`] on `AVX2`: eight scores at a time, each the same
+/// `ints[j] · sq · key_scales[j]` (in that order) as the scalar form, two
+/// running maxima.
+///
+/// # Safety
+/// `AVX2` must be available; the three slices the same length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn convert_scores_avx2(
+    scores: &mut [f32],
+    ints: &[i32],
+    key_scales: &[f32],
+    sq: f32,
+) -> f32 {
+    use std::arch::x86_64::*;
+    let n = scores.len();
+    let mut i = 0;
+    // Safety: every access is below `i + 16 <= n` in all three slices.
+    let mut max = unsafe {
+        let q = _mm256_set1_ps(sq);
+        let mut m = [_mm256_set1_ps(f32::NEG_INFINITY); 2];
+        while i + 16 <= n {
+            for (l, m) in m.iter_mut().enumerate() {
+                let at = i + 8 * l;
+                let v = _mm256_mul_ps(
+                    _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(_mm256_loadu_si256(
+                            ints.as_ptr().add(at) as *const __m256i
+                        )),
+                        q,
+                    ),
+                    _mm256_loadu_ps(key_scales.as_ptr().add(at)),
+                );
+                _mm256_storeu_ps(scores.as_mut_ptr().add(at), v);
+                *m = _mm256_max_ps(*m, v);
+            }
+            i += 16;
+        }
+        let v = _mm256_max_ps(m[0], m[1]);
+        let h = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+        let h = _mm_max_ps(h, _mm_movehl_ps(h, h));
+        _mm_cvtss_f32(_mm_max_ss(h, _mm_shuffle_ps(h, h, 1)))
+    };
+    for j in i..n {
+        let v = ints[j] as f32 * sq * key_scales[j];
+        scores[j] = v;
+        max = max.max(v);
+    }
+    max
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attention_blocked(
     q: &[f32],
@@ -1008,7 +1089,9 @@ fn attention_blocked(
     limits: Option<&[usize]>,
     int8: bool,
 ) -> Vec<f32> {
-    use crate::engine::vecdot::{F32_ROWS, PairedI8, gemm_f32_rows, i8_scores_4rows};
+    use crate::engine::vecdot::{
+        F32_ROWS, PairedI8, gemm_f32_rows, gemm_f32_rows_many, i8_scores_4rows,
+    };
     let dim = n_head * head_dim;
     debug_assert_eq!(q.len(), n_q * dim);
     debug_assert_eq!(k.len(), n * dim);
@@ -1112,29 +1195,32 @@ fn attention_blocked(
     };
     let zeros = vec![0.0f32; head_dim];
 
-    let n_blocks = n_q.div_ceil(ATTN_QUERIES);
+    let queries = attn_queries();
+    let n_blocks = n_q.div_ceil(queries);
     let mut out = vec![0.0f32; n_q * dim];
     let sink = SharedOut(out.as_mut_ptr());
     let k_pairs = n.div_ceil(2);
     (0..n_head * n_blocks).into_par_iter().for_each_init(
         || {
             (
-                vec![0.0f32; ATTN_QUERIES * n],
+                vec![0.0f32; queries * n],
                 // Four output dimensions of a query block for this crate's
                 // tile, a whole block's `[queries, head_dim]` for `rten`'s.
-                vec![0.0f32; (F32_ROWS * ATTN_QUERIES).max(ATTN_QUERIES * head_dim)],
+                vec![0.0f32; (F32_ROWS * queries).max(queries * head_dim)],
                 vec![0i32; F32_ROWS * 2 * k_pairs],
                 rten.then(rten_gemm::GemmExecutor::<f32>::new),
                 // The block's probabilities in `bfmmla`'s layout, each row
                 // written by the softmax that makes it.
-                bf16.then(|| crate::engine::vecdot::PackedBf16::zeroed(ATTN_QUERIES, n)),
+                bf16.then(|| crate::engine::vecdot::PackedBf16::zeroed(queries, n)),
+                // The block's queries times `scale`, for the `f32` scores.
+                vec![0.0f32; queries * head_dim],
             )
         },
-        move |(scores, tile, iscores, gemm, packed), task| {
+        move |(scores, tile, iscores, gemm, packed, q_scaled), task| {
             let sink = sink;
             let (h, b) = (task / n_blocks, task % n_blocks);
-            let q0 = b * ATTN_QUERIES;
-            let nq = ATTN_QUERIES.min(n_q - q0);
+            let q0 = b * queries;
+            let nq = queries.min(n_q - q0);
             let keys = &k_heads[h * n * head_dim..(h + 1) * n * head_dim];
             let values_t = if rten || bf16 {
                 &[][..]
@@ -1143,7 +1229,7 @@ fn attention_blocked(
             };
 
             // Each row's maximum, taken as the `int8` scores are converted.
-            let mut row_max = [f32::NEG_INFINITY; ATTN_QUERIES];
+            let mut row_max = vec![f32::NEG_INFINITY; nq];
             if int8 {
                 // The block's queries for this head, padded to a whole
                 // quad with zero rows whose scores are never read.
@@ -1181,44 +1267,43 @@ fn attention_blocked(
                 }
             }
 
-            // Scores, four queries at a time against every key: the tile's
-            // "rows" are queries, its "tokens" the keys, `in_dim` the head.
-            let mut qi = 0;
-            while qi < nq && !int8 {
-                let quad = F32_ROWS.min(nq - qi);
-                let row = |r: usize| {
-                    let i = q0 + qi + r.min(quad - 1);
-                    &q[i * dim + h * head_dim..i * dim + (h + 1) * head_dim]
-                };
-                let (s0, rest) = scores[qi * n..].split_at_mut(n);
-                let (s1, rest) = rest.split_at_mut(n);
-                let (s2, rest) = rest.split_at_mut(n);
-                let (s3, _) = rest.split_at_mut(n);
-                gemm_f32_rows(
-                    [row(0), row(1), row(2), row(3)],
-                    keys,
-                    head_dim,
-                    [s0, s1, s2, s3],
-                );
-                qi += quad;
+            // Scores, the whole block against every key in one pass: the
+            // tile's "rows" are queries, its "tokens" the keys, `in_dim` the
+            // head. Key tile outermost, so a head's keys (larger than L2 at
+            // 1024 pixels) are read once per block rather than once per four
+            // queries. The block is padded to a whole quad with its last
+            // query, whose extra score rows are never read. `scale` is
+            // applied to the queries, `head_dim` multiplies a query, not to
+            // the scores, `n` of them.
+            if !int8 {
+                for (r, dst) in q_scaled.chunks_mut(head_dim).take(nq).enumerate() {
+                    let i = q0 + r;
+                    let src = &q[i * dim + h * head_dim..i * dim + (h + 1) * head_dim];
+                    for (d, s) in dst.iter_mut().zip(src) {
+                        *d = s * scale;
+                    }
+                }
+                let padded = nq.div_ceil(F32_ROWS) * F32_ROWS;
+                let rows: Vec<&[f32]> = (0..padded)
+                    .map(|r| {
+                        let r = r.min(nq - 1);
+                        &q_scaled[r * head_dim..(r + 1) * head_dim]
+                    })
+                    .collect();
+                let mut outs: Vec<&mut [f32]> = scores.chunks_mut(n).take(padded).collect();
+                gemm_f32_rows_many(&rows, keys, head_dim, &mut outs);
             }
-            // Softmax per query row: `scale` (folded into the `int8`
-            // scores already), max, then the exponentials and their sum in
-            // one pass (`tensor::exp_shifted_sum`, four lanes at a time — a
-            // third of the blocked kernel's time was `expf`, one call per
-            // score). Keys past a query's limit are masked: never read.
-            // Under `bfmmla` a row goes straight into its packed operand
-            // unnormalised and the output row is divided by the sum
-            // instead — `head_dim` multiplies, not `n`.
-            let mut inv = [0f32; ATTN_QUERIES];
+            // Softmax per query row, `scale` already in the scores: max,
+            // then the exponentials and their sum in one pass
+            // (`tensor::exp_shifted_sum`, a vector at a time — a third of
+            // the blocked kernel's time was `expf`, one call per score).
+            // Keys past a query's limit are masked: never read. The rows
+            // stay unnormalised — the value product's output row is divided
+            // by the sum instead, `head_dim` multiplies, not `n`.
+            let mut inv = vec![0f32; nq];
             for (r, row) in scores[..nq * n].chunks_mut(n).enumerate() {
                 let limit = limits.map_or(n, |l| l[q0 + r]);
                 let live = &mut row[..limit];
-                if !int8 {
-                    for s in live.iter_mut() {
-                        *s *= scale;
-                    }
-                }
                 let max = if int8 {
                     row_max[r]
                 } else {
@@ -1229,11 +1314,7 @@ fn attention_blocked(
                         inv[r] = 1.0 / packed.set_row_exp(r, live, max);
                     }
                     None => {
-                        let sum = tensor::exp_shifted_sum(live, max);
-                        let inv = 1.0 / sum;
-                        for s in live.iter_mut() {
-                            *s *= inv;
-                        }
+                        inv[r] = 1.0 / tensor::exp_shifted_sum(live, max);
                         row[limit..].fill(0.0);
                     }
                 }
@@ -1272,7 +1353,10 @@ fn attention_blocked(
                     rten_gemm::GemmOptions::default(),
                 )
                 .expect("the value product's shapes agree");
-                for (t, row) in block.chunks(head_dim).enumerate() {
+                for (t, row) in block.chunks_mut(head_dim).enumerate() {
+                    for v in row.iter_mut() {
+                        *v *= inv[t];
+                    }
                     // Safety: as below — this task's rectangle alone.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -1297,7 +1381,8 @@ fn attention_blocked(
                 for t in 0..nq {
                     for r in 0..F32_ROWS {
                         unsafe {
-                            *sink.0.add((q0 + t) * dim + h * head_dim + d0 + r) = tile[r * nq + t];
+                            *sink.0.add((q0 + t) * dim + h * head_dim + d0 + r) =
+                                tile[r * nq + t] * inv[t];
                         }
                     }
                 }

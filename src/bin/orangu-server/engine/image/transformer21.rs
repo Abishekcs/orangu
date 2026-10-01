@@ -237,7 +237,17 @@ impl QwenImage21Transformer {
             .flat_map(block_weights)
             .map(|w| (w.in_dim * w.out_dim) as u64)
             .sum();
-        let rowi8 = use_rowi8(copy_bytes).then(|| {
+        // The per-row copy is the CPU's kernel: a transformer on a device
+        // runs the device's own, and a copy there would only be 7 GB of RAM
+        // its linears never read.
+        let on_cpu = backend.is_cpu();
+        if !on_cpu && configured_weights() == ImageWeights::Int8 {
+            log::info!(
+                "orangu-server: [image] image_weights = int8 applies to a transformer on the \
+                 CPU; this one runs on the device, which keeps the file's weights"
+            );
+        }
+        let rowi8 = (on_cpu && use_rowi8(copy_bytes)).then(|| {
             let started = std::time::Instant::now();
             let mut map = std::collections::HashMap::new();
             for block in &blocks {
@@ -247,10 +257,11 @@ impl QwenImage21Transformer {
                     map.insert(w.raw_bytes().as_ptr() as usize, rows);
                 }
             }
-            if !crate::engine::vecdot::have_i8mm() {
+            if !crate::engine::vecdot::have_rowi8_tile() {
                 log::warn!(
-                    "orangu-server: [image] image_weights = int8 on a core without i8mm runs \
-                     the scalar int8 tile, far slower than image_weights = file"
+                    "orangu-server: [image] image_weights = int8 on a core without an int8 \
+                     tile (i8mm or AVX2) runs the scalar one, far slower than \
+                     image_weights = file"
                 );
             }
             let bytes: usize = map.values().map(|r| r.bytes()).sum();
@@ -505,7 +516,8 @@ impl QwenImage21Transformer {
     /// `out(silu(gate) · up)`.
     fn mlp(&self, block: &Block, x: &[f32], n: usize) -> Vec<f32> {
         let m = self.mlp_dim;
-        let mut h = vec![0.0f32; n * m];
+        let mut h = self.backend.take_scratch(n * m);
+        h.resize(n * m, 0.0);
         match &block.mlp_in {
             MlpIn::Fused(w) => {
                 let gate_up = self.linear(x, n, w);
@@ -517,6 +529,7 @@ impl QwenImage21Transformer {
                             *o = tensor::silu(*g) * u;
                         }
                     });
+                self.backend.recycle(gate_up);
             }
             MlpIn::Split { gate, up } => {
                 let mut results = self.backend.matmul_batch(&[
@@ -540,9 +553,13 @@ impl QwenImage21Transformer {
                             *o = tensor::silu(*g) * u;
                         }
                     });
+                self.backend.recycle(gate);
+                self.backend.recycle(up);
             }
         }
-        self.linear(&h, n, &block.mlp_out)
+        let out = self.linear(&h, n, &block.mlp_out);
+        self.backend.recycle(h);
+        out
     }
 
     /// One velocity prediction for the picture's tokens: `[n_img, 64]`, the
@@ -609,22 +626,27 @@ impl QwenImage21Transformer {
             values.clear();
             values.extend_from_slice(&prefix.v[bi]);
             values.extend_from_slice(&v);
-            drop((k, v));
+            // Every wide buffer of the block goes back to the backend when
+            // done with, for the next one to reuse (`Backend::recycle`).
+            self.backend.recycle(k);
+            self.backend.recycle(v);
             let attn = step_attention(
                 &q, n_img, &keys, &values, n_kv, c.n_head, c.head_dim, scale, None,
             );
-            drop(q);
+            self.backend.recycle(q);
             clock.lap(|s| &mut s.attention);
             let out = self.linear(&attn, n_img, &block.to_out);
-            drop(attn);
+            self.backend.recycle(attn);
             clock.lap(|s| &mut s.out);
             gated_add(&mut x, &out, &gate1, c.dim);
+            self.backend.recycle(out);
             layer_norm_into(&mut normed, &x, c.dim, c.eps);
             scale_inplace(&mut normed, scale2, c.dim);
             clock.lap(|s| &mut s.other);
             let mlp = self.mlp(block, &normed, n_img);
             clock.lap(|s| &mut s.mlp);
             gated_add(&mut x, &mlp, &gate2, c.dim);
+            self.backend.recycle(mlp);
         }
 
         // `AdaLayerNormContinuous`, scale only.
@@ -647,14 +669,14 @@ impl QwenImage21Transformer {
 /// How the blocks' linears are held — `[orangu-server].image_weights`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ImageWeights {
-    /// Per-row `int8` when the core has `i8mm` and the machine has room
-    /// for it: total memory at least three times the copy (21 GB for
-    /// Qwen-Image 2.1's 7 GB). Without `i8mm` the tile is the scalar
-    /// definition, far slower than the file's K-quant kernel.
+    /// Per-row `int8` when the transformer runs on the CPU, the CPU has an
+    /// `int8` tile (`vecdot::have_rowi8_tile`: `i8mm` or `AVX2`) and the
+    /// machine has room for it: total memory at least three times the copy
+    /// (21 GB for Qwen-Image 2.1's 7 GB).
     #[default]
     Auto,
-    /// Always per-row `int8` (`vecdot::RowI8`) — the 8 × 8 `smmla` tile,
-    /// or its scalar definition on a core without `i8mm`.
+    /// Per-row `int8` (`vecdot::RowI8`) whenever the transformer runs on the
+    /// CPU — on a core with no `int8` tile, the scalar definition.
     Int8,
     /// The file's own weights on the K-quant kernel, and no copy.
     File,
@@ -679,23 +701,29 @@ pub fn set_weights(choice: ImageWeights) {
     WEIGHTS.store(choice as u8, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether the blocks' `copy_bytes` of per-row `int8` are held: the
-/// configuration, `ORANGU_IMAGE_WEIGHTS` (`int8`/`file`) over it for an A/B.
-/// The startup calibration asks too, so it times the kernel a step runs.
-pub fn use_rowi8(copy_bytes: u64) -> bool {
-    let choice = std::env::var("ORANGU_IMAGE_WEIGHTS")
+/// The configured [`ImageWeights`], `ORANGU_IMAGE_WEIGHTS` (`int8`/`file`)
+/// over the configuration for an A/B.
+fn configured_weights() -> ImageWeights {
+    std::env::var("ORANGU_IMAGE_WEIGHTS")
         .ok()
         .and_then(|v| ImageWeights::parse(&v))
         .unwrap_or(match WEIGHTS.load(std::sync::atomic::Ordering::Relaxed) {
             1 => ImageWeights::Int8,
             2 => ImageWeights::File,
             _ => ImageWeights::Auto,
-        });
-    match choice {
+        })
+}
+
+/// Whether a transformer on the CPU holds its blocks' `copy_bytes` of
+/// per-row `int8` ([`configured_weights`]; under `auto`, when the CPU has an
+/// `int8` tile and the memory). The startup calibration asks too, so its
+/// CPU half times the kernel a step runs.
+pub fn use_rowi8(copy_bytes: u64) -> bool {
+    match configured_weights() {
         ImageWeights::Int8 => true,
         ImageWeights::File => false,
         ImageWeights::Auto => {
-            crate::engine::vecdot::have_i8mm()
+            crate::engine::vecdot::have_rowi8_tile()
                 && orangu::hardware::detect_cpu().total_memory_bytes >= 3 * copy_bytes
         }
     }

@@ -1130,6 +1130,7 @@ Options:
       --flamegraph-freq <HZ>           Sampling frequency in Hz for `--flamegraph` [default: 999]
       --flamegraph-call-graph <MODE>   Call-graph mode for `--flamegraph`: `auto`, `fp` or `dwarf` [default: auto]
       --flamegraph-png                 Also render a PNG beside the flamegraph SVG
+      --flamegraph-keep-data           Keep the raw perf.data beside the flamegraph instead of deleting it
       --flamegraph-layers <DIR>        Profile every running orangu, orangu-coordinator and orangu-server for `--flamegraph-duration` while you drive the workload; one flamegraph per process in DIR. Measures nothing itself.
       --flamegraph-duration <SECONDS>  Seconds to keep sampling under `--flamegraph-layers` or `--flamegraph-watch` [default: 60]
       --flamegraph-watch               With `--flamegraph PATH`: profile the server for `--flamegraph-duration` while something else drives it. Measures nothing itself.
@@ -1341,10 +1342,17 @@ Three files come out of one `--flamegraph out.svg`:
 | `out.folded` | the collapsed stacks — a text file that diffs, and re-renders without re-running |
 | `out.meta.json` | pid, sampling frequency, duration, samples, cores busy |
 | `out.png` | a raster copy, with `--flamegraph-png`, for documents that cannot embed an SVG |
+| `out.perf.data`, `out.perf.log` | the raw recording and `perf record`'s log, with `--flamegraph-keep-data` |
 
-The transient `perf.data` is removed once collapsed: it is the largest artifact
-by an order of magnitude and nothing downstream reads it. The `.folded` file is
-the durable one.
+The `perf.data` is removed once collapsed unless `--flamegraph-keep-data` asks
+for it: it is the largest artifact by an order of magnitude and nothing
+downstream reads it. Keep it for what the collapsed stacks cannot answer —
+`perf report`, `perf annotate` on a hot function's instructions, or
+re-symbolizing a recording whose frames came out as a bare binary name
+(`perf script --no-inline -i out.perf.data`). Its path is printed under the
+flamegraph's. Under `--flamegraph-layers` the one system-wide capture is kept
+as `system.perf.data` in the directory. The `.folded` file is the durable
+one.
 
 Because it is durable, the SVG can be rebuilt from it at any time without
 measuring again:

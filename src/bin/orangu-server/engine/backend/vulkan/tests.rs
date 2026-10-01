@@ -5302,6 +5302,166 @@ fn matmul_batch_matches_sequential_cpu_matmuls() {
     }
 }
 
+/// Probe: GB/s of the host's writes into a pooled `MAP_WRITE` staging buffer
+/// (`fill_staging`, as `matmul_batch_striped` writes it) and reads out of a
+/// pooled `MAP_READ` readback, against the same copies between plain
+/// vectors — whether the mapped memory is what makes a wide matmul's host
+/// side slow. `cargo test --release --bin orangu-server
+/// host_visible_copy_rates -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn host_visible_copy_rates() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    for mib in [64usize, 256] {
+        let bytes = mib << 20;
+        let src: Vec<f32> = (0..bytes / 4).map(|i| i as f32).collect();
+        let src_bytes: &[u8] = bytemuck::cast_slice(&src);
+        let gbs = |secs: f64| bytes as f64 / secs / 1e9;
+        let mut plain = vec![0u8; bytes];
+        plain.copy_from_slice(src_bytes);
+        let t = std::time::Instant::now();
+        plain.copy_from_slice(src_bytes);
+        let plain_copy = t.elapsed().as_secs_f64();
+
+        let staging = vulkan.take_staging(bytes as u64);
+        let mut write = 0f64;
+        for rep in 0..3 {
+            let wait = MapWait::new();
+            staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Write, wait.callback());
+            vulkan.poll_blocking("probe map");
+            wait.check("probe map");
+            let t = std::time::Instant::now();
+            {
+                let mut view = staging.slice(..).get_mapped_range_mut().unwrap();
+                fill_staging(view.slice(..), src_bytes);
+            }
+            if rep > 0 {
+                write += t.elapsed().as_secs_f64() / 2.0;
+            }
+            staging.unmap();
+        }
+        vulkan.put_staging(bytes as u64, staging);
+
+        let readback = vulkan.take_readback(bytes as u64);
+        let mut read = 0f64;
+        for rep in 0..3 {
+            let wait = MapWait::new();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, wait.callback());
+            vulkan.poll_blocking("probe map");
+            wait.check("probe map");
+            let t = std::time::Instant::now();
+            {
+                let view = readback.slice(..).get_mapped_range().unwrap();
+                plain.copy_from_slice(&view);
+            }
+            if rep > 0 {
+                read += t.elapsed().as_secs_f64() / 2.0;
+            }
+            readback.unmap();
+        }
+        vulkan.put_readback(bytes as u64, readback);
+        eprintln!(
+            "{mib} MiB: plain copy {:.1} GB/s | staging write (fill_staging, parallel) {:.1} GB/s | readback read {:.1} GB/s",
+            gbs(plain_copy),
+            gbs(write),
+            gbs(read)
+        );
+    }
+}
+
+/// A batch wider than the submission stripe runs `matmul_batch_striped`:
+/// its activations staged whole in a pooled mappable buffer, each stripe
+/// copied into the op's region, the results assembled in a pooled readback
+/// and copied into recycled vectors, its stripes in submissions sized by
+/// the device's learned rate. Three rounds — no rate yet, the learned one,
+/// and one stripe per submission — each on the previous round's pooled
+/// buffers and recycled results, with one shared input and then one input
+/// per op, against the CPU backend, the last stripe a padded tail.
+#[test]
+fn a_striped_matmul_batch_matches_the_cpu_on_pooled_buffers() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let in_dim = 256;
+    let mut seed = 0x0578_19ED_u64;
+    let build = |ggml_type: u32, out_dim: usize, seed: &mut u64| {
+        let elems = block_elems(ggml_type);
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..in_dim / elems {
+                bytes.extend(build_block(ggml_type, seed));
+            }
+        }
+        test_quant_matrix(&bytes, ggml_type, in_dim, out_dim)
+    };
+    let wq = build(GGML_TYPE_Q4_K, 12, &mut seed);
+    let wk = build(GGML_TYPE_F16, 8, &mut seed);
+    let n_tokens = 2 * crate::engine::backend::vulkan::max_matmul_tokens_per_submission() + 37;
+    let input = |seed: &mut u64| -> Vec<f32> {
+        (0..n_tokens * in_dim)
+            .map(|_| (next_byte(seed) as f32 - 128.0) / 64.0)
+            .collect()
+    };
+    let x0 = input(&mut seed);
+    let x1 = input(&mut seed);
+    // Round 0 with no learned rate (the first stripe goes alone), round 1
+    // on whatever round 0 learned, round 2 with a rate so slow every stripe
+    // is its own submission.
+    for round in 0..3 {
+        let rate = match round {
+            0 => None,
+            2 => Some(1.0),
+            _ => *vulkan.striped_secs_per_mac.lock().unwrap(),
+        };
+        *vulkan.striped_secs_per_mac.lock().unwrap() = rate;
+        for (xq, xk) in [(&x0, &x0), (&x0, &x1)] {
+            if round == 2 {
+                *vulkan.striped_secs_per_mac.lock().unwrap() = rate;
+            }
+            let got = vulkan.matmul_batch(&[
+                MatmulOp {
+                    x: xq,
+                    n_tokens,
+                    w: &wq,
+                },
+                MatmulOp {
+                    x: xk,
+                    n_tokens,
+                    w: &wk,
+                },
+            ]);
+            for ((name, want, tol), got) in [
+                ("q", CpuBackend.matmul_dequant(xq, n_tokens, &wq), 6e-2f32),
+                ("k", CpuBackend.matmul_dequant(xk, n_tokens, &wk), 1e-2),
+            ]
+            .into_iter()
+            .zip(got)
+            {
+                assert_eq!(want.len(), got.len(), "round {round} {name}: length");
+                for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                    assert!(
+                        (a - b).abs() <= tol * a.abs().max(1.0),
+                        "round {round} {name}: token {} cpu={a} gpu={b}",
+                        i / (want.len() / n_tokens)
+                    );
+                }
+                vulkan.recycle(got);
+            }
+        }
+    }
+    *vulkan.striped_secs_per_mac.lock().unwrap() = None;
+}
+
 /// `n_tokens = 300` deliberately spans three of `Backend::matmul_batch`'s
 /// own token-range stripes (`MAX_MATMUL_TOKENS_PER_SUBMISSION = 128`:
 /// 0..128, 128..256, 256..300 — the last only partially full), so this

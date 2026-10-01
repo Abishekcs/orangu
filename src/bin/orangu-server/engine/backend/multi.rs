@@ -303,6 +303,20 @@ impl Backend for MultiDeviceBackend {
         })
     }
 
+    /// Any device takes it: the pool a result is recycled into is the
+    /// process's, not a device's.
+    fn recycle(&self, buffer: Vec<f32>) {
+        self.devices[0].recycle(buffer);
+    }
+
+    fn take_scratch(&self, len: usize) -> Vec<f32> {
+        self.devices[0].take_scratch(len)
+    }
+
+    fn split_device(&self, index: usize) -> Option<&dyn Backend> {
+        self.devices.get(index).map(|device| device.as_ref())
+    }
+
     /// Always `None` — see the module doc. This is the single line that
     /// keeps every *cross-layer* fused path off a split model: the
     /// whole-step decode submission, GPU sampling, the logits readback.

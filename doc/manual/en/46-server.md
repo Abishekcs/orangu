@@ -1794,7 +1794,7 @@ shown.
 | `draft_tokens`          | `4`                                        | tokens the draft proposes per verification                                                                                                                                                                                |
 | `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`                                                                                                                                                               |
 | `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, or Qwen-Image 2.1's own                                                                                                                                                           |
-| `image_weights`         | `auto`                                     | how a `qwen_image_2_1` transformer's linears are held: `auto` per-row `int8` on the 8 × 8 `smmla` tile when the CPU has `i8mm` and total memory is at least three times the 7 GB copy, `int8` always, `file` the file's K-quants (no copy); ~1.4–1.9× a step |
+| `image_weights`         | `auto`                                     | how a `qwen_image_2_1` transformer's linears are held: `auto` per-row `int8` on the 8 × 8 `int8` tile (`i8mm` or `AVX2`) when the transformer runs on the CPU and total memory is at least three times the 7 GB copy, `int8` whenever it runs on the CPU, `file` the file's K-quants (no copy); a transformer on a GPU keeps the file's; ~1.4–1.9× a step |
 | `image_cache`           | `easy`                                     | whether a step may reuse the last transformer pass rather than run one (EasyCache): `easy` (the default, threshold 0.08) or `easy:<threshold>` a step whose predicted change since the last pass stays under the threshold takes the last two passes' residual extrapolated to it, and `off` runs every step; at 0.08 about 2.4× a 40-step 1024² picture and 3.6× a 512² edit, the picture close to the uncached one but not identical; 0.05 is closer at 2×, 0.1 and above start to ghost lettering |
 | `image_reference_size`  | `source`                                   | the area an edit reads its reference at: `source` the picture's area but never more than the attached picture's own (upsampling adds nothing but tokens), `output` the picture's area (diffusers reads 1024²), or `WIDTHxHEIGHT` a cap; a 256² picture edited at 1024² encodes in 6 s rather than 84 and steps in 50 s rather than 79 |
 | `vision`                | found beside the text encoder              | the vision projector (`mmproj-*.gguf`) a `qwen_image_2_1` model edits attached pictures with; `none` draws over them instead                                                                                                       |
@@ -3672,8 +3672,14 @@ the device and on the CPU at startup (`[image] calibration 3072x12288 x
 256 tokens: device 352 ms, cpu 39 ms — the CPU: the whole pipeline runs
 there`) and, when the CPU wins, runs the encoder, transformer and VAE all
 on the CPU — the banner's backend then reads `CPU (calibrated: faster
-than the device for pictures)`. An explicit `backend = vulkan` (or
-`--device`) is honoured as given, calibration or not.
+than the device for pictures)`. When the text encoder is split across
+several devices, the transformer is timed on each of them and on the CPU
+and runs whole on the fastest (`[image] transformer placement: …`) — the
+device it runs fastest on, which need not be the one it fits on best. The
+VAE times one of its own convolutions on the device and on the CPU and
+keeps the faster (`[image] VAE placement: …`). An
+explicit `backend = vulkan` (or `--device`) is honoured as given,
+calibration or not.
 
 **The wait is said up front.** The same calibration seeds an estimate of
 the pipeline's rate, and the startup log says what the configured defaults

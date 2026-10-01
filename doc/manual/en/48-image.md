@@ -64,9 +64,10 @@ rather than once per step.
 most of it the transformer and the encoder mapped from disk and shared
 with the page cache — 11 GB with the vision projector — and 7 GB more
 for the 8-bit copy of the transformer that makes it about twice as fast,
-which the server makes only on a CPU with `i8mm` and 21 GB or more;
-elsewhere the file's own weights are the faster kernel. A machine with
-16 GB is enough.
+which the server makes only when the transformer runs on the CPU, the CPU
+has an 8-bit matrix kernel (`i8mm` or `AVX2`) and the machine has 21 GB
+or more; a GPU keeps the file's own weights. A machine with 16 GB is
+enough.
 
 **Time.** A picture is minutes on a CPU, not seconds. On the twelve-core
 ARM board this manual's numbers come from, a step costs 4.8 s at
@@ -78,11 +79,16 @@ The picture is close to, but not the same as, the one every step would
 give; `image_cache = off` runs them all (about 34 minutes at the
 defaults). Those numbers take a copy of the transformer's
 weights as 8-bit integers (7 GB) that the server makes at startup when
-the CPU has `i8mm` and the machine has at least 21 GB (`image_weights`, see the *Inference
+the transformer runs on the CPU and the machine has at least 21 GB (`image_weights`, see the *Inference
 server* chapter); without it a step is about twice as long at 512 × 512. A discrete GPU is faster; an integrated one usually is not, and the
 server measures before it commits: under `backend = auto` it times one
 transformer linear on the device and on the CPU and keeps whichever wins,
-saying so at startup (`[image] calibration …`). The wait is never a
+saying so at startup (`[image] calibration …`). When the text encoder is
+split across several devices, the transformer is timed on each of them
+and on the CPU and runs whole on the fastest (`[image] transformer
+placement …`) — not necessarily the device it fits on best. The VAE is
+timed the same way, on one of its own convolutions, and runs on the CPU
+when the CPU is faster there (`[image] VAE placement …`). The wait is never a
 surprise: the startup log says what a picture at the defaults costs on
 this machine, and the console counts it down.
 

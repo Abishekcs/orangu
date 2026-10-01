@@ -935,8 +935,9 @@ impl Pipeline {
                 transformer.config.txt_dim,
                 encoder.config().n_embd
             );
-            let vae = QwenImage21Vae::load(&companions.vae, backend.clone(), vae_precision)
+            let mut vae = QwenImage21Vae::load(&companions.vae, backend.clone(), vae_precision)
                 .context("loading the VAE")?;
+            vae.choose_backend();
             let vision = match &companions.vision {
                 Some(path) => {
                     let tower = qwen3vl::VisionTower::load(path, backend.clone())?;
@@ -1641,11 +1642,29 @@ impl Pipeline {
         }
 
         let decode_started = Instant::now();
+        let _ = vae::take_conv_clock();
         let picture = self
             .picture_from_latent(&latents, request.width, request.height, cancel)
             .context("decoding the picture")?;
+        let vae_done = decode_started.elapsed();
+        let convs = vae::take_conv_clock();
         let bytes = codec::encode(&picture, request.format)?;
         timings.decode = decode_started.elapsed();
+        log::info!(
+            "orangu-server: [image] decode {:.1}s: convolutions {:.1}s (im2col {:.1}s over \
+             {:.1} GB of bands, matmul {:.1}s for {:.0} G multiply-adds, bias and copy {:.1}s), \
+             rest of the VAE {:.1}s, {} {:.1}s",
+            timings.decode.as_secs_f64(),
+            convs.total().as_secs_f64(),
+            convs.im2col.as_secs_f64(),
+            convs.band_bytes as f64 / 1e9,
+            convs.matmul.as_secs_f64(),
+            convs.macs as f64 / 1e9,
+            convs.rest.as_secs_f64(),
+            vae_done.saturating_sub(convs.total()).as_secs_f64(),
+            request.format.extension(),
+            (timings.decode - vae_done).as_secs_f64(),
+        );
         log::info!(
             "orangu-server: [image] {}x{} in {:.1}s: encode {:.1}s, {} step(s) {:.1}s ({:.1}s each), \
              decode {:.1}s",
@@ -1684,6 +1703,18 @@ impl Pipeline {
             timings,
         })
     }
+}
+
+/// What the client is told when a picture's generation panicked: the
+/// captured panic, unless the GPU device was lost — a loss unwinds the
+/// picture as a panic too (often `wgpu`'s own, inside `Device::poll`), and
+/// then the client is told the server is restarting, never shown the panic.
+fn panicked_message() -> String {
+    if crate::device_lost::is_lost() {
+        return crate::device_lost::CLIENT_MESSAGE.to_string();
+    }
+    crate::panic_capture::take_last_panic_detail()
+        .unwrap_or_else(|| "image generation panicked".to_string())
 }
 
 /// What a background generation reports, in order: progress after every
@@ -1748,10 +1779,7 @@ impl Pipeline {
             let event = match result {
                 Ok(Ok(image)) => ImageEvent::Done(Box::new(image)),
                 Ok(Err(err)) => ImageEvent::Error(format!("{err:#}")),
-                Err(_) => ImageEvent::Error(
-                    crate::panic_capture::take_last_panic_detail()
-                        .unwrap_or_else(|| "image generation panicked".to_string()),
-                ),
+                Err(_) => ImageEvent::Error(panicked_message()),
             };
             let _ = tx.blocking_send(event);
         });
@@ -1875,6 +1903,25 @@ mod tests {
     /// linearly: a step at four times the tokens of the measurement costs
     /// four times the linears and sixteen times the attention, and the
     /// whole picture adds the encode and a per-pixel decode.
+    /// A picture unwound by a lost device tells the client the server is
+    /// restarting, not the panic that carried the loss.
+    #[test]
+    fn a_lost_device_is_reported_without_the_panic() {
+        crate::device_lost::reset_for_test();
+        let _ = std::panic::catch_unwind(|| {
+            crate::device_lost::fail("a test", "Parent device is lost");
+        });
+        assert_eq!(
+            super::panicked_message(),
+            crate::device_lost::CLIENT_MESSAGE
+        );
+        crate::device_lost::reset_for_test();
+        assert_ne!(
+            super::panicked_message(),
+            crate::device_lost::CLIENT_MESSAGE
+        );
+    }
+
     #[test]
     fn the_rate_model_grows_attention_with_the_token_count() {
         let m = RateModel {
