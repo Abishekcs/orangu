@@ -5377,6 +5377,91 @@ fn host_visible_copy_rates() {
     }
 }
 
+/// Probe: a picture transformer's joint attention as one non-causal prefill
+/// attention dispatch — `n_q` picture queries, the last `n_q` of `n_kv`
+/// keys (a text prefix before them) — timed at a 1024-pixel step's shape,
+/// and checked against the host's `f32` blocked attention. Whether the
+/// device is worth sending a step's attention to. `ORANGU_PROBE_ATTN=n_q,
+/// n_kv` overrides the shape. `cargo test --release --bin orangu-server
+/// image_attention_on_the_device -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn image_attention_on_the_device() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let (n_q, n_kv) = std::env::var("ORANGU_PROBE_ATTN")
+        .ok()
+        .and_then(|v| {
+            let mut it = v.split(',').map(|p| p.trim().parse::<usize>().ok());
+            Some((it.next()??, it.next()??))
+        })
+        .unwrap_or((4096, 4200));
+    const N_HEAD: usize = 32;
+    const HEAD_DIM: usize = 128;
+    let dim = N_HEAD * HEAD_DIM;
+    let mut seed = 0x1A77_0E5D_u64;
+    let mut values = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 256.0)
+            .collect()
+    };
+    let k = values(n_kv * dim);
+    let v = values(n_kv * dim);
+    let q = values(n_q * dim);
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let mut cache = crate::engine::kv_cache::KvCache::new(1, n_kv + 1, dim);
+    for j in 0..n_kv {
+        cache.layers[0].push(&k[j * dim..(j + 1) * dim], &v[j * dim..(j + 1) * dim]);
+    }
+    let start = n_kv - n_q;
+    let run = |cache: &mut crate::engine::kv_cache::KvCache| {
+        vulkan.gpu_attention_prefill(
+            &q,
+            &mut cache.layers[0],
+            start,
+            n_q,
+            N_HEAD,
+            N_HEAD,
+            HEAD_DIM,
+            0,
+            false,
+            scale,
+        )
+    };
+    let _ = run(&mut cache);
+    // Timed on a fresh cache: a step's keys and values are new every layer,
+    // so their upload is part of what a step would pay.
+    let mut fresh = crate::engine::kv_cache::KvCache::new(1, n_kv + 1, dim);
+    let started = std::time::Instant::now();
+    for j in 0..n_kv {
+        fresh.layers[0].push(&k[j * dim..(j + 1) * dim], &v[j * dim..(j + 1) * dim]);
+    }
+    let got = run(&mut fresh);
+    let device = started.elapsed();
+    let started = std::time::Instant::now();
+    let want = crate::engine::image::transformer::step_attention_f32_for_probe(
+        &q, n_q, &k, &v, n_kv, N_HEAD, HEAD_DIM, scale,
+    );
+    let host = started.elapsed();
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let macs = 2.0 * (n_q * n_kv * dim) as f64;
+    eprintln!(
+        "{}: {n_q} queries x {n_kv} keys x {N_HEAD}x{HEAD_DIM}: device {:.0} ms ({:.0} G MAC/s), host f32 {:.0} ms ({:.0} G MAC/s), worst |diff| {worst:.2e}",
+        vulkan.device_in_use().name,
+        device.as_secs_f64() * 1e3,
+        macs / device.as_secs_f64() / 1e9,
+        host.as_secs_f64() * 1e3,
+        macs / host.as_secs_f64() / 1e9,
+    );
+}
+
 /// A batch wider than the submission stripe runs `matmul_batch_striped`:
 /// its activations staged whole in a pooled mappable buffer, each stripe
 /// copied into the op's region, the results assembled in a pooled readback

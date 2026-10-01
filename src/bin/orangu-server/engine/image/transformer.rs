@@ -908,6 +908,23 @@ pub(crate) fn step_attention(
     attention_blocked(q, n_q, k, v, n_kv, n_head, head_dim, scale, limits, int8)
 }
 
+/// The host's exact `f32` step attention — no `int8` scores — for a
+/// device probe to check itself against.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_attention_f32_for_probe(
+    q: &[f32],
+    n_q: usize,
+    k: &[f32],
+    v: &[f32],
+    n_kv: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    attention_blocked(q, n_q, k, v, n_kv, n_head, head_dim, scale, None, false)
+}
+
 /// Where attention's value product `P · V` runs, `ORANGU_IMAGE_PV` choosing for an A/B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueProduct {

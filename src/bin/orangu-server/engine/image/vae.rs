@@ -570,9 +570,20 @@ pub(super) fn run_conv(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Featu
                 .expect("one op in, one result out");
             add_conv_time(&CONV_MATMUL_NS, phase);
         }
+        // The bias added on the way into `out`, one parallel pass: a band is
+        // tens of MiB, and the per-pixel rows (`cout` wide) are each too
+        // short for `add_bias_per_row` to split, so it and a separate copy
+        // ran on one thread.
         let phase = std::time::Instant::now();
-        tensor::add_bias_per_row(&mut y, &conv.bias, n);
-        out[start * out_w * conv.cout..end * out_w * conv.cout].copy_from_slice(&y);
+        out[start * out_w * conv.cout..end * out_w * conv.cout]
+            .par_chunks_mut(conv.cout)
+            .zip(y.par_chunks(conv.cout))
+            .with_min_len(64)
+            .for_each(|(o, row)| {
+                for ((o, v), b) in o.iter_mut().zip(row).zip(&conv.bias) {
+                    *o = v + b;
+                }
+            });
         add_conv_time(&CONV_REST_NS, phase);
         start = end;
     }
@@ -904,6 +915,31 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A convolution's bias is added to every pixel's output channels:
+    /// with one, the result is the bias-free result plus the bias, bit for
+    /// bit, over a picture tall enough for several bands' worth of rows.
+    #[test]
+    fn a_convolution_adds_its_bias_to_every_pixel() {
+        let (cin, cout, k) = (3usize, 5usize, 3usize);
+        let value = |i: usize| ((i * 7 % 13) as f32 - 6.0) * 0.1;
+        let rows: Vec<f32> = (0..cout * k * k * cin).map(value).collect();
+        let x = Feature::new(
+            37,
+            11,
+            cin,
+            (0..37 * 11 * cin).map(|i| value(i + 3)).collect(),
+        );
+        let vae = vae_shell();
+        let plain = vae.conv(&conv_with(rows.clone(), cin, cout, k, Padding::Same), &x);
+        let bias: Vec<f32> = (0..cout).map(|c| 0.25 * c as f32 - 0.5).collect();
+        let mut biased_conv = conv_with(rows, cin, cout, k, Padding::Same);
+        biased_conv.bias = bias.clone();
+        let biased = vae.conv(&biased_conv, &x);
+        for (i, (b, p)) in biased.data.iter().zip(&plain.data).enumerate() {
+            assert_eq!(b.to_bits(), (p + bias[i % cout]).to_bits(), "at {i}");
         }
     }
 
