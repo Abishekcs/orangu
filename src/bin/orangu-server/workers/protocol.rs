@@ -44,7 +44,7 @@ pub const PROTOCOL_VERSION: u16 = 2;
 /// Optional extensions this build understands, one bit each: a parent
 /// sends a child a message of an extension only when the child's
 /// `HelloAck` advertised its bit, so peers without it still talk.
-pub const FEATURES: u64 = FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD;
+pub const FEATURES: u64 = FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD | FEATURE_ECHO;
 
 /// [`Message::Fork`]: a worker copies one session's rows into another.
 pub const FEATURE_FORK: u64 = 1;
@@ -56,6 +56,15 @@ pub const FEATURE_ROWS: u64 = 2;
 /// [`Rows::LastLogits`] and [`Rows::AllLogits`]: the node running the final
 /// layer sends back logits.
 pub const FEATURE_HEAD: u64 = 4;
+
+/// [`Message::Echo`]: a worker sends back what it was sent, for its parent
+/// to time the link.
+pub const FEATURE_ECHO: u64 = 8;
+
+/// This worker switches to its parent's model when assigned another one; a
+/// worker without it, and another model, is left out before any layers are
+/// cut. Advertised per node, not in [`FEATURES`].
+pub const FEATURE_SWITCH: u64 = 16;
 
 /// The largest frame either side accepts: a prefill chunk of 8192 tokens
 /// of an 8192-wide model in `f32` is 256 MiB, so this leaves room without
@@ -266,6 +275,10 @@ pub struct NodeSetup {
     /// through a 128-token prompt chunk; `0` when not measured.
     pub decode_rate: f32,
     pub prompt_rate: f32,
+    /// What a decode step and a prompt chunk cost on it whatever their
+    /// layers, in milliseconds; `0` when not measured.
+    pub decode_fixed_ms: f32,
+    pub prompt_fixed_ms: f32,
 }
 
 /// A CPU, GPU or NPU of a node.
@@ -366,6 +379,10 @@ pub struct HelloAck {
     /// parent that finds itself there refuses a loop from its side too.
     pub subtree: Vec<String>,
     pub capacity: Capacity,
+    /// The model this node serves (its layout: `range_hash` is left
+    /// empty), so a parent knows before planning whether it runs the same.
+    /// Appended; `None` from a node that does not say.
+    pub model: Option<ModelIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -586,6 +603,11 @@ pub enum Message {
         layer: u32,
         len: u32,
     },
+    /// Answered with the same bytes: what a parent times a link's bandwidth
+    /// by. Only sent to a child that advertised [`FEATURE_ECHO`].
+    Echo {
+        data: Vec<u8>,
+    },
     /// One layer's rows: `len` rows of `kv_dim` keys, then as many values,
     /// `f32` little-endian in `data`.
     LayerRows {
@@ -628,6 +650,7 @@ mod tag {
     pub const FORK: u8 = 17;
     pub const ROWS: u8 = 18;
     pub const LAYER_ROWS: u8 = 19;
+    pub const ECHO: u8 = 20;
 }
 
 struct Writer(Vec<u8>);
@@ -769,12 +792,14 @@ impl<'a> Reader<'a> {
         (0..n).map(|_| self.string()).collect()
     }
     fn setups(&mut self) -> Result<Vec<NodeSetup>> {
-        let n = self.count(16)?;
+        let n = self.count(24)?;
         (0..n)
             .map(|_| {
                 let name = self.string()?;
                 let decode_rate = self.f32()?;
                 let prompt_rate = self.f32()?;
+                let decode_fixed_ms = self.f32()?;
+                let prompt_fixed_ms = self.f32()?;
                 let n = self.count(21)?;
                 let devices = (0..n)
                     .map(|_| {
@@ -792,6 +817,8 @@ impl<'a> Reader<'a> {
                     devices,
                     decode_rate,
                     prompt_rate,
+                    decode_fixed_ms,
+                    prompt_fixed_ms,
                 })
             })
             .collect()
@@ -891,6 +918,8 @@ impl Message {
                     w.string(&setup.name);
                     w.f32(setup.decode_rate);
                     w.f32(setup.prompt_rate);
+                    w.f32(setup.decode_fixed_ms);
+                    w.f32(setup.prompt_fixed_ms);
                     w.u32(setup.devices.len() as u32);
                     for d in &setup.devices {
                         w.string(&d.kind);
@@ -899,6 +928,9 @@ impl Message {
                         w.u64(d.memory_bytes);
                         w.u8(u8::from(d.in_use));
                     }
+                }
+                if let Some(model) = &h.model {
+                    w.identity(model);
                 }
                 tag::HELLO_ACK
             }
@@ -986,6 +1018,10 @@ impl Message {
                 w.u32(*len);
                 tag::ROWS
             }
+            Self::Echo { data } => {
+                w.bytes(data);
+                tag::ECHO
+            }
             Self::LayerRows { kv_dim, len, data } => {
                 w.u32(*kv_dim);
                 w.u32(*len);
@@ -1042,6 +1078,11 @@ impl Message {
                     budget_bytes: r.u64()?,
                     subtree_budget_bytes: r.u64()?,
                     setups: r.setups()?,
+                },
+                model: if r.0.is_empty() {
+                    None
+                } else {
+                    Some(r.identity()?)
                 },
             }),
             tag::AUTH => Self::Auth { proof: r.fixed()? },
@@ -1103,6 +1144,7 @@ impl Message {
                 layer: r.u32()?,
                 len: r.u32()?,
             },
+            tag::ECHO => Self::Echo { data: r.bytes()? },
             tag::LAYER_ROWS => Self::LayerRows {
                 kv_dim: r.u32()?,
                 len: r.u32()?,
@@ -1268,8 +1310,11 @@ mod tests {
                     ],
                     decode_rate: 21.5,
                     prompt_rate: 310.0,
+                    decode_fixed_ms: 1.5,
+                    prompt_fixed_ms: 12.0,
                 }],
             },
+            model: Some(identity()),
         }));
         round_trip(Message::Auth { proof: [1; 32] });
         round_trip(Message::Assign(Assign {
@@ -1308,6 +1353,9 @@ mod tests {
             session: 7,
             layer: 12,
             len: 440,
+        });
+        round_trip(Message::Echo {
+            data: vec![1, 2, 3],
         });
         round_trip(Message::LayerRows {
             kv_dim: 2,

@@ -140,8 +140,10 @@ prompt as fast as the chain above.
 To check a tree once it is up:
 
 - `curl alpha:8100/v1/workers` shows the plan, what its shares
-  followed, each worker's connection, and every node's processors and
-  measured speed (`setup`, and `setups` under each worker); `curl beta:8100/ready` answers `503 serving a parent
+  followed, each worker's connection and its link's round trip and
+  bandwidth (`link`), and every node's processors, measured speed and
+  what a forward costs it whatever its layers (`setup`, and `setups`
+  under each worker); `curl beta:8100/ready` answers `503 serving a parent
   orangu-server`.
 - A request's log line on `alpha` says where its time went:
   `workers: prefill 946 tokens in 8 forwards (alpha:8400 …, beta:8400 …)`,
@@ -222,6 +224,12 @@ layer instead (`head = last`, or `auto` when that node measured the faster
 decode): it sends logits back rather than its layers' output. That spares a
 weak top-level node the model's largest read.
 
+The decisions weigh the links too. A parent times each worker's link when
+it connects — its round trip and bandwidth — so a fast machine on a slow
+network is not mistaken for a fast part of the tree: handing a sequence
+back to decode alone moves every prompt position's keys and values over
+it, and moving the head moves a row of logits a token.
+
 A node with a `[workers]` section never reads, uploads or times the whole
 model at startup. It skips:
 
@@ -259,6 +267,18 @@ found under its `models`, or downloaded — and the lead takes it back at its
 next plan. It keeps the model it had when the switch fails, or when its
 `[web].reexec` is `no`, and is then left out. A lead that loads a new model
 takes its workers with it the same way.
+
+The lead finds out at the handshake: every worker says which model it
+serves when it connects. One with another model that cannot switch — its
+`[web].reexec` is `no` — is left out before any layers are planned, and the
+lead says so once, naming both models:
+
+```text
+worker left out: beta:8400 serves bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M, not unsloth/gemma-4-E2B-it-GGUF:Q4_K_M, and cannot switch to it ([web].reexec is off there)
+```
+
+A node serving a picture model does not use its workers: its text encoder
+is not split.
 
 ## Encryption
 

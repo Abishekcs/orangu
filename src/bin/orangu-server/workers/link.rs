@@ -45,6 +45,10 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// What a parent echoes off a new worker to time the link: 4 MiB, 13 ms
+/// each way at 2.5 Gbit/s.
+const ECHO_BYTES: usize = 4 << 20;
+
 /// What the worker said about itself in the handshake.
 #[derive(Clone, Debug, Default)]
 pub struct ChildInfo {
@@ -53,6 +57,11 @@ pub struct ChildInfo {
     pub capacity: Capacity,
     /// The extensions it understands (`protocol::FEATURES`).
     pub features: u64,
+    /// The link's round trip and bandwidth (bytes a second each way), as
+    /// timed after the handshake; `None` from a worker that cannot echo.
+    pub link: Option<(Duration, f64)>,
+    /// The model it serves, as its handshake said.
+    pub model: Option<super::protocol::ModelIdentity>,
 }
 
 type Answer = Result<(Message, usize), WorkerError>;
@@ -95,6 +104,8 @@ pub struct ChildLink {
     path: Mutex<Vec<String>>,
     /// Whether the current outage has been reported.
     unreachable: AtomicBool,
+    /// Why the last plan left it out, said once until the reason changes.
+    left_out: Mutex<Option<String>>,
 }
 
 impl ChildLink {
@@ -120,7 +131,25 @@ impl ChildLink {
             info: Mutex::new(None),
             path: Mutex::new(Vec::new()),
             unreachable: AtomicBool::new(false),
+            left_out: Mutex::new(None),
         }
+    }
+
+    /// Records why a plan left the worker out; whether that is news — a
+    /// reason other than the last one — so a worker left out for the same
+    /// reason at every plan is said once.
+    pub fn note_left_out(&self, reason: &str) -> bool {
+        let mut last = self.left_out.lock().unwrap();
+        if last.as_deref() == Some(reason) {
+            return false;
+        }
+        *last = Some(reason.to_string());
+        true
+    }
+
+    /// A plan used the worker: the next reason to leave it out is news.
+    pub fn clear_left_out(&self) {
+        *self.left_out.lock().unwrap() = None;
     }
 
     /// Marks the worker unreachable; whether that is news — the first
@@ -271,19 +300,47 @@ impl ChildLink {
                 .spawn(move || read_answers(connection, reader, lost))
                 .map_err(|e| self.lost(e))?;
         }
-        let info = ChildInfo {
+        let mut info = ChildInfo {
             node: ack.node,
             subtree: ack.subtree,
             capacity: ack.capacity,
             features: ack.features,
+            link: None,
+            model: ack.model,
         };
         *self.connection.lock().unwrap() = Some(connection);
+        if info.features & super::protocol::FEATURE_ECHO != 0 {
+            info.link = self.time_link();
+        }
         *self.info.lock().unwrap() = Some(info.clone());
         *self.path.lock().unwrap() = path.to_vec();
         if self.unreachable.swap(false, Ordering::Relaxed) {
             log::info!("orangu-server: worker {} is back", self.addr);
         }
         Ok(info)
+    }
+
+    /// The link's round trip — the fastest of three pings — and its
+    /// bandwidth, from echoing [`ECHO_BYTES`] less a round trip. `None` when
+    /// the worker does not answer.
+    fn time_link(&self) -> Option<(Duration, f64)> {
+        let mut rtt = Duration::MAX;
+        for nonce in 0..3u64 {
+            let at = Instant::now();
+            match self.request(&Message::Ping { nonce }) {
+                Ok(Message::Pong { nonce: n }) if n == nonce => rtt = rtt.min(at.elapsed()),
+                _ => return None,
+            }
+        }
+        let at = Instant::now();
+        match self.request(&Message::Echo {
+            data: vec![0x5a; ECHO_BYTES],
+        }) {
+            Ok(Message::Echo { data }) if data.len() == ECHO_BYTES => {}
+            _ => return None,
+        }
+        let moving = at.elapsed().saturating_sub(rtt).as_secs_f64().max(1e-6);
+        Some((rtt, 2.0 * ECHO_BYTES as f64 / moving))
     }
 
     /// A refusal from the worker, named after it.

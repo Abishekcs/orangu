@@ -193,6 +193,50 @@ pub fn by_speed(budgets: &[u64], rates: &[f64], total_bytes: u64) -> Option<Vec<
     Some(target.iter().map(|t| (t.round() as u64).max(1)).collect())
 }
 
+/// The order of the workers with `rates` whose plan `cost`s least — a
+/// plan's cost being, say, the time of a decode step through it. Order
+/// matters where a model cannot be cut anywhere: what cannot be divided
+/// goes to whichever share starts at the last cut. Every order of up to
+/// six workers is tried, of more the given one and both by speed; of
+/// equal costs the given order wins.
+pub fn best_order(rates: &[f64], cost: &dyn Fn(&[usize]) -> f64) -> Vec<usize> {
+    let n = rates.len();
+    let mut orders: Vec<Vec<usize>> = vec![(0..n).collect()];
+    if n <= 6 {
+        orders.extend(permutations(n));
+    } else {
+        let mut by_speed: Vec<usize> = (0..n).collect();
+        by_speed.sort_by(|a, b| rates[*a].total_cmp(&rates[*b]));
+        orders.push(by_speed.clone());
+        by_speed.reverse();
+        orders.push(by_speed);
+    }
+    let mut best = (f64::INFINITY, (0..n).collect());
+    for order in orders {
+        let c = cost(&order);
+        if c < best.0 {
+            best = (c, order);
+        }
+    }
+    best.1
+}
+
+/// Every order of `0..n`.
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for shorter in permutations(n - 1) {
+        for at in 0..=shorter.len() {
+            let mut order = shorter.clone();
+            order.insert(at, n - 1);
+            out.push(order);
+        }
+    }
+    out
+}
+
 /// The bytes of weights in `layers`.
 pub fn bytes_of(layers: &Range<usize>, layer_bytes: &[u64]) -> u64 {
     layers.clone().filter_map(|il| layer_bytes.get(il)).sum()
@@ -294,6 +338,34 @@ mod tests {
             plan_shares(0..5, &EVEN, LocalLayers::Count(0), 1, &[], &ANY),
             (0..5, vec![])
         );
+    }
+
+    /// Twelve even layers that may only be cut up to layer 4: the rest goes
+    /// to one worker whatever the rates, and the best order gives it to the
+    /// fastest. With every cut allowed, the given order stands.
+    #[test]
+    fn what_cannot_be_divided_goes_to_the_fastest() {
+        let rates = [1.0, 4.0];
+        let plan = |allowed: &dyn Fn(usize) -> bool, order: &[usize]| {
+            let weights: Vec<u64> = order.iter().map(|i| (rates[*i] * 10.0) as u64).collect();
+            plan_shares(0..12, &EVEN, LocalLayers::Auto, 10, &weights, allowed)
+        };
+        let cost = |allowed: &dyn Fn(usize) -> bool, order: &[usize]| {
+            let (local, shares) = plan(allowed, order);
+            local.len() as f64
+                + shares
+                    .iter()
+                    .zip(order)
+                    .map(|(s, i)| s.len() as f64 / rates[*i])
+                    .sum::<f64>()
+        };
+        let head = |at: usize| at <= 4;
+        let order = best_order(&rates, &|o| cost(&head, o));
+        let (_, shares) = plan(&head, &order);
+        let tail = order[shares.iter().position(|s| s.end == 12).unwrap()];
+        assert_eq!(tail, 1, "{order:?} {shares:?}");
+        assert_eq!(best_order(&rates, &|o| cost(&ANY, o)), vec![0, 1]);
+        assert_eq!(permutations(3).len(), 6);
     }
 
     #[test]

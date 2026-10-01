@@ -39,9 +39,9 @@ use super::metrics::{LinkSnapshot, NodeMetrics};
 use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage};
 use super::plan;
 use super::protocol::{
-    ActivationFormat, Assign, Capacity, ErrorCode, FEATURES, HelloAck, MAX_DEPTH, Message,
-    NodeSetup, PROTOCOL_VERSION, PlanEntry, WorkerError, check_path, read_frame, read_message,
-    write_message,
+    ActivationFormat, Assign, Capacity, ErrorCode, FEATURE_SWITCH, FEATURES, HelloAck, MAX_DEPTH,
+    Message, NodeSetup, PROTOCOL_VERSION, PlanEntry, WorkerError, check_path, read_frame,
+    read_message, write_message,
 };
 use super::session::SessionStore;
 use super::stage::{EncodedStage, MessageStage};
@@ -104,6 +104,10 @@ pub struct NodeSettings {
     pub decode: DecodeOn,
     /// `[workers].head`: which node applies the output head.
     pub head: HeadOn,
+    /// Whether this node serves its model through its tree at all: not a
+    /// picture model, whose text encoder is never split. Without it the
+    /// node plans nothing for its workers, and serves only as a worker.
+    pub split: bool,
     /// `[workers].offload`: whether the workers are used when this node
     /// could serve alone.
     pub offload: Offload,
@@ -208,6 +212,12 @@ pub struct Node {
     /// The weights outside every layer: the embedding, the final norm and
     /// the output head, which only the top-level node runs.
     non_layer_bytes: u64,
+    /// The model this node serves, as its handshake tells a parent.
+    identity: super::protocol::ModelIdentity,
+    /// The output head's bytes: the matrix as wide as the vocabulary.
+    head_bytes: u64,
+    /// Each layer's keys and values of one position, in bytes as `f32`.
+    kv_row_bytes: Vec<u64>,
     local_addr: Option<SocketAddr>,
     metrics: NodeMetrics,
     next_connection: AtomicU64,
@@ -290,6 +300,8 @@ fn setups_json(setups: &[NodeSetup]) -> serde_json::Value {
                 "name": s.name,
                 "decode_gb_per_s": (s.decode_rate > 0.0).then_some(s.decode_rate),
                 "prompt_gb_per_s": (s.prompt_rate > 0.0).then_some(s.prompt_rate),
+                "decode_fixed_ms": (s.decode_fixed_ms > 0.0).then_some(s.decode_fixed_ms),
+                "prompt_fixed_ms": (s.prompt_fixed_ms > 0.0).then_some(s.prompt_fixed_ms),
                 "devices": s.devices.iter().map(|d| serde_json::json!({
                     "kind": d.kind,
                     "name": d.name,
@@ -339,13 +351,32 @@ impl Node {
         };
         let local_addr = listener.as_ref().and_then(|l| l.local_addr().ok());
         let mut layer_bytes = vec![0u64; n_layer];
+        let mut head_bytes = 0u64;
+        let mut embd_bytes = 0u64;
         let mut non_layer_bytes = 0u64;
         for (name, bytes) in loaded.tensor_sizes() {
+            match name {
+                "output.weight" => head_bytes = bytes,
+                "token_embd.weight" => embd_bytes = bytes,
+                _ => {}
+            }
             match crate::engine::loader::block_index(name).filter(|il| *il < n_layer) {
                 Some(il) => layer_bytes[il] += bytes,
                 None => non_layer_bytes += bytes,
             }
         }
+        // A tied head is the embedding matrix read the other way.
+        if head_bytes == 0 {
+            head_bytes = embd_bytes;
+        }
+        // Keys and values, `f32`, of one position per layer: what a sequence's
+        // rows cost to bring back to the top-level node.
+        let kv_row_bytes: Vec<u64> = model
+            .new_kv_cache(1)
+            .layers
+            .iter()
+            .map(|l| 8 * l.kv_dim() as u64)
+            .collect();
         if settings.capacity.setups.is_empty() {
             settings.capacity.setups.push(NodeSetup {
                 name: settings.name.clone(),
@@ -364,17 +395,22 @@ impl Node {
                 Ok((speed, layers, took)) => {
                     log::info!(
                         "orangu-server: [workers] this node runs {:.2} GB of weights a second \
-                         in a decode step, {:.1} in a {}-token prompt chunk (layers {}..{}, \
-                         measured in {:.1} s)",
+                         in a decode step, {:.1} in a {}-token prompt chunk, and each costs \
+                         {:.1} and {:.1} ms whatever its layers (layers {}..{}, measured in \
+                         {:.1} s)",
                         speed.decode,
                         speed.prompt,
                         super::speed::PROMPT_TOKENS,
+                        speed.decode_fixed_ms,
+                        speed.prompt_fixed_ms,
                         layers.start,
                         layers.end,
                         took.as_secs_f64()
                     );
                     settings.capacity.setups[0].decode_rate = speed.decode;
                     settings.capacity.setups[0].prompt_rate = speed.prompt;
+                    settings.capacity.setups[0].decode_fixed_ms = speed.decode_fixed_ms;
+                    settings.capacity.setups[0].prompt_fixed_ms = speed.prompt_fixed_ms;
                 }
                 Err(e) => log::warn!(
                     "orangu-server: [workers] could not time this node's layers, its share \
@@ -389,6 +425,9 @@ impl Node {
             // and refuses every assignment.
             LayerPipeline::unchecked(model.clone(), 0..n_layer)
         };
+        // The model this node serves, by its layout: what a parent compares.
+        let own_identity =
+            identity::model_identity(&loaded, &settings.label, &settings.quant, 0..0);
         let node = Arc::new(Self {
             id: format!("{:016x}", rand::random::<u64>()),
             settings,
@@ -417,6 +456,9 @@ impl Node {
             delegating: OnceLock::new(),
             layer_bytes,
             non_layer_bytes,
+            head_bytes,
+            kv_row_bytes,
+            identity: own_identity,
             local_addr,
             metrics: NodeMetrics::default(),
             next_connection: AtomicU64::new(1),
@@ -460,7 +502,7 @@ impl Node {
 
     /// Whether this node hands layers to workers when it is top-level.
     fn delegates(&self) -> bool {
-        !self.links.is_empty() && self.model.supports_layer_split()
+        self.settings.split && !self.links.is_empty() && self.model.supports_layer_split()
     }
 
     /// The model this node's own API serves: a [`DelegatingModel`] over
@@ -536,6 +578,10 @@ impl Node {
                     "node": info.as_ref().map(|i| i.node.clone()),
                     "subtree_nodes": info.as_ref().map(|i| i.capacity.subtree_nodes),
                     "setups": info.as_ref().map(|i| setups_json(&i.capacity.setups)),
+                    "link": info.as_ref().and_then(|i| i.link).map(|(rtt, bandwidth)| serde_json::json!({
+                        "rtt_ms": rtt.as_secs_f64() * 1e3,
+                        "mb_per_s": bandwidth / 1e6,
+                    })),
                 })
             })
             .collect();
@@ -621,6 +667,97 @@ impl Node {
         capacity
     }
 
+    /// This node's layers and each worker's share of `range`, in the order of
+    /// `candidates`: by speed when every node below has measured it, each
+    /// share up to what its memory holds; by memory otherwise. Also says
+    /// which it followed.
+    fn cut(
+        &self,
+        range: &Range<usize>,
+        own_budget: u64,
+        candidates: &[(Arc<ChildLink>, ChildInfo)],
+    ) -> (Range<usize>, Vec<Range<usize>>, &'static str) {
+        let budgets: Vec<u64> = candidates
+            .iter()
+            .map(|(_, info)| plan::subtree_budget(&info.capacity))
+            .collect();
+        let mut weights = vec![own_budget];
+        weights.extend(&budgets);
+        let mut rates = vec![self.rate(&self.settings.capacity.setups[..1])];
+        rates.extend(
+            candidates
+                .iter()
+                .map(|(_, info)| self.rate(&info.capacity.setups)),
+        );
+        let by_speed = if self.settings.shares == Shares::Memory {
+            None
+        } else {
+            plan::by_speed(&weights, &rates, plan::bytes_of(range, &self.layer_bytes))
+        };
+        let by = match (&by_speed, self.settings.shares) {
+            (Some(_), Shares::Prompt) => "prompt speed",
+            (Some(_), _) => "decode speed",
+            (None, _) => "memory",
+        };
+        if let Some(by_speed) = by_speed {
+            weights = by_speed;
+        }
+        let (local, shares) = plan::plan_shares(
+            range.clone(),
+            &self.layer_bytes,
+            self.settings.local_layers,
+            // A budget of nothing still takes a share when every budget
+            // is nothing — a tree of nodes that did not say.
+            weights[0].max(1),
+            &weights[1..].iter().map(|b| (*b).max(1)).collect::<Vec<_>>(),
+            &|at| self.model.split_allowed(at),
+        );
+        (local, shares, by)
+    }
+
+    /// `candidates` in the order whose plan runs a decode step soonest, each
+    /// node's layers at its measured speed. A model may not let its layers
+    /// be cut anywhere (Gemma 4's last layers read an earlier layer's KV
+    /// cache), and what cannot be divided goes to whichever worker's share
+    /// starts at the last cut — so which worker that is depends on the
+    /// order. Every order of up to six workers is tried, of more the
+    /// configured one and both by speed. The configured order when a worker
+    /// did not measure its speed, or shares follow memory.
+    fn best_order(
+        &self,
+        range: &Range<usize>,
+        own_budget: u64,
+        candidates: Vec<(Arc<ChildLink>, ChildInfo)>,
+    ) -> Vec<(Arc<ChildLink>, ChildInfo)> {
+        let own = self.rate(&self.settings.capacity.setups[..1]);
+        let rates: Vec<f64> = candidates
+            .iter()
+            .map(|(_, info)| self.rate(&info.capacity.setups))
+            .collect();
+        if self.settings.shares == Shares::Memory
+            || candidates.len() < 2
+            || own <= 0.0
+            || rates.iter().any(|r| *r <= 0.0)
+        {
+            return candidates;
+        }
+        let bytes = |layers: &Range<usize>| plan::bytes_of(layers, &self.layer_bytes) as f64;
+        let cost = |order: &[usize]| {
+            let ordered: Vec<_> = order.iter().map(|i| candidates[*i].clone()).collect();
+            let (local, shares, _) = self.cut(range, own_budget, &ordered);
+            bytes(&local) / own
+                + shares
+                    .iter()
+                    .zip(order)
+                    .map(|(share, i)| bytes(share) / rates[*i])
+                    .sum::<f64>()
+        };
+        plan::best_order(&rates, &cost)
+            .into_iter()
+            .map(|i| candidates[i].clone())
+            .collect()
+    }
+
     /// The speed a share over `setups` — a node, or a worker and every node
     /// below it — runs at, by `[workers].shares`: their rates added up, as
     /// each takes a part in proportion. `0` when one of them did not measure.
@@ -678,6 +815,29 @@ impl Node {
                 }
             }
         }
+        // A worker with another model is left out before anything is cut —
+        // unless it switches to this node's model when assigned it. Said once
+        // for as long as the reason stands; the link stays up, so a worker
+        // that changes its model is seen when it reconnects.
+        candidates.retain(|(link, info)| {
+            let Some(model) = &info.model else {
+                return true;
+            };
+            if model.header_hash == self.identity.header_hash || info.features & FEATURE_SWITCH != 0
+            {
+                return true;
+            }
+            let reason = format!(
+                "{} serves {}, not {}, and cannot switch to it ([web].reexec is off there)",
+                link.addr,
+                named(model),
+                named(&self.identity)
+            );
+            if link.note_left_out(&reason) {
+                log::warn!("orangu-server: worker left out: {reason}");
+            }
+            false
+        });
         // The top-level node also holds the embedding and the output head,
         // which no layer range counts: its budget for layers is what they
         // leave.
@@ -690,44 +850,10 @@ impl Node {
         } else {
             self.settings.capacity.budget_bytes
         };
+        candidates = self.best_order(&range, own_budget, candidates);
         loop {
-            let budgets: Vec<u64> = candidates
-                .iter()
-                .map(|(_, info)| plan::subtree_budget(&info.capacity))
-                .collect();
-            // By speed when every node below has measured it, each
-            // share up to what its memory holds; by memory otherwise.
-            let mut weights = vec![own_budget];
-            weights.extend(&budgets);
-            let mut rates = vec![self.rate(&self.settings.capacity.setups[..1])];
-            rates.extend(
-                candidates
-                    .iter()
-                    .map(|(_, info)| self.rate(&info.capacity.setups)),
-            );
-            let by_speed = if self.settings.shares == Shares::Memory {
-                None
-            } else {
-                plan::by_speed(&weights, &rates, plan::bytes_of(&range, &self.layer_bytes))
-            };
-            *self.shares_by.lock().unwrap() = match (&by_speed, self.settings.shares) {
-                (Some(_), Shares::Prompt) => "prompt speed",
-                (Some(_), _) => "decode speed",
-                (None, _) => "memory",
-            };
-            if let Some(by_speed) = by_speed {
-                weights = by_speed;
-            }
-            let (local, shares) = plan::plan_shares(
-                range.clone(),
-                &self.layer_bytes,
-                self.settings.local_layers,
-                // A budget of nothing still takes a share when every budget
-                // is nothing — a tree of nodes that did not say.
-                weights[0].max(1),
-                &weights[1..].iter().map(|b| (*b).max(1)).collect::<Vec<_>>(),
-                &|at| self.model.split_allowed(at),
-            );
+            let (local, shares, by) = self.cut(&range, own_budget, &candidates);
+            *self.shares_by.lock().unwrap() = by;
             if top {
                 let why = self.not_worth_offloading(&range, &local, &shares, &candidates);
                 let alone = why.is_some();
@@ -763,12 +889,19 @@ impl Node {
                 }
                 match self.assign(link, share.clone(), terms) {
                     Ok(plan) => {
+                        link.clear_left_out();
                         entries.extend(plan);
                         used.push(link.addr.clone());
                         stages.push(self.stage_for(link, share.clone(), path, terms));
                     }
                     Err(error) => {
-                        log::warn!("orangu-server: worker left out: {error}");
+                        // Once for as long as the reason stands: a worker
+                        // that refuses is asked again at every plan.
+                        if link.note_left_out(&error.to_string()) {
+                            log::warn!("orangu-server: worker left out: {error}");
+                        } else {
+                            log::debug!("orangu-server: worker still left out: {error}");
+                        }
                         failed = Some(i);
                         break;
                     }
@@ -780,6 +913,10 @@ impl Node {
                     link.disconnect();
                 }
                 None => {
+                    let budgets: Vec<u64> = candidates
+                        .iter()
+                        .map(|(_, info)| plan::subtree_budget(&info.capacity))
+                        .collect();
                     self.report_fit(&local, own_budget, &candidates, &shares, &budgets);
                     let pipeline = LayerPipeline::new(self.model.clone(), local, stages)?
                         .named(&self.settings.name);
@@ -1105,9 +1242,11 @@ impl Node {
     /// Whether sequences decode on this node alone once their prompt is
     /// through the tree, by `[workers].decode`: only when the plan
     /// uses workers, every one of them can send rows back, and this node's
-    /// budget holds the whole model — and, with `auto`, when its measured
-    /// decode speed takes a token through every layer sooner than the plan's
-    /// nodes take it through theirs, each at its own speed.
+    /// budget holds the whole model — and, with `auto`, when the decode step
+    /// it saves (every node's layers at its speed, its fixed cost and the
+    /// hops, against this node alone) at least covers bringing one prompt
+    /// position's rows over the slowest link: the rows pay for themselves
+    /// within an answer as long as the prompt.
     fn decides_to_decode_alone(&self, entries: &[PlanEntry], used: &[String]) -> bool {
         let working: Vec<&PlanEntry> = entries
             .iter()
@@ -1134,25 +1273,51 @@ impl Node {
                 setups.extend(info.capacity.setups);
             }
         }
-        let rate = |name: &str| {
+        // A node's rate, and what each forward costs it whatever its layers,
+        // in nanoseconds (bytes over gigabytes a second are).
+        let measured = |name: &str| {
             setups
                 .iter()
                 .find(|s| s.name == name)
-                .map(|s| s.decode_rate as f64)
-                .filter(|r| *r > 0.0)
+                .filter(|s| s.decode_rate > 0.0)
+                .map(|s| (s.decode_rate as f64, s.decode_fixed_ms as f64 * 1e6))
         };
-        let Some(own) = rate(&self.settings.name) else {
+        let Some((own, own_fixed)) = measured(&self.settings.name) else {
             return false;
         };
+        let link = self.slowest_link(used);
         let mut tree = 0.0;
-        for entry in working {
-            let Some(r) = rate(&entry.node) else {
+        let mut remote_rows = 0.0;
+        for (i, entry) in working.iter().enumerate() {
+            let Some((r, fixed)) = measured(&entry.node) else {
                 return false;
             };
             let layers = entry.layer_start as usize..entry.layer_end as usize;
-            tree += plan::bytes_of(&layers, &self.layer_bytes) as f64 / r;
+            tree += plan::bytes_of(&layers, &self.layer_bytes) as f64 / r + fixed;
+            if i > 0 {
+                tree += link.map_or(0.0, |(rtt, _)| rtt.as_nanos() as f64);
+                remote_rows += layers
+                    .map(|il| self.kv_row_bytes.get(il).copied().unwrap_or(0) as f64)
+                    .sum::<f64>();
+            }
         }
-        total as f64 / own < tree
+        let alone = total as f64 / own + own_fixed;
+        // Each prompt position's rows cross the link once; each generated
+        // token saves `tree - alone`. Worth it when an answer as long as its
+        // prompt pays the rows back — on a slow link, a slow worker, or both.
+        let rows_per_position = link.map_or(0.0, |(_, bandwidth)| remote_rows / bandwidth * 1e9);
+        tree - alone > 0.0 && tree - alone >= rows_per_position
+    }
+
+    /// The slowest link to the workers `used`: the longest round trip and
+    /// the least bandwidth among them. `None` when none was timed.
+    fn slowest_link(&self, used: &[String]) -> Option<(Duration, f64)> {
+        self.links
+            .iter()
+            .chain(&self.standby_links)
+            .filter(|link| used.contains(&link.addr))
+            .filter_map(|link| link.info().and_then(|info| info.link))
+            .reduce(|a, b| (a.0.max(b.0), a.1.min(b.1)))
     }
 
     /// Why this node should serve alone rather than hand `shares` to its
@@ -1182,8 +1347,12 @@ impl Node {
             return None;
         }
         let bytes = |layers: &Range<usize>| plan::bytes_of(layers, &self.layer_bytes) as f64;
-        let mut prompt_stage = bytes(local) / own_prompt;
-        let mut decode_steps = bytes(local) / own_decode;
+        // In nanoseconds, as bytes over gigabytes a second are.
+        let ns = |ms: f32| ms as f64 * 1e6;
+        let (own_prompt_fixed, own_decode_fixed) =
+            (ns(own.prompt_fixed_ms), ns(own.decode_fixed_ms));
+        let mut prompt_stage = bytes(local) / own_prompt + own_prompt_fixed;
+        let mut decode_steps = bytes(local) / own_decode + own_decode_fixed;
         for ((_, info), share) in candidates.iter().zip(shares) {
             if share.is_empty() {
                 continue;
@@ -1198,10 +1367,32 @@ impl Node {
             }
             let prompt: f64 = setups.iter().map(|s| s.prompt_rate as f64).sum();
             let decode: f64 = setups.iter().map(|s| s.decode_rate as f64).sum();
-            prompt_stage = prompt_stage.max(bytes(share) / prompt);
-            decode_steps += bytes(share) / decode;
+            // Beside its layers: what each forward costs a node whatever its
+            // layers — the slowest node's for a prompt stage, every node's in
+            // turn for a decode step — and the hop to the worker and back.
+            let prompt_fixed = setups
+                .iter()
+                .map(|s| ns(s.prompt_fixed_ms))
+                .fold(0.0, f64::max);
+            let decode_fixed: f64 = setups.iter().map(|s| ns(s.decode_fixed_ms)).sum();
+            let hop = info.link.map_or(0.0, |(rtt, _)| rtt.as_nanos() as f64);
+            // A prompt chunk's activations over the link, as they travel.
+            let chunk = super::protocol::Activations::bytes_per_row(
+                self.settings.activations,
+                self.model.config().n_embd,
+            )
+            .unwrap_or(4 * self.model.config().n_embd) as f64
+                * super::speed::PROMPT_TOKENS as f64;
+            let carry = info
+                .link
+                .map_or(0.0, |(_, bandwidth)| chunk / bandwidth * 1e9);
+            prompt_stage = prompt_stage.max(bytes(share) / prompt + prompt_fixed + carry);
+            decode_steps += bytes(share) / decode + decode_fixed + hop;
         }
-        let (alone_prompt, alone_decode) = (total / own_prompt, total / own_decode);
+        let (alone_prompt, alone_decode) = (
+            total / own_prompt + own_prompt_fixed,
+            total / own_decode + own_decode_fixed,
+        );
         let tree_decode = if self.settings.decode == DecodeOn::Tree {
             decode_steps
         } else {
@@ -1225,8 +1416,10 @@ impl Node {
     /// Whether the node running the model's final layer applies the output
     /// head, by `[workers].head`: only when that node is a worker of
     /// this plan and every worker used can send logits back — and, with
-    /// `auto`, when its measured decode speed beats this node's: the head is
-    /// a matrix as wide as the vocabulary, read once a token.
+    /// `auto`, when reading the head there at its measured speed and sending
+    /// the logits back over the slowest link takes less than reading it
+    /// here: the head is a matrix as wide as the vocabulary, read once a
+    /// token.
     fn decides_head_on_last(&self, entries: &[PlanEntry], used: &[String]) -> bool {
         let n_layer = self.model.config().n_layer as u32;
         let Some(last) = entries
@@ -1263,7 +1456,18 @@ impl Node {
                 .map(|s| s.decode_rate)
                 .filter(|r| *r > 0.0)
         };
-        matches!((rate(&last.node), rate(&self.settings.name)), (Some(there), Some(here)) if there > here)
+        let (Some(there), Some(here)) = (rate(&last.node), rate(&self.settings.name)) else {
+            return false;
+        };
+        // Nanoseconds a token: the head read at each node's rate, and from
+        // there its logits back over the slowest link, `f32` — a wide
+        // vocabulary's megabyte a token matters on a slow link.
+        let head = self.head_bytes as f64;
+        let logits = 4.0 * self.model.config().n_vocab as f64;
+        let back = self
+            .slowest_link(used)
+            .map_or(0.0, |(_, bandwidth)| logits / bandwidth * 1e9);
+        head / (there as f64) + back < head / (here as f64)
     }
 
     fn set_alone(&self, alone: bool) -> Result<(), String> {
@@ -1339,8 +1543,9 @@ impl Node {
 
     /// Builds the prompt-weight copies of the layers this node runs, by the
     /// top-level node's decision: a node copies only its own layers,
-    /// and every node rounds as the top does. Kept while a plan leaves the
-    /// layers and the decision as they were.
+    /// and every node rounds as the top does — then runs the layers once
+    /// ([`super::speed::warm`]). Kept while a plan leaves the layers and the
+    /// decision as they were.
     fn copy_prompt_weights(&self, local: &Range<usize>, weights: Decision) {
         let mut copied = self.copied.lock().unwrap();
         if copied.as_ref() == Some(&(local.clone(), weights)) {
@@ -1353,6 +1558,23 @@ impl Node {
             self.model.config().n_layer,
             "as the top-level node decided",
         );
+        // The layers are new to this node: run them once now, so that no
+        // request pays for reading them in and preparing the device.
+        if !local.is_empty() && self.model.supports_layer_split() {
+            match super::speed::warm(self.model.as_ref(), local.clone()) {
+                Ok(took) => log::info!(
+                    "orangu-server: [workers] layers {}..{} warmed in {:.1} s",
+                    local.start,
+                    local.end,
+                    took.as_secs_f64()
+                ),
+                Err(e) => log::warn!(
+                    "orangu-server: [workers] could not warm layers {}..{}: {e:#}",
+                    local.start,
+                    local.end
+                ),
+            }
+        }
         *copied = Some((local.clone(), weights));
     }
 
@@ -1593,6 +1815,7 @@ impl Node {
                 // is what keeps them answered while forwards run.
                 Message::Assign(assign) => self.handle_assign(assign, &hello),
                 Message::Ping { nonce } => Message::Pong { nonce },
+                Message::Echo { data } => Message::Echo { data },
                 message => {
                     let store = self
                         .assignment
@@ -1693,14 +1916,17 @@ impl Node {
         }
         let secret = self.settings.secret.as_deref();
         let nonce = auth::nonce();
+        // Whether it would switch to a parent's other model (`switch_to`).
+        let switches = self.handover.get().is_some();
         let ack = Message::HelloAck(HelloAck {
             version: PROTOCOL_VERSION,
-            features: FEATURES,
+            features: FEATURES | if switches { FEATURE_SWITCH } else { 0 },
             nonce,
             proof: auth::worker_proof(secret, &hello.nonce, &nonce),
             node: self.id.clone(),
             subtree: self.subtree_ids(),
             capacity: self.subtree_capacity(),
+            model: Some(self.identity.clone()),
         });
         write_message(writer, 0, &ack).ok()?;
         let proof = match read_message(reader) {
@@ -1913,6 +2139,16 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Message {
     Message::Error(WorkerError::new(code, message))
 }
 
+/// A model as a log line names it: its label, and its quantization when
+/// the label does not end with it.
+fn named(model: &super::protocol::ModelIdentity) -> String {
+    if model.quant.is_empty() || model.label.ends_with(&model.quant) {
+        model.label.clone()
+    } else {
+        format!("{} ({})", model.label, model.quant)
+    }
+}
+
 /// `a 0..8, b 8..20, c 20..32`.
 pub fn describe(entries: &[PlanEntry]) -> String {
     entries
@@ -1953,6 +2189,7 @@ mod tests {
             decode: DecodeOn::Tree,
             head: HeadOn::Top,
             offload: Offload::Always,
+            split: true,
             maintenance: Duration::from_millis(50),
             readmit: Duration::from_millis(200),
             tls: None,
@@ -2093,7 +2330,29 @@ mod tests {
         let top = node("top", &[&other], Variant::default());
         assert!(!other.is_assigned());
         assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
+        // Found by the handshake, not by an assignment it refused: the link
+        // stays up, and planning again leaves it out again, quietly.
+        assert!(top.links[0].is_connected());
+        top.plan_top();
+        assert!(!other.is_assigned());
+        assert!(top.links[0].is_connected());
         other.stop();
+        top.stop();
+    }
+
+    /// A node whose model is not split across its tree — a picture model's
+    /// text encoder — plans nothing for its workers.
+    #[test]
+    fn a_node_that_does_not_split_assigns_nothing() {
+        let worker = node("worker", &[], Variant::default());
+        let mut s = settings("top", vec![worker.local_addr().unwrap().to_string()], None);
+        s.split = false;
+        let top = node_with(s, Variant::default());
+        assert!(top.delegating_model().is_none());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!worker.is_assigned());
+        assert!(top.plan().is_empty());
+        worker.stop();
         top.stop();
     }
 
@@ -2157,6 +2416,32 @@ mod tests {
         for n in [&top, &middle, &leaf] {
             n.stop();
         }
+    }
+
+    /// A frame far past what a TLS session buffers — a prompt chunk's
+    /// activations, a layer's rows — crosses a TLS link whole, and the
+    /// link is timed.
+    #[test]
+    fn a_large_frame_crosses_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = transport::fixture::certificate(dir.path(), "shared");
+        let mut s = settings("leaf", vec![], Some("s"));
+        s.tls = tls(Some(&shared), None);
+        let leaf = node_with(s, Variant::default());
+        let link = ChildLink::with_tls(
+            leaf.local_addr().unwrap().to_string(),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+            tls(Some(&shared), None),
+        );
+        let info = link.connect(Some("s"), &["x".to_string()]).unwrap();
+        assert!(info.link.is_some_and(|(_, bandwidth)| bandwidth > 0.0));
+        let data: Vec<u8> = (0..4usize << 20).map(|i| i as u8).collect();
+        match link.request(&Message::Echo { data: data.clone() }) {
+            Ok(Message::Echo { data: back }) => assert!(back == data),
+            other => panic!("{other:?}"),
+        }
+        leaf.stop();
     }
 
     /// A worker behind TLS is left out by a parent that dials in the clear,
@@ -2360,8 +2645,10 @@ mod tests {
             }];
             node_with(s, Variant::default())
         };
-        let slow = with_rate("slow", vec![], 1.0);
-        let top = with_rate("top", vec![slow.local_addr().unwrap().to_string()], 10.0);
+        // Rates slow enough (a megabyte a second) that the fixture's small
+        // layers, not a round trip on the loopback, decide.
+        let slow = with_rate("slow", vec![], 0.0001);
+        let top = with_rate("top", vec![slow.local_addr().unwrap().to_string()], 0.001);
         let _model = top.delegating_model().unwrap();
         assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
         assert!(!slow.is_assigned());
@@ -2371,8 +2658,8 @@ mod tests {
             .to_string();
         assert!(why.contains("decode step"), "{why}");
 
-        let fast = with_rate("fast", vec![], 100.0);
-        let other = with_rate("other", vec![fast.local_addr().unwrap().to_string()], 10.0);
+        let fast = with_rate("fast", vec![], 0.01);
+        let other = with_rate("other", vec![fast.local_addr().unwrap().to_string()], 0.001);
         let _model = other.delegating_model().unwrap();
         assert!(
             other.plan().iter().any(|e| e.node == "fast"),

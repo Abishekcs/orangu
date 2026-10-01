@@ -52,6 +52,11 @@ const MIN_SHARE: f64 = 0.15;
 pub struct Speed {
     pub decode: f32,
     pub prompt: f32,
+    /// What a decode step and a prompt chunk cost whatever their layers, in
+    /// milliseconds: the shorter range's time less its layers at the rate.
+    /// `0` when a model is too small for two cuts to tell.
+    pub decode_fixed_ms: f32,
+    pub prompt_fixed_ms: f32,
 }
 
 /// The most weights the longer of the two timed ranges takes: what a node
@@ -86,7 +91,7 @@ pub fn measure(
         }
     }
     let (short_prompt, short_decode) = short_times;
-    let (layers, prompt, decode) = match long {
+    let (layers, prompt, decode, rated_apart) = match long {
         Some(long) => {
             let (long_prompt, long_decode) = long_times;
             let between = |long: Duration, short: Duration| {
@@ -97,17 +102,28 @@ pub fn measure(
                 between(long_prompt, short_prompt),
                 between(long_decode, short_decode),
             ) {
-                (Some(p), Some(d)) => (short..long, p, d),
-                _ => (0..long, long_prompt, long_decode),
+                (Some(p), Some(d)) => (short..long, p, d, true),
+                _ => (0..long, long_prompt, long_decode, false),
             }
         }
-        None => (0..short, short_prompt, short_decode),
+        None => (0..short, short_prompt, short_decode, false),
     };
     let bytes = plan::bytes_of(&layers, layer_bytes) as f64;
     let rate = |d: Duration| (bytes / d.as_secs_f64().max(1e-9) / 1e9) as f32;
+    // The short range at the rate, and what its time holds beyond that.
+    let short_bytes = plan::bytes_of(&(0..short), layer_bytes) as f64;
+    let fixed = |time: Duration, per: Duration| {
+        if !rated_apart {
+            return 0.0;
+        }
+        let layers_ms = short_bytes / bytes * per.as_secs_f64() * 1e3;
+        (time.as_secs_f64() * 1e3 - layers_ms).max(0.0) as f32
+    };
     let speed = Speed {
         decode: rate(decode),
         prompt: rate(prompt),
+        decode_fixed_ms: fixed(short_decode, decode),
+        prompt_fixed_ms: fixed(short_prompt, prompt),
     };
     Ok((speed, layers, started.elapsed()))
 }
@@ -124,6 +140,24 @@ fn cuts(model: &dyn ModelForward, layer_bytes: &[u64]) -> (usize, Option<usize>)
         .rev()
         .find(|at| cut(*at) && plan::bytes_of(&(0..*at), layer_bytes) <= MEASURE_BYTES);
     (short, long)
+}
+
+/// Runs `layers` once, untimed — a 128-token prompt chunk and a decode
+/// step — so that the first request does not pay for reading the weights
+/// in, uploading them or building a device's pipelines: a node does it
+/// when a plan gives it layers. Returns how long it took.
+pub fn warm(model: &dyn ModelForward, layers: Range<usize>) -> Result<Duration> {
+    let started = Instant::now();
+    let mut cache = model.new_kv_cache_for_layers(layers.clone(), PROMPT_TOKENS + 1);
+    let vocab = model.config().n_vocab.clamp(2, 1000) as u32;
+    let tokens: Vec<u32> = (0..PROMPT_TOKENS as u32)
+        .map(|i| 1 + i * 7 % (vocab - 1))
+        .collect();
+    let hidden = model.embed(&tokens)?;
+    model.forward_layers(&mut cache, hidden, &tokens, layers.clone(), 0)?;
+    let hidden = model.embed(&tokens[..1])?;
+    model.forward_layers(&mut cache, hidden, &tokens[..1], layers, PROMPT_TOKENS)?;
+    Ok(started.elapsed())
 }
 
 /// One 128-token prompt chunk's time and one decode step's (the fastest of
@@ -187,6 +221,13 @@ mod tests {
     /// A node rates the layers between the two cuts — or, when its clock
     /// cannot tell a layer from noise (the longer range timed no slower),
     /// the whole longer range.
+    #[test]
+    fn a_range_can_be_warmed() {
+        let model = fixture::model();
+        assert!(warm(model.as_ref(), 1..3).is_ok());
+        assert!(warm(model.as_ref(), 0..model.config().n_layer).is_ok());
+    }
+
     #[test]
     fn a_node_measures_its_first_layers() {
         let model = fixture::model();

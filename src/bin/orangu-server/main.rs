@@ -2639,6 +2639,9 @@ fn prepare(args: Args) -> Result<Prepared> {
                     slots.total(),
                     conf.prompt_weights,
                     &backend_label,
+                    // A picture model's text encoder is not split: such a node
+                    // serves only as a worker.
+                    image.is_none(),
                 )?;
                 workers::node::set_global(node.clone());
                 match node.delegating_model() {
@@ -3343,6 +3346,7 @@ fn start_workers_node(
     slots: usize,
     prompt_weights: engine::prompt_weights::PromptWeights,
     backend_label: &str,
+    split: bool,
 ) -> Result<Arc<workers::node::Node>> {
     let host = config::resolve_bind_host(&workers_conf.host);
     if workers_conf.secret.is_none()
@@ -3409,6 +3413,7 @@ fn start_workers_node(
         decode: workers_conf.decode,
         head: workers_conf.head,
         offload: workers_conf.offload,
+        split,
         maintenance: std::time::Duration::from_secs(5),
         readmit: std::time::Duration::from_secs(30),
         tls: workers::transport::Tls::from_paths(

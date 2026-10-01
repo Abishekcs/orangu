@@ -207,11 +207,21 @@ struct TlsWriter {
     out: Arc<Mutex<TcpStream>>,
 }
 
+/// Plaintext handed to the session at a time: one TLS record's worth. The
+/// session buffers only so much before it has been sent (64 KiB by
+/// default), and a frame larger than that — a prompt chunk's activations,
+/// a layer's rows — was refused whole: "failed to write whole buffer".
+const TLS_PIECE: usize = 16 << 10;
+
 impl Write for TlsWriter {
+    /// In pieces, each sent before the next is taken, the session's lock let
+    /// go in between so the reader can go on with what arrives meanwhile.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut session = self.session.lock().unwrap();
-        session.writer().write_all(buf)?;
-        flush_tls(&mut session, &self.out)?;
+        for piece in buf.chunks(TLS_PIECE) {
+            let mut session = self.session.lock().unwrap();
+            session.writer().write_all(piece)?;
+            flush_tls(&mut session, &self.out)?;
+        }
         Ok(buf.len())
     }
 
