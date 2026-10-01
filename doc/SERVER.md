@@ -1701,8 +1701,8 @@ or the same one from another release, is refused with a message naming
 both models.
 
 Llama-family models (`llama`, `qwen2`, `qwen3`, `qwen3moe`, `mistral`,
-`qwen2vl`, `qwen3vl`, `granite`), Phi-3 (`phi3`), Qwen3.5 dense (`qwen35`)
-and Gemma 4 (`gemma4`) can be split so far. A node with another architecture serves alone, with a warning, and
+`qwen2vl`, `qwen3vl`, `granite`), Phi-3 (`phi3`), Qwen3.5 dense (`qwen35`),
+Qwen3-Next (`qwen3next`) and Gemma 4 (`gemma4`) can be split so far. A node with another architecture serves alone, with a warning, and
 refuses to work for a parent. Picture models are not delegated. The embedding role is: an embeddings
 request runs through the tree like a prompt, and the top applies the final
 norm and the pooling.

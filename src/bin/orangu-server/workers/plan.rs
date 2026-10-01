@@ -93,7 +93,19 @@ pub fn split_range(
             // pieces after it as there are layers left for: the earlier
             // pieces are served first when there are too few to go round.
             let reserved = after.min(n - start - 1);
-            let latest = n - reserved;
+            let mut latest = n - reserved;
+            // And a cut the model allows left for each of the pieces after it,
+            // where there are enough: a model that may only be cut early (Gemma
+            // 4's layers that share an earlier layer's KV cache) gave the rest
+            // to one piece and left the next with nothing.
+            // (The last piece ends at the end, always allowed: the pieces after
+            // this one need one cut fewer than there are of them.)
+            let later: Vec<usize> = (start + 1..n)
+                .filter(|j| allowed(range.start + *j))
+                .collect();
+            if after > 0 && later.len() >= after {
+                latest = latest.min(later[later.len() - after]);
+            }
             let earliest = (start + 1).min(latest);
             let cut = |j: &usize| *j == n || allowed(range.start + *j);
             let closest = |candidates: &mut dyn Iterator<Item = usize>| {
@@ -366,6 +378,18 @@ mod tests {
         assert_eq!(tail, 1, "{order:?} {shares:?}");
         assert_eq!(best_order(&rates, &|o| cost(&ANY, o)), vec![0, 1]);
         assert_eq!(permutations(3).len(), 6);
+    }
+
+    /// A model that may only be cut up to layer 4 still gives every piece
+    /// a layer, however the weights lean: the cuts it allows are kept for
+    /// the pieces after.
+    #[test]
+    fn early_cuts_still_give_every_piece_a_layer() {
+        let early = |at: usize| at <= 4;
+        let pieces = split_range(0..12, &EVEN, &[10.0, 1.0, 1.0], &early);
+        assert!(pieces.iter().all(|p| !p.is_empty()), "{pieces:?}");
+        assert_eq!(pieces[2].end, 12);
+        assert!(pieces[1].end <= 4, "{pieces:?}");
     }
 
     #[test]

@@ -321,8 +321,9 @@ impl ChildLink {
     }
 
     /// The link's round trip — the fastest of three pings — and its
-    /// bandwidth, from echoing [`ECHO_BYTES`] less a round trip. `None` when
-    /// the worker does not answer.
+    /// bandwidth, from echoing [`ECHO_BYTES`] (the better of two) less a
+    /// round trip — each way, the echo going there and coming back in turn.
+    /// `None` when the worker does not answer.
     fn time_link(&self) -> Option<(Duration, f64)> {
         let mut rtt = Duration::MAX;
         for nonce in 0..3u64 {
@@ -332,14 +333,20 @@ impl ChildLink {
                 _ => return None,
             }
         }
-        let at = Instant::now();
-        match self.request(&Message::Echo {
-            data: vec![0x5a; ECHO_BYTES],
-        }) {
-            Ok(Message::Echo { data }) if data.len() == ECHO_BYTES => {}
-            _ => return None,
+        // The better of two: the first also pays for the buffers growing.
+        let mut echo = Duration::MAX;
+        for _ in 0..2 {
+            let at = Instant::now();
+            match self.request(&Message::Echo {
+                data: vec![0x5a; ECHO_BYTES],
+            }) {
+                Ok(Message::Echo { data }) if data.len() == ECHO_BYTES => {
+                    echo = echo.min(at.elapsed())
+                }
+                _ => return None,
+            }
         }
-        let moving = at.elapsed().saturating_sub(rtt).as_secs_f64().max(1e-6);
+        let moving = echo.saturating_sub(rtt).as_secs_f64().max(1e-6);
         Some((rtt, 2.0 * ECHO_BYTES as f64 / moving))
     }
 

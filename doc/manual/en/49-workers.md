@@ -37,8 +37,8 @@ Each node holds in memory only the layers it runs. Measured with
 Every node needs the model: its own copy of the file, or, for a worker,
 the parts it runs (below). Llama-family models (`llama`, `qwen2`, `qwen3`,
 `qwen3moe`, `mistral`, `qwen2vl`, `qwen3vl`, `granite`), Phi-3 (`phi3`),
-Qwen3.5 dense (`qwen35`, such as Ternary-Bonsai-2-27B) and Gemma 4 can be
-split so far.
+Qwen3.5 dense (`qwen35`, such as Ternary-Bonsai-2-27B), Qwen3-Next
+(`qwen3next`, such as Qwen3-Coder-Next) and Gemma 4 can be split so far.
 
 A worker does not need the whole model. On a machine without it, set
 
