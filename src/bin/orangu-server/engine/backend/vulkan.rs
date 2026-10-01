@@ -371,6 +371,27 @@ fn fill_staging(view: wgpu::WriteOnly<'_, [u8]>, src: &[u8]) {
         .for_each(|(mut piece, bytes)| piece.0.copy_from_slice(bytes));
 }
 
+/// Appends `src` to the empty `dst` in parallel 4 MiB pieces, written
+/// straight into its spare capacity (no zero-fill first) — a wide result's
+/// copy out of its readback. One thread moved a 400 MB `gate_up` result at
+/// about 2 GB/s, a third of the call's time on the device.
+fn copy_out_parallel(src: &[f32], dst: &mut Vec<f32>) {
+    use rayon::prelude::*;
+    const PIECE: usize = 1 << 20;
+    debug_assert!(dst.is_empty());
+    dst.reserve_exact(src.len());
+    dst.spare_capacity_mut()[..src.len()]
+        .par_chunks_mut(PIECE)
+        .zip(src.par_chunks(PIECE))
+        .for_each(|(d, s)| {
+            for (d, s) in d.iter_mut().zip(s) {
+                d.write(*s);
+            }
+        });
+    // Safety: every one of the first `src.len()` slots was written above.
+    unsafe { dst.set_len(src.len()) };
+}
+
 /// One `uniform_arena` chunk. Per-op meta uniforms are tiny (a handful of
 /// `u32`s each) but there are hundreds of them across a model's layers — the
 /// whole set fits, offset-packed, in a single chunk this size, collapsing
@@ -7635,6 +7656,12 @@ impl VulkanBackend {
     /// *submission*, so a single reused staging buffer would only ever hold the
     /// last stripe's data.
     fn matmul_batch_striped(&self, ops: &[MatmulOp<'_>], n_tokens: usize) -> Vec<Vec<f32>> {
+        // `ORANGU_STRIPED_TRACE=1`: one line a call — the time to stage the
+        // inputs, to run the stripes (submission to the readback's map), and
+        // to copy the results out — the host's share of a wide device
+        // linear against the device's.
+        let trace =
+            crate::engine::env::flag_on("ORANGU_STRIPED_TRACE").then(std::time::Instant::now);
         // Held for the whole recording and its readback, as everywhere else
         // that touches pooled regions.
         //
@@ -7752,6 +7779,7 @@ impl VulkanBackend {
             }
         }
 
+        let staged = trace.map(|t| t.elapsed());
         // Each op's full-length result, assembled from the stripes straight
         // into a pooled readback buffer.
         let outs: Vec<(wgpu::Buffer, usize)> = ops
@@ -7899,17 +7927,32 @@ impl VulkanBackend {
         for (bytes, staging) in stagings {
             self.put_staging(bytes, staging);
         }
-        outs.into_iter()
+        let ran = trace.map(|t| t.elapsed());
+        let results = outs
+            .into_iter()
             .map(|(readback, len)| {
                 let data = self.mapped_bytes(&readback, CONTEXT);
                 let mut out = self.take_result(len);
-                out.extend_from_slice(&bytemuck::cast_slice::<u8, f32>(&data)[..len]);
+                copy_out_parallel(&bytemuck::cast_slice::<u8, f32>(&data)[..len], &mut out);
                 drop(data);
                 readback.unmap();
                 self.put_readback((len as u64) * 4, readback);
                 out
             })
-            .collect()
+            .collect();
+        if let (Some(t), Some(staged), Some(ran)) = (trace, staged, ran) {
+            let total = t.elapsed();
+            eprintln!(
+                "orangu-server: [striped] {} op(s) x {n_tokens} tokens, out {:?}: stage {:.1} ms, \
+                 run {:.1} ms, copy out {:.1} ms",
+                ops.len(),
+                ops.iter().map(|op| op.w.out_dim).collect::<Vec<_>>(),
+                staged.as_secs_f64() * 1e3,
+                (ran - staged).as_secs_f64() * 1e3,
+                (total - ran).as_secs_f64() * 1e3,
+            );
+        }
+        results
     }
 
     fn matmul_batch_dispatch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {

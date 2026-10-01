@@ -2038,6 +2038,18 @@ fn prepare(args: Args) -> Result<Prepared> {
                 conf.vae_precision,
             )?;
             pipeline.adapter = lora_path.clone();
+            // The encoder's and the transformer's weights reach their devices
+            // on the first picture, read through their mappings then — from
+            // disk, if the page cache has lost them. Reading them ahead now,
+            // in the background, turns any idle time before that picture into
+            // the read (on a slow disk, a minute or two of the first
+            // picture's encode).
+            if let Some(bytes) = engine::page_cache::prefetch_registered() {
+                log::info!(
+                    "orangu-server: [image] reading the model files ahead ({}) while idle",
+                    orangu::format::format_bytes(bytes)
+                );
+            }
             // What the defaults cost on this machine, said once, up front —
             // with the knobs that bring it down, when it is long enough
             // that somebody would otherwise conclude the server hung.

@@ -5462,6 +5462,132 @@ fn image_attention_on_the_device() {
     );
 }
 
+/// Probe: the picture transformer's linears on this device at a 1024-pixel
+/// step's width — `Q4_K`, the three shapes a block runs — read two ways:
+/// the shader alone on one submission stripe (device timestamps), and one
+/// whole `matmul_batch` of 4096 tokens end to end (stripes, staging,
+/// submissions, readback). The gap between the two is the host's side of
+/// a device linear. `cargo test --release --bin orangu-server
+/// image_linears_on_the_device -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn image_linears_on_the_device() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let n_tokens = 4096usize;
+    let stripe = max_matmul_tokens_per_submission();
+    for (in_dim, out_dim) in [(4096usize, 4096usize), (4096, 24576), (12288, 4096)] {
+        let mut seed = 0x0051_DE0F_u64;
+        let mut bytes = Vec::new();
+        let block = crate::engine::quant::block_layout(GGML_TYPE_Q4_K)
+            .expect("layout")
+            .1;
+        for _ in 0..out_dim * (in_dim / block) {
+            bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+        }
+        let w = test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim);
+        let x: Vec<f32> = (0..in_dim * n_tokens)
+            .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
+            .collect();
+        for width in [128usize, 256, 384, 512, 1024] {
+            if let Some((us, name)) =
+                vulkan.matmul_kernel_us_tokens(&x[..width * in_dim], width, &w, 4)
+            {
+                eprintln!(
+                    "  {in_dim}x{out_dim} x {width}: shader {name} {:.0} G MAC/s",
+                    (in_dim * out_dim * width) as f64 / us / 1e3
+                );
+            }
+        }
+        let (kernel_us, name) = vulkan
+            .matmul_kernel_us_tokens(&x[..stripe * in_dim], stripe, &w, 4)
+            .expect("timestamps");
+        for width in [256usize, 512, 1024, 2048] {
+            let op = [MatmulOp {
+                x: &x[..width * in_dim],
+                n_tokens: width,
+                w: &w,
+            }];
+            let _ = vulkan.matmul_batch(&op);
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let y = vulkan.matmul_batch(&op);
+                best = best.min(t.elapsed().as_secs_f64());
+                for v in y {
+                    vulkan.recycle(v);
+                }
+            }
+            eprintln!(
+                "  {in_dim}x{out_dim}: matmul_batch of {width}: {:.1} ms = {:.0} G MAC/s",
+                best * 1e3,
+                (in_dim * out_dim * width) as f64 / best / 1e9
+            );
+        }
+        // The same 4096 tokens as consecutive narrow calls, each its own
+        // `matmul_batch` (the integer-dot GEMM's width), results appended.
+        for chunk in [256usize, 512] {
+            let run = || {
+                let mut out = Vec::with_capacity(n_tokens * out_dim);
+                for c in (0..n_tokens).step_by(chunk) {
+                    let y = vulkan
+                        .matmul_batch(&[MatmulOp {
+                            x: &x[c * in_dim..(c + chunk) * in_dim],
+                            n_tokens: chunk,
+                            w: &w,
+                        }])
+                        .pop()
+                        .unwrap();
+                    out.extend_from_slice(&y);
+                    vulkan.recycle(y);
+                }
+                out
+            };
+            let _ = run();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let _ = run();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "  {in_dim}x{out_dim}: {n_tokens} as {}x{chunk}-token calls: {:.0} ms = {:.0} G MAC/s",
+                n_tokens / chunk,
+                best * 1e3,
+                (in_dim * out_dim * n_tokens) as f64 / best / 1e9
+            );
+        }
+        let op = [MatmulOp {
+            x: &x,
+            n_tokens,
+            w: &w,
+        }];
+        let _ = vulkan.matmul_batch(&op);
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let y = vulkan.matmul_batch(&op);
+            best = best.min(t.elapsed().as_secs_f64());
+            for v in y {
+                vulkan.recycle(v);
+            }
+        }
+        let macs = (in_dim * out_dim) as f64;
+        eprintln!(
+            "{in_dim}x{out_dim}: shader {name} {:.0} G MAC/s on a {stripe}-token stripe ({:.1} ms); \
+             matmul_batch of {n_tokens} {:.0} ms = {:.0} G MAC/s ({:.0} ms of shader at that rate)",
+            macs * stripe as f64 / kernel_us / 1e3,
+            kernel_us / 1e3,
+            best * 1e3,
+            macs * n_tokens as f64 / best / 1e9,
+            kernel_us / 1e3 * (n_tokens / stripe) as f64,
+        );
+    }
+}
+
 /// A batch wider than the submission stripe runs `matmul_batch_striped`:
 /// its activations staged whole in a pooled mappable buffer, each stripe
 /// copied into the op's region, the results assembled in a pooled readback

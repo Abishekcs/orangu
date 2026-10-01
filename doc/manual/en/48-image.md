@@ -67,7 +67,11 @@ for the 8-bit copy of the transformer that makes it about twice as fast,
 which the server makes only when the transformer runs on the CPU, the CPU
 has an 8-bit matrix kernel (`i8mm` or `AVX2`) and the machine has 21 GB
 or more; a GPU keeps the file's own weights. A machine with 16 GB is
-enough.
+enough. Once it is ready the server reads its model files through in the
+background, at the lowest disk priority, when they fit in half the
+available memory (`[image] reading the model files ahead …`): the
+encoder and the transformer reach their devices on the first picture,
+and from RAM rather than from a slow disk if any idle time has passed.
 
 **Time.** A picture is minutes on a CPU, not seconds. On the twelve-core
 ARM board this manual's numbers come from, a step costs 4.8 s at

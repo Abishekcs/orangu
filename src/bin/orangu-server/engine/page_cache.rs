@@ -286,6 +286,85 @@ fn unmap_pages(mapping: &Mmap) {
     }
 }
 
+/// Starts reading every registered shard into the page cache in the
+/// background, when they all fit in half the memory the kernel says is
+/// available — so weights a server uploads lazily, on its first request
+/// (a picture model's encoder and transformer), come from RAM rather than
+/// from a slow disk if any idle time passes first. Returns the bytes it
+/// will read, or `None` when they do not fit (reading ahead a model larger
+/// than RAM only evicts what is already there).
+///
+/// A thread reads each file through, sequentially, rather than asking the
+/// kernel (`MADV_WILLNEED`): on a compressed btrfs volume the advice
+/// returned at once having read 4 MiB of a 3.9 GiB file. The thread runs at
+/// the idle I/O priority, so a request's own page faults go first.
+pub fn prefetch_registered() -> Option<u64> {
+    // One read a file: a picture server maps its transformer and its text
+    // encoder more than once (the calibration's open, the vision path's).
+    let mut seen = std::collections::HashSet::new();
+    let paths: Vec<(PathBuf, u64)> = SHARDS
+        .lock()
+        .ok()?
+        .iter()
+        .filter(|shard| seen.insert(shard.path.clone()))
+        .map(|shard| (shard.path.clone(), shard.mmap.len() as u64))
+        .collect();
+    let total: u64 = paths.iter().map(|(_, len)| len).sum();
+    let available = available_memory_bytes()?;
+    if total == 0 || total > available / 2 {
+        return None;
+    }
+    std::thread::Builder::new()
+        .name("orangu-prefetch".to_string())
+        .spawn(move || {
+            set_idle_io_priority();
+            let mut buffer = vec![0u8; 8 << 20];
+            for (path, _) in &paths {
+                let Ok(mut file) = std::fs::File::open(path) else {
+                    continue;
+                };
+                while matches!(std::io::Read::read(&mut file, &mut buffer), Ok(n) if n > 0) {}
+            }
+        })
+        .ok()?;
+    Some(total)
+}
+
+/// Puts the calling thread in the idle I/O scheduling class: its reads are
+/// served only when nothing else wants the disk.
+#[cfg(target_os = "linux")]
+fn set_idle_io_priority() {
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+    const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+    // Safety: `ioprio_set` on the calling thread (`who` 0) with a valid class
+    // only changes this thread's I/O scheduling.
+    unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0 as libc::c_long,
+            IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_idle_io_priority() {}
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes.
+fn available_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo
+        .lines()
+        .find(|l| l.starts_with("MemAvailable:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(kib * 1024)
+}
+
 /// `MADV_WILLNEED` over a mapped byte range: asks the kernel to start reading
 /// those pages in, and returns without waiting.
 ///
@@ -357,6 +436,17 @@ mod tests {
     /// file just written and mapped is in the page cache, so this must report
     /// close to all of it — a measurement that reported zero here would call
     /// every warm run cold.
+    /// The prefetch asks for nothing when nothing is registered, and reads
+    /// the kernel's available memory where it can.
+    #[test]
+    fn the_prefetch_needs_shards_and_reads_available_memory() {
+        if SHARDS.lock().map(|s| s.is_empty()).unwrap_or(false) {
+            assert_eq!(prefetch_registered(), None);
+        }
+        #[cfg(target_os = "linux")]
+        assert!(available_memory_bytes().is_some_and(|b| b > 0));
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn a_freshly_written_mapping_reads_as_resident() {
