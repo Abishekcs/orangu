@@ -212,8 +212,8 @@ pub struct WorkersConfiguration {
 /// could serve alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Offload {
-    /// Only when the tree is predicted clearly faster than this node alone,
-    /// or this node cannot hold the model.
+    /// Only when the tree is predicted — then found — clearly faster than
+    /// this node alone at a request, or this node cannot hold the model.
     #[default]
     Auto,
     /// Whenever it has workers.

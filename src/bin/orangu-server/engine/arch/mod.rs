@@ -3477,6 +3477,12 @@ pub trait ModelForward: Send + Sync {
         self.new_kv_cache(capacity)
     }
 
+    /// Where layer `il` keeps a sequence in a cache this model made. The
+    /// default is rows at `il`: every layer an attention layer.
+    fn cache_slot(&self, il: usize) -> crate::engine::kv_cache::CacheSlot {
+        crate::engine::kv_cache::CacheSlot::Rows(il)
+    }
+
     /// The residual stream entering layer 0 for `tokens`: `[n_tokens,
     /// n_embd]`, row-major. Only valid when [`Self::supports_layer_split`].
     fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {

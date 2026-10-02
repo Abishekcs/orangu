@@ -25,7 +25,7 @@
 
 use super::protocol::{ErrorCode, Rows, WorkerError};
 use crate::engine::arch::{DecodeRow, ModelForward};
-use crate::engine::kv_cache::{KvCache, RemoteLayers, RemoteSession};
+use crate::engine::kv_cache::{KvCache, LayerHold, RemoteLayers, RemoteSession};
 use crate::engine::loader::ModelConfig;
 use anyhow::{Result, ensure};
 use std::collections::HashMap;
@@ -67,15 +67,10 @@ pub trait Stage: Send + Sync {
         anyhow::bail!("{} cannot copy a session", self.name())
     }
 
-    /// Layer `layer`'s first `len` positions of `session` — `kv_dim`, keys,
-    /// values — from whichever node at or below this stage runs it. A
-    /// stage that cannot says so.
-    fn layer_rows(
-        &self,
-        session: u64,
-        layer: usize,
-        len: usize,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>)> {
+    /// What layer `layer` holds of `session`'s first `len` positions — its
+    /// rows, or a recurrent layer's state — from whichever node at or below
+    /// this stage runs it. A stage that cannot says so.
+    fn layer_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold> {
         let _ = (session, layer, len);
         anyhow::bail!("{} cannot send rows back", self.name())
     }
@@ -750,12 +745,7 @@ impl LayerPipeline {
 
     /// Layer `layer`'s first `len` positions of `session`, from the stage
     /// that runs it, once what the sequence has queued is through.
-    pub fn stage_rows(
-        &self,
-        session: u64,
-        layer: usize,
-        len: usize,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>)> {
+    pub fn stage_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold> {
         self.drain(session);
         let stage = self
             .stages
@@ -822,6 +812,12 @@ pub trait PipelineSource: Send + Sync {
     /// run at.
     fn observed_decode(&self, parts: &[(String, Duration)], tokens: usize) {
         let _ = (parts, tokens);
+    }
+
+    /// A finished request's prompt and decode, each a [`Trace`] of the
+    /// tree as a whole: how fast the tree really is at both.
+    fn observed_request(&self, prefill: &Trace, decode: &Trace) {
+        let _ = (prefill, decode);
     }
 
     /// Whether the node running the model's final layer applies the output
@@ -916,12 +912,13 @@ impl RemoteLayers for SessionOwner {
             .unwrap()
             .get_mut(&session)
             .map(SessionState::log_trace);
-        let Some((parts, decode)) = traced else {
+        let Some((parts, prefill, decode)) = traced else {
             return Vec::new();
         };
         if decode.tokens > 0 {
             self.source.observed_decode(&decode.parts, decode.tokens);
         }
+        self.source.observed_request(&prefill, &decode);
         parts
     }
 }
@@ -930,24 +927,24 @@ impl SessionState {
     /// Logs the time since the last log, if any forward ran, and starts
     /// counting again. Answers that time per part, prefill and decode
     /// together.
-    fn log_trace(&mut self) -> (Vec<(String, Duration)>, Trace) {
+    fn log_trace(&mut self) -> (Vec<(String, Duration)>, Trace, Trace) {
         let (prefill, decode) = (
             std::mem::take(&mut self.prefill),
             std::mem::take(&mut self.decode),
         );
         if prefill.forwards + decode.forwards == 0 {
-            return (Vec::new(), Trace::default());
+            return (Vec::new(), Trace::default(), Trace::default());
         }
         log::info!(
             "orangu-server: workers: prefill {}; decode {}",
             prefill.describe("tokens"),
             decode.describe("tokens")
         );
-        let mut total = prefill;
+        let mut total = prefill.clone();
         for (name, elapsed) in &decode.parts {
             total.add(name, *elapsed);
         }
-        (total.parts, decode)
+        (total.parts, prefill, decode)
     }
 }
 
@@ -1162,9 +1159,9 @@ impl DelegatingModel {
         }
     }
 
-    /// Brings the rows of every layer the workers hold for `cache`'s
-    /// sequence into `cache` — which has room for them ([`SessionState::full`])
-    /// — and lets the workers' session go.
+    /// Brings what every layer the workers run holds of `cache`'s sequence —
+    /// its rows, or a recurrent layer's state — into `cache`, which has room
+    /// for them ([`SessionState::full`]), and lets the workers' session go.
     fn hand_over(&self, cache: &mut KvCache, len: usize) -> Result<()> {
         let started = Instant::now();
         let session = cache.remote.as_ref().map_or(0, |r| r.id);
@@ -1175,10 +1172,11 @@ impl DelegatingModel {
         let result = (|| {
             let mut bytes = 0usize;
             for layer in (0..n_layer).filter(|l| !local.contains(l)) {
-                let (kv_dim, k, v) = pipeline.stage_rows(session, layer, len)?;
-                bytes += 4 * (k.len() + v.len());
-                cache.set_layer_rows(layer, kv_dim, k, v)?;
-                moved.push(layer);
+                let hold = pipeline.stage_rows(session, layer, len)?;
+                bytes += hold.bytes();
+                let slot = self.model.cache_slot(layer);
+                cache.set_layer_hold(slot, hold)?;
+                moved.push(slot);
             }
             ensure!(
                 cache.holds_every_layer(len),
@@ -1200,8 +1198,8 @@ impl DelegatingModel {
                 Ok(())
             }
             Err(error) => {
-                for layer in moved {
-                    cache.layers[layer].truncate(0);
+                for slot in moved {
+                    cache.clear_layer(slot);
                 }
                 Err(error)
             }
@@ -1572,6 +1570,7 @@ impl ModelForward for DelegatingModel {
 pub(crate) mod fixture {
     use crate::engine::arch::ModelForward;
     use crate::engine::arch::llama::LlamaModel;
+    use crate::engine::arch::qwen35::Qwen35Model;
     use crate::engine::backend::CpuBackend;
     use crate::engine::loader::LoadedModel;
     use std::sync::Arc;
@@ -1611,60 +1610,130 @@ pub(crate) mod fixture {
         /// One weight of this layer's `attn_q` changed: the same layout
         /// with different weights, like another release of a model.
         pub nudge_layer: Option<usize>,
+        /// A `qwen35` model instead: gated-DeltaNet layers, each keeping a
+        /// recurrent state, and an attention layer every
+        /// [`HYBRID_INTERVAL`]-th.
+        pub hybrid: bool,
     }
 
-    /// The GGUF bytes: `llama` metadata and every tensor in `F32`, filled
-    /// from a fixed-seed generator so every run builds the same model.
+    /// The hybrid fixture's attention layers: every second one.
+    const HYBRID_INTERVAL: usize = 2;
+    /// Its attention head size.
+    const HYBRID_HEAD_DIM: usize = 16;
+    /// Its gated-DeltaNet layers: conv window, state size per head, key
+    /// heads and value heads.
+    const SSM_CONV: usize = 4;
+    const SSM_STATE: usize = 8;
+    const SSM_GROUPS: usize = 2;
+    const SSM_V_HEADS: usize = 4;
+
+    /// The GGUF bytes: `llama` (or `qwen35`) metadata and every tensor in
+    /// `F32`, filled from a fixed-seed generator so every run builds the
+    /// same model.
     fn gguf(variant: Variant) -> Vec<u8> {
         let head_dim = N_EMBD / N_HEAD;
         let kv_dim = N_HEAD_KV * head_dim;
+        let e = N_EMBD as u64;
         // (name, dims with the contiguous one first, is a norm weight)
         let mut tensors: Vec<(String, Vec<u64>, bool)> = vec![
-            (
-                "token_embd.weight".into(),
-                vec![N_EMBD as u64, N_VOCAB as u64],
-                false,
-            ),
-            ("output_norm.weight".into(), vec![N_EMBD as u64], true),
-            (
-                "output.weight".into(),
-                vec![N_EMBD as u64, N_VOCAB as u64],
-                false,
-            ),
+            ("token_embd.weight".into(), vec![e, N_VOCAB as u64], false),
+            ("output_norm.weight".into(), vec![e], true),
+            ("output.weight".into(), vec![e, N_VOCAB as u64], false),
+        ];
+        let ffn = [
+            ("ffn_gate.weight", vec![e, N_FF as u64], false),
+            ("ffn_up.weight", vec![e, N_FF as u64], false),
+            ("ffn_down.weight", vec![N_FF as u64, e], false),
         ];
         for i in 0..N_LAYER {
-            let e = N_EMBD as u64;
-            for (suffix, dims, norm) in [
-                ("attn_norm.weight", vec![e], true),
-                ("attn_q.weight", vec![e, e], false),
-                ("attn_k.weight", vec![e, kv_dim as u64], false),
-                ("attn_v.weight", vec![e, kv_dim as u64], false),
-                ("attn_output.weight", vec![e, e], false),
-                ("ffn_norm.weight", vec![e], true),
-                ("ffn_gate.weight", vec![e, N_FF as u64], false),
-                ("ffn_up.weight", vec![e, N_FF as u64], false),
-                ("ffn_down.weight", vec![N_FF as u64, e], false),
-            ] {
+            let layer: Vec<(&str, Vec<u64>, bool)> = if !variant.hybrid {
+                vec![
+                    ("attn_norm.weight", vec![e], true),
+                    ("attn_q.weight", vec![e, e], false),
+                    ("attn_k.weight", vec![e, kv_dim as u64], false),
+                    ("attn_v.weight", vec![e, kv_dim as u64], false),
+                    ("attn_output.weight", vec![e, e], false),
+                    ("ffn_norm.weight", vec![e], true),
+                ]
+            } else if (i + 1) % HYBRID_INTERVAL == 0 {
+                // A gated attention layer: each head's query and gate
+                // interleaved in `attn_q`.
+                let hd = HYBRID_HEAD_DIM as u64;
+                vec![
+                    ("attn_norm.weight", vec![e], true),
+                    ("post_attention_norm.weight", vec![e], true),
+                    ("attn_q.weight", vec![e, 2 * N_HEAD as u64 * hd], false),
+                    ("attn_q_norm.weight", vec![hd], true),
+                    ("attn_k.weight", vec![e, N_HEAD_KV as u64 * hd], false),
+                    ("attn_k_norm.weight", vec![hd], true),
+                    ("attn_v.weight", vec![e, N_HEAD_KV as u64 * hd], false),
+                    ("attn_output.weight", vec![N_HEAD as u64 * hd, e], false),
+                ]
+            } else {
+                // A gated-DeltaNet layer.
+                let key = (SSM_STATE * SSM_GROUPS) as u64;
+                let value = (SSM_STATE * SSM_V_HEADS) as u64;
+                let conv = 2 * key + value;
+                vec![
+                    ("attn_norm.weight", vec![e], true),
+                    ("post_attention_norm.weight", vec![e], true),
+                    ("attn_qkv.weight", vec![e, conv], false),
+                    ("attn_gate.weight", vec![e, value], false),
+                    ("ssm_beta.weight", vec![e, SSM_V_HEADS as u64], false),
+                    ("ssm_alpha.weight", vec![e, SSM_V_HEADS as u64], false),
+                    ("ssm_conv1d.weight", vec![SSM_CONV as u64, conv], false),
+                    ("ssm_dt.bias", vec![SSM_V_HEADS as u64], false),
+                    ("ssm_a", vec![SSM_V_HEADS as u64], false),
+                    ("ssm_norm.weight", vec![SSM_STATE as u64], true),
+                    ("ssm_out.weight", vec![value, e], false),
+                ]
+            };
+            for (suffix, dims, norm) in layer.into_iter().chain(ffn.iter().cloned()) {
                 tensors.push((format!("blk.{i}.{suffix}"), dims, norm));
             }
         }
+
+        let arch = if variant.hybrid { "qwen35" } else { "llama" };
+        let mut meta = Vec::new();
+        let mut n_meta = 1u64;
+        let mut u32_kv = |key: &str, value: u32| {
+            meta_u32(&mut meta, &format!("{arch}.{key}"), value);
+            n_meta += 1;
+        };
+        u32_kv("embedding_length", N_EMBD as u32);
+        u32_kv("block_count", N_LAYER as u32);
+        u32_kv("attention.head_count", N_HEAD as u32);
+        u32_kv("attention.head_count_kv", N_HEAD_KV as u32);
+        u32_kv("context_length", N_CTX as u32);
+        u32_kv("vocab_size", N_VOCAB as u32);
+        if variant.hybrid {
+            u32_kv("attention.key_length", HYBRID_HEAD_DIM as u32);
+            u32_kv("attention.value_length", HYBRID_HEAD_DIM as u32);
+            u32_kv("rope.dimension_count", HYBRID_HEAD_DIM as u32);
+            u32_kv("full_attention_interval", HYBRID_INTERVAL as u32);
+            u32_kv("ssm.conv_kernel", SSM_CONV as u32);
+            u32_kv("ssm.state_size", SSM_STATE as u32);
+            u32_kv("ssm.group_count", SSM_GROUPS as u32);
+            u32_kv("ssm.time_step_rank", SSM_V_HEADS as u32);
+            u32_kv("ssm.inner_size", (SSM_STATE * SSM_V_HEADS) as u32);
+        }
+        meta_f32(&mut meta, &format!("{arch}.rope.freq_base"), 10000.0);
+        meta_f32(
+            &mut meta,
+            &format!("{arch}.attention.layer_norm_rms_epsilon"),
+            1e-5,
+        );
+        n_meta += 2;
 
         let mut buf = Vec::new();
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&9u64.to_le_bytes());
+        buf.extend_from_slice(&n_meta.to_le_bytes());
         string(&mut buf, "general.architecture");
         buf.extend_from_slice(&8u32.to_le_bytes());
-        string(&mut buf, "llama");
-        meta_u32(&mut buf, "llama.embedding_length", N_EMBD as u32);
-        meta_u32(&mut buf, "llama.block_count", N_LAYER as u32);
-        meta_u32(&mut buf, "llama.attention.head_count", N_HEAD as u32);
-        meta_u32(&mut buf, "llama.attention.head_count_kv", N_HEAD_KV as u32);
-        meta_u32(&mut buf, "llama.context_length", N_CTX as u32);
-        meta_u32(&mut buf, "llama.vocab_size", N_VOCAB as u32);
-        meta_f32(&mut buf, "llama.rope.freq_base", 10000.0);
-        meta_f32(&mut buf, "llama.attention.layer_norm_rms_epsilon", 1e-5);
+        string(&mut buf, arch);
+        buf.extend_from_slice(&meta);
 
         let mut data = Vec::new();
         let mut state = 0x2545_f491_4f6c_dd1du64;
@@ -1688,6 +1757,10 @@ pub(crate) mod fixture {
                 state ^= state << 17;
                 let unit = (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
                 let mut value = if *norm { 1.0 + unit * 0.2 } else { unit * 0.4 };
+                // A recurrent state decays: its `A` is negative.
+                if name.ends_with("ssm_a") {
+                    value = -0.5 - unit.abs();
+                }
                 if nudged && i == n / 2 {
                     value += 0.01;
                 }
@@ -1716,12 +1789,27 @@ pub(crate) mod fixture {
         if let Some((_, path)) = paths.iter().find(|(v, _)| *v == variant) {
             return path.clone();
         }
-        let path = std::env::temp_dir().join(format!(
-            "orangu-workers-fixture-{}-{}.gguf",
-            std::process::id(),
-            paths.len()
+        // Named by its content, so every test process shares one file per
+        // variant rather than leaving its own behind; written aside and
+        // renamed into place, so a process never reads another's half.
+        use std::hash::{Hash, Hasher};
+        let bytes = gguf(variant);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "orangu-workers-fixture-{:016x}.gguf",
+            hasher.finish()
         ));
-        std::fs::write(&path, gguf(variant)).expect("write the fixture model");
+        if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(bytes.len() as u64) {
+            let aside = dir.join(format!(
+                "orangu-workers-fixture-{}-{}.part",
+                std::process::id(),
+                paths.len()
+            ));
+            std::fs::write(&aside, &bytes).expect("write the fixture model");
+            std::fs::rename(&aside, &path).expect("put the fixture model in place");
+        }
         paths.push((variant, path.clone()));
         path
     }
@@ -1733,7 +1821,18 @@ pub(crate) mod fixture {
 
     /// The fixture model on the CPU backend.
     pub fn model() -> Arc<dyn ModelForward> {
-        let loaded = loaded(Variant::default());
+        model_for(Variant::default())
+    }
+
+    /// The fixture model of `variant` on the CPU backend.
+    pub fn model_for(variant: Variant) -> Arc<dyn ModelForward> {
+        let loaded = loaded(variant);
+        if variant.hybrid {
+            return Arc::new(
+                Qwen35Model::load_with_backend(&loaded, Arc::new(CpuBackend))
+                    .expect("build the hybrid fixture model"),
+            );
+        }
         Arc::new(
             LlamaModel::load_with_backend(&loaded, Arc::new(CpuBackend))
                 .expect("build the fixture model"),
@@ -2254,6 +2353,78 @@ mod tests {
         assert_eq!(store.reuse_into(0, &long, &mut fresh), 0);
         split.forward(&mut fresh, &long, 0, 0).unwrap();
         assert_eq!((middle.len(), leaf.len()), (1, 1), "through the tree");
+    }
+
+    /// A hybrid model decodes alone too: its recurrent layers' states come
+    /// back with the attention layers' rows, from both levels of the tree,
+    /// and every logit after is the model's alone. Its layers alternate,
+    /// so each node holds both kinds — or, at the leaf, only attention.
+    #[test]
+    fn a_hybrid_sequence_decodes_alone_with_its_states_brought_back() {
+        let model = fixture::model_for(fixture::Variant {
+            hybrid: true,
+            ..fixture::Variant::default()
+        });
+        let leaf = Arc::new(SessionStore::new(
+            Arc::new(LayerPipeline::new(model.clone(), 3..4, vec![]).unwrap()),
+            N_CTX,
+            8,
+        ));
+        let middle = Arc::new(SessionStore::new(
+            Arc::new(
+                LayerPipeline::new(
+                    model.clone(),
+                    1..3,
+                    vec![Box::new(LoopbackStage::new(
+                        leaf.clone(),
+                        ActivationFormat::F32,
+                    ))],
+                )
+                .unwrap(),
+            ),
+            N_CTX,
+            8,
+        ));
+        let pipeline = Arc::new(
+            LayerPipeline::new(
+                model.clone(),
+                0..1,
+                vec![Box::new(LoopbackStage::new(
+                    middle.clone(),
+                    ActivationFormat::F32,
+                ))],
+            )
+            .unwrap(),
+        );
+        let split = DelegatingModel::with_source(model.clone(), Arc::new(HandingOver(pipeline)));
+        let tokens = fixture::tokens();
+        let mut cache = split.new_kv_cache(N_CTX);
+        let mut reference = model.new_kv_cache(N_CTX);
+        let mut worst = 0f32;
+        let mut compare = |a: Vec<f32>, b: Vec<f32>| {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(&b) {
+                worst = worst.max((x - y).abs());
+            }
+        };
+        compare(
+            split.forward(&mut cache, &tokens[..5], 0, 0).unwrap(),
+            model.forward(&mut reference, &tokens[..5], 0, 0).unwrap(),
+        );
+        assert_eq!((middle.len(), leaf.len()), (1, 1));
+        for pos in 5..tokens.len() {
+            compare(
+                split
+                    .forward(&mut cache, &tokens[pos..pos + 1], pos, 0)
+                    .unwrap(),
+                model
+                    .forward(&mut reference, &tokens[pos..pos + 1], pos, 0)
+                    .unwrap(),
+            );
+        }
+        assert!(cache.remote.is_none(), "handed over");
+        assert_eq!((middle.len(), leaf.len()), (0, 0), "the workers let it go");
+        assert!(worst < 1e-4, "{worst}");
     }
 
     /// The end of a request answers where its time went, per node and in

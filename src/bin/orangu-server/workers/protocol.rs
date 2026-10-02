@@ -44,7 +44,7 @@ pub const PROTOCOL_VERSION: u16 = 2;
 /// Optional extensions this build understands, one bit each: a parent
 /// sends a child a message of an extension only when the child's
 /// `HelloAck` advertised its bit, so peers without it still talk.
-pub const FEATURES: u64 = FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD | FEATURE_ECHO;
+pub const FEATURES: u64 = FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD | FEATURE_ECHO | FEATURE_STATE;
 
 /// [`Message::Fork`]: a worker copies one session's rows into another.
 pub const FEATURE_FORK: u64 = 1;
@@ -65,6 +65,27 @@ pub const FEATURE_ECHO: u64 = 8;
 /// worker without it, and another model, is left out before any layers are
 /// cut. Advertised per node, not in [`FEATURES`].
 pub const FEATURE_SWITCH: u64 = 16;
+
+/// [`Message::LayerState`]: asked for a recurrent layer's rows, a worker
+/// sends back its state, so a hybrid model's top-level node can decode
+/// alone too.
+pub const FEATURE_STATE: u64 = 32;
+
+/// The extensions `features` advertises, by name, for `/v1/workers`.
+pub fn feature_names(features: u64) -> Vec<&'static str> {
+    [
+        (FEATURE_FORK, "fork"),
+        (FEATURE_ROWS, "rows"),
+        (FEATURE_HEAD, "head"),
+        (FEATURE_ECHO, "echo"),
+        (FEATURE_SWITCH, "switch"),
+        (FEATURE_STATE, "state"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| features & bit != 0)
+    .map(|(_, name)| name)
+    .collect()
+}
 
 /// The largest frame either side accepts: a prefill chunk of 8192 tokens
 /// of an 8192-wide model in `f32` is 256 MiB, so this leaves room without
@@ -596,7 +617,8 @@ pub enum Message {
     },
     /// Send back layer `layer`'s first `len` positions of `session`, from
     /// this worker or whichever node below it runs that layer. Answered with
-    /// [`Message::LayerRows`]. Only sent to a child that advertised
+    /// [`Message::LayerRows`] — or, for a recurrent layer, by
+    /// [`Message::LayerState`]. Only sent to a child that advertised
     /// [`FEATURE_ROWS`].
     Rows {
         session: u64,
@@ -614,6 +636,12 @@ pub enum Message {
         kv_dim: u32,
         len: u32,
         data: Vec<u8>,
+    },
+    /// One recurrent layer's state: its conv window, then its state
+    /// matrices, each `f32` little-endian.
+    LayerState {
+        conv: Vec<u8>,
+        state: Vec<u8>,
     },
     Cancel {
         session: u64,
@@ -651,6 +679,7 @@ mod tag {
     pub const ROWS: u8 = 18;
     pub const LAYER_ROWS: u8 = 19;
     pub const ECHO: u8 = 20;
+    pub const LAYER_STATE: u8 = 21;
 }
 
 struct Writer(Vec<u8>);
@@ -1028,6 +1057,11 @@ impl Message {
                 w.bytes(data);
                 tag::LAYER_ROWS
             }
+            Self::LayerState { conv, state } => {
+                w.bytes(conv);
+                w.bytes(state);
+                tag::LAYER_STATE
+            }
             Self::Cancel { session, step } => {
                 w.u64(*session);
                 w.u64(*step);
@@ -1149,6 +1183,10 @@ impl Message {
                 kv_dim: r.u32()?,
                 len: r.u32()?,
                 data: r.bytes()?,
+            },
+            tag::LAYER_STATE => Self::LayerState {
+                conv: r.bytes()?,
+                state: r.bytes()?,
             },
             tag::CANCEL => Self::Cancel {
                 session: r.u64()?,
@@ -1356,6 +1394,10 @@ mod tests {
         });
         round_trip(Message::Echo {
             data: vec![1, 2, 3],
+        });
+        round_trip(Message::LayerState {
+            conv: vec![1, 2, 3, 4],
+            state: vec![5, 6, 7, 8, 9, 10, 11, 12],
         });
         round_trip(Message::LayerRows {
             kv_dim: 2,

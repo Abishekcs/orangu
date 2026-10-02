@@ -36,7 +36,7 @@ use super::guard::{GuardedStage, TakeStandby};
 use super::identity;
 use super::link::{ChildInfo, ChildLink};
 use super::metrics::{LinkSnapshot, NodeMetrics};
-use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage};
+use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage, Trace};
 use super::plan;
 use super::protocol::{
     ActivationFormat, Assign, Capacity, ErrorCode, FEATURE_SWITCH, FEATURES, HelloAck, MAX_DEPTH,
@@ -76,6 +76,42 @@ const QUIET: Duration = Duration::from_secs(2);
 /// Decode steps a top-level node observes before it weighs planning again
 /// by the speeds they showed (`Node::calibration_due`).
 const CALIBRATE_TOKENS: usize = 32;
+
+/// Prompt tokens a request needs before its prompt counts toward the
+/// tree's prompt speed: fewer weigh the fixed costs of a forward too much.
+const SEEN_PROMPT_TOKENS: usize = 64;
+
+/// The tree's speeds as requests found them (`Node::tree_seen`).
+#[derive(Clone, Debug, Default)]
+struct TreeSeen {
+    used: Vec<String>,
+    prompt_ns: Option<(f64, usize)>,
+    decode_ns: Option<(f64, usize)>,
+}
+
+/// Whether a tree that takes `tree` — a 128-token prompt chunk and a decode
+/// step, in nanoseconds — pays against this node `alone`: a request of a
+/// chunk of prompt and an answer as long takes it at most 90% of the time.
+fn tree_pays(tree: (f64, f64), alone: (f64, f64)) -> bool {
+    let request =
+        |(prompt, decode): (f64, f64)| prompt + decode * super::speed::PROMPT_TOKENS as f64;
+    request(tree) <= 0.9 * request(alone)
+}
+
+/// `old` over its tokens and `value` over `tokens`, weighted by tokens —
+/// the old capped so a change shows.
+fn weigh(old: Option<(f64, usize)>, value: f64, tokens: usize) -> (f64, usize) {
+    match old {
+        None => (value, tokens),
+        Some((mean, seen)) => {
+            let w = seen.min(256) as f64;
+            (
+                (mean * w + value * tokens as f64) / (w + tokens as f64),
+                seen + tokens,
+            )
+        }
+    }
+}
 
 pub struct NodeSettings {
     /// How this node is named in plans and error paths: its `[workers]`
@@ -195,6 +231,13 @@ pub struct Node {
     observed: Mutex<HashMap<String, (f64, usize)>>,
     /// Decode tokens observed since the last plan.
     observed_since_plan: AtomicUsize,
+    /// The tree as requests found it, with the workers it used: a
+    /// 128-token prompt chunk at its slowest stage and a decode step, in
+    /// nanoseconds, each `None` until enough was seen.
+    tree_seen: Mutex<Option<TreeSeen>>,
+    /// The tree's prompt chunk as the last plan predicted it, in
+    /// nanoseconds: what a tree seen only on short prompts goes by.
+    predicted_prompt: Mutex<Option<f64>>,
     /// The rates the plan in progress uses: the observed ones when every
     /// node has one, the measured ones otherwise (`None`).
     observed_now: Mutex<Option<HashMap<String, f64>>>,
@@ -234,6 +277,13 @@ pub struct Node {
     head_bytes: u64,
     /// Each layer's keys and values of one position, in bytes as `f32`.
     kv_row_bytes: Vec<u64>,
+    /// Each layer's recurrent state, in bytes as `f32`: what it costs to
+    /// bring back once, whatever the length. `0` for an attention layer.
+    state_bytes: Vec<u64>,
+    /// The whole model here alone, in nanoseconds — a 128-token prompt chunk
+    /// and a decode step on its own paths — for a node that could serve
+    /// alone to weigh its tree against (`speed::measure_whole`).
+    alone_ns: Option<(f64, f64)>,
     local_addr: Option<SocketAddr>,
     metrics: NodeMetrics,
     next_connection: AtomicU64,
@@ -385,20 +435,21 @@ impl Node {
         if head_bytes == 0 {
             head_bytes = embd_bytes;
         }
-        // Keys and values, `f32`, of one position per layer: what a sequence's
-        // rows cost to bring back to the top-level node.
-        let kv_row_bytes: Vec<u64> = model
-            .new_kv_cache(1)
-            .layers
-            .iter()
-            .map(|l| 8 * l.kv_dim() as u64)
-            .collect();
+        // What a sequence costs to bring back to the top-level node, per
+        // layer: keys and values of one position, or a recurrent state once.
+        let probe = model.new_kv_cache(1);
+        let (kv_row_bytes, state_bytes): (Vec<u64>, Vec<u64>) = (0..n_layer)
+            .map(|il| probe.hold_bytes(model.cache_slot(il)))
+            .unzip();
+        drop(probe);
         if settings.capacity.setups.is_empty() {
             settings.capacity.setups.push(NodeSetup {
                 name: settings.name.clone(),
                 ..NodeSetup::default()
             });
         }
+        // Speeds a caller already knows (tests) are not measured.
+        let rates_given = settings.capacity.setups[0].decode_rate > 0.0;
         // Measured before a parent can ask: not for a node sharing by
         // memory, nor for one that has only part of the model on disk and
         // does not know yet which layers it will have.
@@ -441,6 +492,34 @@ impl Node {
             // and refuses every assignment.
             LayerPipeline::unchecked(model.clone(), 0..n_layer)
         };
+        // A node that could serve alone times the whole model on its own
+        // paths, to set its tree against (offloading only when it pays).
+        let total_bytes: u64 = layer_bytes.iter().sum();
+        let alone_ns = (!rates_given
+            && settings.offload == Offload::Auto
+            && settings.split
+            && settings.shares != Shares::Memory
+            && !settings.workers.is_empty()
+            && model.supports_layer_split()
+            && !super::fetch::incomplete()
+            && settings.capacity.budget_bytes >= total_bytes + non_layer_bytes)
+            .then(|| super::speed::measure_whole(model.as_ref()))
+            .and_then(|measured| match measured {
+                Ok((prompt, decode)) => {
+                    log::info!(
+                        "orangu-server: [workers] the whole model here alone: {:.0} ms a {}-token \
+                         prompt chunk, {:.1} ms a decode step",
+                        prompt.as_secs_f64() * 1e3,
+                        super::speed::PROMPT_TOKENS,
+                        decode.as_secs_f64() * 1e3
+                    );
+                    Some((prompt.as_nanos() as f64, decode.as_nanos() as f64))
+                }
+                Err(e) => {
+                    log::warn!("orangu-server: [workers] could not time the model alone: {e:#}");
+                    None
+                }
+            });
         // The model this node serves, by its layout: what a parent compares.
         let own_identity =
             identity::model_identity(&loaded, &settings.label, &settings.quant, 0..0);
@@ -461,6 +540,8 @@ impl Node {
             not_worth: Mutex::new(None),
             observed: Mutex::new(HashMap::new()),
             observed_since_plan: AtomicUsize::new(0),
+            tree_seen: Mutex::new(None),
+            predicted_prompt: Mutex::new(None),
             observed_now: Mutex::new(None),
             planned_rates: Mutex::new(HashMap::new()),
             handover: OnceLock::new(),
@@ -478,6 +559,8 @@ impl Node {
             non_layer_bytes,
             head_bytes,
             kv_row_bytes,
+            state_bytes,
+            alone_ns,
             identity: own_identity,
             local_addr,
             metrics: NodeMetrics::default(),
@@ -597,6 +680,7 @@ impl Node {
                     "connected": info.is_some(),
                     "node": info.as_ref().map(|i| i.node.clone()),
                     "subtree_nodes": info.as_ref().map(|i| i.capacity.subtree_nodes),
+                    "features": info.as_ref().map(|i| super::protocol::feature_names(i.features)),
                     "setups": info.as_ref().map(|i| setups_json(&i.capacity.setups)),
                     "link": info.as_ref().and_then(|i| i.link).map(|(rtt, bandwidth)| serde_json::json!({
                         "rtt_ms": rtt.as_secs_f64() * 1e3,
@@ -1321,11 +1405,13 @@ impl Node {
         if self.settings.decode == DecodeOn::Tree || working.len() < 2 {
             return false;
         }
-        let rows = self.links.iter().chain(&self.standby_links).all(|link| {
-            link.info()
-                .is_none_or(|info| info.features & super::protocol::FEATURE_ROWS != 0)
-                || !used.contains(&link.addr)
-        });
+        let rows = self.can_hand_back(
+            self.links
+                .iter()
+                .chain(&self.standby_links)
+                .filter(|link| used.contains(&link.addr))
+                .filter_map(|link| link.info().map(|info| info.features)),
+        );
         let total: u64 = self.layer_bytes.iter().sum();
         if !rows || self.settings.capacity.budget_bytes < total + self.non_layer_bytes {
             return false;
@@ -1354,6 +1440,7 @@ impl Node {
         let link = self.slowest_link(used);
         let mut tree = 0.0;
         let mut remote_rows = 0.0;
+        let mut remote_states = 0.0;
         for (i, entry) in working.iter().enumerate() {
             let Some((r, fixed)) = measured(&entry.node) else {
                 return false;
@@ -1363,16 +1450,37 @@ impl Node {
             if i > 0 {
                 tree += link.map_or(0.0, |(rtt, _)| rtt.as_nanos() as f64);
                 remote_rows += layers
+                    .clone()
                     .map(|il| self.kv_row_bytes.get(il).copied().unwrap_or(0) as f64)
+                    .sum::<f64>();
+                remote_states += layers
+                    .map(|il| self.state_bytes.get(il).copied().unwrap_or(0) as f64)
                     .sum::<f64>();
             }
         }
-        let alone = total as f64 / own + own_fixed;
-        // Each prompt position's rows cross the link once; each generated
-        // token saves `tree - alone`. Worth it when an answer as long as its
-        // prompt pays the rows back — on a slow link, a slow worker, or both.
-        let rows_per_position = link.map_or(0.0, |(_, bandwidth)| remote_rows / bandwidth * 1e9);
-        tree - alone > 0.0 && tree - alone >= rows_per_position
+        let alone = self
+            .alone_ns
+            .map_or(total as f64 / own + own_fixed, |(_, decode)| decode);
+        // Each prompt position's rows cross the link once, and a recurrent
+        // layer's state once a sequence; each generated token saves `tree -
+        // alone`. Worth it when an answer as long as its prompt pays the rows
+        // back, and a 128-token answer the states — on a slow link, a slow
+        // worker, or both.
+        let carry = |bytes: f64| link.map_or(0.0, |(_, bandwidth)| bytes / bandwidth * 1e9);
+        let states_per_token = carry(remote_states) / super::speed::PROMPT_TOKENS as f64;
+        tree - alone > 0.0 && tree - alone >= carry(remote_rows) + states_per_token
+    }
+
+    /// Whether workers with `features` can bring a sequence back here:
+    /// send rows, and a recurrent layer's state when the model keeps one.
+    fn can_hand_back(&self, mut features: impl Iterator<Item = u64>) -> bool {
+        let state = if self.state_bytes.iter().any(|b| *b > 0) {
+            super::protocol::FEATURE_STATE
+        } else {
+            0
+        };
+        let needed = super::protocol::FEATURE_ROWS | state;
+        features.all(|f| f & needed == needed)
     }
 
     /// The slowest link to the workers `used`: the longest round trip and
@@ -1392,7 +1500,8 @@ impl Node {
     /// measure its speed. Predicted from the measured rates: a long
     /// prompt runs at the pace of the tree's slowest stage (its parts
     /// overlap), a decode step through every stage in turn — or here alone
-    /// after a handover. The tree must be at least 10% faster at one.
+    /// after a handover. The tree must take at most 90% of this node's
+    /// time for a request of both (`tree_pays`).
     fn not_worth_offloading(
         &self,
         range: &Range<usize>,
@@ -1455,16 +1564,44 @@ impl Node {
             prompt_stage = prompt_stage.max(bytes(share) / prompt + prompt_fixed + carry);
             decode_steps += bytes(share) / decode + decode_fixed + hop;
         }
-        let (alone_prompt, alone_decode) = (
+        // The model alone as timed on its own paths when it was; else its
+        // layers at this node's rates.
+        let (alone_prompt, alone_decode) = self.alone_ns.unwrap_or((
             total / own_prompt + own_prompt_fixed,
             total / own_decode + own_decode_fixed,
+        ));
+        // Decoded here after a handover — unless the tree is asked to, or
+        // a worker cannot send back what it holds.
+        let hands_back = self.can_hand_back(
+            candidates
+                .iter()
+                .zip(shares)
+                .filter(|(_, share)| !share.is_empty())
+                .map(|((_, info), _)| info.features),
         );
-        let tree_decode = if self.settings.decode == DecodeOn::Tree {
+        let mut tree_decode = if self.settings.decode == DecodeOn::Tree || !hands_back {
             decode_steps
         } else {
             alone_decode
         };
-        if prompt_stage < 0.9 * alone_prompt || tree_decode < 0.9 * alone_decode {
+        // What requests found a tree of these nodes to take goes before
+        // what was predicted of it.
+        let mut used = vec![self.settings.name.clone()];
+        for ((_, info), share) in candidates.iter().zip(shares) {
+            if !share.is_empty() {
+                used.extend(info.capacity.setups.iter().map(|s| s.name.clone()));
+            }
+        }
+        *self.predicted_prompt.lock().unwrap() = Some(prompt_stage);
+        if let Some(seen) = self.tree_seen_with(&used) {
+            if let Some((prompt, _)) = seen.prompt_ns {
+                prompt_stage = prompt;
+            }
+            if let Some((decode, _)) = seen.decode_ns {
+                tree_decode = decode;
+            }
+        }
+        if tree_pays((prompt_stage, tree_decode), (alone_prompt, alone_decode)) {
             return None;
         }
         // Bytes over gigabytes a second: nanoseconds.
@@ -2075,12 +2212,87 @@ impl Node {
         }
     }
 
+    /// What requests found of the tree in force.
+    fn tree_seen_in_force(&self) -> Option<TreeSeen> {
+        let used: Vec<String> = self
+            .plan()
+            .into_iter()
+            .filter(|e| e.layer_start < e.layer_end)
+            .map(|e| e.node)
+            .collect();
+        self.tree_seen_with(&used)
+    }
+
+    /// What requests found of a tree of the nodes `used`, in any order.
+    fn tree_seen_with(&self, used: &[String]) -> Option<TreeSeen> {
+        let seen = self.tree_seen.lock().unwrap().clone()?;
+        let mut a = seen.used.clone();
+        let mut b = used.to_vec();
+        a.sort();
+        b.sort();
+        (a == b).then_some(seen)
+    }
+
+    /// Why the tree in force should give way to this node alone: with
+    /// `offload = auto` and the model held here, once requests found the
+    /// tree not to pay against the model alone — as timed, or at this
+    /// node's rates — by [`tree_pays`], after [`CALIBRATE_TOKENS`] decode
+    /// steps since the plan. `None` otherwise.
+    fn tree_seen_slower(&self) -> Option<String> {
+        if self.settings.offload != Offload::Auto
+            || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
+        {
+            return None;
+        }
+        let (alone_prompt, alone_decode) = self.alone_ns.or_else(|| {
+            // Not timed alone: its layers at this node's rates.
+            let own = self.settings.capacity.setups.first()?;
+            let total = plan::bytes_of(&(0..self.layer_bytes.len()), &self.layer_bytes) as f64;
+            (own.prompt_rate > 0.0 && own.decode_rate > 0.0).then(|| {
+                (
+                    total / own.prompt_rate as f64 + own.prompt_fixed_ms as f64 * 1e6,
+                    total / own.decode_rate as f64 + own.decode_fixed_ms as f64 * 1e6,
+                )
+            })
+        })?;
+        // Only a node that holds the model can serve alone.
+        let total = plan::bytes_of(&(0..self.layer_bytes.len()), &self.layer_bytes);
+        if self.settings.capacity.budget_bytes < total + self.non_layer_bytes {
+            return None;
+        }
+        let seen = self.tree_seen_in_force()?;
+        let (decode, tokens) = seen.decode_ns?;
+        if tokens < CALIBRATE_TOKENS {
+            return None;
+        }
+        // A prompt too short to time the tree by goes by the prediction.
+        let (prompt, how) = match seen.prompt_ns {
+            Some((prompt, _)) => (prompt, "found"),
+            None => ((*self.predicted_prompt.lock().unwrap())?, "predicted"),
+        };
+        if tree_pays((prompt, decode), (alone_prompt, alone_decode)) {
+            return None;
+        }
+        let ms = |ns: f64| ns / 1e6;
+        Some(format!(
+            "requests found the tree no faster: a decode step {:.1} ms against {:.1} alone, a \
+             128-token prompt chunk {:.0} ms at its slowest stage ({how}) against {:.0} alone",
+            ms(decode),
+            ms(alone_decode),
+            ms(prompt),
+            ms(alone_prompt)
+        ))
+    }
+
     /// Whether the speeds requests found tell the plan apart from the speeds
     /// it was made by — some node more than 20% off, set against this
     /// node's own — after enough decode steps to tell ([`CALIBRATE_TOKENS`]).
     /// Says which, for the log. Only for shares by decode speed, and only
     /// when every node the plan uses has been seen.
     fn calibration_due(&self) -> Option<String> {
+        if let Some(why) = self.tree_seen_slower() {
+            return Some(why);
+        }
         if self.settings.shares != Shares::Decode
             || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
         {
@@ -2097,6 +2309,15 @@ impl Node {
         let own = &self.settings.name;
         let (&own_planned, &(own_observed, _)) = (planned.get(own)?, observed.get(own)?);
         let mut off = Vec::new();
+        // Set against the model alone, speeds count as they are, not only
+        // against each other: a tree slower than planned all through may
+        // now lose to this node alone.
+        let own_ratio = own_observed / own_planned;
+        if self.alone_ns.is_some() && !(1.0 / 1.2..=1.2).contains(&own_ratio) {
+            off.push(format!(
+                "this node runs at {own_ratio:.2} of what it was planned at"
+            ));
+        }
         for (name, planned_rate) in &planned {
             if name == own || !in_plan.contains(name) {
                 continue;
@@ -2302,6 +2523,45 @@ impl PipelineSource for Node {
             );
         }
     }
+
+    fn observed_request(&self, prefill: &Trace, decode: &Trace) {
+        let used: Vec<String> = self
+            .plan()
+            .into_iter()
+            .filter(|e| e.layer_start < e.layer_end)
+            .map(|e| e.node)
+            .collect();
+        if used.len() < 2 {
+            return;
+        }
+        let mut seen = self.tree_seen.lock().unwrap();
+        let tree = match &mut *seen {
+            Some(tree) if tree.used == used => tree,
+            _ => seen.insert(TreeSeen {
+                used,
+                ..TreeSeen::default()
+            }),
+        };
+        // A prompt's stages overlap: a chunk takes as long as the slowest.
+        if prefill.tokens >= SEEN_PROMPT_TOKENS
+            && let Some(slowest) = prefill.parts.iter().map(|(_, t)| *t).max()
+        {
+            let chunk = slowest.as_nanos() as f64 / prefill.tokens as f64
+                * super::speed::PROMPT_TOKENS as f64;
+            tree.prompt_ns = Some(weigh(tree.prompt_ns, chunk, prefill.tokens));
+        }
+        // A decode step runs through every stage in turn — here, decoded
+        // alone after a handover.
+        if decode.tokens > 0 {
+            let step = decode
+                .parts
+                .iter()
+                .map(|(_, t)| t.as_nanos() as f64)
+                .sum::<f64>()
+                / decode.tokens as f64;
+            tree.decode_ns = Some(weigh(tree.decode_ns, step, decode.tokens));
+        }
+    }
 }
 
 fn error(code: ErrorCode, message: impl Into<String>) -> Message {
@@ -2381,15 +2641,12 @@ mod tests {
     }
 
     fn node_with(settings: NodeSettings, variant: Variant) -> Arc<Node> {
-        let loaded = fixture::loaded(variant);
-        let model: Arc<dyn ModelForward> = Arc::new(
-            crate::engine::arch::llama::LlamaModel::load_with_backend(
-                &loaded,
-                Arc::new(crate::engine::backend::CpuBackend),
-            )
-            .unwrap(),
-        );
-        Node::start(settings, model, fixture::loaded(variant)).unwrap()
+        Node::start(
+            settings,
+            fixture::model_for(variant),
+            fixture::loaded(variant),
+        )
+        .unwrap()
     }
 
     fn run(model: &dyn ModelForward, tokens: &[u32], prompt: usize) -> Vec<Vec<f32>> {
@@ -2482,6 +2739,45 @@ mod tests {
         for n in [&top, &middle, &leaf] {
             n.stop();
         }
+    }
+
+    /// Over TCP, a hybrid model's top-level node decodes alone: its
+    /// worker sends back each recurrent layer's state with the attention
+    /// layers' rows, and the answer is the model's alone.
+    #[test]
+    fn a_hybrid_tree_hands_its_states_back() {
+        let hybrid = Variant {
+            hybrid: true,
+            ..Variant::default()
+        };
+        let worker = node("worker", &[], hybrid);
+        let mut s = settings("top", vec![worker.local_addr().unwrap().to_string()], None);
+        s.decode = DecodeOn::Top;
+        let top = node_with(s, hybrid);
+        let split = top.delegating_model().unwrap();
+        assert!(top.plan().iter().any(|e| e.node == "worker"));
+        assert!(top.decode_alone(), "{}", top.status());
+        let tokens = fixture::tokens();
+        let model = fixture::model_for(hybrid);
+        let mut cache = split.new_kv_cache(N_CTX);
+        let mut reference = model.new_kv_cache(N_CTX);
+        let mut worst = 0f32;
+        for (start, end) in [(0, 5), (5, 6), (6, 7), (7, 8)] {
+            let a = split
+                .forward(&mut cache, &tokens[start..end], start, 0)
+                .unwrap();
+            let b = model
+                .forward(&mut reference, &tokens[start..end], start, 0)
+                .unwrap();
+            for (x, y) in a.iter().zip(&b) {
+                worst = worst.max((x - y).abs());
+            }
+        }
+        assert!(cache.remote.is_none(), "handed over");
+        assert!(worst < 1e-4, "{worst}");
+        drop(cache);
+        top.stop();
+        worker.stop();
     }
 
     /// A worker with another quantization is left out, and the top serves
@@ -2888,6 +3184,31 @@ mod tests {
             describe(&other.plan())
         );
         assert!(other.status()["not_worth_offloading"].is_null());
+
+        // Requests find that tree slower than this node alone: it gives
+        // way, and stays alone when planned again.
+        assert!(other.calibration_due().is_none(), "nothing observed yet");
+        let slow_step = Trace {
+            forwards: 40,
+            tokens: 40,
+            parts: vec![("other".to_string(), Duration::from_secs(40 * 3600))],
+        };
+        let short_prompt = Trace {
+            forwards: 1,
+            tokens: 33,
+            parts: vec![("other".to_string(), Duration::from_secs(3600))],
+        };
+        other.observed_request(&short_prompt, &slow_step);
+        other.observed_decode(&slow_step.parts, slow_step.tokens);
+        let why = other
+            .calibration_due()
+            .expect("the tree is slower than alone");
+        assert!(why.contains("no faster"), "{why}");
+        other.plan_top();
+        assert_eq!(describe(&other.plan()), format!("other 0..{N_LAYER}"));
+        assert!(other.status()["not_worth_offloading"].is_string());
+        other.plan_top();
+        assert_eq!(describe(&other.plan()), format!("other 0..{N_LAYER}"));
         for n in [&top, &slow, &other, &fast] {
             n.stop();
         }

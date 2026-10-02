@@ -22,7 +22,7 @@ use super::pipeline::{BatchRow, LayerPipeline, Trace};
 use super::protocol::{
     ActivationFormat, Activations, ErrorCode, Forward, ForwardResult, Message, WorkerError,
 };
-use crate::engine::kv_cache::KvCache;
+use crate::engine::kv_cache::{KvCache, LayerHold};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::ops::Range;
@@ -155,10 +155,14 @@ impl SessionStore {
                 layer,
                 len,
             } => match self.layer_rows(session, layer as usize, len as usize) {
-                Ok((kv_dim, k, v)) => Message::LayerRows {
+                Ok(LayerHold::Rows { kv_dim, k, v }) => Message::LayerRows {
                     kv_dim: kv_dim as u32,
                     len,
-                    data: k.iter().chain(&v).flat_map(|x| x.to_le_bytes()).collect(),
+                    data: bytes_of(k.iter().chain(&v)),
+                },
+                Ok(LayerHold::State { conv, state }) => Message::LayerState {
+                    conv: bytes_of(&conv),
+                    state: bytes_of(&state),
                 },
                 Err(error) => Message::Error(error),
             },
@@ -229,14 +233,10 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Layer `layer`'s first `len` positions of `session`: from this node's
-    /// cache when it runs the layer, else from the worker below that does.
-    fn layer_rows(
-        &self,
-        session: u64,
-        layer: usize,
-        len: usize,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>), WorkerError> {
+    /// What layer `layer` holds of `session`'s first `len` positions: from
+    /// this node's cache when it runs the layer, else from the worker below
+    /// that does.
+    fn layer_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold, WorkerError> {
         let entry = self.sessions.lock().unwrap().get(&session).cloned();
         let Some(entry) = entry else {
             return Err(self.error(
@@ -246,7 +246,8 @@ impl SessionStore {
         };
         if self.pipeline.local_layers().contains(&layer) {
             let entry = entry.lock().unwrap();
-            return entry.cache.layer_rows(layer, len).ok_or_else(|| {
+            let slot = self.pipeline.model().cache_slot(layer);
+            return entry.cache.layer_hold(slot, len).ok_or_else(|| {
                 self.error(
                     ErrorCode::PositionMismatch,
                     format!(
@@ -480,6 +481,11 @@ impl SessionStore {
             .map(|a| a.expect("every forward is answered"))
             .collect()
     }
+}
+
+/// Values as `f32` little-endian bytes, the way they travel.
+fn bytes_of<'a>(values: impl IntoIterator<Item = &'a f32>) -> Vec<u8> {
+    values.into_iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
 #[cfg(test)]

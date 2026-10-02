@@ -42,6 +42,7 @@
 use super::pipeline::{BatchItem, Stage};
 use super::protocol::{ActivationFormat, Activations, ErrorCode, Rows, WorkerError};
 use super::stage::EncodedStage;
+use crate::engine::kv_cache::LayerHold;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -260,12 +261,7 @@ impl Stage for GuardedStage {
         self.current().0.release(session);
     }
 
-    fn layer_rows(
-        &self,
-        session: u64,
-        layer: usize,
-        len: usize,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>)> {
+    fn layer_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold> {
         self.current().0.layer_rows(session, layer, len)
     }
 

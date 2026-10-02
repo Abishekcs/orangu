@@ -98,6 +98,10 @@ impl ModelForward for Qwen35MoeModel {
         self.trunk.new_kv_cache_for_layers(layers, capacity)
     }
 
+    fn cache_slot(&self, il: usize) -> crate::engine::kv_cache::CacheSlot {
+        self.trunk.cache_slot(il)
+    }
+
     fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         self.trunk.embed(tokens)
     }

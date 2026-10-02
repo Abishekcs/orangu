@@ -203,8 +203,10 @@ itself.
 
 A top-level node that holds the whole model and decodes faster than its
 tree takes each sequence back once its prompt is through (`decode = auto`):
-at the first decode step every worker sends its layers' rows back, and the
-node decodes alone on the model's own paths while the workers free theirs.
+at the first decode step every worker sends its layers' rows back — and,
+for a hybrid model (`qwen35`, `qwen35moe`, `qwen3next`), each recurrent
+layer's state, a fixed size whatever the prompt's length — and the node
+decodes alone on the model's own paths while the workers free theirs.
 The prompt keeps the tree's speed and the answer the node's. On the board
 above: decode 15.2 tok/s with the tree's 58.5 tok/s prompts, where
 decoding through the tree gave 6.2. `decode = tree` keeps every step on the
@@ -212,12 +214,20 @@ tree, `decode = top` hands over whenever the node holds the model, and
 `/v1/workers` says which applies.
 
 A node with workers does not have to use them. When it holds the whole
-model and its measured speeds say the tree would not be at least 10%
-faster, it serves alone and gives its workers nothing (`offload = auto`,
-the default; `always` uses them regardless). `/v1/workers` then says why
+model and its measured speeds say the tree would not take at most 90% of
+its time for a request — a 128-token prompt chunk at the tree's slowest
+stage and an answer as long, its steps through every stage — it serves
+alone and gives its workers nothing (`offload = auto`, the default;
+`always` uses them regardless). The whole model alone is timed at start
+for this, on the paths it would run alone; and once requests have run
+through the tree, what they took goes before the prediction: between
+requests, a tree that turns out not to pay gives way to the node alone. `/v1/workers` then says why
 under `not_worth_offloading`, and every later plan weighs it again. On a
 LAN of this board and two RK3588s with gemma-4-E2B, the node chose to
-serve alone: 261 tok/s on a long prompt, where its tree gave 28.
+serve alone: 261 tok/s on a long prompt, where its tree gave 28. With
+Qwen3.6-35B-A3B the prediction chose the tree; its first requests decoded
+at 2.8 tok/s, where the node alone gives 4.5, and the node then served
+alone.
 
 When sequences decode through the tree, the output head — a matrix as wide
 as the vocabulary, read once a token — can run on the node with the final

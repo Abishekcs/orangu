@@ -2486,6 +2486,42 @@ impl LayerCache {
     }
 }
 
+/// Where a model's layer keeps a sequence in a [`KvCache`] the model made:
+/// the rows in `layers[i]`, or the recurrent state in `recurrent[i]`. Each
+/// kind is counted on its own, so a hybrid model's layer `il` is seldom
+/// at `i == il`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheSlot {
+    Rows(usize),
+    State(usize),
+}
+
+/// What one layer holds of a sequence, as it travels between the nodes
+/// of a tree of workers (`crate::workers`): an attention layer's first
+/// positions, or a recurrent layer's state after them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerHold {
+    /// `k.len() / kv_dim` rows of `kv_dim` keys, and as many values.
+    Rows {
+        kv_dim: usize,
+        k: Vec<f32>,
+        v: Vec<f32>,
+    },
+    /// The conv window and the state matrices, laid out as
+    /// [`RecurrentLayerState`] keeps them.
+    State { conv: Vec<f32>, state: Vec<f32> },
+}
+
+impl LayerHold {
+    /// Its size in `f32`, as it travels.
+    pub fn bytes(&self) -> usize {
+        4 * match self {
+            Self::Rows { k, v, .. } => k.len() + v.len(),
+            Self::State { conv, state } => conv.len() + state.len(),
+        }
+    }
+}
+
 pub struct KvCache {
     pub layers: Vec<LayerCache>,
     /// Recurrent (SSM / gated-delta-net) layer state, for architectures
@@ -3003,25 +3039,67 @@ impl KvCache {
         self.recent_tokens = std::mem::take(&mut src.recent_tokens);
     }
 
-    /// Layer `layer`'s first `len` positions as the host holds them — its
-    /// `kv_dim`, keys and values — for a tree's top-level node taking a
-    /// sequence's rows over from its workers (`crate::workers`). `None`
-    /// when the host does not hold them all, or the layer keeps more than one
-    /// position a row. A layer that stores nothing (`kv_dim` 0) gives nothing.
-    pub fn layer_rows(&self, layer: usize, len: usize) -> Option<(usize, Vec<f32>, Vec<f32>)> {
-        let l = self.layers.get(layer)?;
-        if l.kv_dim == 0 {
-            return Some((0, Vec::new(), Vec::new()));
+    /// What layer `slot` holds of a sequence's first `len` positions as the
+    /// host holds them, for a tree's top-level node taking a sequence over
+    /// from its workers (`crate::workers`): an attention layer's rows —
+    /// its `kv_dim`, keys and values — or a recurrent layer's state, which
+    /// must then be at exactly `len` positions. `None` when the host does
+    /// not hold them, the layer keeps more than one position a row, or the
+    /// slot was left empty here. A layer that stores nothing (`kv_dim` 0)
+    /// gives nothing.
+    pub fn layer_hold(&self, slot: CacheSlot, len: usize) -> Option<LayerHold> {
+        match slot {
+            CacheSlot::Rows(i) => {
+                let l = self.layers.get(i)?;
+                if l.kv_dim == 0 {
+                    return Some(LayerHold::Rows {
+                        kv_dim: 0,
+                        k: Vec::new(),
+                        v: Vec::new(),
+                    });
+                }
+                if l.stride != 1 || l.len.min(l.host_len()) < len {
+                    return None;
+                }
+                let (k, v) = l.flatten(len);
+                Some(LayerHold::Rows {
+                    kv_dim: l.kv_dim,
+                    k,
+                    v,
+                })
+            }
+            CacheSlot::State(i) => {
+                let r = self.recurrent.get(i)?;
+                // A state is of every position so far: only one at `len`
+                // will do. A cache with no rows of its own cannot tell.
+                let held = self.committed_len();
+                if r.is_empty() || (held != 0 && held != len) {
+                    return None;
+                }
+                let snapshot = r.host_snapshot();
+                Some(LayerHold::State {
+                    conv: snapshot.conv.into_owned(),
+                    state: snapshot.state.into_owned(),
+                })
+            }
         }
-        if l.stride != 1 || l.len.min(l.host_len()) < len {
-            return None;
-        }
-        let (k, v) = l.flatten(len);
-        Some((l.kv_dim, k, v))
     }
 
-    /// Writes rows [`Self::layer_rows`] gave as layer `layer`'s first
-    /// positions, in a cache that holds none there yet.
+    /// What layer `slot`'s [`LayerHold`] costs to carry, in bytes as `f32`:
+    /// `(a position, once)` — rows by the position, a state once whatever
+    /// the length.
+    pub fn hold_bytes(&self, slot: CacheSlot) -> (u64, u64) {
+        match slot {
+            CacheSlot::Rows(i) => (self.layers.get(i).map_or(0, |l| 8 * l.kv_dim as u64), 0),
+            CacheSlot::State(i) => (
+                0,
+                self.recurrent.get(i).map_or(0, |r| {
+                    4 * (r.conv_history.len() + r.delta_state.len()) as u64
+                }),
+            ),
+        }
+    }
+
     /// Whether `src` holds every layer's first `len` positions here
     /// ([`Self::whole`]) and this cache is laid out for all of them: a
     /// conversation a tree's top-level node went on with alone, taken up
@@ -3044,35 +3122,59 @@ impl KvCache {
             .all(|l| l.kv_dim == 0 || (l.stride == 1 && l.len.min(l.host_len()) >= len))
     }
 
-    pub fn set_layer_rows(
-        &mut self,
-        layer: usize,
-        kv_dim: usize,
-        k: Vec<f32>,
-        v: Vec<f32>,
-    ) -> anyhow::Result<()> {
-        let dst = self
-            .layers
-            .get_mut(layer)
-            .ok_or_else(|| anyhow::anyhow!("no layer {layer} in this cache"))?;
-        if kv_dim == 0 && dst.kv_dim == 0 {
-            return Ok(());
+    /// Writes what [`Self::layer_hold`] gave into layer `slot`: rows as its
+    /// first positions, in a layer that holds none yet, or a recurrent
+    /// state in place of the one here.
+    pub fn set_layer_hold(&mut self, slot: CacheSlot, hold: LayerHold) -> anyhow::Result<()> {
+        match (slot, hold) {
+            (CacheSlot::Rows(layer), LayerHold::Rows { kv_dim, k, v }) => {
+                let dst = self
+                    .layers
+                    .get_mut(layer)
+                    .ok_or_else(|| anyhow::anyhow!("no rows {layer} in this cache"))?;
+                if kv_dim == 0 && dst.kv_dim == 0 {
+                    return Ok(());
+                }
+                let len = k.len() / kv_dim.max(1);
+                anyhow::ensure!(
+                    dst.kv_dim == kv_dim
+                        && dst.stride == 1
+                        && dst.paged.is_none()
+                        && dst.len == 0
+                        && k.len() == len * kv_dim
+                        && v.len() == k.len()
+                        && len <= dst.capacity,
+                    "rows {layer}: {len} rows of {kv_dim} do not fit a layer of {} with room for {}",
+                    dst.kv_dim,
+                    dst.capacity
+                );
+                dst.copy_prefix_from(&LayerCache::from_parts(kv_dim, len, k, v), len);
+                Ok(())
+            }
+            (CacheSlot::State(i), LayerHold::State { conv, state }) => self
+                .recurrent
+                .get_mut(i)
+                .ok_or_else(|| anyhow::anyhow!("no recurrent state {i} in this cache"))?
+                .set_parts(conv, state),
+            (slot, _) => anyhow::bail!("{slot:?} cannot take what another kind of layer holds"),
         }
-        let len = k.len() / kv_dim.max(1);
-        anyhow::ensure!(
-            dst.kv_dim == kv_dim
-                && dst.stride == 1
-                && dst.paged.is_none()
-                && dst.len == 0
-                && k.len() == len * kv_dim
-                && v.len() == k.len()
-                && len <= dst.capacity,
-            "layer {layer}: {len} rows of {kv_dim} do not fit a layer of {} with room for {}",
-            dst.kv_dim,
-            dst.capacity
-        );
-        dst.copy_prefix_from(&LayerCache::from_parts(kv_dim, len, k, v), len);
-        Ok(())
+    }
+
+    /// Empties layer `slot` again — a handover that failed part way: rows
+    /// rolled back to none, a state to its start.
+    pub fn clear_layer(&mut self, slot: CacheSlot) {
+        match slot {
+            CacheSlot::Rows(i) => {
+                if let Some(l) = self.layers.get_mut(i) {
+                    l.truncate(0);
+                }
+            }
+            CacheSlot::State(i) => {
+                if let Some(r) = self.recurrent.get_mut(i) {
+                    r.reset();
+                }
+            }
+        }
     }
 
     /// Tells the owner of this cache's remote rows, if any, that the request
@@ -3760,6 +3862,36 @@ impl RecurrentLayerState {
         self.conv_history.copy_from_slice(&src.conv);
         self.delta_state.copy_from_slice(&src.state);
         // The host wrote; a device copy of ours is stale until re-uploaded.
+        self.fresh = Fresh::Host;
+    }
+
+    /// Whether this state holds nothing: a layer another node of a tree
+    /// runs, in a cache for some layers only.
+    fn is_empty(&self) -> bool {
+        self.conv_history.is_empty() && self.delta_state.is_empty()
+    }
+
+    /// Takes another node's state of this layer — [`LayerHold::State`] —
+    /// as this one's own.
+    fn set_parts(&mut self, conv: Vec<f32>, state: Vec<f32>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            conv.len() == self.conv_history.len() && state.len() == self.delta_state.len(),
+            "a state of {} and {} values does not fit one of {} and {}",
+            conv.len(),
+            state.len(),
+            self.conv_history.len(),
+            self.delta_state.len()
+        );
+        self.conv_history = conv;
+        self.delta_state = state;
+        self.fresh = Fresh::Host;
+        Ok(())
+    }
+
+    /// Back to the state before any position.
+    fn reset(&mut self) {
+        self.conv_history.fill(0.0);
+        self.delta_state.fill(0.0);
         self.fresh = Fresh::Host;
     }
 

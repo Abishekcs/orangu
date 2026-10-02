@@ -102,7 +102,7 @@ use rayon::prelude::*;
 use crate::engine::backend::{Backend, MatmulOp};
 use crate::engine::decode_stages::{self, Stage};
 use crate::engine::hadamard::{self, FoldLedger, Rotation};
-use crate::engine::kv_cache::{KvCache, LayerCache, RecurrentSpec};
+use crate::engine::kv_cache::{CacheSlot, KvCache, LayerCache, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::moe_stats;
 use crate::engine::tensor;
@@ -2072,6 +2072,21 @@ impl<F: HybridFfn> Trunk<F> {
             }
         }
         KvCache::new_mixed(capacity, &kv_dims, &recurrent_specs)
+    }
+
+    /// Where layer `il` keeps a sequence: attention layers and recurrent
+    /// layers each counted on their own, as [`Self::new_kv_cache`] lays
+    /// them out.
+    pub(crate) fn cache_slot(&self, il: usize) -> CacheSlot {
+        let before = &self.layers[..il.min(self.layers.len())];
+        let attention = before
+            .iter()
+            .filter(|l| matches!(l, Layer::FullAttn(..)))
+            .count();
+        match self.layers.get(il) {
+            Some(Layer::Recurrent(..)) => CacheSlot::State(before.len() - attention),
+            _ => CacheSlot::Rows(attention),
+        }
     }
 
     /// The residual stream entering the first layer, for a tree of workers:

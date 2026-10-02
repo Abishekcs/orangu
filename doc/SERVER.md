@@ -1533,13 +1533,15 @@ machines without a `secret` is warned about at startup.
 - `decode` — where a top-level node's sequences decode once their prompt
   is through the tree: `auto` (the default), `tree` or `top`. With `auto`
   or `top`, the node takes every layer's rows back from the workers at the
-  first decode step and decodes alone on the model's own paths — with
-  `auto` only when its measured decode speed beats the tree's, and with
-  either only when it holds the whole model (it then keeps every layer's
-  weights). A chat's next turn goes on there from the kept rows, unless
-  less than half the prompt is reused. On one board, a Mali top-level node
-  with two CPU workers decoded Llama-3.2-3B at 15.2 tok/s this way, against
-  6.2 through the tree, with prompts still read 1.45× faster than alone.
+  first decode step (and a hybrid model's recurrent states) and decodes
+  alone on the model's own paths — with `auto` only when its measured
+  decode speed beats the tree's, and with either only when it holds the
+  whole model (it then keeps every layer's weights) and every worker can
+  send back what it holds. A chat's next turn goes on there from the kept
+  rows, unless less than half the prompt is reused. On one board, a Mali
+  top-level node with two CPU workers decoded Llama-3.2-3B at 15.2 tok/s
+  this way, against 6.2 through the tree, with prompts still read 1.45×
+  faster than alone.
 - `head` — which node applies the output head while a tree decodes
   through its nodes: `auto` (the default), `top` or `last`. `last` has the
   node with the final layer send logits back instead of its layers'
@@ -1549,9 +1551,12 @@ machines without a `secret` is warned about at startup.
   head in memory.
 - `offload` — `auto` (the default) or `always`. With `auto` a top-level
   node that holds the whole model uses its workers only when its measured
-  speeds say the tree is at least 10% faster — at a long prompt (its
-  slowest stage) or a decode step — and otherwise serves alone on the
-  model's own paths, its workers connected but given nothing;
+  speeds say the tree takes at most 90% of its time for a request — a
+  128-token prompt chunk at the tree's slowest stage and an answer as
+  long — and otherwise serves alone on the model's own paths; once
+  requests have run through the tree, what they took goes before the
+  prediction, and a tree that turns out not to pay gives way between
+  requests. Serving alone, its workers stay connected but get nothing;
   `/v1/workers` says why (`not_worth_offloading`). `always` uses them
   whenever it has any.
 - `standby` — spare workers, `host:port` like `workers`, never given layers
@@ -1636,8 +1641,10 @@ not reused there: a file holds only this node's rows.
 
 `GET /v1/workers` shows a node's place in its tree: its role, the layers
 it runs, the plan below it and what its shares followed, each configured
-worker, the processors and measured speed of every node, and any worker
-the plan has lost; the web console shows the same under **Settings › Workers**.
+worker and what it can do (`features`: `state`, for one, lets a hybrid
+model's sequence come back to decode alone), the processors and measured
+speed of every node, and any worker the plan has lost; the web console
+shows the same under **Settings › Workers**.
 `/metrics` adds the `orangu_server_worker*` families: per worker,
 the round trip of a forward, bytes each way, failures, and whether it is
 up; per node, plans and mid-request recoveries. When a request finishes,

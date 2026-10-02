@@ -27,6 +27,7 @@ use super::protocol::{
 };
 #[cfg(test)]
 use super::session::SessionStore;
+use crate::engine::kv_cache::LayerHold;
 use anyhow::{Result, anyhow, bail, ensure};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -299,12 +300,7 @@ impl<E: Exchange> Stage for MessageStage<E> {
         }
     }
 
-    fn layer_rows(
-        &self,
-        session: u64,
-        layer: usize,
-        len: usize,
-    ) -> Result<(usize, Vec<f32>, Vec<f32>)> {
+    fn layer_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold> {
         ensure!(
             self.exchange.features() & super::protocol::FEATURE_ROWS != 0,
             "{} cannot send rows back",
@@ -328,17 +324,38 @@ impl<E: Exchange> Stage for MessageStage<E> {
                     self.exchange.name(),
                     data.len()
                 );
-                let floats: Vec<f32> = data
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b))
-                    .collect();
+                let floats = floats_of(&data);
                 let (k, v) = floats.split_at(n * kv_dim);
-                Ok((kv_dim, k.to_vec(), v.to_vec()))
+                Ok(LayerHold::Rows {
+                    kv_dim,
+                    k: k.to_vec(),
+                    v: v.to_vec(),
+                })
+            }
+            Message::LayerState { conv, state } => {
+                ensure!(
+                    conv.len() % 4 == 0 && state.len() % 4 == 0,
+                    "{} sent a state of {} and {} bytes",
+                    self.exchange.name(),
+                    conv.len(),
+                    state.len()
+                );
+                Ok(LayerHold::State {
+                    conv: floats_of(&conv),
+                    state: floats_of(&state),
+                })
             }
             Message::Error(error) => Err(anyhow!(error)),
             other => bail!("unexpected reply to a rows request: {other:?}"),
         }
     }
+}
+
+/// `f32` little-endian bytes as the values they are.
+fn floats_of(data: &[u8]) -> Vec<f32> {
+    data.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect()
 }
