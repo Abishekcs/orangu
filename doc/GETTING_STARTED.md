@@ -59,7 +59,7 @@ asked for a picture model, which is asked its own keys instead:
 | `log_type` | `console` | `console` or `file`; `file` asks for `log_path`. |
 | `Add web console` | `Y` | Answering `n` writes no `[web]` section, and no console is served. |
 | `Add Prometheus metrics` | `Y` | `n` writes no `[prometheus]` section. Accepting asks for its `host` and `port` (`8300`). |
-| `Add workers` | `Y` | `n` writes no `[workers]` section. Accepting asks for its `host`, `port` (`8400`), `workers`, `standby`, `secret` and `activations`; with no workers listed the server is a node another can use as a worker. |
+| `Add workers` | `Y` | `n` writes no `[workers]` section. Accepting asks for its `host`, `port` (`8400`), `workers`, `standby`, `secret` (`none`, the default, `generate` — shown, to give every node the same — or `type`) and `activations`; with no workers listed the server is a node another can use as a worker. |
 
 Accepting the web console asks four more: its `host` (defaulting to the address
 the API just took), `port` (`8200`), `reexec` (`Y` — may the console load a

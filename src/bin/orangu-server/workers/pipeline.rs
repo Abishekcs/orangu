@@ -817,6 +817,13 @@ pub trait PipelineSource: Send + Sync {
     /// a new plan decides again.
     fn handover_failed(&self) {}
 
+    /// A finished request's decode steps took `parts` — per node, its
+    /// subtree included — over `tokens` steps: what the plan's nodes really
+    /// run at.
+    fn observed_decode(&self, parts: &[(String, Duration)], tokens: usize) {
+        let _ = (parts, tokens);
+    }
+
     /// Whether the node running the model's final layer applies the output
     /// head and sends logits back, rather than this node.
     fn head_on_last(&self) -> bool {
@@ -859,6 +866,8 @@ type Sessions = Arc<Mutex<HashMap<u64, SessionState>>>;
 struct SessionOwner {
     pipeline: Arc<LayerPipeline>,
     sessions: Sessions,
+    /// Told where each finished request's decode time went.
+    source: Arc<dyn PipelineSource>,
 }
 
 impl RemoteLayers for SessionOwner {
@@ -901,10 +910,19 @@ impl RemoteLayers for SessionOwner {
     /// Where the request's time went, logged as it ends: its session may
     /// live on, carried to the slot's next request.
     fn request_finished(&self, session: u64) -> Vec<(String, Duration)> {
-        match self.sessions.lock().unwrap().get_mut(&session) {
-            Some(state) => state.log_trace(),
-            None => Vec::new(),
+        let traced = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&session)
+            .map(SessionState::log_trace);
+        let Some((parts, decode)) = traced else {
+            return Vec::new();
+        };
+        if decode.tokens > 0 {
+            self.source.observed_decode(&decode.parts, decode.tokens);
         }
+        parts
     }
 }
 
@@ -912,13 +930,13 @@ impl SessionState {
     /// Logs the time since the last log, if any forward ran, and starts
     /// counting again. Answers that time per part, prefill and decode
     /// together.
-    fn log_trace(&mut self) -> Vec<(String, Duration)> {
+    fn log_trace(&mut self) -> (Vec<(String, Duration)>, Trace) {
         let (prefill, decode) = (
             std::mem::take(&mut self.prefill),
             std::mem::take(&mut self.decode),
         );
         if prefill.forwards + decode.forwards == 0 {
-            return Vec::new();
+            return (Vec::new(), Trace::default());
         }
         log::info!(
             "orangu-server: workers: prefill {}; decode {}",
@@ -926,10 +944,10 @@ impl SessionState {
             decode.describe("tokens")
         );
         let mut total = prefill;
-        for (name, elapsed) in decode.parts {
-            total.add(&name, elapsed);
+        for (name, elapsed) in &decode.parts {
+            total.add(name, *elapsed);
         }
-        total.parts
+        (total.parts, decode)
     }
 }
 
@@ -1084,6 +1102,7 @@ impl DelegatingModel {
         let owner: Arc<dyn RemoteLayers> = Arc::new(SessionOwner {
             pipeline: pipeline.clone(),
             sessions: self.sessions.clone(),
+            source: self.source.clone(),
         });
         let mut cache = pipeline.new_cache_owned_by(session, capacity, owner);
         if full {

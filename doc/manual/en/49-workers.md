@@ -37,8 +37,9 @@ Each node holds in memory only the layers it runs. Measured with
 Every node needs the model: its own copy of the file, or, for a worker,
 the parts it runs (below). Llama-family models (`llama`, `qwen2`, `qwen3`,
 `qwen3moe`, `mistral`, `qwen2vl`, `qwen3vl`, `granite`), Phi-3 (`phi3`),
-Qwen3.5 dense (`qwen35`, such as Ternary-Bonsai-2-27B), Qwen3-Next
-(`qwen3next`, such as Qwen3-Coder-Next) and Gemma 4 can be split so far.
+Qwen3.5 dense (`qwen35`, such as Ternary-Bonsai-2-27B), the Qwen3.5 mixture
+(`qwen35moe`, such as Qwen3.6-35B-A3B), Qwen3-Next (`qwen3next`, such as
+Qwen3-Coder-Next) and Gemma 4 can be split so far.
 
 A worker does not need the whole model. On a machine without it, set
 
@@ -223,6 +224,11 @@ as the vocabulary, read once a token — can run on the node with the final
 layer instead (`head = last`, or `auto` when that node measured the faster
 decode): it sends logits back rather than its layers' output. That spares a
 weak top-level node the model's largest read.
+
+Once requests have run, a lead plans by the speed each node really showed —
+its layers over its time a token — and plans again between requests when a
+node runs more than 20% off what it was planned at; `/v1/workers` shows
+both (`observed_gb_per_s`, `planned_gb_per_s`).
 
 The decisions weigh the links too. A parent times each worker's link when
 it connects — its round trip and bandwidth — so a fast machine on a slow

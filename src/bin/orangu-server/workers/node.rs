@@ -51,10 +51,11 @@ use crate::engine::arch::ModelForward;
 use crate::engine::loader::LoadedModel;
 use crate::engine::prompt_weights::{self, Decision};
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,10 @@ const ASSIGN_TIMEOUT: Duration = Duration::from_secs(3600);
 /// for a slot's next request live far longer and do not count: a plan made
 /// under them costs that request a rebuild.
 const QUIET: Duration = Duration::from_secs(2);
+
+/// Decode steps a top-level node observes before it weighs planning again
+/// by the speeds they showed (`Node::calibration_due`).
+const CALIBRATE_TOKENS: usize = 32;
 
 pub struct NodeSettings {
     /// How this node is named in plans and error paths: its `[workers]`
@@ -184,6 +189,17 @@ pub struct Node {
     /// Why the last plan used no worker though there were some, or
     /// `None` when it used them.
     not_worth: Mutex<Option<String>>,
+    /// Each node's decode speed as requests found it, by its own name: the
+    /// bytes it ran over its time a token (its subtree, its link and its
+    /// fixed costs included), and over how many tokens.
+    observed: Mutex<HashMap<String, (f64, usize)>>,
+    /// Decode tokens observed since the last plan.
+    observed_since_plan: AtomicUsize,
+    /// The rates the plan in progress uses: the observed ones when every
+    /// node has one, the measured ones otherwise (`None`).
+    observed_now: Mutex<Option<HashMap<String, f64>>>,
+    /// The rate each node of the last top-level plan was planned at.
+    planned_rates: Mutex<HashMap<String, f64>>,
     /// How this process loads another model — its own image again, with
     /// that model — for a parent that assigns one. `None` where
     /// `[web].reexec` is off or there is no `execve`.
@@ -443,6 +459,10 @@ impl Node {
             decode_alone: AtomicBool::new(false),
             head_on_last: AtomicBool::new(false),
             not_worth: Mutex::new(None),
+            observed: Mutex::new(HashMap::new()),
+            observed_since_plan: AtomicUsize::new(0),
+            observed_now: Mutex::new(None),
+            planned_rates: Mutex::new(HashMap::new()),
             handover: OnceLock::new(),
             switching: AtomicBool::new(false),
             serving: OnceLock::new(),
@@ -604,6 +624,11 @@ impl Node {
             "decode": if self.decode_alone.load(Ordering::Acquire) { "here alone" } else { "through the tree" },
             // Why the plan uses no worker though there are some.
             "not_worth_offloading": self.not_worth.lock().unwrap().clone(),
+            // Each node's decode speed as requests found it (gigabytes of its
+            // layers a second, and over how many tokens), and the speed the
+            // plan went by.
+            "observed_gb_per_s": self.observed.lock().unwrap().iter().map(|(n, (rate, tokens))| (n.clone(), serde_json::json!({"rate": rate, "tokens": tokens}))).collect::<serde_json::Map<_, _>>(),
+            "planned_gb_per_s": self.planned_rates.lock().unwrap().clone(),
             "head": if self.head_on_last.load(Ordering::Acquire) { "on the node with the final layer" } else { "here" },
             // Spare workers, and whom each stands in for since the last
             // plan, if anyone.
@@ -762,6 +787,17 @@ impl Node {
     /// below it — runs at, by `[workers].shares`: their rates added up, as
     /// each takes a part in proportion. `0` when one of them did not measure.
     fn rate(&self, setups: &[NodeSetup]) -> f64 {
+        if self.settings.shares == Shares::Decode
+            && let Some(first) = setups.first()
+            && let Some(observed) = self
+                .observed_now
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|rates| rates.get(&first.name).copied())
+        {
+            return observed;
+        }
         let rate = |s: &NodeSetup| match self.settings.shares {
             Shares::Decode => s.decode_rate as f64,
             Shares::Prompt => s.prompt_rate as f64,
@@ -850,6 +886,36 @@ impl Node {
         } else {
             self.settings.capacity.budget_bytes
         };
+        // A top-level plan goes by the speeds requests found once every
+        // node has one — a measurement at start can misjudge a model whose
+        // steps read different weights each token (a mixture's experts) —
+        // and remembers what it went by.
+        if path.len() == 1 {
+            let observed = self.observed.lock().unwrap();
+            let mut names = vec![self.settings.name.clone()];
+            names.extend(
+                candidates
+                    .iter()
+                    .filter_map(|(_, info)| info.capacity.setups.first().map(|s| s.name.clone())),
+            );
+            *self.observed_now.lock().unwrap() = names
+                .iter()
+                .all(|name| observed.contains_key(name))
+                .then(|| names.iter().map(|n| (n.clone(), observed[n].0)).collect());
+            drop(observed);
+            let mut planned = HashMap::new();
+            planned.insert(
+                self.settings.name.clone(),
+                self.rate(&self.settings.capacity.setups[..1]),
+            );
+            for (_, info) in &candidates {
+                if let Some(first) = info.capacity.setups.first() {
+                    planned.insert(first.name.clone(), self.rate(&info.capacity.setups));
+                }
+            }
+            *self.planned_rates.lock().unwrap() = planned;
+            self.observed_since_plan.store(0, Ordering::Relaxed);
+        }
         candidates = self.best_order(&range, own_budget, candidates);
         loop {
             let (local, shares, by) = self.cut(&range, own_budget, &candidates);
@@ -2000,8 +2066,56 @@ impl Node {
                 .is_none_or(|model| model.quiet(QUIET));
             if idle && self.missing_and_due() {
                 self.plan_top();
+            } else if idle && let Some(why) = self.calibration_due() {
+                log::info!(
+                    "orangu-server: workers: planning again by the speeds requests found: {why}"
+                );
+                self.plan_top();
             }
         }
+    }
+
+    /// Whether the speeds requests found tell the plan apart from the speeds
+    /// it was made by — some node more than 20% off, set against this
+    /// node's own — after enough decode steps to tell ([`CALIBRATE_TOKENS`]).
+    /// Says which, for the log. Only for shares by decode speed, and only
+    /// when every node the plan uses has been seen.
+    fn calibration_due(&self) -> Option<String> {
+        if self.settings.shares != Shares::Decode
+            || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
+        {
+            return None;
+        }
+        let in_plan: Vec<String> = self
+            .plan()
+            .into_iter()
+            .filter(|e| e.layer_start < e.layer_end)
+            .map(|e| e.node)
+            .collect();
+        let planned = self.planned_rates.lock().unwrap().clone();
+        let observed = self.observed.lock().unwrap();
+        let own = &self.settings.name;
+        let (&own_planned, &(own_observed, _)) = (planned.get(own)?, observed.get(own)?);
+        let mut off = Vec::new();
+        for (name, planned_rate) in &planned {
+            if name == own || !in_plan.contains(name) {
+                continue;
+            }
+            let &(rate, _) = observed.get(name)?;
+            let ratio = (rate / own_observed) / (planned_rate / own_planned);
+            if !(1.0 / 1.2..=1.2).contains(&ratio) {
+                off.push(format!(
+                    "{name} runs at {ratio:.2} of what it was planned at"
+                ));
+            }
+        }
+        drop(observed);
+        if off.is_empty() {
+            // The plan holds; look again after as many tokens more.
+            self.observed_since_plan.store(0, Ordering::Relaxed);
+            return None;
+        }
+        Some(off.join(", "))
     }
 
     /// Whether a configured worker is not connected, and it is time to try
@@ -2124,6 +2238,61 @@ impl PipelineSource for Node {
 
     fn head_on_last(&self) -> bool {
         self.head_on_last.load(Ordering::Acquire)
+    }
+
+    fn observed_decode(&self, parts: &[(String, Duration)], tokens: usize) {
+        if tokens == 0 {
+            return;
+        }
+        let plan = self.plan();
+        let bytes_of_nodes = |names: &[String]| -> u64 {
+            plan.iter()
+                .filter(|e| names.contains(&e.node))
+                .map(|e| {
+                    plan::bytes_of(
+                        &(e.layer_start as usize..e.layer_end as usize),
+                        &self.layer_bytes,
+                    )
+                })
+                .sum()
+        };
+        let mut observed = self.observed.lock().unwrap();
+        for (part, elapsed) in parts {
+            // This node's own layers, or a worker's subtree by its address.
+            let names: Vec<String> = if *part == self.settings.name {
+                vec![part.clone()]
+            } else {
+                match self
+                    .links
+                    .iter()
+                    .find(|l| l.addr == *part)
+                    .and_then(|l| l.info())
+                {
+                    Some(info) => info
+                        .capacity
+                        .setups
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect(),
+                    None => continue,
+                }
+            };
+            let bytes = bytes_of_nodes(&names);
+            let per_token = elapsed.as_nanos() as f64 / tokens as f64;
+            let (Some(own), true) = (names.first(), bytes > 0 && per_token > 0.0) else {
+                continue;
+            };
+            // Bytes over nanoseconds: gigabytes a second, as measured rates
+            // are. Weighted by tokens, the old capped so a change shows.
+            let rate = bytes as f64 / per_token;
+            let entry = observed.entry(own.clone()).or_insert((rate, 0));
+            let old = entry.1.min(256) as f64;
+            entry.0 = (entry.0 * old + rate * tokens as f64) / (old + tokens as f64);
+            entry.1 += tokens;
+        }
+        drop(observed);
+        self.observed_since_plan
+            .fetch_add(tokens, Ordering::Relaxed);
     }
 
     fn handover_failed(&self) {
@@ -2625,6 +2794,58 @@ mod tests {
         assert!(worker.set_alone(true).is_err());
         top.stop();
         worker.stop();
+    }
+
+    /// A worker that runs slower than it measured — a mixture's experts read
+    /// from disk, say — is given fewer layers once requests show it: the
+    /// plan goes by the speeds they found.
+    #[test]
+    fn a_plan_follows_the_speeds_requests_find() {
+        let with_rate = |name: &str, workers: Vec<String>| {
+            let mut s = settings(name, workers, None);
+            s.shares = Shares::Decode;
+            s.decode = DecodeOn::Tree;
+            s.capacity.setups = vec![NodeSetup {
+                name: name.to_string(),
+                decode_rate: 1.0,
+                prompt_rate: 1.0,
+                ..NodeSetup::default()
+            }];
+            node_with(s, Variant::default())
+        };
+        let a = with_rate("a", vec![]);
+        let addr = a.local_addr().unwrap().to_string();
+        let top = with_rate("top", vec![addr.clone()]);
+        let _model = top.delegating_model().unwrap();
+        let share = |n: &Node| -> usize {
+            n.plan()
+                .iter()
+                .filter(|e| e.node == "a")
+                .map(|e| (e.layer_end - e.layer_start) as usize)
+                .sum()
+        };
+        let before = share(&top);
+        assert!(before >= 2, "{}", describe(&top.plan()));
+        assert!(top.calibration_due().is_none(), "nothing observed yet");
+        // Per byte, `a` took four times as long as this node.
+        let top_layers = N_LAYER - before;
+        top.observed_decode(
+            &[
+                (
+                    "top".to_string(),
+                    Duration::from_millis(10 * top_layers as u64),
+                ),
+                (addr, Duration::from_millis(40 * before as u64)),
+            ],
+            40,
+        );
+        let why = top.calibration_due().expect("a runs slower than planned");
+        assert!(why.contains("a runs at"), "{why}");
+        top.plan_top();
+        assert!(share(&top) < before, "{}", describe(&top.plan()));
+        assert!(top.calibration_due().is_none(), "planned by what was found");
+        top.stop();
+        a.stop();
     }
 
     /// A node that holds the model and would run it faster alone serves

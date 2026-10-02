@@ -85,6 +85,41 @@ impl ModelForward for Qwen35MoeModel {
     fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
         anyhow::bail!("embeddings are not yet supported for Qwen3.5-MoE models")
     }
+
+    /// The same cut as `qwen35`'s and `qwen3next`'s, through the same trunk:
+    /// each layer keeps its own state — a full-attention layer its KV rows, a
+    /// gated-DeltaNet layer its recurrent state — and passes on only the
+    /// residual stream, the experts included, so any cut is exact.
+    fn supports_layer_split(&self) -> bool {
+        true
+    }
+
+    fn new_kv_cache_for_layers(&self, layers: std::ops::Range<usize>, capacity: usize) -> KvCache {
+        self.trunk.new_kv_cache_for_layers(layers, capacity)
+    }
+
+    fn embed(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.trunk.embed(tokens)
+    }
+
+    /// The host path over `layers`, the card's clock held as for a whole
+    /// step.
+    fn forward_layers(
+        &self,
+        cache: &mut KvCache,
+        hidden: Vec<f32>,
+        tokens: &[u32],
+        layers: std::ops::Range<usize>,
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        let _clock = super::hold_clock_for_step(self.trunk.backend.as_ref(), tokens.len());
+        self.trunk
+            .forward_range(cache, hidden, tokens.len(), start_pos, layers)
+    }
+
+    fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        self.trunk.head_rows(hidden, n_rows)
+    }
 }
 
 #[cfg(test)]

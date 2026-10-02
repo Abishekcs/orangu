@@ -160,14 +160,22 @@ pub fn run_init() -> Result<()> {
         let standby = prompt_workers_list("standby, blank for none", workers_port.trim())?;
         // The same warning the API key gives: a blank secret on a widened
         // address lets anything that reaches the port take part.
-        let secret = if is_public_host(&workers_host) {
-            prompt_line(
-                "secret (blank = no authentication, and any machine that can reach this port can \
-                 join)",
-                "",
-            )?
-        } else {
-            prompt_line("secret (blank = no authentication)", "")?
+        // None (the default), a generated one, or one typed in — the same on
+        // every node of the tree, so a generated one is shown to be copied.
+        let secret = match prompt_choice(
+            "secret (none, generate or type)",
+            "none",
+            &["none", "generate", "type"],
+        )?
+        .as_str()
+        {
+            "generate" => {
+                let secret = new_secret();
+                println!("secret: {secret} (give every node of the tree the same)");
+                secret
+            }
+            "type" => prompt_required("secret (the same on every node of the tree)")?,
+            _ => String::new(),
         };
         let activations = prompt_choice(
             "activations",
@@ -1686,6 +1694,12 @@ impl WorkersAnswers {
         }
         section
     }
+}
+
+/// A random `[workers].secret`: 128 bits as hex.
+fn new_secret() -> String {
+    let bits: [u8; 16] = rand::random();
+    bits.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Prompts for a plain value (no filesystem completion), reusing `default`

@@ -2142,7 +2142,9 @@ prefill chunk and every generated token.
 
 Like `[web]` and `[prometheus]`, a config with no `[workers]` section has
 none. `-i`/`--init` asks `Add workers` (default yes), then `host`, `port`,
-`workers`, `secret` and `activations`, or writes no section at all.
+`workers`, `secret` and `activations`, or writes no section at all. `secret`
+is `none` (the default), `generate` — a random one, shown so the same can
+be given to every node — or `type`.
 
 ```ini
 [workers]
@@ -2378,7 +2380,8 @@ both models.
 
 Llama-family models (`llama`, `qwen2`, `qwen3`, `qwen3moe`, `mistral`,
 `qwen2vl`, `qwen3vl`, `granite`), Phi-3 (`phi3`), Qwen3.5 dense (`qwen35`),
-Qwen3-Next (`qwen3next`) and Gemma 4 (`gemma4`) can be split so far. A node with another architecture serves alone, with a warning, and
+the Qwen3.5 mixture (`qwen35moe`), Qwen3-Next (`qwen3next`) and Gemma 4
+(`gemma4`) can be split so far. A node with another architecture serves alone, with a warning, and
 refuses to work for a parent. Picture models are not delegated. The embedding role is: an embeddings
 request runs through the tree like a prompt, and the top applies the final
 norm and the pooling.
@@ -2416,7 +2419,8 @@ Then `Add workers` (default yes) — declining writes no `[workers]` section;
 accepting prompts for a `host` (defaulting to the API's), a `port`
 (suggesting `8400`), the comma-separated `host:port` list of `workers`
 — an entry without a port takes that `port` — re-prompting until the list
-parses, then `secret` (blank writes none) and `activations` (TAB-completing
+parses, then `secret` (`none`, the default, writes none; `generate` writes
+a random one and shows it; `type` asks for it) and `activations` (TAB-completing
 `f32`/`f16`/`q8_0`, written only when not `f16`). A `models`
 directory that doesn't exist yet is created, parents included, rather than
 refused. The last `[orangu-server]`
