@@ -187,6 +187,18 @@ Every completed request logs a throughput line, orangu-server-style:
 orangu-server: [slot 0] prompt 42 tokens in 0.18s (233.33 tok/s), generated 128 tokens in 4.31s (29.70 tok/s)
 ```
 
+
+**Reading the model ahead.** A model whose weights are read from their
+file while it serves — on the CPU, a split's layers on the host, or a
+picture model, whose encoder and transformer reach their devices on the
+first picture — would otherwise read them from disk on the first
+requests. Once it is ready the server reads its model files through in
+the background at the lowest disk priority, when they fit in half the
+available memory, and says so (`reading the model files ahead …`); a
+request that arrives meanwhile still goes first. A model copied whole to a
+GPU at startup has read its files already, and is not read again.
+`ORANGU_PREFETCH=0` turns the read-ahead off.
+
 ## GGUF inventory
 
 Eight subcommands cover getting, sizing, choosing, keeping current, and

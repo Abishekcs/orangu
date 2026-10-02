@@ -1255,6 +1255,18 @@ tokens). `ORANGU_EXPERT_I8MM=0` turns it off for an A/B on one binary;
 of 4–64 on that core: more rows reuse each activation tile from L1 across
 more `smmla` tiles, until the unpacked rows crowd it out).
 
+On x86-64 with `AVX2` the same tile runs as `vecdot::dot_k_rows_avx2`, over
+the same `ActQ8Mm` layout: the rows are re-laid into that pair layout once
+per call, each 32-byte load is `vpmaddubsw(|w|, sign(x, w))`, and the
+`vpmaddwd` that widens the products to `i32` multiplies by the rows'
+sub-block scales on the way, so the K-quant scale costs no instruction.
+Four rows against four tokens per pass, one horizontal fold per
+super-block; `Q4_K`'s min correction is a `vpmaddwd` of the mins against
+the tokens' sub-block sums. It is bit-identical to the pair kernel as
+well, under the same test. `vecdot::have_k_rows_tile` (`i8mm` on aarch64,
+`AVX2` on x86-64) is what `CpuBackend::matmul_k_gemm_into` and the VAE's
+gathered `Q6_K` convolutions ask before taking the tile.
+
 **A picture's attention scores run on `smmla` too.** Attention is the part
 of a denoising step that grows with the square of the picture: profiled
 with `orangu-bench --image … --flamegraph`, a Qwen-Image 2.1 step spends
@@ -1281,13 +1293,28 @@ shape against ~100 for `gemm_f32_rows`); `ORANGU_IMAGE_PV=rten|orangu`
 picks the `f32` paths. The prompt prefix, the vision tower and the VAE keep `f32`
 attention; they run once a picture.
 
+**A step overlaps the host's attention with the device's linears.** When
+the picture transformer's linears run on a device (no per-row `int8`
+copy), `QwenImage21Transformer::forward` cuts each block's attention into
+query chunks — four by default, each at least 1024 tokens, else the block
+runs its stages in order — on the global rayon pool, and a device lane
+on a small pool of its own (`image-lane-*`, a quarter of the workers, at
+most four) runs every finished chunk's tail: the output projection, the
+gated residual, the norm and the MLP. A token's tail reads only its own
+row and a query's attention only its own query and the keys, so the
+result is the serial pass's to the bit
+(`attention_by_query_chunks_is_the_whole_attention`). The stage line
+then reads attention as the chunked attention's wall time (the device
+working inside it) and mlp as the wait for the last chunk's tail.
+`ORANGU_IMAGE_OVERLAP` sets the tokens per chunk; `0` turns it off.
+
 **Every one of these kernels exists on every architecture.** The
 `smmla` tile product has a portable twin (`vecdot::dot_k_rows_portable`,
 the same arithmetic in `i32` and `f32` scalars, bit-identical to the pair
 kernel and to `smmla`, which the same test asserts on every machine), and
-it is what `dot_k_rows_tiles` is off `aarch64` — a complete definition,
-not a stub, though the callers there prefer the pair kernels' `AVX2`/`VNNI`
-forms through `have_i8mm`. The float prefill GEMM (`gemm_f32_rows`,
+it is what `dot_k_rows_tiles` runs on a core with neither `i8mm` nor
+`AVX2` — a complete definition, not a stub; the callers there take the pair
+kernels instead, through `have_k_rows_tile`. The float prefill GEMM (`gemm_f32_rows`,
 `dot_f32_slices`, `widen_float_row`), its two-dimensional split in
 `CpuBackend::matmul_float_into`, and the blocked joint attention of the
 picture transformer (`joint_attention_blocked`) are architecture-

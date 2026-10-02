@@ -288,9 +288,10 @@ fn unmap_pages(mapping: &Mmap) {
 
 /// Starts reading every registered shard into the page cache in the
 /// background, when they all fit in half the memory the kernel says is
-/// available — so weights a server uploads lazily, on its first request
-/// (a picture model's encoder and transformer), come from RAM rather than
-/// from a slow disk if any idle time passes first. Returns the bytes it
+/// available — so weights a server reads through their mappings on its
+/// first requests (a picture model's encoder and transformer, uploaded
+/// lazily; a model on the CPU, or a split's host layers) come from RAM
+/// rather than from a slow disk if any idle time passes first. Returns the bytes it
 /// will read, or `None` when they do not fit (reading ahead a model larger
 /// than RAM only evicts what is already there).
 ///
@@ -299,6 +300,16 @@ fn unmap_pages(mapping: &Mmap) {
 /// returned at once having read 4 MiB of a 3.9 GiB file. The thread runs at
 /// the idle I/O priority, so a request's own page faults go first.
 pub fn prefetch_registered() -> Option<u64> {
+    // `ORANGU_PREFETCH=0` turns it off (an A/B, a fast disk, a machine whose
+    // memory is better left to something else).
+    if std::env::var("ORANGU_PREFETCH").is_ok_and(|v| v.trim() == "0") {
+        return None;
+    }
+    // Once a process: a second call would only start a second reader.
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     // One read a file: a picture server maps its transformer and its text
     // encoder more than once (the calibration's open, the vision path's).
     let mut seen = std::collections::HashSet::new();
@@ -312,6 +323,9 @@ pub fn prefetch_registered() -> Option<u64> {
     let total: u64 = paths.iter().map(|(_, len)| len).sum();
     let available = available_memory_bytes()?;
     if total == 0 || total > available / 2 {
+        return None;
+    }
+    if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return None;
     }
     std::thread::Builder::new()

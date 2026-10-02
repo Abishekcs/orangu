@@ -1904,6 +1904,14 @@ fn prepare(args: Args) -> Result<Prepared> {
     // backend exactly as the encoder's were above: a device with no kernel
     // for one of its quantizations must fail here, not on the first step of
     // the first picture.
+    // Whether this model's weights are read through their mappings while it
+    // serves rather than all copied to a device at load: a picture model
+    // (its encoder and transformer reach their devices on the first
+    // picture), a model on the CPU, a split's host layers. Those are read
+    // ahead once the server is ready — see `page_cache::prefetch_registered`.
+    let reads_through_mappings = image_companions.is_some()
+        || split.as_ref().is_some_and(|s| s.plan.runs_on_host())
+        || (split.is_none() && backend.as_wgpu().is_none());
     let image = match &image_companions {
         Some(companions) => {
             let mut transformer = match transformer_opened.take() {
@@ -2038,18 +2046,6 @@ fn prepare(args: Args) -> Result<Prepared> {
                 conf.vae_precision,
             )?;
             pipeline.adapter = lora_path.clone();
-            // The encoder's and the transformer's weights reach their devices
-            // on the first picture, read through their mappings then — from
-            // disk, if the page cache has lost them. Reading them ahead now,
-            // in the background, turns any idle time before that picture into
-            // the read (on a slow disk, a minute or two of the first
-            // picture's encode).
-            if let Some(bytes) = engine::page_cache::prefetch_registered() {
-                log::info!(
-                    "orangu-server: [image] reading the model files ahead ({}) while idle",
-                    orangu::format::format_bytes(bytes)
-                );
-            }
             // What the defaults cost on this machine, said once, up front —
             // with the knobs that bring it down, when it is long enough
             // that somebody would otherwise conclude the server hung.
@@ -2823,6 +2819,16 @@ fn prepare(args: Args) -> Result<Prepared> {
         if let Err(err) = orangu::model_registry::record_used(&model_label, path) {
             log::warn!("warning: could not update ~/.orangu/models: {err:#}");
         }
+    }
+
+    // Read the model files ahead, in the background, so any idle time
+    // before the first requests becomes the read rather than leaving it to
+    // their page faults — on a slow disk, minutes of a cold first request.
+    if reads_through_mappings && let Some(bytes) = engine::page_cache::prefetch_registered() {
+        log::info!(
+            "orangu-server: reading the model files ahead ({}) while idle",
+            orangu::format::format_bytes(bytes)
+        );
     }
 
     Ok(Prepared {

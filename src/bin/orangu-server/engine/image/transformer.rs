@@ -145,11 +145,16 @@ pub struct Stages {
     pub modulation: Duration,
     /// The six attention input projections (`to_q/k/v`, `add_q/k/v_proj`).
     pub qkv: Duration,
-    /// The head norms, RoPE, and the joint attention itself.
+    /// The head norms, RoPE, and the joint attention itself. When a pass
+    /// overlaps its attention with the device, this is the attention's wall
+    /// time, with the earlier chunks' output projection and MLP running on
+    /// the device inside it.
     pub attention: Duration,
     /// The two attention output projections.
     pub out: Duration,
-    /// The four feed-forward linears and their GELU.
+    /// The four feed-forward linears and their GELU. Under the overlap,
+    /// the wait for the last chunk's output projection and MLP after the
+    /// attention ends.
     pub mlp: Duration,
     /// Embeddings, layer norms, modulation arithmetic, gated residual adds,
     /// and the final projection — everything else.
@@ -1762,6 +1767,52 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(worst < 0.02, "causal worst {worst}");
+    }
+
+    /// A step's attention cut into query chunks — what a step overlapping
+    /// the device runs — is the whole picture's attention to the bit, on
+    /// both score paths: a query's row depends on its own query and the
+    /// keys, never on which queries share its block. Chunks that are no
+    /// multiple of the query block, nor of four, and keys past the queries
+    /// (the prompt's prefix).
+    #[test]
+    fn attention_by_query_chunks_is_the_whole_attention() {
+        let n_q = ATTN_QUERIES * 3 + 7;
+        let n_kv = n_q + 11;
+        let (n_head, head_dim) = (2, 16);
+        let dim = n_head * head_dim;
+        let unit = |i: usize, salt: usize| ((i * 31 + salt * 17) % 29) as f32 / 14.0 - 1.0;
+        let q: Vec<f32> = (0..n_q * dim).map(|i| unit(i, 1)).collect();
+        let k: Vec<f32> = (0..n_kv * dim)
+            .map(|i| unit(i, 2) + 3.0 * ((i % 7) == 0) as u8 as f32)
+            .collect();
+        let v: Vec<f32> = (0..n_kv * dim).map(|i| unit(i, 3)).collect();
+        for int8 in [false, true] {
+            let whole = attention_blocked(&q, n_q, &k, &v, n_kv, n_head, head_dim, 0.5, None, int8);
+            for chunk in [37usize, 101] {
+                let mut got = Vec::new();
+                for qc in q.chunks(chunk * dim) {
+                    got.extend(attention_blocked(
+                        qc,
+                        qc.len() / dim,
+                        &k,
+                        &v,
+                        n_kv,
+                        n_head,
+                        head_dim,
+                        0.5,
+                        None,
+                        int8,
+                    ));
+                }
+                assert_eq!(got.len(), whole.len());
+                let differ = got
+                    .iter()
+                    .zip(&whole)
+                    .position(|(a, b)| a.to_bits() != b.to_bits());
+                assert_eq!(differ, None, "int8 {int8} chunk {chunk}");
+            }
+        }
     }
 
     /// One query identical to one key attends almost entirely to it under a

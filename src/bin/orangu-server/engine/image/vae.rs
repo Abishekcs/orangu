@@ -515,10 +515,11 @@ pub(super) fn run_conv(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Featu
     // feature map, 268 MiB at full resolution) never exists. Any other
     // backend, or `f32` weights, get the band through `matmul_batch`.
     // The per-row weights take the `int8` tile wherever one exists
-    // (`have_rowi8_tile`); the `Q6_K` ones the K-quant tile, `i8mm` only.
+    // (`have_rowi8_tile`); the `Q6_K` ones the K-quant tile
+    // (`have_k_rows_tile`).
     let gathered = backend.is_cpu()
         && ((conv.rowi8.is_some() && crate::engine::vecdot::have_rowi8_tile())
-            || (crate::engine::vecdot::have_i8mm()
+            || (crate::engine::vecdot::have_k_rows_tile()
                 && crate::engine::vecdot::supports_k(conv.w.ggml_type(), cols)));
     let mut patches = Vec::new();
     let mut y = Vec::new();
@@ -891,7 +892,7 @@ mod tests {
         let vae = vae_shell();
         for padding in [Padding::Same, Padding::HalveDownRight] {
             let exact = vae.conv(&conv_with(rows.clone(), cin, cout, k, padding), &x);
-            // `Q6_K` on the K-quant kernel (the band, off `i8mm`), and
+            // `Q6_K` on the K-quant tile (or the band, without one), and
             // per-row `int8` on the `int8` tile, gathered.
             for rowi8 in [false, true] {
                 let int8 = Conv {

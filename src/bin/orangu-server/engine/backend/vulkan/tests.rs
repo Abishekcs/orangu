@@ -5505,7 +5505,7 @@ fn image_linears_on_the_device() {
         let (kernel_us, name) = vulkan
             .matmul_kernel_us_tokens(&x[..stripe * in_dim], stripe, &w, 4)
             .expect("timestamps");
-        for width in [256usize, 512, 1024, 2048] {
+        for width in [256usize, 512, 1024, 2048, 4096] {
             let op = [MatmulOp {
                 x: &x[..width * in_dim],
                 n_tokens: width,
@@ -5529,7 +5529,7 @@ fn image_linears_on_the_device() {
         }
         // The same 4096 tokens as consecutive narrow calls, each its own
         // `matmul_batch` (the integer-dot GEMM's width), results appended.
-        for chunk in [256usize, 512] {
+        for chunk in [256usize, 512, 1024, 2048] {
             let run = || {
                 let mut out = Vec::with_capacity(n_tokens * out_dim);
                 for c in (0..n_tokens).step_by(chunk) {

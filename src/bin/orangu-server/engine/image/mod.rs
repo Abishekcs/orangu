@@ -1147,10 +1147,18 @@ impl Pipeline {
         match &self.model {
             Model::QwenImage { .. } => Ok(Condition::Hidden(self.encode_prompt(prompt)?)),
             Model::QwenImage21 { transformer, .. } => {
+                let started = Instant::now();
                 let hidden = self.encode_prompt21(prompt)?;
-                Ok(Condition::Prefix(
-                    transformer.prefill(&hidden, Some(cancel))?,
-                ))
+                let encoded = started.elapsed();
+                let prefix = transformer.prefill(&hidden, Some(cancel))?;
+                log::info!(
+                    "orangu-server: [image] prompt: text encoder {:.1}s, transformer prefix {:.1}s \
+                     ({} tokens)",
+                    encoded.as_secs_f64(),
+                    (started.elapsed() - encoded).as_secs_f64(),
+                    hidden.len() / self.encoder.config().n_embd.max(1),
+                );
+                Ok(Condition::Prefix(prefix))
             }
         }
     }

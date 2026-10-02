@@ -69,7 +69,7 @@ has an 8-bit matrix kernel (`i8mm` or `AVX2`) and the machine has 21 GB
 or more; a GPU keeps the file's own weights. A machine with 16 GB is
 enough. Once it is ready the server reads its model files through in the
 background, at the lowest disk priority, when they fit in half the
-available memory (`[image] reading the model files ahead …`): the
+available memory (`reading the model files ahead …`): the
 encoder and the transformer reach their devices on the first picture,
 and from RAM rather than from a slow disk if any idle time has passed.
 
@@ -92,7 +92,12 @@ split across several devices, the transformer is timed on each of them
 and on the CPU and runs whole on the fastest (`[image] transformer
 placement …`) — not necessarily the device it fits on best. The VAE is
 timed the same way, on one of its own convolutions, and runs on the CPU
-when the CPU is faster there (`[image] VAE placement …`). The wait is never a
+when the CPU is faster there (`[image] VAE placement …`). With the
+transformer on a device, each block's attention runs on the CPU in
+chunks of the picture's tokens while the device runs the output
+projection and the feed-forward layers of the chunks already done, so
+the two work at the same time; the picture is the same, bit for bit
+(`ORANGU_IMAGE_OVERLAP=0` runs them one after the other). The wait is never a
 surprise: the startup log says what a picture at the defaults costs on
 this machine, and the console counts it down.
 

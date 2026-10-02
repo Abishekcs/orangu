@@ -58,7 +58,7 @@ const F32_TOKEN_BLOCK: usize = 258;
 const F32_ROW_GROUP: usize = 32;
 
 /// A raw output pointer rayon tasks may share. Sound only under the
-/// discipline `matmul_k_gemm_into`'s `i8mm` path keeps: every task writes a
+/// discipline `matmul_k_gemm_into`'s tile path keeps: every task writes a
 /// column range no other task touches, inside the loop the pointer was
 /// taken for.
 #[derive(Clone, Copy)]
@@ -259,7 +259,7 @@ impl CpuBackend {
         in_dim: usize,
         out_dim: usize,
     ) {
-        if vecdot::have_i8mm() {
+        if vecdot::have_k_rows_tile() {
             let acts = vecdot::ActQ8Mm::quantize(x, in_dim, n_tokens);
             Self::matmul_k_mm_into(
                 out, &acts, n_tokens, ggml_type, raw, row_bytes, in_dim, out_dim,
@@ -288,7 +288,7 @@ impl CpuBackend {
         Self::finish_into(out, yt, n_tokens, out_dim);
     }
 
-    /// The K-quant prefill GEMM on the `i8mm` kernel for activations
+    /// The K-quant prefill GEMM on the tile kernel for activations
     /// already quantized — the entry a caller with its own `ActQ8Mm` uses
     /// (the VAE gathers its convolution windows straight into one).
     #[allow(clippy::too_many_arguments)]
@@ -303,7 +303,7 @@ impl CpuBackend {
         out_dim: usize,
     ) {
         {
-            // `k_rows_per_task` rows per task for the `smmla` kernel
+            // `k_rows_per_task` rows per task for the tile kernel
             // (`vecdot::dot_k_rows_tiles`), unpacked once each, over a block
             // of token tiles — two dimensions, so a matmul of few rows
             // against many tokens (a VAE convolution: 96 rows, 65,536
@@ -754,12 +754,30 @@ impl CpuBackend {
             std::mem::swap(out, &mut yt);
             return;
         }
-        out.resize(n_tokens * out_dim, 0.0);
-        for o in 0..out_dim {
-            for t in 0..n_tokens {
-                out[t * out_dim + o] = yt[o * n_tokens + t];
-            }
-        }
+        // A blocked transpose, a rayon task per block of tokens, written
+        // straight into `out`'s spare capacity: one thread walking the whole
+        // `[out_dim][n_tokens]` accumulator column by column (after zeroing
+        // `out` first) was 5% of a `Q8_0` model's prompt. Per block, each
+        // output row's tokens are one contiguous read.
+        const TOKENS: usize = 16;
+        out.clear();
+        out.reserve_exact(n_tokens * out_dim);
+        let dst = &mut out.spare_capacity_mut()[..n_tokens * out_dim];
+        dst.par_chunks_mut(TOKENS * out_dim)
+            .enumerate()
+            .for_each(|(block, rows)| {
+                let t0 = block * TOKENS;
+                let n = rows.len() / out_dim;
+                for o in 0..out_dim {
+                    let src = &yt[o * n_tokens + t0..o * n_tokens + t0 + n];
+                    for (k, &v) in src.iter().enumerate() {
+                        rows[k * out_dim + o].write(v);
+                    }
+                }
+            });
+        // Safety: every one of the first `n_tokens * out_dim` slots was
+        // written above — each block covers its tokens' whole rows.
+        unsafe { out.set_len(n_tokens * out_dim) };
     }
 
     /// The dequantize path, on its own: every weight row widened to `f32`
@@ -1452,9 +1470,9 @@ mod tests {
         let gmac = (in_dim * out_dim * n_tokens) as f64 / secs / 1e9;
         eprintln!(
             "k_gemm {in_dim}x{out_dim} x {n_tokens} tokens: {:.1} ms, {gmac:.1} G MAC/s \
-             (i8mm {}, rows/task {})",
+             (tile {}, rows/task {})",
             secs * 1e3,
-            vecdot::have_i8mm(),
+            vecdot::have_k_rows_tile(),
             vecdot::k_rows_per_task()
         );
     }
@@ -1530,6 +1548,73 @@ mod tests {
         assert!(
             !CpuBackend::packed_gemm_f32(&mut out, &x, &rows, 1, in_dim, out_dim),
             "one token should stay on the mat-vec kernel"
+        );
+    }
+
+    /// The output transpose is the plain `[out_dim][n_tokens]` →
+    /// `[n_tokens][out_dim]` one, over a token count whose last block is
+    /// short, into an output that held something before.
+    #[test]
+    fn finish_into_is_the_plain_transpose() {
+        let (n_tokens, out_dim) = (37usize, 5usize);
+        let yt: Vec<f32> = (0..n_tokens * out_dim).map(|i| i as f32 * 0.5).collect();
+        let mut out = vec![9.0f32; 3];
+        CpuBackend::finish_into(&mut out, yt.clone(), n_tokens, out_dim);
+        assert_eq!(out.len(), n_tokens * out_dim);
+        for t in 0..n_tokens {
+            for o in 0..out_dim {
+                assert_eq!(
+                    out[t * out_dim + o],
+                    yt[o * n_tokens + t],
+                    "token {t} row {o}"
+                );
+            }
+        }
+    }
+
+    /// The flat (`Q8_0`) sibling of [`k_gemm_throughput`]: a text encoder's
+    /// prompt (4096 → 12288, 55 tokens) by default.
+    /// `ORANGU_BENCH_SHAPE=in,out,tokens` picks another; `cargo test --release
+    /// --bin orangu-server flat_gemm_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn flat_gemm_throughput() {
+        let (in_dim, out_dim, n_tokens) = std::env::var("ORANGU_BENCH_SHAPE")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').map(|p| p.trim().parse::<usize>().ok());
+                Some((it.next()??, it.next()??, it.next()??))
+            })
+            .unwrap_or((4096, 12288, 55));
+        // `Q8_0` blocks: an `f16` scale and 32 signed bytes.
+        let mut bytes = Vec::with_capacity(out_dim * in_dim / 32 * 34);
+        for b in 0..out_dim * in_dim / 32 {
+            bytes.extend_from_slice(
+                &half::f16::from_f32(0.01 + (b % 7) as f32 * 0.001).to_le_bytes(),
+            );
+            bytes.extend((0..32).map(|i| (((b * 31 + i * 17) % 255) as i32 - 127) as i8 as u8));
+        }
+        let w = test_quant_matrix(
+            &bytes,
+            crate::engine::quant::GGML_TYPE_Q8_0,
+            in_dim,
+            out_dim,
+        );
+        let x: Vec<f32> = (0..n_tokens * in_dim)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.037)
+            .collect();
+        let mut out = Vec::new();
+        CpuBackend.matmul_into(&mut out, &x, n_tokens, &w);
+        let reps = 5;
+        let started = std::time::Instant::now();
+        for _ in 0..reps {
+            CpuBackend.matmul_into(&mut out, &x, n_tokens, &w);
+        }
+        let secs = started.elapsed().as_secs_f64() / reps as f64;
+        eprintln!(
+            "flat Q8_0 {in_dim}x{out_dim} x {n_tokens} tokens: {:.1} ms, {:.1} G MAC/s",
+            secs * 1e3,
+            (in_dim * out_dim * n_tokens) as f64 / secs / 1e9
         );
     }
 

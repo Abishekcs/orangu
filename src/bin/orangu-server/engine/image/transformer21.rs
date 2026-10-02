@@ -513,6 +513,47 @@ impl QwenImage21Transformer {
         })
     }
 
+    /// The query tokens per chunk when a step overlaps its attention with
+    /// the device ([`Self::forward`]), or `None` to run each block's stages
+    /// one after the other. Overlap needs the linears off the host — a
+    /// device backend, no per-row `int8` copy — and pays from about a
+    /// thousand tokens a chunk: by default four chunks, none under
+    /// [`OVERLAP_MIN_CHUNK`] tokens. `ORANGU_IMAGE_OVERLAP` sets the tokens
+    /// per chunk; `0` turns it off.
+    fn overlap_chunk(&self, n_img: usize) -> Option<usize> {
+        if self.backend.is_cpu() || self.rowi8.is_some() {
+            return None;
+        }
+        let configured = std::env::var("ORANGU_IMAGE_OVERLAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let chunk = match configured {
+            Some(0) => return None,
+            Some(tokens) => tokens,
+            None => n_img.div_ceil(OVERLAP_CHUNKS),
+        };
+        (chunk >= OVERLAP_MIN_CHUNK && chunk < n_img).then_some(chunk)
+    }
+
+    /// One block's per-token tail over `x`'s rows, given their attention:
+    /// `x += gate1 · to_out(attn)`, then `x += gate2 · mlp(norm(x) · scale2)`
+    /// — what [`Self::forward`] runs on the whole picture, for a chunk.
+    fn block_tail(&self, block: &Block, gates: &Gates<'_>, x: &mut [f32], attn: Vec<f32>) {
+        let c = &self.config;
+        let n = x.len() / c.dim;
+        let out = self.linear(&attn, n, &block.to_out);
+        self.backend.recycle(attn);
+        gated_add(x, &out, gates.gate1, c.dim);
+        self.backend.recycle(out);
+        let mut normed = self.backend.take_scratch(x.len());
+        layer_norm_into(&mut normed, x, c.dim, c.eps);
+        scale_inplace(&mut normed, gates.scale2, c.dim);
+        let mlp = self.mlp(block, &normed, n);
+        self.backend.recycle(normed);
+        gated_add(x, &mlp, gates.gate2, c.dim);
+        self.backend.recycle(mlp);
+    }
+
     /// `out(silu(gate) · up)`.
     fn mlp(&self, block: &Block, x: &[f32], n: usize) -> Vec<f32> {
         let m = self.mlp_dim;
@@ -604,6 +645,7 @@ impl QwenImage21Transformer {
         let mut normed = Vec::new();
         let mut keys = Vec::with_capacity(n_kv * c.dim);
         let mut values = Vec::with_capacity(n_kv * c.dim);
+        let overlap = self.overlap_chunk(n_img);
         clock.lap(|s| &mut s.other);
         for (bi, block) in self.blocks.iter().enumerate() {
             if super::cancelled(input.cancel) {
@@ -630,6 +672,54 @@ impl QwenImage21Transformer {
             // done with, for the next one to reuse (`Backend::recycle`).
             self.backend.recycle(k);
             self.backend.recycle(v);
+            if let Some(chunk) = overlap {
+                // The attention by query chunks on the host, and each
+                // finished chunk's tail (`to_out`, residual, norm, MLP) on
+                // the device lane meanwhile: a token's tail reads only its
+                // own row, and a query's attention only its own query.
+                let gates = Gates {
+                    gate1: &gate1,
+                    scale2,
+                    gate2: &gate2,
+                };
+                std::thread::scope(|scope| {
+                    let (send, receive) = std::sync::mpsc::channel::<Vec<f32>>();
+                    let x = &mut x;
+                    let lane = scope.spawn(move || {
+                        lane_pool().install(|| {
+                            for (rows, attn) in x.chunks_mut(chunk * c.dim).zip(receive) {
+                                self.block_tail(block, &gates, rows, attn);
+                            }
+                        })
+                    });
+                    for qc in q.chunks(chunk * c.dim) {
+                        let attn = step_attention(
+                            qc,
+                            qc.len() / c.dim,
+                            &keys,
+                            &values,
+                            n_kv,
+                            c.n_head,
+                            c.head_dim,
+                            scale,
+                            None,
+                        );
+                        if send.send(attn).is_err() {
+                            // The lane ended early: its panic is re-raised
+                            // by the join below.
+                            break;
+                        }
+                    }
+                    drop(send);
+                    clock.lap(|s| &mut s.attention);
+                    if let Err(panic) = lane.join() {
+                        std::panic::resume_unwind(panic);
+                    }
+                });
+                self.backend.recycle(q);
+                clock.lap(|s| &mut s.mlp);
+                continue;
+            }
             let attn = step_attention(
                 &q, n_img, &keys, &values, n_kv, c.n_head, c.head_dim, scale, None,
             );
@@ -664,6 +754,35 @@ impl QwenImage21Transformer {
             .add(&clock.stages);
         Ok(out)
     }
+}
+
+/// The chunks a step's attention is cut into when it overlaps the device
+/// ([`QwenImage21Transformer::overlap_chunk`]).
+const OVERLAP_CHUNKS: usize = 4;
+
+/// The narrowest chunk worth overlapping: below it the device's calls on
+/// a chunk cost more than the overlap saves.
+const OVERLAP_MIN_CHUNK: usize = 1024;
+
+/// A block's modulation for its per-token tail.
+struct Gates<'a> {
+    gate1: &'a [f32],
+    scale2: &'a [f32],
+    gate2: &'a [f32],
+}
+
+/// The threads the device lane's host work runs on (the residual adds, the
+/// norm, the MLP's activation, the device calls' staging and copies) while
+/// the attention holds the global pool: a quarter of it, at most four.
+fn lane_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((rayon::current_num_threads() / 4).clamp(1, 4))
+            .thread_name(|i| format!("image-lane-{i}"))
+            .build()
+            .expect("the image lane's thread pool")
+    })
 }
 
 /// How the blocks' linears are held — `[orangu-server].image_weights`.
