@@ -5502,6 +5502,39 @@ fn image_linears_on_the_device() {
                 );
             }
         }
+        // The integer-dot GEMM a short call takes, against the float
+        // kernel the striped path runs: on one matrix repeated (as the
+        // float figures above) and over four (as a layer loop sees them).
+        let others: Vec<QuantMatrix> = (1..4u64)
+            .map(|k| {
+                let mut seed = 0x0051_DE0F_u64 ^ (k * 0x9E37_79B9);
+                let mut bytes = Vec::new();
+                for _ in 0..out_dim * (in_dim / block) {
+                    bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+                }
+                test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim)
+            })
+            .collect();
+        let mut four = vec![w.clone()];
+        four.extend(others);
+        for width in [256usize, 512] {
+            let xs = &x[..width * in_dim];
+            let macs = (in_dim * out_dim * width) as f64;
+            let one = vulkan.mmq_kernel_us_tokens_rotating(xs, width, std::slice::from_ref(&w), 8);
+            let rot = vulkan.mmq_kernel_us_tokens_rotating(xs, width, &four, 8);
+            let float = vulkan.matmul_kernel_us_tokens(xs, width, &w, 8);
+            let rate = |r: Option<(f64, &'static str)>| {
+                r.map_or("-".to_string(), |(us, name)| {
+                    format!("{name} {:.0}", macs / us / 1e3)
+                })
+            };
+            eprintln!(
+                "  {in_dim}x{out_dim} x {width}: one matrix: integer {}, float {}; four matrices: integer {} G MAC/s",
+                rate(one),
+                rate(float),
+                rate(rot)
+            );
+        }
         let (kernel_us, name) = vulkan
             .matmul_kernel_us_tokens(&x[..stripe * in_dim], stripe, &w, 4)
             .expect("timestamps");
@@ -8905,6 +8938,92 @@ fn cross_check_fused_ffn_prefill(n_tokens: usize) {
         assert!(
             (a - b).abs() <= tol,
             "n_tokens={n_tokens}: mismatch at {i}: unfused={a} fused={b}"
+        );
+    }
+}
+
+/// The picture transformer's feed-forward on the device: a fused
+/// `gate_up` tensor (gate rows first) handed to `fused_ffn_prefill` as two
+/// row views of its bytes, SwiGLU between — against the exact form in
+/// `f64` over the dequantized weights. The chain runs the integer-dot
+/// GEMM, its inputs rounded to `int8` per 32 values, which puts it a few
+/// percent of each token's magnitude off; halves taken the wrong way round
+/// (`silu(up) · gate`) or a view one row off miss by tens of percent.
+#[test]
+fn a_fused_gate_up_runs_as_two_row_views_on_the_device() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
+        return;
+    }
+    let (n_embd, ffn_len, n_tokens) = (256usize, 512usize, 37usize);
+    // Smooth weights of a trained layer's size, encoded to `Q4_K` — random
+    // blocks would drive the outputs to ~1e13, where one rounding flip of
+    // an activation block moves a token by percent.
+    let encoded = |in_dim: usize, out_dim: usize, salt: usize| {
+        let values: Vec<f32> = (0..in_dim * out_dim)
+            .map(|i| (((i * 7919 + salt * 104_729) % 2003) as f32 / 1001.0 - 1.0) * 0.06)
+            .collect();
+        let bytes = orangu::quantize::encode(GGML_TYPE_Q4_K, &values, in_dim);
+        test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim)
+    };
+    let gate_up = encoded(n_embd, 2 * ffn_len, 1);
+    let down = encoded(ffn_len, n_embd, 2);
+    let x: Vec<f32> = (0..n_tokens * n_embd)
+        .map(|i| ((i * 31 % 97) as f32 / 48.0 - 1.0) * 2.0)
+        .collect();
+
+    // The exact form, in `f64` over the dequantized weights.
+    let weights = |m: &QuantMatrix| {
+        crate::engine::quant::dequantize(m.ggml_type(), m.raw_bytes(), m.in_dim * m.out_dim)
+            .expect("Q4_K dequantizes")
+    };
+    let (wg, wd) = (weights(&gate_up), weights(&down));
+    let dot = |w: &[f32], x: &[f32]| {
+        w.iter()
+            .zip(x)
+            .map(|(a, b)| *a as f64 * *b as f64)
+            .sum::<f64>()
+    };
+    let mut expected = Vec::with_capacity(n_tokens * n_embd);
+    for xt in x.chunks(n_embd) {
+        let h: Vec<f32> = (0..ffn_len)
+            .map(|j| {
+                let g = dot(&wg[j * n_embd..(j + 1) * n_embd], xt);
+                let u = dot(&wg[(ffn_len + j) * n_embd..(ffn_len + j + 1) * n_embd], xt);
+                (g / (1.0 + (-g).exp()) * u) as f32
+            })
+            .collect();
+        expected.extend((0..n_embd).map(|o| dot(&wd[o * ffn_len..(o + 1) * ffn_len], &h) as f32));
+    }
+    let got = vulkan
+        .fused_ffn_prefill(
+            &x,
+            n_tokens,
+            &gate_up.rows(0, ffn_len),
+            &gate_up.rows(ffn_len, ffn_len),
+            &down,
+            crate::engine::backend::vulkan::FfnActivation::Swiglu,
+            None,
+        )
+        .expect("fused path available without MMVQ");
+    assert_eq!(got.len(), expected.len());
+    // Each token's error against that token's magnitude: an output near
+    // zero has no relative error to speak of.
+    for (t, (want, have)) in expected.chunks(n_embd).zip(got.chunks(n_embd)).enumerate() {
+        let scale = want.iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
+        let worst = want
+            .iter()
+            .zip(have)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 0.1 * scale,
+            "token {t}: error {worst} against {scale}"
         );
     }
 }

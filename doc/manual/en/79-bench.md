@@ -1347,12 +1347,27 @@ Three files come out of one `--flamegraph out.svg`:
 The `perf.data` is removed once collapsed unless `--flamegraph-keep-data` asks
 for it: it is the largest artifact by an order of magnitude and nothing
 downstream reads it. Keep it for what the collapsed stacks cannot answer —
-`perf report`, `perf annotate` on a hot function's instructions, or
-re-symbolizing a recording whose frames came out as a bare binary name
-(`perf script --no-inline -i out.perf.data`). Its path is printed under the
-flamegraph's. Under `--flamegraph-layers` the one system-wide capture is kept
-as `system.perf.data` in the directory. The `.folded` file is the durable
-one.
+`perf report`, or `perf annotate` on a hot function's instructions. Its path
+is printed under the flamegraph's. Under `--flamegraph-layers` the one
+system-wide capture is kept as `system.perf.data` in the directory. The
+`.folded` file is the durable one.
+
+Under `--call-graph dwarf` a recording can lose most of its user-space call
+chains: `perf`'s unwinder sometimes refuses the program's modules for the
+rest of a file (`perf script -v` reports "address range overlaps an existing
+module"), and whether it does changes from one run of the same binary to the
+next. Such a sample is not dropped. A second `perf script` pass without call
+chains reads the frame each one was executing, and the flamegraph files it
+under `[user stack lost]` right below its thread, so the top self-time
+frames still add up and the missing callers show as what they are. The
+share is in `out.meta.json` (`lost_stacks_pct`), and above 5% the summary
+says so:
+
+```text
+           78.8% of samples lost their call stack (perf's unwinder): their own frames are kept, under [user stack lost]
+```
+
+Re-running the measurement usually gets a recording with whole stacks.
 
 Because it is durable, the SVG can be rebuilt from it at any time without
 measuring again:

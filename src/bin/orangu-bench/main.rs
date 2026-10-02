@@ -3921,6 +3921,7 @@ fn report_profile(s: &profile::Summary, args: &Args) {
                 "cores_busy": s.cores_busy,
                 "gpu_wait_pct": s.gpu_wait,
                 "pool_idle_pct": s.pool_idle,
+                "lost_stacks_pct": s.lost_stacks,
                 "buckets": s.buckets.iter().map(|(k, v)| serde_json::json!({"bucket": k, "pct": v})).collect::<Vec<_>>(),
                 "leaves": s.leaves.iter().map(|(k, v)| serde_json::json!({"frame": k, "pct": v})).collect::<Vec<_>>(),
             })
@@ -3948,6 +3949,14 @@ fn report_profile(s: &profile::Summary, args: &Args) {
         s.cores_busy * s.pool_idle / 100.0,
         s.cores_busy * (100.0 - s.gpu_wait - s.pool_idle) / 100.0,
     );
+    if s.lost_stacks >= 5.0 {
+        println!(
+            "           {:.1}% of samples lost their call stack (perf's unwinder): \
+             their own frames are kept, under {}",
+            s.lost_stacks,
+            orangu::profiling::flamegraph::LOST_STACK
+        );
+    }
     println!("           {}", s.folded.display());
     if let Some(data) = &s.data {
         println!("           {}", data.display());

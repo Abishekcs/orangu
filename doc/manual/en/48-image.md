@@ -65,7 +65,7 @@ most of it the transformer and the encoder mapped from disk and shared
 with the page cache — 11 GB with the vision projector — and 7 GB more
 for the 8-bit copy of the transformer that makes it about twice as fast,
 which the server makes only when the transformer runs on the CPU, the CPU
-has an 8-bit matrix kernel (`i8mm` or `AVX2`) and the machine has 21 GB
+has an 8-bit matrix kernel (`i8mm`, `dotprod` or `AVX2`) and the machine has 21 GB
 or more; a GPU keeps the file's own weights. A machine with 16 GB is
 enough. Once it is ready the server reads its model files through in the
 background, at the lowest disk priority, when they fit in half the
@@ -97,7 +97,9 @@ transformer on a device, each block's attention runs on the CPU in
 chunks of the picture's tokens while the device runs the output
 projection and the feed-forward layers of the chunks already done, so
 the two work at the same time; the picture is the same, bit for bit
-(`ORANGU_IMAGE_OVERLAP=0` runs them one after the other). The wait is never a
+(`ORANGU_IMAGE_OVERLAP=0` runs them one after the other). Each block's
+feed-forward layers run on the device as one submission, their
+intermediate never coming back to the host. The wait is never a
 surprise: the startup log says what a picture at the defaults costs on
 this machine, and the console counts it down.
 

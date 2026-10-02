@@ -18253,6 +18253,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// recorded together would race for that one region. Fusing therefore
     /// happens within a stripe — which is where the round trips were.
     ///
+    /// The projections run on the integer-dot GEMM where it serves them
+    /// (`mmq_for`) — the input quantized once for gate and up, the
+    /// activation's output once more for down — and on the float kernel
+    /// otherwise.
+    ///
     /// `activation` picks GEGLU or SwiGLU between the projections, and
     /// `mid_rotation` is a Hadamard-folded `down` (`engine::hadamard`): the
     /// activation's output is rotated in place, on the device, before the
@@ -18341,10 +18346,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let down_g = down_entry.lock().unwrap_or_else(|p| p.into_inner());
         let t1 = std::time::Instant::now();
 
+        // The integer-dot form of the three projections where the kernel
+        // serves them (`mmq_for`), as `fused_post_attention_prefill` runs
+        // them: the input quantized once from gate's region for gate and
+        // up both, and the activation's output once more for down. `None`
+        // keeps the float kernels.
+        let x_len = ((n_tokens * gate.in_dim) as u64) * 4;
+        let mmq_ffn = (self.mmq_for(gate, n_tokens) && self.mmq_for(up, n_tokens)).then(|| {
+            let (q8, qbg, qwg, qmeta) = self.mmq_stage(
+                BindSrc::Slice(&gate_g.x_buffer, gate_g.x_offset, x_len),
+                n_tokens,
+                gate.in_dim,
+            );
+            let gate_op = self.mmq_op(gate, &gate_g, &q8);
+            let up_op = self.mmq_op(up, &up_g, &q8);
+            (q8, qbg, qwg, qmeta, gate_op, up_op)
+        });
+        let mmq_down = self.mmq_for(down, n_tokens).then(|| {
+            let (q8, qbg, qwg, qmeta) = self.mmq_stage(
+                BindSrc::Slice(
+                    &down_g.x_buffer,
+                    down_g.x_offset,
+                    ((n_tokens * ffn_len) as u64) * 4,
+                ),
+                n_tokens,
+                down.in_dim,
+            );
+            let op = self.mmq_op(down, &down_g, &q8);
+            (q8, qbg, qwg, qmeta, op)
+        });
+
         self.queue
             .write_buffer(&gate_g.x_buffer, gate_g.x_offset, bytemuck::cast_slice(x));
-        self.queue
-            .write_buffer(&up_g.x_buffer, up_g.x_offset, bytemuck::cast_slice(x));
+        // Up reads gate's quantized rows on the integer path; its own
+        // region is only the float kernel's input.
+        if mmq_ffn.is_none() {
+            self.queue
+                .write_buffer(&up_g.x_buffer, up_g.x_offset, bytemuck::cast_slice(x));
+        }
         let t2 = std::time::Instant::now();
 
         let elems = n_tokens * ffn_len;
@@ -18389,8 +18428,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 label: Some("orangu-server fused prefill FFN pass"),
                 timestamp_writes: None,
             });
-            self.record_matmul(&mut pass, gate, &gate_g);
-            self.record_matmul(&mut pass, up, &up_g);
+            match &mmq_ffn {
+                Some((_, qbg, qwg, _, gate_op, up_op)) => {
+                    self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                    self.record_mmq(&mut pass, &gate_op.0, gate_op.1, gate_op.2);
+                    self.record_mmq(&mut pass, &up_op.0, up_op.1, up_op.2);
+                }
+                None => {
+                    self.record_matmul(&mut pass, gate, &gate_g);
+                    self.record_matmul(&mut pass, up, &up_g);
+                }
+            }
 
             pass.set_pipeline(self.ffn_activation_pipeline(activation));
             pass.set_bind_group(0, &bg_gelu_mul, &[]);
@@ -18402,7 +18450,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 pass.dispatch_workgroups(*workgroups, 1, 1);
             }
 
-            self.record_matmul(&mut pass, down, &down_g);
+            match &mmq_down {
+                Some((_, qbg, qwg, _, op)) => {
+                    self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                    self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                }
+                None => self.record_matmul(&mut pass, down, &down_g),
+            }
         }
         let t3 = std::time::Instant::now();
         let (out, split) = self.submit_and_readback_split(

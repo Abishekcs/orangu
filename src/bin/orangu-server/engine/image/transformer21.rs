@@ -61,8 +61,17 @@ use super::transformer::{
 /// The feed-forward's two input projections: ComfyUI's checkpoints fuse
 /// them into one `gate_up` (gate first), diffusers' keep them apart.
 enum MlpIn {
-    Fused(QuantMatrix),
-    Split { gate: QuantMatrix, up: QuantMatrix },
+    /// `w` and its two halves as row views of the same bytes: the host runs
+    /// `w` in one matmul, a device's fused feed-forward takes the halves.
+    Fused {
+        w: QuantMatrix,
+        gate: QuantMatrix,
+        up: QuantMatrix,
+    },
+    Split {
+        gate: QuantMatrix,
+        up: QuantMatrix,
+    },
 }
 
 struct Block {
@@ -213,7 +222,13 @@ impl QwenImage21Transformer {
         for i in 0..c.n_layer {
             let p = format!("transformer_blocks.{i}");
             let mlp_in = if loaded.has_tensor(&format!("{p}.img_mlp.gate_up.weight")) {
-                MlpIn::Fused(matrix(&format!("{p}.img_mlp.gate_up"))?)
+                let w = matrix(&format!("{p}.img_mlp.gate_up"))?;
+                let m = w.out_dim / 2;
+                MlpIn::Fused {
+                    gate: w.rows(0, m),
+                    up: w.rows(m, w.out_dim - m),
+                    w,
+                }
             } else {
                 MlpIn::Split {
                     gate: matrix(&format!("{p}.img_mlp.gate_layer"))?,
@@ -303,7 +318,7 @@ impl QwenImage21Transformer {
         );
         for (i, block) in model.blocks.iter().enumerate() {
             let mlp_ok = match &block.mlp_in {
-                MlpIn::Fused(w) => w.in_dim == c.dim && w.out_dim == 2 * model.mlp_dim,
+                MlpIn::Fused { w, .. } => w.in_dim == c.dim && w.out_dim == 2 * model.mlp_dim,
                 MlpIn::Split { gate, up } => {
                     gate.out_dim == model.mlp_dim && up.out_dim == model.mlp_dim
                 }
@@ -343,6 +358,21 @@ impl QwenImage21Transformer {
             .matmul_batch(&[MatmulOp { x, n_tokens: n, w }])
             .pop()
             .expect("one op in, one result out")
+    }
+
+    /// A block's query, key and value projections of the same rows. On a
+    /// device they are one call (`Backend::matmul_batch`), which stages the
+    /// shared input once and runs the three in one sequence of submissions,
+    /// one wait and one readback, rather than three of each.
+    fn qkv(&self, x: &[f32], n: usize, block: &Block) -> [Vec<f32>; 3] {
+        let weights = [&block.to_q, &block.to_k, &block.to_v];
+        if self.rowi8.is_some() {
+            return weights.map(|w| self.linear(x, n, w));
+        }
+        let ops = weights.map(|w| MatmulOp { x, n_tokens: n, w });
+        let mut results = self.backend.matmul_batch(&ops).into_iter();
+        let mut next = || results.next().expect("three ops in, three results out");
+        [next(), next(), next()]
     }
 
     /// The timestep's modulation vectors, from the cache when the last pass
@@ -472,9 +502,7 @@ impl QwenImage21Transformer {
             layer_norm_into(&mut normed, &x, c.dim, c.eps);
             scale_inplace(&mut normed, &scale1, c.dim);
             clock.lap(|s| &mut s.other);
-            let mut q = self.linear(&normed, n, &block.to_q);
-            let mut k = self.linear(&normed, n, &block.to_k);
-            let v = self.linear(&normed, n, &block.to_v);
+            let [mut q, mut k, v] = self.qkv(&normed, n, block);
             clock.lap(|s| &mut s.qkv);
             head_rms_norm(&mut q, &block.norm_q, c.head_dim, c.eps);
             head_rms_norm(&mut k, &block.norm_k, c.head_dim, c.eps);
@@ -511,6 +539,34 @@ impl QwenImage21Transformer {
             k: keys,
             v: values,
         })
+    }
+
+    /// [`Self::mlp`] on the card that holds the block, as one submission
+    /// (`VulkanBackend::fused_ffn_prefill`): the gate and up projections,
+    /// the SwiGLU and the down projection with the `[n, mlp_dim]`
+    /// intermediate never leaving the device. `None` — the host-orchestrated
+    /// form — off a Vulkan device, with the per-row `int8` copy, or with
+    /// `ORANGU_IMAGE_FUSED_FFN=0`.
+    fn device_mlp(&self, block: &Block, x: &[f32], n: usize) -> Option<Vec<f32>> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON
+            .get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_IMAGE_FUSED_FFN"));
+        if !on || self.rowi8.is_some() {
+            return None;
+        }
+        let vulkan = self.backend.as_wgpu_on(block.mlp_out.device())?;
+        let (gate, up) = match &block.mlp_in {
+            MlpIn::Fused { gate, up, .. } | MlpIn::Split { gate, up } => (gate, up),
+        };
+        vulkan.fused_ffn_prefill(
+            x,
+            n,
+            gate,
+            up,
+            &block.mlp_out,
+            crate::engine::backend::vulkan::FfnActivation::Swiglu,
+            None,
+        )
     }
 
     /// The query tokens per chunk when a step overlaps its attention with
@@ -556,11 +612,14 @@ impl QwenImage21Transformer {
 
     /// `out(silu(gate) · up)`.
     fn mlp(&self, block: &Block, x: &[f32], n: usize) -> Vec<f32> {
+        if let Some(out) = self.device_mlp(block, x, n) {
+            return out;
+        }
         let m = self.mlp_dim;
         let mut h = self.backend.take_scratch(n * m);
         h.resize(n * m, 0.0);
         match &block.mlp_in {
-            MlpIn::Fused(w) => {
+            MlpIn::Fused { w, .. } => {
                 let gate_up = self.linear(x, n, w);
                 h.par_chunks_mut(m)
                     .zip(gate_up.par_chunks(2 * m))
@@ -654,9 +713,7 @@ impl QwenImage21Transformer {
             layer_norm_into(&mut normed, &x, c.dim, c.eps);
             scale_inplace(&mut normed, scale1, c.dim);
             clock.lap(|s| &mut s.other);
-            let mut q = self.linear(&normed, n_img, &block.to_q);
-            let mut k = self.linear(&normed, n_img, &block.to_k);
-            let v = self.linear(&normed, n_img, &block.to_v);
+            let [mut q, mut k, v] = self.qkv(&normed, n_img, block);
             clock.lap(|s| &mut s.qkv);
             head_rms_norm(&mut q, &block.norm_q, c.head_dim, c.eps);
             head_rms_norm(&mut k, &block.norm_k, c.head_dim, c.eps);
@@ -853,7 +910,7 @@ fn block_weights(block: &Block) -> Vec<&QuantMatrix> {
     let mut weights = vec![&block.to_q, &block.to_k, &block.to_v, &block.to_out];
     weights.push(&block.mlp_out);
     match &block.mlp_in {
-        MlpIn::Fused(w) => weights.push(w),
+        MlpIn::Fused { w, .. } => weights.push(w),
         MlpIn::Split { gate, up } => weights.extend([gate, up]),
     }
     weights

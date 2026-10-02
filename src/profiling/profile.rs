@@ -137,6 +137,10 @@ pub struct Summary {
     pub buckets: Vec<(&'static str, f64)>,
     /// The heaviest individual leaf frames, largest first: `(frame, share)`.
     pub leaves: Vec<(String, f64)>,
+    /// Share of samples whose user-space call chain did not unwind, filed
+    /// under [`flamegraph::LOST_STACK`] — the graph's callers are missing
+    /// for that share, its leaf frames are not.
+    pub lost_stacks: f64,
 }
 
 impl Recorder {
@@ -312,6 +316,7 @@ impl Recorder {
                 "cores_busy": cores_busy,
                 "gpu_wait_pct": attribution.gpu_wait,
                 "pool_idle_pct": attribution.pool_idle,
+                "lost_stacks_pct": attribution.lost_stacks,
                 "cores_working": cores_busy
                     * (1.0 - (attribution.gpu_wait + attribution.pool_idle) / 100.0),
                 // The kernel's own accounting for the same window, so a stored
@@ -334,6 +339,7 @@ impl Recorder {
             pool_idle: attribution.pool_idle,
             buckets: attribution.buckets,
             leaves: attribution.leaves,
+            lost_stacks: attribution.lost_stacks,
         })
     }
 }
@@ -530,6 +536,8 @@ impl SystemRecorder {
                     "cores_busy": cores_busy,
                     "gpu_wait_pct": attribution.gpu_wait,
                     "pool_idle_pct": attribution.pool_idle,
+                    "lost_stacks_pct": attribution.lost_stacks,
+                "lost_stacks_pct": attribution.lost_stacks,
                     "system_wide": true,
                 }))
                 .unwrap_or_default(),
@@ -555,6 +563,7 @@ impl SystemRecorder {
                     pool_idle: attribution.pool_idle,
                     buckets: attribution.buckets,
                     leaves: attribution.leaves,
+                    lost_stacks: attribution.lost_stacks,
                 },
             });
         }
@@ -734,9 +743,37 @@ fn sibling(svg: &Path, ext: &str) -> PathBuf {
 /// `perf script | flamegraph::collapse`, streamed rather than buffered: a
 /// decode profile is a few hundred megabytes of `perf script` text before it
 /// collapses, and only the collapsed form is ever needed.
+///
+/// When some samples' user-space stacks did not unwind
+/// ([`flamegraph::LOST_STACK`]), a second, cheap pass without call chains
+/// (`-G`) reads each sample's own frame, and those samples are filed under
+/// it — self time stays right, and the loss is visible in the graph.
 fn collapse(data: &Path) -> anyhow::Result<String> {
+    let script = perf_script(data, &["--no-inline"])?;
+    let text = String::from_utf8_lossy(&script);
+    let mut totals = flamegraph::collapse(&text);
+    let lost = |stack: &str| {
+        stack
+            .split(';')
+            .nth(1)
+            .is_some_and(|f| f == flamegraph::LOST_STACK)
+    };
+    if totals.keys().any(|stack| lost(stack)) {
+        let own = perf_script(data, &["-G", "-F", "comm,tid,time,ip,sym,dso"])?;
+        totals = flamegraph::collapse_with(
+            &text,
+            &flamegraph::own_frames(&String::from_utf8_lossy(&own)),
+        );
+    }
+    Ok(flamegraph::to_folded(&totals))
+}
+
+/// `perf script <args> -i data`'s output.
+fn perf_script(data: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
     let script = Command::new("perf")
-        .args(["script", "--no-inline", "-i"])
+        .arg("script")
+        .args(args)
+        .arg("-i")
         .arg(data)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -745,8 +782,7 @@ fn collapse(data: &Path) -> anyhow::Result<String> {
     if !script.status.success() {
         anyhow::bail!("`perf script` failed on {}", data.display());
     }
-    let totals = flamegraph::collapse(&String::from_utf8_lossy(&script.stdout));
-    Ok(flamegraph::to_folded(&totals))
+    Ok(script.stdout)
 }
 
 /// Total samples in a collapsed profile — the subtitle's denominator.
@@ -978,6 +1014,8 @@ struct Attribution {
     gpu_wait: f64,
     /// Share of samples on a parked or work-stealing thread ([`POOL_IDLE`]).
     pool_idle: f64,
+    /// Share of samples filed under [`flamegraph::LOST_STACK`].
+    lost_stacks: f64,
 }
 
 /// Total samples, self-time share per bucket, and the heaviest leaf frames.
@@ -993,6 +1031,7 @@ fn summarize(folded: &str) -> Attribution {
     let mut by_leaf: HashMap<&str, u64> = HashMap::new();
     let mut gpu_wait = 0u64;
     let mut pool_idle = 0u64;
+    let mut lost_stacks = 0u64;
 
     for line in folded.lines() {
         let Some((stack, count)) = line.rsplit_once(' ') else {
@@ -1003,6 +1042,9 @@ fn summarize(folded: &str) -> Attribution {
         };
         let leaf = stack.rsplit(';').next().unwrap_or(stack);
         total += count;
+        if stack.split(';').nth(1) == Some(flamegraph::LOST_STACK) {
+            lost_stacks += count;
+        }
         *by_leaf.entry(leaf).or_default() += count;
         *by_bucket.entry(classify(leaf)).or_default() += count;
 
@@ -1019,6 +1061,7 @@ fn summarize(folded: &str) -> Attribution {
             leaves: Vec::new(),
             gpu_wait: 0.0,
             pool_idle: 0.0,
+            lost_stacks: 0.0,
         };
     }
 
@@ -1040,6 +1083,7 @@ fn summarize(folded: &str) -> Attribution {
         leaves,
         gpu_wait: pct(gpu_wait),
         pool_idle: pct(pool_idle),
+        lost_stacks: pct(lost_stacks),
     }
 }
 
@@ -1174,6 +1218,28 @@ pub fn pid_listening_on(port: u16) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// A kept recording (`ORANGU_PERF_DATA`, from `--flamegraph-keep-data`)
+    /// collapsed the way the recorder collapses it: the share of samples
+    /// whose stack did not unwind, and the heaviest leaf frames — what a
+    /// recording that lost its stacks still says.
+    #[test]
+    #[ignore = "needs a kept perf.data"]
+    fn collapse_a_kept_recording() {
+        let Ok(path) = std::env::var("ORANGU_PERF_DATA") else {
+            eprintln!("set ORANGU_PERF_DATA to a perf.data file");
+            return;
+        };
+        let folded = super::collapse(std::path::Path::new(&path)).expect("collapses");
+        let a = super::summarize(&folded);
+        eprintln!("{} samples, {:.1}% lost stacks", a.samples, a.lost_stacks);
+        for (frame, pct) in a.leaves.iter().take(8) {
+            eprintln!(
+                "  {pct:5.1}%  {}",
+                frame.chars().take(90).collect::<String>()
+            );
+        }
+    }
+
     /// The split that turns one system-wide capture into one profile per
     /// process rides on reading `comm` and `pid` off every sample header,
     /// including a comm with a space in it.

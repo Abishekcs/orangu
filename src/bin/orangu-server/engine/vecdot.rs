@@ -754,6 +754,32 @@ unsafe fn dot32_sdot(w: &[i8], x: &[i8]) -> i32 {
     }
 }
 
+/// `sdot` into a running accumulator, its four `i32` lanes kept: `acc[i]
+/// += a[4i..4i+4] · b[4i..4i+4]`. The vector form the vertically
+/// accumulating kernels build on — [`dot32_sdot`] reduces its lanes, these
+/// callers keep them. `asm!` for the reasons given at [`dot16_sdot`];
+/// callable only where [`have_dotprod`] is true.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot_lanes(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut acc = acc;
+    unsafe {
+        std::arch::asm!(
+            ".arch_extension dotprod",
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack)
+        );
+    }
+    acc
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot32_avx2(w: &[i8], x: &[i8]) -> i32 {
@@ -2821,6 +2847,12 @@ pub fn i8_scores_4rows_in(
         }
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if have_dotprod() {
+        // Safety: `dotprod` was verified.
+        unsafe { i8_scores_4rows_sdot(q, qa, qb, k, pairs, out) };
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         // Safety: `AVX2` was detected.
@@ -2840,17 +2872,91 @@ pub fn i8_scores_4rows_in(
     }
 }
 
-/// Whether [`i8_scores_4rows`] has a fast kernel here: `smmla` on `aarch64`
-/// ([`have_i8mm`]), `AVX2` on `x86_64` — what the picture attention asks
-/// before it scores in `int8`.
+/// Whether [`i8_scores_4rows`] has a fast kernel here: `smmla`
+/// ([`have_i8mm`]) or `sdot` ([`have_dotprod`]) on `aarch64`, `AVX2` on
+/// `x86_64` — what the picture attention asks before it scores in `int8`.
 pub fn have_i8_scores() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         is_x86_feature_detected!("avx2")
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        have_i8mm()
+        have_i8mm() || have_dotprod()
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// [`i8_scores_4rows_in`] on `sdot`, exact — for an `aarch64` core with
+/// `dotprod` but no `i8mm`. The pair layout puts a pair's two rows' 8 bytes
+/// side by side per chunk, so one `sdot` of a query pair's chunk against a
+/// key pair's gives row 0 · key 0 in lanes 0–1 and row 1 · key 1 in lanes
+/// 2–3 ("direct"), and against the key halves swapped (`ext`) row 0 · key
+/// 1 and row 1 · key 0 ("cross"); one `addp` per key pair folds them into
+/// the four scores. Two key pairs at a time keep eight accumulators.
+///
+/// # Safety
+/// [`have_dotprod`] must be true.
+#[cfg(target_arch = "aarch64")]
+unsafe fn i8_scores_4rows_sdot(
+    q: &PairedI8,
+    qa: usize,
+    qb: usize,
+    k: &PairedI8,
+    pairs: std::ops::Range<usize>,
+    out: [&mut [i32]; 4],
+) {
+    use std::arch::aarch64::*;
+    let dim = q.dim;
+    let p0 = pairs.start;
+    let n_pairs = pairs.len();
+    let (a, b) = (q.pair(qa), q.pair(qb));
+    let [o0, o1, o2, o3] = out;
+    let mut p = 0;
+    while p < n_pairs {
+        let width = (n_pairs - p).min(2);
+        // `[key pair][query pair][direct, cross]`.
+        let mut acc = [[[unsafe { vdupq_n_s32(0) }; 2]; 2]; 2];
+        // Safety: NEON is baseline and `dotprod` the caller's contract;
+        // every load is 16 bytes inside a `2 * dim` pair, `dim` a multiple
+        // of 8.
+        unsafe {
+            let mut c = 0;
+            while c < 2 * dim {
+                let qv = [vld1q_s8(a.as_ptr().add(c)), vld1q_s8(b.as_ptr().add(c))];
+                for (j, acc_j) in acc.iter_mut().enumerate().take(width) {
+                    let kv = vld1q_s8(k.pair(p0 + p + j).as_ptr().add(c));
+                    let ks = vextq_s8::<8>(kv, kv);
+                    for (v, acc_jq) in qv.iter().zip(acc_j.iter_mut()) {
+                        acc_jq[0] = sdot_lanes(acc_jq[0], *v, kv);
+                        acc_jq[1] = sdot_lanes(acc_jq[1], *v, ks);
+                    }
+                }
+                c += 16;
+            }
+        }
+        for (j, acc_j) in acc.iter().enumerate().take(width) {
+            let key = 2 * (p + j);
+            for (pair, [direct, cross]) in acc_j.iter().enumerate() {
+                // `[r0·k0, r1·k1, r0·k1, r1·k0]`.
+                let mut s4 = [0i32; 4];
+                // Safety: NEON is baseline; `s4` is four lanes.
+                unsafe { vst1q_s32(s4.as_mut_ptr(), vpaddq_s32(*direct, *cross)) };
+                let (r0, r1): (&mut [i32], &mut [i32]) = if pair == 0 {
+                    (&mut *o0, &mut *o1)
+                } else {
+                    (&mut *o2, &mut *o3)
+                };
+                r0[key] = s4[0];
+                r0[key + 1] = s4[2];
+                r1[key] = s4[3];
+                r1[key + 1] = s4[1];
+            }
+        }
+        p += width;
     }
 }
 
@@ -3132,25 +3238,12 @@ impl ActQ8Mm {
                         existing
                     };
                     for s in 0..n_super {
-                        let chunk = &row[s * SUPER_BLOCK..(s + 1) * SUPER_BLOCK];
-                        let amax = abs_max(chunk);
-                        let scale = amax / 127.0;
-                        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-                        d[s * MM_TILE + k] = scale;
-                        for j in 0..SUBS {
-                            let b = s * SUBS + j;
-                            let src = &chunk[j * 32..(j + 1) * 32];
-                            let block = &mut q[b * MM_TILE * 32..][..MM_TILE * 32];
-                            let mut sum = 0i32;
-                            for c in 0..4 {
-                                let dst: &mut [i8; 8] = (&mut block
-                                    [((tp * 4 + c) * 2 + half) * 8..][..8])
-                                    .try_into()
-                                    .unwrap();
-                                sum += quantize_8(&src[c * 8..c * 8 + 8], inv, dst);
-                            }
-                            bsum[(s * MM_TILE + k) * SUBS + j] = sum as i16;
-                        }
+                        d[s * MM_TILE + k] = quantize_super(
+                            &row[s * SUPER_BLOCK..(s + 1) * SUPER_BLOCK],
+                            &mut q[s * SUBS * MM_TILE * 32..][..SUBS * MM_TILE * 32],
+                            tp * 64 + half * 8,
+                            &mut bsum[(s * MM_TILE + k) * SUBS..][..SUBS],
+                        );
                     }
                 }
             });
@@ -3164,6 +3257,116 @@ impl ActQ8Mm {
             bsum,
         }
     }
+}
+
+/// One token's super-block into an [`ActQ8Mm`] tile: `chunk`'s
+/// [`SUPER_BLOCK`] values scaled by their largest magnitude to `±127`, each
+/// 32-element block's four 8-byte chunks written at `slot + c * 16` of its
+/// block in `q` (the super-block's [`SUBS`] blocks of `MM_TILE * 32` bytes,
+/// `slot` the token's place in the pair layout), and each block's sum into
+/// `bsum`. Returns the scale.
+///
+/// [`quantize_super_portable`] defines it; on `x86_64` with `AVX2` it runs
+/// as [`quantize_super_avx2`], byte for byte the same.
+#[inline]
+fn quantize_super(chunk: &[f32], q: &mut [i8], slot: usize, bsum: &mut [i16]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        debug_assert!(chunk.len() == SUPER_BLOCK && bsum.len() == SUBS);
+        debug_assert!(q.len() == SUBS * MM_TILE * 32 && slot + 3 * 16 + 8 <= MM_TILE * 32);
+        // Safety: `AVX2` was detected; the lengths are the contract above.
+        return unsafe { quantize_super_avx2(chunk, q, slot, bsum) };
+    }
+    quantize_super_portable(chunk, q, slot, bsum)
+}
+
+/// [`quantize_super`] in portable Rust — the definition the vector forms
+/// are held to.
+fn quantize_super_portable(chunk: &[f32], q: &mut [i8], slot: usize, bsum: &mut [i16]) -> f32 {
+    let amax = abs_max(chunk);
+    let scale = amax / 127.0;
+    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+    for (j, sum_out) in bsum.iter_mut().enumerate().take(SUBS) {
+        let src = &chunk[j * 32..(j + 1) * 32];
+        let block = &mut q[j * MM_TILE * 32..][..MM_TILE * 32];
+        let mut sum = 0i32;
+        for c in 0..4 {
+            let dst: &mut [i8; 8] = (&mut block[slot + c * 16..][..8]).try_into().unwrap();
+            sum += quantize_8(&src[c * 8..c * 8 + 8], inv, dst);
+        }
+        *sum_out = sum as i16;
+    }
+    scale
+}
+
+/// [`quantize_super_portable`] on `AVX2`, to the byte. The largest
+/// magnitude is a vector `max` of `|x|` (order cannot change a maximum);
+/// the product is the same single `f32` multiply by the same `inv`; and
+/// `f32::round`'s ties-away rounding, which `AVX2` has no mode for, is
+/// rebuilt exactly: truncate, then step one away from zero where the
+/// dropped fraction (exact: `v - trunc(v)`) is at least a half. Then the
+/// same clamp to `±127`, and the integers packed to bytes and summed.
+///
+/// # Safety
+/// `AVX2` must be available; `chunk` is [`SUPER_BLOCK`] long, `bsum`
+/// [`SUBS`], `q` `SUBS * MM_TILE * 32` with `slot + 56 <= MM_TILE * 32`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_super_avx2(chunk: &[f32], q: &mut [i8], slot: usize, bsum: &mut [i16]) -> f32 {
+    use std::arch::x86_64::*;
+    let sign = _mm256_set1_ps(-0.0);
+    let mut m = _mm256_setzero_ps();
+    for i in (0..SUPER_BLOCK).step_by(8) {
+        // Safety: `i + 8 <= SUPER_BLOCK = chunk.len()`.
+        let v = unsafe { _mm256_loadu_ps(chunk.as_ptr().add(i)) };
+        m = _mm256_max_ps(m, _mm256_andnot_ps(sign, v));
+    }
+    let m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+    let m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+    let amax = _mm_cvtss_f32(_mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1)));
+    let scale = amax / 127.0;
+    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+    let invv = _mm256_set1_ps(inv);
+    let half = _mm256_set1_ps(0.5);
+    let one = _mm256_set1_ps(1.0);
+    let limit = _mm256_set1_ps(127.0);
+    let neg_limit = _mm256_set1_ps(-127.0);
+    for (j, sum_out) in bsum.iter_mut().enumerate().take(SUBS) {
+        let mut sum = _mm256_setzero_si256();
+        for c in 0..4 {
+            // Safety: element `j * 32 + c * 8 + 7 < SUPER_BLOCK`, and the
+            // 8-byte store lands at `j * MM_TILE * 32 + slot + c * 16`,
+            // inside block `j` by the contract.
+            unsafe {
+                let v = _mm256_mul_ps(_mm256_loadu_ps(chunk.as_ptr().add(j * 32 + c * 8)), invv);
+                let t = _mm256_round_ps(v, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+                let away = _mm256_cmp_ps(
+                    _mm256_andnot_ps(sign, _mm256_sub_ps(v, t)),
+                    half,
+                    _CMP_GE_OQ,
+                );
+                let step = _mm256_or_ps(_mm256_and_ps(v, sign), one);
+                let r = _mm256_add_ps(t, _mm256_and_ps(away, step));
+                let r = _mm256_min_ps(_mm256_max_ps(r, neg_limit), limit);
+                let i = _mm256_cvttps_epi32(r);
+                sum = _mm256_add_epi32(sum, i);
+                let w = _mm_packs_epi32(_mm256_castsi256_si128(i), _mm256_extracti128_si256(i, 1));
+                let b = _mm_packs_epi16(w, w);
+                _mm_storel_epi64(
+                    q.as_mut_ptr().add(j * MM_TILE * 32 + slot + c * 16) as *mut __m128i,
+                    b,
+                );
+            }
+        }
+        let s4 = _mm_add_epi32(
+            _mm256_castsi256_si128(sum),
+            _mm256_extracti128_si256(sum, 1),
+        );
+        let s2 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0b01_00_11_10));
+        let s1 = _mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0b10_11_00_01));
+        *sum_out = _mm_cvtsi128_si32(s1) as i16;
+    }
+    scale
 }
 
 /// The largest magnitude in `x`, four lanes at a time on NEON.
@@ -3253,15 +3456,26 @@ pub fn dot_k_rows_tiles(
     debug_assert!(w.iter().all(|r| r.kind == w[0].kind));
     debug_assert!(out.iter().all(|o| o.len() == a.n_tokens));
     debug_assert!(tiles.end <= a.n_tile);
-    debug_assert!(have_i8mm());
-    // Safety: `have_i8mm` verified the instruction and the caller's
-    // contract requires it.
-    unsafe {
-        match w[0].kind {
-            KKind::Q4K => gemm_k_rows_mmla::<true, false>(w, a, tiles, out),
-            KKind::Iq4Xs => gemm_k_rows_mmla::<false, false>(w, a, tiles, out),
-            KKind::Q6K => gemm_k_rows_mmla::<false, true>(w, a, tiles, out),
+    if have_i8mm() {
+        // Safety: `have_i8mm` verified the instruction.
+        unsafe {
+            match w[0].kind {
+                KKind::Q4K => gemm_k_rows_mmla::<true, false>(w, a, tiles, out),
+                KKind::Iq4Xs => gemm_k_rows_mmla::<false, false>(w, a, tiles, out),
+                KKind::Q6K => gemm_k_rows_mmla::<false, true>(w, a, tiles, out),
+            }
         }
+    } else if have_dotprod() {
+        // Safety: `have_dotprod` verified the instruction.
+        unsafe {
+            match w[0].kind {
+                KKind::Q4K => gemm_k_rows_sdot::<true, false>(w, a, tiles, out),
+                KKind::Iq4Xs => gemm_k_rows_sdot::<false, false>(w, a, tiles, out),
+                KKind::Q6K => gemm_k_rows_sdot::<false, true>(w, a, tiles, out),
+            }
+        }
+    } else {
+        dot_k_rows_portable(w, a, tiles, out)
     }
 }
 
@@ -3291,17 +3505,21 @@ pub fn dot_k_rows_tiles(
 }
 
 /// Whether this process has a fast K-quant tile for [`dot_k_rows_tiles`]:
-/// `smmla` on `aarch64` ([`have_i8mm`]), `AVX2` on `x86_64`. The callers
-/// choosing between the tile layout ([`ActQ8Mm`]) and the pair kernels
-/// ([`dot_k_pair`]) ask this.
+/// `smmla` ([`have_i8mm`]) or `sdot` ([`have_dotprod`]) on `aarch64`,
+/// `AVX2` on `x86_64`. The callers choosing between the tile layout
+/// ([`ActQ8Mm`]) and the pair kernels ([`dot_k_pair`]) ask this.
 pub fn have_k_rows_tile() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         is_x86_feature_detected!("avx2")
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        have_i8mm()
+        have_i8mm() || have_dotprod()
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
     }
 }
 
@@ -3839,6 +4057,140 @@ unsafe fn gemm_k_rows_mmla<const MINS: bool, const SC16: bool>(
                     let base = tl * MM_TILE;
                     let n = MM_TILE.min(dst.len().saturating_sub(base));
                     dst[base..base + n].copy_from_slice(&row_acc[..n]);
+                }
+            }
+        }
+    }
+}
+
+/// [`dot_k_rows_portable`] on `sdot`, to the bit — the tile for an
+/// `aarch64` core with `dotprod` but no `i8mm` (Cortex-A76/A78), shaped as
+/// [`dot_k_rows_avx2`] is. The rows come re-paired by [`PairedRows`]
+/// (`[pair][block][chunk][2][8]`, the activations' layout), so one `sdot` of
+/// a row pair's chunk against a token pair's chunk gives row 0 · token 0 in
+/// lanes 0–1 and row 1 · token 1 in lanes 2–3 ("direct"); the same with the
+/// token halves swapped (`ext`) gives row 0 · token 1 and row 1 · token 0
+/// ("cross"). A scale group's lanes take the rows' integer scales with one
+/// `mla` by `[sc0, sc0, sc1, sc1]`; per super-block one `addp` folds a
+/// direct and a cross accumulator into the four exact sums. `Q4_K`'s min
+/// correction is the portable form's integer sum. Every `f32` step is the
+/// portable form's, per (row, token) in the same order.
+///
+/// # Safety
+/// [`have_dotprod`] must be true; `rows.len()` a multiple of [`ROW_QUAD`],
+/// all of one kind.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+// The pair and token indices name accumulator lanes, not just positions.
+#[allow(clippy::needless_range_loop)]
+unsafe fn gemm_k_rows_sdot<const MINS: bool, const SC16: bool>(
+    rows: &[&KRow],
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    out: &mut [&mut [f32]],
+) {
+    use std::arch::aarch64::*;
+    let paired = PairedRows::build(rows, a.n_block, a.n_super, SC16);
+    let groups_per_block = if SC16 { 2 } else { 1 };
+    let n_groups = a.n_block * groups_per_block;
+    for tl in tiles {
+        let qtile = &a.q[tl * a.n_block * MM_TILE * 32..][..a.n_block * MM_TILE * 32];
+        let dtile = &a.d[tl * a.n_super * MM_TILE..][..a.n_super * MM_TILE];
+        let btile = &a.bsum[tl * a.n_super * MM_TILE * SUBS..][..a.n_super * MM_TILE * SUBS];
+        for quad in 0..rows.len() / ROW_QUAD {
+            for token_half in 0..2 {
+                // `acc[r][k]`: row `quad * 4 + r`, token `token_half * 4 + k`
+                // of the tile.
+                let mut acc = [[0f32; 4]; 4];
+                let ad = |s: usize, k: usize| dtile[s * MM_TILE + token_half * 4 + k];
+                if MINS {
+                    for (r, acc_r) in acc.iter_mut().enumerate() {
+                        let row = rows[quad * ROW_QUAD + r];
+                        for s in 0..a.n_super {
+                            for (k, v) in acc_r.iter_mut().enumerate() {
+                                let sums =
+                                    &btile[(s * MM_TILE + token_half * 4 + k) * SUBS..][..SUBS];
+                                let mut i = 0i32;
+                                for (j, &b) in sums.iter().enumerate() {
+                                    i += row.mins[s * SUBS + j] as i32 * b as i32;
+                                }
+                                *v -= ad(s, k) * row.dmin[s] * i as f32;
+                            }
+                        }
+                    }
+                }
+                for s in 0..a.n_super {
+                    // Safety (the block): NEON is baseline and `dotprod` the
+                    // caller's contract; every load is 16 bytes inside a
+                    // pair's 64 of block `b` (rows) or a token pair's 64 of
+                    // it (the tile), or one `[i32; 4]` scale vector.
+                    unsafe {
+                        // `[row pair][token pair][direct, cross]`.
+                        let mut isum = [[[vdupq_n_s32(0); 2]; 2]; 2];
+                        for j in 0..SUBS {
+                            let b = s * SUBS + j;
+                            let xb = qtile.as_ptr().add(b * MM_TILE * 32);
+                            for grp in 0..groups_per_block {
+                                let g = b * groups_per_block + grp;
+                                let chunks = if SC16 { grp * 2..grp * 2 + 2 } else { 0..4 };
+                                let mut blk = [[[vdupq_n_s32(0); 2]; 2]; 2];
+                                for c in chunks {
+                                    let wv = [0, 1].map(|pi| {
+                                        let p = quad * 2 + pi;
+                                        vld1q_s8(
+                                            paired
+                                                .q
+                                                .as_ptr()
+                                                .add((p * a.n_block + b) * 64 + c * 16),
+                                        )
+                                    });
+                                    for qi in 0..2 {
+                                        let tp = token_half * 2 + qi;
+                                        let xv = vld1q_s8(xb.add(tp * 64 + c * 16));
+                                        let xs = vextq_s8::<8>(xv, xv);
+                                        for (pi, w) in wv.iter().enumerate() {
+                                            blk[pi][qi][0] = sdot_lanes(blk[pi][qi][0], *w, xv);
+                                            blk[pi][qi][1] = sdot_lanes(blk[pi][qi][1], *w, xs);
+                                        }
+                                    }
+                                }
+                                for (pi, blk_p) in blk.iter().enumerate() {
+                                    let scv = vld1q_s32(
+                                        paired.sc[(quad * 2 + pi) * n_groups + g].as_ptr(),
+                                    );
+                                    for (qi, blk_pq) in blk_p.iter().enumerate() {
+                                        for (dc, v) in blk_pq.iter().enumerate() {
+                                            isum[pi][qi][dc] = vmlaq_s32(isum[pi][qi][dc], *v, scv);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for (pi, by_token) in isum.iter().enumerate() {
+                            for (qi, [direct, cross]) in by_token.iter().enumerate() {
+                                // `[r0·t0, r1·t1, r0·t1, r1·t0]`.
+                                let mut s4 = [0i32; 4];
+                                vst1q_s32(s4.as_mut_ptr(), vpaddq_s32(*direct, *cross));
+                                let (r0, r1) = (pi * 2, pi * 2 + 1);
+                                let (k0, k1) = (qi * 2, qi * 2 + 1);
+                                let d0 = rows[quad * ROW_QUAD + r0].d[s];
+                                let d1 = rows[quad * ROW_QUAD + r1].d[s];
+                                acc[r0][k0] += ad(s, k0) * (d0 * s4[0] as f32);
+                                acc[r1][k1] += ad(s, k1) * (d1 * s4[1] as f32);
+                                acc[r0][k1] += ad(s, k1) * (d0 * s4[2] as f32);
+                                acc[r1][k0] += ad(s, k0) * (d1 * s4[3] as f32);
+                            }
+                        }
+                    }
+                }
+                for (r, by_token) in acc.iter().enumerate() {
+                    let o = &mut out[quad * ROW_QUAD + r];
+                    for (k, v) in by_token.iter().enumerate() {
+                        let t = tl * MM_TILE + token_half * 4 + k;
+                        if t < a.n_tokens {
+                            o[t] = *v;
+                        }
+                    }
                 }
             }
         }
@@ -4540,6 +4892,12 @@ pub fn rowi8_tiles(
         unsafe { rowi8_tiles_mmla(w, g, a, tiles, yt) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if have_dotprod() {
+        // Safety: `dotprod` was verified.
+        unsafe { rowi8_tiles_sdot(w, g, a, tiles, yt) };
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         // Safety: `AVX2` was detected.
@@ -4550,18 +4908,111 @@ pub fn rowi8_tiles(
 }
 
 /// Whether this process has a fast per-row `int8` tile for [`rowi8_tiles`]:
-/// `smmla` on `aarch64` ([`have_i8mm`]), `AVX2` on `x86_64`. Without one
-/// the tile is [`rowi8_tiles_portable`], the scalar definition — what the
-/// callers choosing an `int8` layout (`image_weights = auto`, the VAE's
-/// per-row convolutions) ask before they choose it.
+/// `smmla` ([`have_i8mm`]) or `sdot` ([`have_dotprod`]) on `aarch64`, `AVX2`
+/// on `x86_64`. Without one the tile is [`rowi8_tiles_portable`], the
+/// scalar definition — what the callers choosing an `int8` layout
+/// (`image_weights = auto`, the VAE's per-row convolutions) ask before
+/// they choose it.
 pub fn have_rowi8_tile() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         is_x86_feature_detected!("avx2")
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        have_i8mm()
+        have_i8mm() || have_dotprod()
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// [`rowi8_tiles_portable`] on `sdot`, to the bit — for an `aarch64` core
+/// with `dotprod` but no `i8mm`, shaped as [`rowi8_tiles_avx2`] is: per
+/// 32-element block a row pair's chunk (`[r0 8 bytes][r1 8 bytes]`) against
+/// a token pair's, one `sdot` giving row 0 · token 0 and row 1 · token 1
+/// ("direct"), one more on the token halves swapped (`ext`) giving the
+/// other two ("cross"), four rows by four tokens a pass, and one `addp`
+/// fold per super-block into the four exact sums, folded in the portable
+/// form's order.
+///
+/// # Safety
+/// [`have_dotprod`] must be true.
+#[cfg(target_arch = "aarch64")]
+// The pair and token indices name accumulator lanes, not just positions.
+#[allow(clippy::needless_range_loop)]
+unsafe fn rowi8_tiles_sdot(
+    w: &RowI8,
+    g: usize,
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    yt: &mut [&mut [f32]],
+) {
+    use std::arch::aarch64::*;
+    let wq = w.group(g);
+    let block_bytes = ROW_OCT * 32;
+    for tl in tiles {
+        let qtile = &a.q[tl * a.n_block * MM_TILE * 32..][..a.n_block * MM_TILE * 32];
+        let dtile = &a.d[tl * a.n_super * MM_TILE..][..a.n_super * MM_TILE];
+        for row_half in 0..2 {
+            for token_half in 0..2 {
+                // `acc[r][k]`: rows `row_half * 4 + r`, tokens
+                // `token_half * 4 + k` of the tile.
+                let mut acc = [[0f32; 4]; 4];
+                for s in 0..a.n_super {
+                    // Safety (the block): NEON is baseline and `dotprod` the
+                    // caller's contract; every load is 16 bytes inside a
+                    // pair's 64 of block `b`, which the group and the tile
+                    // hold whole.
+                    unsafe {
+                        // `[row pair][token pair][direct, cross]`.
+                        let mut iacc = [[[vdupq_n_s32(0); 2]; 2]; 2];
+                        for j in 0..SUBS {
+                            let b = s * SUBS + j;
+                            let wb = wq.as_ptr().add(b * block_bytes);
+                            let xb = qtile.as_ptr().add(b * MM_TILE * 32);
+                            for c in 0..4 {
+                                let wv = [0, 1]
+                                    .map(|pi| vld1q_s8(wb.add((row_half * 2 + pi) * 64 + c * 16)));
+                                for qi in 0..2 {
+                                    let xv = vld1q_s8(xb.add((token_half * 2 + qi) * 64 + c * 16));
+                                    let xs = vextq_s8::<8>(xv, xv);
+                                    for pi in 0..2 {
+                                        iacc[pi][qi][0] = sdot_lanes(iacc[pi][qi][0], wv[pi], xv);
+                                        iacc[pi][qi][1] = sdot_lanes(iacc[pi][qi][1], wv[pi], xs);
+                                    }
+                                }
+                            }
+                        }
+                        for (pi, by_token) in iacc.iter().enumerate() {
+                            for (qi, [direct, cross]) in by_token.iter().enumerate() {
+                                // `[r0·t0, r1·t1, r0·t1, r1·t0]`.
+                                let mut s4 = [0i32; 4];
+                                vst1q_s32(s4.as_mut_ptr(), vpaddq_s32(*direct, *cross));
+                                let (r0, r1) = (pi * 2, pi * 2 + 1);
+                                let (k0, k1) = (qi * 2, qi * 2 + 1);
+                                let d = |k: usize| dtile[s * MM_TILE + token_half * 4 + k];
+                                acc[r0][k0] += s4[0] as f32 * d(k0);
+                                acc[r1][k1] += s4[1] as f32 * d(k1);
+                                acc[r0][k1] += s4[2] as f32 * d(k1);
+                                acc[r1][k0] += s4[3] as f32 * d(k0);
+                            }
+                        }
+                    }
+                }
+                for (r, by_token) in acc.iter().enumerate() {
+                    let row = row_half * 4 + r;
+                    let scale = w.scale[g * ROW_OCT + row];
+                    for (k, v) in by_token.iter().enumerate() {
+                        let t = tl * MM_TILE + token_half * 4 + k;
+                        if t < a.n_tokens {
+                            yt[row][t] = v * scale;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -5145,7 +5596,8 @@ pub fn dot_flat_pair(
     debug_assert!(!w0.has_min && !w1.has_min);
     #[cfg(target_arch = "aarch64")]
     if have_dotprod() {
-        return dot_flat_pair_impl::<ISA_DOTPROD>(w0, w1, a, out0, out1);
+        // Safety: `have_dotprod` verified the instruction.
+        return unsafe { dot_flat_pair_sdot(w0, w1, a, out0, out1) };
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -5233,6 +5685,67 @@ unsafe fn dot_flat_pair_avx2(
         for (row, sum) in acc.iter().zip(sums.iter_mut()) {
             for (k, v) in row.iter().enumerate() {
                 sum[k] = hsum_ps_avx2(*v);
+            }
+        }
+        store_tile(tl, &sums[0], out0);
+        store_tile(tl, &sums[1], out1);
+    }
+}
+
+/// [`dot_flat_pair_avx2`]'s shape on `sdot`: per (row, token) a four-lane
+/// `f32` accumulator, into which each 32-element block's two `sdot`s go
+/// converted and scaled (`d · s`, one `fmla`), reduced to one number only
+/// at the end of the row — where [`dot_flat_pair_impl`] reduces every
+/// block's products to a scalar ([`dot32_sdot`]'s `addv`) and scales that.
+/// A row's 32 bytes are loaded once a block for the tile's four tokens.
+///
+/// The same products in another summation order than the scalar form —
+/// `f32` rounding, inside the flat tests' tolerance — and each token's
+/// result its own, whatever the batch.
+///
+/// # Safety
+/// [`have_dotprod`] must be true.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_flat_pair_sdot(
+    w0: &UnpackedRow,
+    w1: &UnpackedRow,
+    a: &ActQ8Flat,
+    out0: &mut [f32],
+    out1: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    for tl in 0..a.n_tile {
+        let qtile = &a.q[tl * a.n_block * TOKEN_TILE * ACT_BLOCK..];
+        let dtile = &a.d[tl * a.n_block * TOKEN_TILE..];
+        // Safety (every block below): NEON is baseline on aarch64; a load
+        // is 16 bytes at a block's start or middle inside a row (`n_block *
+        // 32` long) or the tile's activations (`n_block * TOKEN_TILE * 32`).
+        let mut acc = [[unsafe { vdupq_n_f32(0.0) }; TOKEN_TILE]; 2];
+        for b in 0..a.n_block {
+            let (s0, s1) = (w0.scale[b], w1.scale[b]);
+            let xq = &qtile[b * TOKEN_TILE * ACT_BLOCK..];
+            let ad = &dtile[b * TOKEN_TILE..];
+            unsafe {
+                let p0 = w0.q.as_ptr().add(b * ACT_BLOCK);
+                let p1 = w1.q.as_ptr().add(b * ACT_BLOCK);
+                let (w0l, w0h) = (vld1q_s8(p0), vld1q_s8(p0.add(16)));
+                let (w1l, w1h) = (vld1q_s8(p1), vld1q_s8(p1.add(16)));
+                for (k, &d) in ad.iter().take(TOKEN_TILE).enumerate() {
+                    let xp = xq.as_ptr().add(k * ACT_BLOCK);
+                    let (xl, xh) = (vld1q_s8(xp), vld1q_s8(xp.add(16)));
+                    let zero = vdupq_n_s32(0);
+                    let q0 = sdot_lanes(sdot_lanes(zero, w0l, xl), w0h, xh);
+                    let q1 = sdot_lanes(sdot_lanes(zero, w1l, xl), w1h, xh);
+                    acc[0][k] = vfmaq_f32(acc[0][k], vcvtq_f32_s32(q0), vdupq_n_f32(d * s0));
+                    acc[1][k] = vfmaq_f32(acc[1][k], vcvtq_f32_s32(q1), vdupq_n_f32(d * s1));
+                }
+            }
+        }
+        let mut sums = [[0f32; TOKEN_TILE]; 2];
+        for (row, sum) in acc.iter().zip(sums.iter_mut()) {
+            for (k, v) in row.iter().enumerate() {
+                // Safety: NEON is baseline on aarch64.
+                sum[k] = unsafe { vaddvq_f32(*v) };
             }
         }
         store_tile(tl, &sums[0], out0);
@@ -9186,6 +9699,174 @@ mod tests {
             }
         }
         yt
+    }
+
+    /// The `sdot` kernels — an `aarch64` core with `dotprod` but no `i8mm`
+    /// runs them — are the portable definitions exactly: the K-quant tile
+    /// (all three kinds, a short last tile), the per-row `int8` tile, and
+    /// the `int8` attention scores. Called directly, so a core that also
+    /// has `i8mm` (and so dispatches past them) checks them too.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_sdot_tiles_are_the_portable_definitions_exactly() {
+        if !have_dotprod() {
+            eprintln!("no dotprod on this core; skipped");
+            return;
+        }
+        let (in_dim, n_tokens) = (768usize, 13usize);
+        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS] {
+            let out_dim = 2 * ROW_QUAD;
+            let (raw, x, row_bytes) = k_fixture(ggml_type, in_dim, out_dim, n_tokens, 4242);
+            let mut rows: Vec<KRow> = (0..out_dim).map(|_| KRow::new()).collect();
+            for (o, row) in rows.iter_mut().enumerate() {
+                unpack_k_row(
+                    ggml_type,
+                    &raw[o * row_bytes..(o + 1) * row_bytes],
+                    in_dim,
+                    row,
+                );
+            }
+            let refs: Vec<&KRow> = rows.iter().collect();
+            let mm = ActQ8Mm::quantize(&x, in_dim, n_tokens);
+            let mut want = vec![0f32; out_dim * n_tokens];
+            let mut got = vec![0f32; out_dim * n_tokens];
+            {
+                let mut outs: Vec<&mut [f32]> = want.chunks_mut(n_tokens).collect();
+                dot_k_rows_portable(&refs, &mm, 0..mm.n_tiles(), &mut outs);
+            }
+            {
+                let mut outs: Vec<&mut [f32]> = got.chunks_mut(n_tokens).collect();
+                let tiles = 0..mm.n_tiles();
+                // Safety: `dotprod` was verified.
+                unsafe {
+                    match rows[0].kind {
+                        KKind::Q4K => gemm_k_rows_sdot::<true, false>(&refs, &mm, tiles, &mut outs),
+                        KKind::Iq4Xs => {
+                            gemm_k_rows_sdot::<false, false>(&refs, &mm, tiles, &mut outs)
+                        }
+                        KKind::Q6K => gemm_k_rows_sdot::<false, true>(&refs, &mm, tiles, &mut outs),
+                    }
+                }
+            }
+            assert!(want.iter().any(|v| *v != 0.0));
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
+                "type {ggml_type}: sdot {got:?} != portable {want:?}"
+            );
+        }
+
+        let out_dim = 2 * ROW_OCT;
+        let w = RowI8::quantize(out_dim, in_dim, |o| {
+            (0..in_dim)
+                .map(|i| ((o * 31 + i * 7) % 23) as f32 - 11.0)
+                .collect()
+        });
+        let x: Vec<f32> = (0..n_tokens * in_dim)
+            .map(|i| ((i * 13) % 17) as f32 - 8.0)
+            .collect();
+        let a = ActQ8Mm::quantize(&x, in_dim, n_tokens);
+        for g in 0..out_dim / ROW_OCT {
+            let mut want = vec![0f32; ROW_OCT * n_tokens];
+            let mut got = vec![0f32; ROW_OCT * n_tokens];
+            {
+                let mut yt: Vec<&mut [f32]> = want.chunks_mut(n_tokens).collect();
+                rowi8_tiles_portable(&w, g, &a, 0..a.n_tiles(), &mut yt);
+            }
+            {
+                let mut yt: Vec<&mut [f32]> = got.chunks_mut(n_tokens).collect();
+                // Safety: `dotprod` was verified.
+                unsafe { rowi8_tiles_sdot(&w, g, &a, 0..a.n_tiles(), &mut yt) };
+            }
+            assert!(want.iter().any(|v| *v != 0.0));
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
+                "rowi8 group {g}: sdot {got:?} != portable {want:?}"
+            );
+        }
+
+        let dim = 24;
+        let values: Vec<f32> = (0..10 * dim)
+            .map(|i| ((i * 29) % 31) as f32 - 15.0)
+            .collect();
+        let q = PairedI8::quantize(4, dim, |i| &values[i * dim..(i + 1) * dim]);
+        let k = PairedI8::quantize(10, dim, |i| &values[(9 - i) * dim..(10 - i) * dim]);
+        let (p0, n) = (1usize, 3usize);
+        let mut got = vec![vec![0i32; 2 * n]; 4];
+        {
+            let [g0, g1, g2, g3] = &mut got[..] else {
+                unreachable!()
+            };
+            // Safety: `dotprod` was verified.
+            unsafe { i8_scores_4rows_sdot(&q, 1, 0, &k, p0..p0 + n, [g0, g1, g2, g3]) };
+        }
+        let unpaired = |m: &PairedI8, row: usize, c: usize| -> i32 {
+            m.data[(row / 2) * 2 * dim + (c / 8) * 16 + (row % 2) * 8 + c % 8] as i32
+        };
+        for (o, row) in got.iter().zip([2usize, 3, 0, 1]) {
+            for (j, &score) in o.iter().enumerate() {
+                let want: i32 = (0..dim)
+                    .map(|c| unpaired(&q, row, c) * unpaired(&k, 2 * p0 + j, c))
+                    .sum();
+                assert_eq!(score, want, "query row {row}, key {j}");
+            }
+        }
+    }
+
+    /// The `AVX2` super-block quantizer writes the portable one's bytes,
+    /// sums and scale exactly: on exact ties (`±n.5` after scaling, which
+    /// `AVX2` has no rounding mode for), just either side of them, at the
+    /// clamp, on ordinary values and on an all-zero block — at every token
+    /// slot of the pair layout.
+    #[test]
+    fn the_avx2_super_block_quantizer_is_the_portable_one_to_the_byte() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !is_x86_feature_detected!("avx2") {
+                eprintln!("no AVX2 on this core; skipped");
+                return;
+            }
+            let mut chunks: Vec<Vec<f32>> = Vec::new();
+            // amax 127: the scale is exactly 1, so these are exact ties.
+            let mut ties: Vec<f32> = (0..SUPER_BLOCK)
+                .map(|i| (i % 50) as f32 - 25.0 + if i % 2 == 0 { 0.5 } else { -0.5 })
+                .collect();
+            ties[7] = 127.0;
+            chunks.push(ties.clone());
+            // Just either side of the ties.
+            chunks.push(ties.iter().map(|v| v + v.signum() * 1e-4).collect());
+            chunks.push(ties.iter().map(|v| v - v.signum() * 1e-4).collect());
+            // Ordinary values, one far past the others (the clamp holds the
+            // rest), and a block of zeros.
+            chunks.push(
+                (0..SUPER_BLOCK)
+                    .map(|i| ((i * 7919 % 2003) as f32 / 1001.0 - 1.0) * 3.7)
+                    .collect(),
+            );
+            chunks.push(vec![0.0; SUPER_BLOCK]);
+            for chunk in &chunks {
+                for slot in [0usize, 8, 64, 200] {
+                    let mut q0 = vec![0i8; SUBS * MM_TILE * 32];
+                    let mut q1 = q0.clone();
+                    let (mut b0, mut b1) = ([0i16; SUBS], [0i16; SUBS]);
+                    let s0 = quantize_super_portable(chunk, &mut q0, slot, &mut b0);
+                    // Safety: AVX2 detected; the lengths are the contract.
+                    let s1 = unsafe { quantize_super_avx2(chunk, &mut q1, slot, &mut b1) };
+                    assert_eq!(s0.to_bits(), s1.to_bits(), "scale at slot {slot}");
+                    assert_eq!(b0, b1, "sums at slot {slot}");
+                    assert_eq!(q0, q1, "bytes at slot {slot}");
+                }
+            }
+            // The ties really are ties: the portable form rounds them away.
+            let mut q = vec![0i8; SUBS * MM_TILE * 32];
+            let mut b = [0i16; SUBS];
+            quantize_super_portable(&chunks[0], &mut q, 0, &mut b);
+            // Element 0 is -24.5, element 1 is -24.5 too (1 - 25 - 0.5).
+            assert_eq!((q[0], q[1]), (-25, -25));
+        }
     }
 
     /// The `i8mm` four-row kernel is the pair kernel's arithmetic in a

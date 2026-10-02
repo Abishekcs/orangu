@@ -1267,6 +1267,23 @@ well, under the same test. `vecdot::have_k_rows_tile` (`i8mm` on aarch64,
 `AVX2` on x86-64) is what `CpuBackend::matmul_k_gemm_into` and the VAE's
 gathered `Q6_K` convolutions ask before taking the tile.
 
+On an `aarch64` core with `dotprod` but no `i8mm` (Cortex-A76/A78) the
+tiles run on `sdot`, in the same shape: `vecdot::gemm_k_rows_sdot` (the
+K-quant tile), `rowi8_tiles_sdot` (the per-row `int8` tile the picture
+transformer and the VAE use) and `i8_scores_4rows_sdot` (the picture
+attention's `int8` scores). The pair layout puts a pair's two rows' 8 bytes
+side by side per chunk, so one `sdot` of a row pair against a token pair
+gives row 0 · token 0 and row 1 · token 1 in its lanes, and one more against
+the token halves swapped (`ext`) the other two; the K-quant scale is an
+`mla` by `[sc0, sc0, sc1, sc1]` per scale group, and one `addp` per
+super-block folds the lanes into the four exact sums. Each is its portable
+definition to the bit (`the_sdot_tiles_are_the_portable_definitions_exactly`,
+which calls them directly wherever `dotprod` exists, so an `i8mm` core
+checks them too). `have_k_rows_tile`, `have_rowi8_tile` and `have_i8_scores`
+answer yes on such a core; the `Q8_0`-type prompt kernel
+(`dot_flat_pair_sdot`) keeps its sums in four `f32` lanes per row and token
+on every core with `dotprod`, as the `AVX2` one keeps eight.
+
 **A picture's attention scores run on `smmla` too.** Attention is the part
 of a denoising step that grows with the square of the picture: profiled
 with `orangu-bench --image … --flamegraph`, a Qwen-Image 2.1 step spends
@@ -1307,6 +1324,26 @@ result is the serial pass's to the bit
 then reads attention as the chunked attention's wall time (the device
 working inside it) and mlp as the wait for the last chunk's tail.
 `ORANGU_IMAGE_OVERLAP` sets the tokens per chunk; `0` turns it off.
+
+**A block's feed-forward is one device submission.** On a Vulkan device
+the picture transformer's MLP goes through
+`VulkanBackend::fused_ffn_prefill` — gate and up projections, SwiGLU and
+the down projection recorded together — so the `[tokens, mlp_dim]`
+intermediate never leaves the card: no readback of the gate and up
+results, no host SiLU, no upload of its product. A checkpoint that
+fuses `gate_up` into one tensor hands the chain its two halves as row
+views of the same bytes (`QuantMatrix::rows`), so the card holds the
+weights once (`a_fused_gate_up_runs_as_two_row_views_on_the_device`).
+Where the integer-dot GEMM serves the projections (`mmq_for`: `Q4_K` and
+the other K-quants at whole tiles) the chain runs them on it, as the text
+models' post-attention chain does: its input quantized to `int8` once for
+gate and up, the activation's output once more for down; other shapes
+keep the float kernel. The host form remains for the CPU and the per-row
+`int8` copy;
+`ORANGU_IMAGE_FUSED_FFN=0` selects it on a device. A block's query, key
+and value projections read the same rows and go to the backend as one
+`matmul_batch`, so a device stages that input once and runs the three in
+one sequence of submissions with one readback.
 
 **Every one of these kernels exists on every architecture.** The
 `smmla` tile product has a portable twin (`vecdot::dot_k_rows_portable`,
@@ -2025,9 +2062,14 @@ as `Q6_K` at load under the default `VaePrecision::Int8`, each `im2col`
 row zero-padded to a multiple of 256 so the K-quant kernel takes it, and
 `matmul_k_gemm_into` splits such a matmul over token tiles as well as row
 groups (`vecdot::dot_k_rows_tiles`) — 96 rows against 65,536 pixels was six
-tasks on twelve cores before. `ActQ8Mm::quantize` is NEON (`vcvtaq`, the
-same ties-away rounding as `f32::round`, so the bit-identity test still
-holds); it was a tenth of a decode's samples as a scalar loop. And the
+tasks on twelve cores before. `ActQ8Mm::quantize` quantizes a token a
+super-block at a time (`vecdot::quantize_super`): NEON on aarch64 (`vcvtaq`,
+the same ties-away rounding as `f32::round`), `AVX2` on x86-64
+(`quantize_super_avx2`, which has no ties-away mode and rebuilds it exactly
+— truncate, then step one away from zero where the dropped fraction is at
+least a half), byte for byte the portable form
+(`the_avx2_super_block_quantizer_is_the_portable_one_to_the_byte`, exact
+ties included), so the bit-identity tests still hold. And the
 `im2col` band no longer exists on this path: `ActQ8Mm::quantize_with`
 takes a closure that fills one token's row into a scratch buffer, `vae::
 gather_window` is that closure for a pixel's 3×3 window, and

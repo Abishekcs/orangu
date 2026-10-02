@@ -37,13 +37,31 @@
 //! highlight everything matching a substring with the matched fraction
 //! reported. It is one self-contained file with no external references.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 /// The suffix put on kernel-mode frames — the same mark
 /// `stackcollapse-perf.pl --kernel` used, so collapsed files from before this
 /// module and after it classify identically.
 pub const KERNEL_MARK: &str = "_[k]";
+
+/// The frame a sample is filed under, right below its thread, when its
+/// user-space call chain did not unwind: `perf script` printed no
+/// user-space frame for it — only its header, or the kernel's frames.
+///
+/// It happens with `--call-graph dwarf`, intermittently and per recording:
+/// the unwinder refuses every module it is asked to add for the rest of the
+/// file (`perf script -v`: "address range overlaps an existing module"), so
+/// one run keeps every stack and the next, of the same binary, loses most.
+/// Such a sample still has its own instruction pointer, which `perf script
+/// -G` resolves ([`own_frames`]); [`collapse_with`] files it as
+/// `thread;[user stack lost];frame`, so the time is charged to the right
+/// function and the loss shows in the graph rather than vanishing from it.
+pub const LOST_STACK: &str = "[user stack lost]";
+
+/// A sample's identity across two `perf script` passes over one file: its
+/// thread id and its timestamp, as printed.
+pub type SampleKey = (u32, String);
 
 /// Collapse `perf script` output into `stack count` lines.
 ///
@@ -59,33 +77,54 @@ pub const KERNEL_MARK: &str = "_[k]";
 ///
 /// Frames come out root-first with the thread name as the root, symbol offsets
 /// stripped, kernel frames marked, and recursion cycles folded.
+///
+/// A sample with no user-space frame is filed under [`LOST_STACK`].
 pub fn collapse(perf_script: &str) -> BTreeMap<String, u64> {
+    collapse_with(perf_script, &HashMap::new())
+}
+
+/// [`collapse`], with each lost-stack sample's own frame looked up in
+/// `own` (from [`own_frames`]) and put under [`LOST_STACK`].
+pub fn collapse_with(perf_script: &str, own: &HashMap<SampleKey, String>) -> BTreeMap<String, u64> {
     let mut totals: BTreeMap<String, u64> = BTreeMap::new();
     let mut comm = String::new();
+    let mut key: Option<SampleKey> = None;
     let mut frames: Vec<String> = Vec::new();
 
-    let mut flush = |comm: &mut String, frames: &mut Vec<String>| {
+    let mut flush = |comm: &mut String, key: &mut Option<SampleKey>, frames: &mut Vec<String>| {
+        let key = key.take();
         if comm.is_empty() {
             frames.clear();
             return;
         }
+        let lost = !frames.iter().any(|f| !f.ends_with(KERNEL_MARK));
+        if lost
+            && frames.is_empty()
+            && let Some(frame) = key.and_then(|k| own.get(&k))
+        {
+            frames.push(frame.clone());
+        }
         // `perf` prints leaf first; a flamegraph reads root first.
         frames.reverse();
         let mut stack = vec![std::mem::take(comm)];
+        if lost {
+            stack.push(LOST_STACK.to_string());
+        }
         stack.append(frames);
         *totals.entry(fold_cycles(&stack)).or_default() += 1;
     };
 
     for line in perf_script.lines() {
         if line.trim().is_empty() {
-            flush(&mut comm, &mut frames);
+            flush(&mut comm, &mut key, &mut frames);
             continue;
         }
         // A sample header starts in column zero; a frame is indented.
         if !line.starts_with([' ', '\t']) {
             // Two samples with no blank line between them would otherwise merge.
-            flush(&mut comm, &mut frames);
+            flush(&mut comm, &mut key, &mut frames);
             comm = sample_comm(line).unwrap_or_default();
+            key = sample_key(line).map(|(key, _)| key);
             continue;
         }
         if !comm.is_empty()
@@ -94,8 +133,51 @@ pub fn collapse(perf_script: &str) -> BTreeMap<String, u64> {
             frames.push(frame);
         }
     }
-    flush(&mut comm, &mut frames);
+    flush(&mut comm, &mut key, &mut frames);
     totals
+}
+
+/// Every sample's own frame, from `perf script -G -F comm,tid,time,ip,sym,dso`
+/// — one line a sample, `comm tid time: ip sym (dso)` — by [`SampleKey`]:
+/// what [`collapse_with`] files a lost-stack sample under.
+pub fn own_frames(perf_script_g: &str) -> HashMap<SampleKey, String> {
+    perf_script_g
+        .lines()
+        .filter_map(|line| {
+            let (key, rest) = sample_key(line)?;
+            Some((key, parse_frame(rest)?))
+        })
+        .collect()
+}
+
+/// A sample header's thread and timestamp, and what follows the timestamp.
+/// The thread is the field [`sample_comm`] stops at (`tid`, or the `tid`
+/// of `pid/tid`); the timestamp is the next field, the one ending in `:`.
+fn sample_key(header: &str) -> Option<(SampleKey, &str)> {
+    let mut fields = Vec::new();
+    let mut at = 0;
+    for field in header.split_whitespace() {
+        let start = at + header[at..].find(field)?;
+        at = start + field.len();
+        fields.push((field, at));
+    }
+    let tid_at = fields.iter().position(|(f, _)| {
+        let core = f.split_once('/').map_or(*f, |(a, _)| a);
+        !core.is_empty() && core.bytes().all(|b| b.is_ascii_digit())
+    })?;
+    if tid_at == 0 {
+        return None;
+    }
+    let tid_field = fields[tid_at].0;
+    let tid = tid_field.rsplit('/').next()?.parse().ok()?;
+    let (time, end) = fields
+        .get(tid_at + 1..)?
+        .iter()
+        .find(|(f, _)| f.ends_with(':'))?;
+    Some((
+        (tid, time.trim_end_matches(':').to_string()),
+        &header[*end..],
+    ))
 }
 
 /// The thread name from a `perf script` sample header.
@@ -545,6 +627,76 @@ orangu-server 1234 [003] 98.765600:     250000 cycles:ppp:
         assert_eq!(out["orangu-server;run_layers;dot_avx2"], 2);
         assert_eq!(out["orangu-server;run_layers;read_hpet_[k]"], 1);
         assert_eq!(out.len(), 2);
+    }
+
+    /// What `perf script` prints when a sample's user-space chain did not
+    /// unwind: the header alone, or the kernel's frames alone — and, from
+    /// the `-G` pass, each sample's own frame on one line.
+    const LOST: &str = "\
+orangu-server.c 3868986 4106296.444053:     834042 cpu/cycles/P: 
+
+orangu-server.c 3868984 4106296.443333:     972211 cpu/cycles/P: 
+\tffffffffa938c4d7 schedule+0x27 ([kernel.kallsyms])
+\tffffffffa8092f1e __x64_sys_sched_yield+0xe ([kernel.kallsyms])
+
+orangu-server.c 3868981 4106296.443999:     250000 cpu/cycles/P: 
+\t    7f0a1234abcd dot_avx2+0x1c (/opt/orangu-server.copy)
+\t    7f0a1234ab00 run_layers+0x8 (/opt/orangu-server.copy)
+";
+    const OWN: &str = "\
+ orangu-server.c 3868986 4106296.444053:     55f7a1cbc2f3 i8_scores_4rows_in+0x2a3 (/opt/orangu-server.copy)
+ orangu-server.c 3868984 4106296.443333: ffffffffa938c4d7 schedule+0x27 ([kernel.kallsyms])
+ orangu-server.c 3868981 4106296.443999:     7f0a1234abcd dot_avx2+0x1c (/opt/orangu-server.copy)
+";
+
+    #[test]
+    fn a_sample_whose_user_stack_did_not_unwind_is_filed_as_lost() {
+        let out = collapse(LOST);
+        // Nothing to go on: the thread and the mark.
+        assert_eq!(out["orangu-server.c;[user stack lost]"], 1);
+        // The kernel's half survives, under the mark.
+        assert_eq!(
+            out["orangu-server.c;[user stack lost];__x64_sys_sched_yield_[k];schedule_[k]"],
+            1
+        );
+        // A whole stack is not touched.
+        assert_eq!(out["orangu-server.c;run_layers;dot_avx2"], 1);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn a_lost_sample_keeps_its_own_frame_from_the_second_pass() {
+        let own = own_frames(OWN);
+        assert_eq!(
+            own[&(3868986, "4106296.444053".to_string())],
+            "i8_scores_4rows_in"
+        );
+        let out = collapse_with(LOST, &own);
+        assert_eq!(
+            out["orangu-server.c;[user stack lost];i8_scores_4rows_in"],
+            1
+        );
+        // A kernel-only sample already ends in its own frame; it gains no
+        // second copy of it.
+        assert_eq!(
+            out["orangu-server.c;[user stack lost];__x64_sys_sched_yield_[k];schedule_[k]"],
+            1
+        );
+        assert_eq!(out["orangu-server.c;run_layers;dot_avx2"], 1);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn a_sample_key_is_the_thread_and_the_time_in_either_header_shape() {
+        assert_eq!(
+            sample_key("orangu-server 1234/1240 [003] 98.765432:     250000 cycles:ppp:")
+                .map(|(k, _)| k),
+            Some((1240, "98.765432".to_string()))
+        );
+        let (key, rest) =
+            sample_key("tokio rt worker 77 12.5: 7f0a1234abcd poll+0x1 (/opt/x)").unwrap();
+        assert_eq!(key, (77, "12.5".to_string()));
+        assert_eq!(parse_frame(rest).as_deref(), Some("poll"));
     }
 
     #[test]
