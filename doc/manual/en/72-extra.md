@@ -161,6 +161,16 @@ Set `platform = gitlab` in the `[orangu]` section to drive `glab` instead of `gh
 
 As with `gh`, `/pull` and `/merge` fall back to plain Git when `glab` is not installed, while `/comment`, `/issue`, and `/pull_request` require it. The default branch used by `/rebase` and the startup sync is detected through Git (`origin/HEAD`, then `main`/`master`) when running against GitLab.
 
+**Credential prompts at startup**
+
+The startup sync and the startup `gh`/`glab` fetches run in the background. If one of them needs a password, a username, or an SSH key passphrase, the prompt is shown in the input area, prefixed with `GitHub` or `GitLab` according to `[orangu].platform`:
+
+```
+> GitHub: Enter passphrase for key '/home/me/.ssh/id_ed25519': ******
+```
+
+Passwords and passphrases are masked. Press `Enter` to answer, or `Esc` (or `Ctrl+C`) to cancel the prompt, in which case the sync reports that it failed. **orangu** does this by acting as `GIT_ASKPASS` and `SSH_ASKPASS` for those commands. The SSH prompt needs OpenSSH 8.4 or later.
+
 **Installation**
 
 ```sh

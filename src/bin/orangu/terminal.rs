@@ -289,6 +289,16 @@ impl Drop for RawModePauseGuard {
 
 impl TerminalUiGuard {
     pub fn print_screen(&mut self, render: RenderContext<'_>, screen: ScreenState<'_>) {
+        self.draw_screen(render, screen, true);
+    }
+
+    /// Draw the screen for a prompt that is not a command line, such as a
+    /// credential prompt: no completion hint and no command highlighting.
+    pub fn print_prompt_screen(&mut self, render: RenderContext<'_>, screen: ScreenState<'_>) {
+        self.draw_screen(render, screen, false);
+    }
+
+    fn draw_screen(&mut self, render: RenderContext<'_>, screen: ScreenState<'_>, hints: bool) {
         // Only hint a completion while the cursor sits at the end of what was typed.
         // Slash commands take priority over natural-language bindings; for the latter,
         // `ghost_index` selects which candidate to preview (cycled with Shift+Tab).
@@ -301,9 +311,7 @@ impl TerminalUiGuard {
         // its greeting instead. That one is a label rather than a suggestion —
         // it is not in the Tab candidates, so it can never be filled in — which
         // is why it is added here and not in `input_ghost_suffix`.
-        let structured_ghost = screen
-            .reverse_search
-            .is_none()
+        let structured_ghost = (hints && screen.reverse_search.is_none())
             .then(|| {
                 completion::input_ghost_suffix(
                     screen.input,
@@ -322,7 +330,7 @@ impl TerminalUiGuard {
             None => structured_ghost.as_deref().unwrap_or(""),
         };
         let mut valid_command_len = 0;
-        if screen.input.starts_with('/') {
+        if hints && screen.input.starts_with('/') {
             let first_word = screen.input.split_whitespace().next().unwrap_or("");
             if crate::slash_command::SlashCommand::iter().any(|c| c.command() == first_word)
                 || render

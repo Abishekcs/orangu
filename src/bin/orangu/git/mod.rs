@@ -55,6 +55,14 @@ impl Forge {
             Forge::GitLab => "glab",
         }
     }
+
+    /// The forge's display name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Forge::GitHub => "GitHub",
+            Forge::GitLab => "GitLab",
+        }
+    }
 }
 
 pub fn discover_git_root(workspace: &Path) -> Option<PathBuf> {

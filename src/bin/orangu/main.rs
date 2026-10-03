@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 mod activity_log;
+mod askpass;
 mod build;
 mod commands;
 mod completion;
@@ -358,6 +359,9 @@ fn command_mode_refusal(args: &Args) -> Option<&'static str> {
 }
 
 fn main() -> ExitCode {
+    if let Some(code) = askpass::run_helper() {
+        return code;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -672,6 +676,9 @@ async fn run() -> Result<()> {
         }
     }
 
+    // Credential prompts from the background git/gh/glab calls are answered in
+    // the input area, since the TUI owns the terminal from here on.
+    let askpass_requests = askpass::start();
     let mut _terminal_ui_guard = TerminalUiGuard::new(config.mouse)?;
 
     let vw = terminal_width();
@@ -765,7 +772,9 @@ async fn run() -> Result<()> {
     let forge = Forge::from_platform(&config.platform);
     let mut sync_handle = discover_git_root(tools.workspace()).map(|_| {
         let sync_workspace = tools.workspace().to_path_buf();
-        tokio::task::spawn_blocking(move || sync_default_branch(&sync_workspace, forge))
+        tokio::task::spawn_blocking(move || {
+            askpass::with_prompts(|| sync_default_branch(&sync_workspace, forge))
+        })
     });
     let mut sync_notice: Option<(String, std::time::Instant)> = None;
 
@@ -774,7 +783,9 @@ async fn run() -> Result<()> {
     // numbers without shelling out to `gh`/`glab` on every keystroke.
     let mut pr_handle = discover_git_root(tools.workspace()).map(|_| {
         let pr_workspace = tools.workspace().to_path_buf();
-        tokio::task::spawn_blocking(move || fetch_active_pull_requests(&pr_workspace, forge))
+        tokio::task::spawn_blocking(move || {
+            askpass::with_prompts(|| fetch_active_pull_requests(&pr_workspace, forge))
+        })
     });
 
     // Likewise fetch the repository's reviewers, assignees, and labels once, off
@@ -782,7 +793,9 @@ async fn run() -> Result<()> {
     // `gh`/`glab` call.
     let mut issue_meta_handle = discover_git_root(tools.workspace()).map(|_| {
         let meta_workspace = tools.workspace().to_path_buf();
-        tokio::task::spawn_blocking(move || fetch_issue_metadata(&meta_workspace, forge))
+        tokio::task::spawn_blocking(move || {
+            askpass::with_prompts(|| fetch_issue_metadata(&meta_workspace, forge))
+        })
     });
 
     // Scan the workspace and build the initial Knowledge Graph in the background.
@@ -1066,15 +1079,21 @@ async fn run() -> Result<()> {
             sync_notice = None;
             sync_handle = discover_git_root(tools.workspace()).map(|_| {
                 let w = tools.workspace().to_path_buf();
-                tokio::task::spawn_blocking(move || sync_default_branch(&w, forge))
+                tokio::task::spawn_blocking(move || {
+                    askpass::with_prompts(|| sync_default_branch(&w, forge))
+                })
             });
             pr_handle = discover_git_root(tools.workspace()).map(|_| {
                 let w = tools.workspace().to_path_buf();
-                tokio::task::spawn_blocking(move || fetch_active_pull_requests(&w, forge))
+                tokio::task::spawn_blocking(move || {
+                    askpass::with_prompts(|| fetch_active_pull_requests(&w, forge))
+                })
             });
             issue_meta_handle = discover_git_root(tools.workspace()).map(|_| {
                 let w = tools.workspace().to_path_buf();
-                tokio::task::spawn_blocking(move || fetch_issue_metadata(&w, forge))
+                tokio::task::spawn_blocking(move || {
+                    askpass::with_prompts(|| fetch_issue_metadata(&w, forge))
+                })
             });
         }};
     }
@@ -1386,7 +1405,9 @@ async fn run() -> Result<()> {
         if pr_handle.is_none() && completion::flow::take_refresh_request() {
             pr_handle = discover_git_root(tools.workspace()).map(|_| {
                 let w = tools.workspace().to_path_buf();
-                tokio::task::spawn_blocking(move || fetch_active_pull_requests(&w, forge))
+                tokio::task::spawn_blocking(move || {
+                    askpass::with_prompts(|| fetch_active_pull_requests(&w, forge))
+                })
             });
         }
 
@@ -1443,6 +1464,34 @@ async fn run() -> Result<()> {
             kg_rescan_handle = None;
         }
 
+        // A background git/gh/glab call asked for a password or passphrase:
+        // take over the input area until it is answered or cancelled.
+        while let Some(request) = askpass_requests
+            .as_ref()
+            .and_then(|requests| requests.try_recv().ok())
+        {
+            let answer = askpass::read_answer(
+                &mut _terminal_ui_guard,
+                render,
+                &ScreenState {
+                    transcript: output_state.lines(),
+                    transcript_epoch: output_state.render_epoch(),
+                    scroll_offset: output_state.scroll_offset(),
+                    left_status: None,
+                    pending_count: pending_commands.len(),
+                    pending_lines: &[],
+                    input: "",
+                    cursor: 0,
+                    ghost_index: 0,
+                    dropdown: None,
+                    reverse_search: None,
+                },
+                forge.name(),
+                &request.prompt,
+            )?;
+            request.answer(answer);
+        }
+
         let resume_left_status = startup_notice_until
             .filter(|&deadline| std::time::Instant::now() < deadline)
             .map(|_| StatusFragment::plain(format!("Resuming session {session_id}")));
@@ -1481,7 +1530,11 @@ async fn run() -> Result<()> {
 
         // While the startup sync is running or its result is still on the status
         // bar, refresh more often so the status clears promptly when it is done.
+        // The forge fetches are polled too, so a credential prompt they raise
+        // reaches the input area promptly.
         let sync_active = sync_handle.is_some()
+            || pr_handle.is_some()
+            || issue_meta_handle.is_some()
             || sync_notice
                 .as_ref()
                 .is_some_and(|(_, deadline)| std::time::Instant::now() < *deadline);

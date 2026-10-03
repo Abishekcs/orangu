@@ -455,7 +455,7 @@ pub fn git_rebase_onto_remote(repo_root: &Path, remote: &str, branch: &str) -> R
 /// present on origin. GitLab relies on the git-based detection.
 fn git_default_branch(repo_root: &Path, forge: Forge) -> Option<String> {
     if forge == Forge::GitHub
-        && let Ok(output) = std::process::Command::new("gh")
+        && let Ok(output) = crate::askpass::apply(&mut std::process::Command::new("gh"))
             .args([
                 "repo",
                 "view",
@@ -538,7 +538,7 @@ pub fn sync_default_branch(workspace: &Path, forge: Forge) -> Result<Option<Stri
     let on_default = workspace_branch_name(&repo_root).as_deref() == Some(default.as_str());
     let output = if on_default {
         // On the default branch: fast-forward the working tree.
-        std::process::Command::new("git")
+        crate::askpass::apply(&mut std::process::Command::new("git"))
             .arg("-C")
             .arg(&repo_root)
             .args(["pull", "--ff-only", "origin", &default])
@@ -546,7 +546,7 @@ pub fn sync_default_branch(workspace: &Path, forge: Forge) -> Result<Option<Stri
             .context("failed to run git pull")?
     } else {
         // On another branch: fast-forward the local default ref in place.
-        std::process::Command::new("git")
+        crate::askpass::apply(&mut std::process::Command::new("git"))
             .arg("-C")
             .arg(&repo_root)
             .args(["fetch", "origin", &format!("{default}:{default}")])

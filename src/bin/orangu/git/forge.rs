@@ -52,7 +52,7 @@ pub fn fetch_active_pull_requests(workspace: &Path, forge: Forge) -> Result<Vec<
         Forge::GitHub => vec![request, "list", "--state", "open", "--json", "number,title"],
         Forge::GitLab => vec![request, "list", "--output", "json"],
     };
-    let output = match std::process::Command::new(cli)
+    let output = match crate::askpass::apply(&mut std::process::Command::new(cli))
         .args(&args)
         .current_dir(&repo_root)
         .output()
@@ -570,7 +570,7 @@ pub fn fetch_issue_metadata(workspace: &Path, forge: Forge) -> IssueMetadata {
     // GitLab's `api members` returns JSON objects; pull the `username` field out.
     // GitHub's `--jq` already yields one login per line.
     let collect = |args: &[&str], json_field: Option<&str>| -> Vec<String> {
-        let Ok(output) = std::process::Command::new(cli)
+        let Ok(output) = crate::askpass::apply(&mut std::process::Command::new(cli))
             .args(args)
             .current_dir(&repo_root)
             .output()
