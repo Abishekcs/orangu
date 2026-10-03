@@ -211,7 +211,10 @@ The prompt keeps the tree's speed and the answer the node's. On the board
 above: decode 15.2 tok/s with the tree's 58.5 tok/s prompts, where
 decoding through the tree gave 6.2. `decode = tree` keeps every step on the
 tree, `decode = top` hands over whenever the node holds the model, and
-`/v1/workers` says which applies.
+`/v1/workers` says which applies. With `auto` the measured speeds decide
+at first; once requests have decoded through the tree, the step they took
+does, weighed again between requests, and the node runs the whole model
+once before its first sequence decodes alone.
 
 A node with workers does not have to use them. When it holds the whole
 model and its measured speeds say the tree would not take at most 90% of

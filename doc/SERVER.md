@@ -1535,13 +1535,14 @@ machines without a `secret` is warned about at startup.
   or `top`, the node takes every layer's rows back from the workers at the
   first decode step (and a hybrid model's recurrent states) and decodes
   alone on the model's own paths — with `auto` only when its measured
-  decode speed beats the tree's, and with either only when it holds the
-  whole model (it then keeps every layer's weights) and every worker can
-  send back what it holds. A chat's next turn goes on there from the kept
-  rows, unless less than half the prompt is reused. On one board, a Mali
-  top-level node with two CPU workers decoded Llama-3.2-3B at 15.2 tok/s
-  this way, against 6.2 through the tree, with prompts still read 1.45×
-  faster than alone.
+  decode speed beats the tree's (once requests have run, the decode step
+  they found through the tree, weighed again between requests), and with
+  either only when it holds the whole model (it then keeps every layer's
+  weights) and every worker can send back what it holds. A chat's next
+  turn goes on there from the kept rows, unless less than half the prompt
+  is reused. On one board, a Mali top-level node with two CPU workers
+  decoded Llama-3.2-3B at 15.2 tok/s this way, against 6.2 through the
+  tree, with prompts still read 1.45× faster than alone.
 - `head` — which node applies the output head while a tree decodes
   through its nodes: `auto` (the default), `top` or `last`. `last` has the
   node with the final layer send logits back instead of its layers'

@@ -222,6 +222,9 @@ pub struct Node {
     decode_alone: AtomicBool,
     /// Whether the node running the final layer applies the output head.
     head_on_last: AtomicBool,
+    /// Whether the whole model has run here once, for sequences decoded
+    /// alone ([`super::speed::warm_whole`]).
+    warmed_whole: AtomicBool,
     /// Why the last plan used no worker though there were some, or
     /// `None` when it used them.
     not_worth: Mutex<Option<String>>,
@@ -493,10 +496,11 @@ impl Node {
             LayerPipeline::unchecked(model.clone(), 0..n_layer)
         };
         // A node that could serve alone times the whole model on its own
-        // paths, to set its tree against (offloading only when it pays).
+        // paths, to set its tree against (offloading, or decoding alone,
+        // only when it pays).
         let total_bytes: u64 = layer_bytes.iter().sum();
         let alone_ns = (!rates_given
-            && settings.offload == Offload::Auto
+            && (settings.offload == Offload::Auto || settings.decode == DecodeOn::Auto)
             && settings.split
             && settings.shares != Shares::Memory
             && !settings.workers.is_empty()
@@ -537,6 +541,7 @@ impl Node {
             alone: AtomicBool::new(false),
             decode_alone: AtomicBool::new(false),
             head_on_last: AtomicBool::new(false),
+            warmed_whole: AtomicBool::new(false),
             not_worth: Mutex::new(None),
             observed: Mutex::new(HashMap::new()),
             observed_since_plan: AtomicUsize::new(0),
@@ -1343,6 +1348,9 @@ impl Node {
             _ => {}
         }
         let decode_alone = self.decides_to_decode_alone(&entries, &used);
+        if decode_alone {
+            self.warm_whole_once();
+        }
         let working = entries
             .iter()
             .filter(|e| e.layer_start < e.layer_end)
@@ -1457,6 +1465,12 @@ impl Node {
                     .map(|il| self.state_bytes.get(il).copied().unwrap_or(0) as f64)
                     .sum::<f64>();
             }
+        }
+        // What requests found a decode step through these nodes to take
+        // goes before the prediction.
+        let names: Vec<String> = working.iter().map(|e| e.node.clone()).collect();
+        if let Some((seen, _)) = self.tree_seen_with(&names).and_then(|s| s.decode_ns) {
+            tree = seen;
         }
         let alone = self
             .alone_ns
@@ -2212,6 +2226,54 @@ impl Node {
         }
     }
 
+    /// With `decode = auto`, once requests have shown a decode step through
+    /// the tree ([`CALIBRATE_TOKENS`] of them), weighs again whether
+    /// sequences decode here alone — the plan stays as it is.
+    fn decide_decode_again(&self) {
+        if self.settings.decode != DecodeOn::Auto
+            || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
+            || self
+                .tree_seen_in_force()
+                .and_then(|seen| seen.decode_ns)
+                .is_none_or(|(_, tokens)| tokens < CALIBRATE_TOKENS)
+        {
+            return;
+        }
+        let plan = self.plan();
+        let used = self.used.lock().unwrap().clone();
+        let alone = self.decides_to_decode_alone(&plan, &used);
+        if alone {
+            self.warm_whole_once();
+        }
+        if alone != self.decode_alone.swap(alone, Ordering::AcqRel) {
+            log::info!(
+                "orangu-server: workers: by the decode steps requests found, sequences decode {} \
+                 once their prompt is through the tree",
+                if alone {
+                    "on this node alone"
+                } else {
+                    "through the tree"
+                }
+            );
+        }
+    }
+
+    /// Runs the whole model once on its own paths before the first sequence
+    /// decodes here alone: its own layers are warm from the plan, the rest
+    /// would be read in by a request.
+    fn warm_whole_once(&self) {
+        if self.warmed_whole.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        match super::speed::warm_whole(self.model.as_ref()) {
+            Ok(took) => log::info!(
+                "orangu-server: [workers] the whole model warmed in {:.1} s, to decode alone",
+                took.as_secs_f64()
+            ),
+            Err(e) => log::warn!("orangu-server: [workers] could not warm the whole model: {e:#}"),
+        }
+    }
+
     /// What requests found of the tree in force.
     fn tree_seen_in_force(&self) -> Option<TreeSeen> {
         let used: Vec<String> = self
@@ -2293,6 +2355,7 @@ impl Node {
         if let Some(why) = self.tree_seen_slower() {
             return Some(why);
         }
+        self.decide_decode_again();
         if self.settings.shares != Shares::Decode
             || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
         {
@@ -2550,9 +2613,13 @@ impl PipelineSource for Node {
                 * super::speed::PROMPT_TOKENS as f64;
             tree.prompt_ns = Some(weigh(tree.prompt_ns, chunk, prefill.tokens));
         }
-        // A decode step runs through every stage in turn — here, decoded
-        // alone after a handover.
-        if decode.tokens > 0 {
+        // A decode step runs through every stage in turn. One decoded here
+        // alone after a handover is no step of the tree's.
+        let through_workers = decode
+            .parts
+            .iter()
+            .any(|(name, _)| *name != self.settings.name);
+        if decode.tokens > 0 && through_workers {
             let step = decode
                 .parts
                 .iter()
@@ -3191,7 +3258,10 @@ mod tests {
         let slow_step = Trace {
             forwards: 40,
             tokens: 40,
-            parts: vec![("other".to_string(), Duration::from_secs(40 * 3600))],
+            parts: vec![
+                ("other".to_string(), Duration::from_secs(40 * 1800)),
+                ("fast".to_string(), Duration::from_secs(40 * 1800)),
+            ],
         };
         let short_prompt = Trace {
             forwards: 1,
@@ -3212,6 +3282,50 @@ mod tests {
         for n in [&top, &slow, &other, &fast] {
             n.stop();
         }
+    }
+
+    /// A node whose measured speeds say its tree decodes faster goes by
+    /// what requests found instead: a tree slower than this node alone
+    /// has its sequences decode here, with the plan left as it is.
+    #[test]
+    fn a_node_decodes_alone_once_requests_find_the_tree_slower() {
+        let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
+            let mut s = settings(name, workers, None);
+            s.shares = Shares::Decode;
+            s.decode = DecodeOn::Auto;
+            s.capacity.setups = vec![NodeSetup {
+                name: name.to_string(),
+                decode_rate: rate,
+                prompt_rate: rate,
+                ..NodeSetup::default()
+            }];
+            node_with(s, Variant::default())
+        };
+        let fast = with_rate("fast", vec![], 1.0);
+        let top = with_rate("top", vec![fast.local_addr().unwrap().to_string()], 0.001);
+        let _model = top.delegating_model().unwrap();
+        let before = top.plan();
+        assert!(
+            before.iter().any(|e| e.node == "fast"),
+            "{}",
+            describe(&before)
+        );
+        assert!(!top.decode_alone(), "predicted: the tree decodes faster");
+        let slow_step = Trace {
+            forwards: 40,
+            tokens: 40,
+            parts: vec![
+                ("top".to_string(), Duration::from_secs(40)),
+                ("fast".to_string(), Duration::from_secs(40 * 3600)),
+            ],
+        };
+        top.observed_request(&Trace::default(), &slow_step);
+        top.observed_decode(&slow_step.parts, slow_step.tokens);
+        let _ = top.calibration_due();
+        assert!(top.decode_alone(), "found: the tree decodes slower");
+        assert_eq!(top.plan(), before, "the plan stays");
+        top.stop();
+        fast.stop();
     }
 
     /// Shares follow the nodes' speeds when they differ, and each

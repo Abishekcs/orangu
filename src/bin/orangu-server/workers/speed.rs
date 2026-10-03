@@ -178,6 +178,17 @@ pub fn measure_whole(model: &dyn ModelForward) -> Result<(Duration, Duration)> {
     Ok((prompt, decode))
 }
 
+/// Runs the whole model once on its own paths — a token, then one decode
+/// step — so that a node about to decode alone has every layer read in
+/// and its device prepared before a request does. Answers how long it took.
+pub fn warm_whole(model: &dyn ModelForward) -> Result<Duration> {
+    let started = Instant::now();
+    let mut cache = model.new_kv_cache(2);
+    model.forward(&mut cache, &[1], 0, 0)?;
+    model.forward(&mut cache, &[1], 1, 0)?;
+    Ok(started.elapsed())
+}
+
 /// Runs `layers` once, untimed — a 128-token prompt chunk and a decode
 /// step — so that the first request does not pay for reading the weights
 /// in, uploading them or building a device's pipelines: a node does it
