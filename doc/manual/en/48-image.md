@@ -102,8 +102,13 @@ when the device is faster for them (`[image] VAE wide convolutions …`). With t
 transformer on a device, each block's attention runs on the CPU in
 chunks of the picture's tokens while the device runs the output
 projection and the feed-forward layers of the chunks already done, so
-the two work at the same time; the picture is the same, bit for bit
-(`ORANGU_IMAGE_OVERLAP=0` runs them one after the other). Each block's
+the two work at the same time (`ORANGU_IMAGE_OVERLAP=0` runs them one
+after the other). The device also takes a few of each block's attention
+heads, as many as keep the two sides finishing together: the count is
+measured from each pass and is near its balance from the second pass of
+the server's first picture (`ORANGU_IMAGE_DEVICE_HEADS` fixes it; `0` keeps every head on
+the CPU). The log's `[image] overlap: …` line says how the two sides
+waited on each other. Each block's
 feed-forward layers run on the device as one submission, their
 intermediate never coming back to the host. A transformer larger than its
 card keeps as many leading blocks on it as fit and streams the rest

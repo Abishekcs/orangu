@@ -1417,7 +1417,10 @@ impl Pipeline {
                 denormalize_latent(&mut z);
                 vae.decode_unless(&Feature::new(h8, w8, Z_DIM, z), Some(cancel))
             }
-            Model::QwenImage21 { vae, .. } => {
+            Model::QwenImage21 { transformer, vae } => {
+                // The step's device scratch goes before the VAE takes the
+                // card.
+                transformer.release_pass_scratch();
                 let (h16, w16) = (
                     height / vae21::SPATIAL_COMPRESSION,
                     width / vae21::SPATIAL_COMPRESSION,
@@ -1700,6 +1703,25 @@ impl Pipeline {
             pct(st.other),
             pct(st.lora),
         );
+        if !st.lane_busy.is_zero() {
+            log::info!(
+                "orangu-server: [image] overlap: the device lane ran heads {:.1}s and tails \
+                 {:.1}s (output projection {:.1}s, feed-forward {:.1}s, its own host work \
+                 {:.1}s) and waited \
+                 {:.1}s on the attention ({:.1}s of it the first chunks'); the host waited \
+                 {:.1}s on the last tails",
+                st.lane_heads.as_secs_f64(),
+                st.lane_busy.saturating_sub(st.lane_heads).as_secs_f64(),
+                st.lane_out.as_secs_f64(),
+                st.lane_mlp.as_secs_f64(),
+                st.lane_busy
+                    .saturating_sub(st.lane_heads + st.lane_out + st.lane_mlp)
+                    .as_secs_f64(),
+                st.lane_idle.as_secs_f64(),
+                st.first_chunk.as_secs_f64(),
+                st.mlp.as_secs_f64(),
+            );
+        }
         Ok(GeneratedImage {
             bytes,
             format: request.format,

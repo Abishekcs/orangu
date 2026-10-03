@@ -1321,7 +1321,10 @@ attention; they run once a picture.
 the picture transformer's linears run on a device (no per-row `int8`
 copy), `QwenImage21Transformer::forward` cuts each block's attention into
 query chunks — four by default, each at least 1024 tokens, else the block
-runs its stages in order — on the global rayon pool, and a device lane
+runs its stages in order, tapered (`tapered_chunks`: an eighth of the
+picture first and last, the rest halved between, so the lane starts on a
+block sooner and the host waits less on its last tail) — on the global
+rayon pool, and a device lane
 on a small pool of its own (`image-lane-*`, a quarter of the workers, at
 most four) runs every finished chunk's tail: the output projection, the
 gated residual, the norm and the MLP. A token's tail reads only its own
@@ -1329,8 +1332,48 @@ row and a query's attention only its own query and the keys, so the
 result is the serial pass's to the bit
 (`attention_by_query_chunks_is_the_whole_attention`). The stage line
 then reads attention as the chunked attention's wall time (the device
-working inside it) and mlp as the wait for the last chunk's tail.
-`ORANGU_IMAGE_OVERLAP` sets the tokens per chunk; `0` turns it off.
+working inside it) and mlp as the wait for the last chunk's tail, and a
+second line says how the overlap went: the lane's time on the card's heads
+and on the tails (the output projection's calls, the feed-forward's, its
+own host work between), its wait on the attention (and how much of that
+was the first chunks'), and the host's wait on the last tails.
+`ORANGU_IMAGE_OVERLAP` sets even chunks of that many tokens; `0` turns
+the overlap off; `ORANGU_IMAGE_OVERLAP_TAPER=0` keeps the default four
+even.
+
+**The card takes a share of the attention's heads.** In an overlapped
+pass the lane first runs the last few heads' attention on the card
+(`device_attention` over `VulkanBackend::gpu_attention_prefill`: the
+queries' columns gathered in parallel, the keys' and values' pushed
+straight from their columns into a cache kept from block to block, so its
+device mirror is allocated once), while the host runs the other heads by
+query chunks (`step_attention_heads` over `attention_blocked_heads`, each
+head's arithmetic the whole call's to the bit,
+`attention_over_a_head_range_is_those_heads_of_the_whole`); each chunk's
+card columns are filled in before its tail. How many heads is measured,
+not set: `HeadTuner` reads each pass's stages — the lane's wait on the
+attention less the host's wait past the last chunk's own tail is the
+lane's slack, a head moved to the card costs its lane time per head (the
+host's, before the card has run one) and returns the host's — and moves
+the count half the way to where the slack would be none, a head at least,
+up to half the heads, kept from picture to picture. From none it goes the
+whole way: a server's first pass is the measurement, priced with the
+card's heads at the host's rate, which errs toward too few, so the second
+pass already runs near the balance. The heads' cache is kept from pass
+to pass, so its device mirror is allocated once (on a card at its driver
+budget, allocating it every pass made the driver move buffers mid-step),
+and released before the VAE decodes
+(`QwenImage21Transformer::release_pass_scratch`).
+`ORANGU_IMAGE_DEVICE_HEADS` fixes the count (`0`: all on the host);
+`ORANGU_IMAGE_HEADS_TRACE=1` prints the card's gather, cache fill, key
+and value upload (`VulkanBackend::sync_kv_mirror`, run apart for the
+timing) and call per block, and each pass's slack and next count. An
+`f16` mirror's rows are converted with `half`'s slice conversion (the
+CPU's own `f16` conversion where it has one), split across the pool for
+large uploads — the same bytes as `f16::from_f32` value for value
+(`the_f16_upload_conversion_is_the_scalar_one`). The card's heads use its
+`f32` attention where the host's use `int8` scores, so the picture
+differs from an all-host one in fine detail.
 
 **A block's feed-forward is one device submission.** On a Vulkan device
 the picture transformer's MLP goes through
@@ -1347,7 +1390,12 @@ models' post-attention chain does: its input quantized to `int8` once for
 gate and up, the activation's output once more for down; other shapes
 keep the float kernel. The host form remains for the CPU and the per-row
 `int8` copy;
-`ORANGU_IMAGE_FUSED_FFN=0` selects it on a device. A block's query, key
+`ORANGU_IMAGE_FUSED_FFN=0` selects it on a device. A call wider than a
+stripe runs its stripes two in flight: the next stripe is uploaded,
+recorded and submitted before the last one's readback is waited on and
+copied out (`fused_ffn_submit`, `submit_for_readback`,
+`finish_readback`), so the card runs while the host does both
+(`a_striped_fused_ffn_keeps_each_stripe_in_its_rows`). A block's query, key
 and value projections read the same rows and go to the backend as one
 `matmul_batch`, so a device stages that input once and runs the three in
 one sequence of submissions with one readback. A batch wider than one
@@ -1356,6 +1404,10 @@ picture's q/k/v and each chunk's output projection) runs each stripe on
 the integer-dot GEMM where it serves the op's shape (`mmq_for`): the
 stripe's rows quantized from the op's input region, then the GEMM, in the
 same encoder as the stripe's copies; other shapes keep the float kernel.
+Ops that share one input and all run on the integer-dot GEMM share its
+stripe too: the input crosses the bus into the first op's region once,
+is quantized once, and every op's GEMM reads those rows
+(`ops_sharing_an_input_share_its_quantized_rows`).
 
 **A transformer larger than its card streams its last blocks.** At load
 (`QwenImage21Transformer::plan_streaming`) the driver's free memory on the
@@ -2124,7 +2176,8 @@ upload and copy run beside the card. The bias is added on the host.
 `QwenImage21Vae::choose_wide` times the decoder's first wide convolution
 over a 64 × 64 map, gathered on the device against wherever the rest of
 the VAE runs (`[image] VAE wide convolutions: …`), and sends the wide class
-to the card only when it wins. Narrow convolutions stay where
+to the card only when it wins. `ORANGU_VRAM_REPORT=1` prints what holds
+the card as the decode starts (`[vae decode] …`). Narrow convolutions stay where
 `choose_backend` put them. `ORANGU_VAE_GATHER=0` keeps every convolution
 there. `a_gathered_convolution_is_the_convolution` checks the chain
 against the exact `f64` convolution with both paddings, several stripes a

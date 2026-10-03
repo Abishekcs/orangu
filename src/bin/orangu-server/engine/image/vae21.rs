@@ -416,6 +416,16 @@ impl QwenImage21Vae {
             latent.channels
         );
         let tower = &self.decoder;
+        // `ORANGU_VRAM_REPORT=1`: what holds the card as the wide
+        // convolutions start on it — whatever the step left there competes
+        // with their bands.
+        if let Some(vulkan) = self
+            .wide_device
+            .as_ref()
+            .and_then(|device| device.as_wgpu_on(self.post_quant.w.device()))
+        {
+            vulkan.report_device_memory("vae decode");
+        }
         let x = self.conv(&self.post_quant, latent);
         let mut x = self.conv(&tower.conv_in, &x);
         x = self.middle(&tower.middle, &x);

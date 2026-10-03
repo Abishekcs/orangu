@@ -52,10 +52,11 @@ use crate::engine::tensor;
 use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::transformer::{
     StageClock, Stages, TIMESTEP_FREQUENCIES, TransformerConfig, head_rms_norm, layer_norm_into,
-    silu_inplace, step_attention, timestep_embedding,
+    silu_inplace, step_attention, step_attention_heads, timestep_embedding,
 };
 
 /// The feed-forward's two input projections: ComfyUI's checkpoints fuse
@@ -95,6 +96,14 @@ pub struct QwenImage21Transformer {
     /// The last pass's modulation, keyed by its sigma: under guidance the
     /// negative prompt's pass follows the positive one at the same sigma.
     modulation: Mutex<Option<Modulation>>,
+    /// The card's heads' keys and values ([`Self::device_attention`]),
+    /// kept from block to block and pass to pass so its device mirror is
+    /// allocated once and only refilled — on a card at its driver budget,
+    /// allocating it each pass made the driver move buffers mid-step —
+    /// until [`Self::release_pass_scratch`] before the VAE.
+    head_cache: Mutex<Option<crate::engine::kv_cache::KvCache>>,
+    /// How many heads the card takes, tuned pass by pass ([`HeadTuner`]).
+    head_tuner: Mutex<HeadTuner>,
     img_in: QuantMatrix,
     txt_norm: Vec<f32>,
     txt_in: QuantMatrix,
@@ -293,6 +302,8 @@ impl QwenImage21Transformer {
             mlp_dim,
             stages: Mutex::new(Stages::default()),
             modulation: Mutex::new(None),
+            head_cache: Mutex::new(None),
+            head_tuner: Mutex::new(HeadTuner::new()),
             img_in: matrix("img_in")?,
             txt_norm: vector("txt_in.text_norm.weight", c.txt_dim)?,
             txt_in: matrix("txt_in.in_layer")?,
@@ -604,6 +615,114 @@ impl QwenImage21Transformer {
         })
     }
 
+    /// Drops what the steps keep on the card between passes (the heads'
+    /// cache and its mirror), for the VAE's decode, which follows on the
+    /// same card.
+    pub fn release_pass_scratch(&self) {
+        *self
+            .head_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// How many of a block's heads (the last ones) the card takes in an
+    /// overlapped pass: `ORANGU_IMAGE_DEVICE_HEADS` fixes the count (`0`
+    /// keeps them all on the host); unset, [`HeadTuner`] picks it from the
+    /// passes before. None without a Vulkan card holding the block, and at
+    /// most half of the block's heads.
+    fn device_heads(&self, block: &Block) -> usize {
+        if self.backend.as_wgpu_on(block.to_q.device()).is_none() {
+            return 0;
+        }
+        let n = fixed_device_heads().unwrap_or_else(|| {
+            self.head_tuner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .heads
+        });
+        n.min(self.config.n_head / 2)
+    }
+
+    /// The attention of the heads `heads` on the card holding `block`
+    /// (`VulkanBackend::gpu_attention_prefill`, non-causal): their columns
+    /// of the queries, keys and values gathered, `[n_q][heads · head_dim]`
+    /// back.
+    #[allow(clippy::too_many_arguments)]
+    fn device_attention(
+        &self,
+        block: &Block,
+        q: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        n_q: usize,
+        n_kv: usize,
+        heads: std::ops::Range<usize>,
+        scale: f32,
+    ) -> Vec<f32> {
+        let c = &self.config;
+        let vulkan = self
+            .backend
+            .as_wgpu_on(block.to_q.device())
+            .expect("device_heads saw the card");
+        let (first, width) = (heads.start * c.head_dim, heads.len() * c.head_dim);
+        // `ORANGU_IMAGE_HEADS_TRACE=1`: a line a block — the gather of the
+        // queries' columns, the cache fill (straight from the keys' and
+        // values' columns), the device's call.
+        let trace = crate::engine::env::flag_on("ORANGU_IMAGE_HEADS_TRACE").then(Instant::now);
+        let mut q_sub = vec![0.0f32; n_q * width];
+        q_sub
+            .par_chunks_mut(width)
+            .zip(q.par_chunks(c.dim))
+            .with_min_len(64)
+            .for_each(|(sub, row)| sub.copy_from_slice(&row[first..first + width]));
+        let gathered = trace.map(|t| t.elapsed());
+        let mut held = self
+            .head_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = match held.as_mut() {
+            Some(cache)
+                if cache.layers[0].capacity() > n_kv && cache.layers[0].kv_dim() == width =>
+            {
+                cache.layers[0].truncate(0);
+                cache
+            }
+            _ => held.insert(crate::engine::kv_cache::KvCache::new(1, n_kv + 1, width)),
+        };
+        for (k, v) in keys.chunks(c.dim).zip(values.chunks(c.dim)) {
+            cache.layers[0].push(&k[first..first + width], &v[first..first + width]);
+        }
+        let filled = trace.map(|t| t.elapsed());
+        if trace.is_some() {
+            vulkan.sync_kv_mirror(&mut cache.layers[0], heads.len());
+        }
+        let synced = trace.map(|t| t.elapsed());
+        let out = vulkan.gpu_attention_prefill(
+            &q_sub,
+            &mut cache.layers[0],
+            n_kv - n_q,
+            n_q,
+            heads.len(),
+            heads.len(),
+            c.head_dim,
+            0,
+            false,
+            scale,
+        );
+        if let (Some(t), Some(g), Some(f), Some(y)) = (trace, gathered, filled, synced) {
+            eprintln!(
+                "orangu-server: [image] {} heads on the device: gather {:.1} ms, cache {:.1} ms, \
+                 kv upload {:.1} ms, device {:.1} ms",
+                heads.len(),
+                g.as_secs_f64() * 1e3,
+                (f - g).as_secs_f64() * 1e3,
+                (y - f).as_secs_f64() * 1e3,
+                (t.elapsed() - y).as_secs_f64() * 1e3
+            );
+        }
+        out
+    }
+
     /// [`Self::mlp`] on the card that holds the block, as one submission
     /// (`VulkanBackend::fused_ffn_prefill`): the gate and up projections,
     /// the SwiGLU and the down projection with the `[n, mlp_dim]`
@@ -632,14 +751,18 @@ impl QwenImage21Transformer {
         )
     }
 
-    /// The query tokens per chunk when a step overlaps its attention with
+    /// The query chunks, in tokens, when a step overlaps its attention with
     /// the device ([`Self::forward`]), or `None` to run each block's stages
     /// one after the other. Overlap needs the linears off the host — a
     /// device backend, no per-row `int8` copy — and pays from about a
     /// thousand tokens a chunk: by default four chunks, none under
-    /// [`OVERLAP_MIN_CHUNK`] tokens. `ORANGU_IMAGE_OVERLAP` sets the tokens
-    /// per chunk; `0` turns it off.
-    fn overlap_chunk(&self, n_img: usize) -> Option<usize> {
+    /// [`OVERLAP_MIN_CHUNK`] tokens, tapered — the first and the last an
+    /// eighth of the picture each, the two between the rest — so the lane
+    /// starts on a block sooner and the host waits less on its last tail.
+    /// `ORANGU_IMAGE_OVERLAP` sets even chunks of that many tokens, `0`
+    /// turns the overlap off; `ORANGU_IMAGE_OVERLAP_TAPER=0` keeps the
+    /// default four chunks even.
+    fn overlap_plan(&self, n_img: usize) -> Option<Vec<usize>> {
         if self.backend.is_cpu() || self.rowi8.is_some() {
             return None;
         }
@@ -651,26 +774,48 @@ impl QwenImage21Transformer {
             Some(tokens) => tokens,
             None => n_img.div_ceil(OVERLAP_CHUNKS),
         };
-        (chunk >= OVERLAP_MIN_CHUNK && chunk < n_img).then_some(chunk)
+        if chunk < OVERLAP_MIN_CHUNK || chunk >= n_img {
+            return None;
+        }
+        let taper = configured.is_none()
+            && crate::engine::env::flag_on_unless_disabled("ORANGU_IMAGE_OVERLAP_TAPER");
+        Some(if taper {
+            tapered_chunks(n_img)
+        } else {
+            even_chunks(n_img, chunk)
+        })
     }
 
     /// One block's per-token tail over `x`'s rows, given their attention:
     /// `x += gate1 · to_out(attn)`, then `x += gate2 · mlp(norm(x) · scale2)`
     /// — what [`Self::forward`] runs on the whole picture, for a chunk.
-    fn block_tail(&self, block: &Block, gates: &Gates<'_>, x: &mut [f32], attn: Vec<f32>) {
+    /// Returns the time in the output projection's and the feed-forward's
+    /// calls.
+    fn block_tail(
+        &self,
+        block: &Block,
+        gates: &Gates<'_>,
+        x: &mut [f32],
+        attn: Vec<f32>,
+    ) -> (Duration, Duration) {
         let c = &self.config;
         let n = x.len() / c.dim;
+        let started = Instant::now();
         let out = self.linear(&attn, n, &block.to_out);
+        let out_call = started.elapsed();
         self.backend.recycle(attn);
         gated_add(x, &out, gates.gate1, c.dim);
         self.backend.recycle(out);
         let mut normed = self.backend.take_scratch(x.len());
         layer_norm_into(&mut normed, x, c.dim, c.eps);
         scale_inplace(&mut normed, gates.scale2, c.dim);
+        let started = Instant::now();
         let mlp = self.mlp(block, &normed, n);
+        let mlp_call = started.elapsed();
         self.backend.recycle(normed);
         gated_add(x, &mlp, gates.gate2, c.dim);
         self.backend.recycle(mlp);
+        (out_call, mlp_call)
     }
 
     /// `out(silu(gate) · up)`.
@@ -767,7 +912,7 @@ impl QwenImage21Transformer {
         let mut normed = Vec::new();
         let mut keys = Vec::with_capacity(n_kv * c.dim);
         let mut values = Vec::with_capacity(n_kv * c.dim);
-        let overlap = self.overlap_chunk(n_img);
+        let overlap = self.overlap_plan(n_img);
         clock.lap(|s| &mut s.other);
         for (bi, block) in self.blocks.iter().enumerate() {
             if super::cancelled(input.cancel) {
@@ -792,38 +937,102 @@ impl QwenImage21Transformer {
             // done with, for the next one to reuse (`Backend::recycle`).
             self.backend.recycle(k);
             self.backend.recycle(v);
-            if let Some(chunk) = overlap {
+            if let Some(plan) = &overlap {
                 // The attention by query chunks on the host, and each
                 // finished chunk's tail (`to_out`, residual, norm, MLP) on
                 // the device lane meanwhile: a token's tail reads only its
                 // own row, and a query's attention only its own query.
+                //
+                // The last `device_heads` heads' attention runs on the card,
+                // first thing in the lane — which is otherwise idle until the
+                // first chunk's attention is done — and their columns are
+                // filled into each chunk before its tail.
                 let gates = Gates {
                     gate1: &gate1,
                     scale2,
                     gate2: &gate2,
                 };
+                let device_heads = self.device_heads(block);
+                let host_heads = 0..c.n_head - device_heads;
                 std::thread::scope(|scope| {
                     let (send, receive) = std::sync::mpsc::channel::<Vec<f32>>();
                     let x = &mut x;
+                    let (q, keys, values) = (&q, &keys, &values);
                     let lane = scope.spawn(move || {
-                        lane_pool().install(|| {
-                            for (rows, attn) in x.chunks_mut(chunk * c.dim).zip(receive) {
-                                self.block_tail(block, &gates, rows, attn);
+                        lane_pool().install(move || {
+                            let (mut busy, mut idle) = (Duration::ZERO, Duration::ZERO);
+                            let (mut out, mut mlp) = (Duration::ZERO, Duration::ZERO);
+                            let mut last = Duration::ZERO;
+                            let ran = Instant::now();
+                            let device = (device_heads > 0).then(|| {
+                                self.device_attention(
+                                    block,
+                                    q,
+                                    keys,
+                                    values,
+                                    n_img,
+                                    n_kv,
+                                    c.n_head - device_heads..c.n_head,
+                                    scale,
+                                )
+                            });
+                            let heads = ran.elapsed();
+                            busy += heads;
+                            let width = device_heads * c.head_dim;
+                            let column = (c.n_head - device_heads) * c.head_dim;
+                            let mut t0 = 0;
+                            let mut rest: &mut [f32] = x;
+                            let mut chunks = plan.iter().map(move |&tokens| {
+                                let (rows, tail) =
+                                    std::mem::take(&mut rest).split_at_mut(tokens * c.dim);
+                                rest = tail;
+                                rows
+                            });
+                            loop {
+                                let waited = Instant::now();
+                                let Ok(attn) = receive.recv() else { break };
+                                idle += waited.elapsed();
+                                let Some(rows) = chunks.next() else { break };
+                                let mut attn = attn;
+                                let ran = Instant::now();
+                                let n = rows.len() / c.dim;
+                                if let Some(dev) = &device {
+                                    for t in 0..n {
+                                        attn[t * c.dim + column..t * c.dim + column + width]
+                                            .copy_from_slice(
+                                                &dev[(t0 + t) * width..(t0 + t + 1) * width],
+                                            );
+                                    }
+                                }
+                                t0 += n;
+                                let (o, m) = self.block_tail(block, &gates, rows, attn);
+                                last = ran.elapsed();
+                                busy += last;
+                                out += o;
+                                mlp += m;
                             }
+                            (busy, idle, out, mlp, heads, last)
                         })
                     });
-                    for qc in q.chunks(chunk * c.dim) {
-                        let attn = step_attention(
+                    let attention_started = Instant::now();
+                    let mut first = 0;
+                    for (ci, &tokens) in plan.iter().enumerate() {
+                        let qc = &q[first * c.dim..(first + tokens) * c.dim];
+                        first += tokens;
+                        let attn = step_attention_heads(
                             qc,
                             qc.len() / c.dim,
-                            &keys,
-                            &values,
+                            keys,
+                            values,
                             n_kv,
                             c.n_head,
                             c.head_dim,
                             scale,
-                            None,
+                            host_heads.clone(),
                         );
+                        if ci == 0 {
+                            clock.stages.first_chunk += attention_started.elapsed();
+                        }
                         if send.send(attn).is_err() {
                             // The lane ended early: its panic is re-raised
                             // by the join below.
@@ -832,8 +1041,16 @@ impl QwenImage21Transformer {
                     }
                     drop(send);
                     clock.lap(|s| &mut s.attention);
-                    if let Err(panic) = lane.join() {
-                        std::panic::resume_unwind(panic);
+                    match lane.join() {
+                        Ok((busy, idle, out, mlp, heads, last)) => {
+                            clock.stages.lane_heads += heads;
+                            clock.stages.lane_last += last;
+                            clock.stages.lane_busy += busy;
+                            clock.stages.lane_idle += idle;
+                            clock.stages.lane_out += out;
+                            clock.stages.lane_mlp += mlp;
+                        }
+                        Err(panic) => std::panic::resume_unwind(panic),
                     }
                 });
                 self.backend.recycle(q);
@@ -864,6 +1081,27 @@ impl QwenImage21Transformer {
         scale_inplace(&mut normed, &modulation.out, c.dim);
         let out = self.linear(&normed, n_img, &self.proj_out);
         clock.lap(|s| &mut s.other);
+        if overlap.is_some()
+            && fixed_device_heads().is_none()
+            && self
+                .blocks
+                .first()
+                .is_some_and(|b| self.backend.as_wgpu_on(b.to_q.device()).is_some())
+        {
+            let mut tuner = self
+                .head_tuner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let heads = tuner.heads;
+            let slack = tuner.observe(&clock.stages, c.n_head, c.n_head / 2);
+            if crate::engine::env::flag_on("ORANGU_IMAGE_HEADS_TRACE") {
+                eprintln!(
+                    "orangu-server: [image] pass with {heads} heads on the device: lane slack \
+                     {:+.2}s, next pass {}",
+                    slack, tuner.heads
+                );
+            }
+        }
         *self
             .modulation
             .lock()
@@ -877,8 +1115,25 @@ impl QwenImage21Transformer {
 }
 
 /// The chunks a step's attention is cut into when it overlaps the device
-/// ([`QwenImage21Transformer::overlap_chunk`]).
+/// ([`QwenImage21Transformer::overlap_plan`]).
 const OVERLAP_CHUNKS: usize = 4;
+
+/// `n` tokens in chunks of `chunk`, the last what is left.
+fn even_chunks(n: usize, chunk: usize) -> Vec<usize> {
+    (0..n)
+        .step_by(chunk)
+        .map(|start| chunk.min(n - start))
+        .collect()
+}
+
+/// `n` tokens in four chunks: the first and the last an eighth each
+/// (whole 64-token tiles), the two between halving the rest.
+fn tapered_chunks(n: usize) -> Vec<usize> {
+    let end = (n / 8 / 64 * 64).max(64);
+    let middle = n - 2 * end;
+    let half = middle / 2;
+    vec![end, half, middle - half, end]
+}
 
 /// The narrowest chunk worth overlapping: below it the device's calls on
 /// a chunk cost more than the overlap saves.
@@ -904,6 +1159,67 @@ fn device_weights(block: &Block) -> Vec<&QuantMatrix> {
         up,
         &block.mlp_out,
     ]
+}
+
+/// `ORANGU_IMAGE_DEVICE_HEADS`, read once: the heads the card takes, fixed.
+fn fixed_device_heads() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_IMAGE_DEVICE_HEADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
+/// Picks how many heads the card takes from how one pass's overlap went,
+/// measured inside the pass — so a machine's drifting clocks, which move
+/// whole passes, do not steer it. The lane's slack is its time waiting on
+/// the host's attention less the host's time waiting on the lane past the
+/// last chunk's own tail; a head moved to the card takes its time on the
+/// lane (`lane_heads` per head; before the card has run one, the host's)
+/// from that slack and gives back the host's time per head
+/// (`attention` over the host's heads). The count goes half the way to
+/// where the slack would be none, a head at least, each pass, and is kept
+/// from one picture to the next. From none it goes the whole way: the
+/// first pass is the measurement, and pricing the card's heads at the
+/// host's rate errs toward too few.
+struct HeadTuner {
+    heads: usize,
+}
+
+impl HeadTuner {
+    fn new() -> Self {
+        Self { heads: 0 }
+    }
+
+    /// One pass's stages at the current count of a block's `n_head` heads;
+    /// moves the count for the next pass, within `0..=most`. Returns the
+    /// lane's slack, seconds.
+    fn observe(&mut self, pass: &Stages, n_head: usize, most: usize) -> f64 {
+        let secs = |d: Duration| d.as_secs_f64();
+        let host = secs(pass.attention) / (n_head - self.heads).max(1) as f64;
+        let card = if self.heads > 0 {
+            secs(pass.lane_heads) / self.heads as f64
+        } else {
+            host
+        };
+        let behind = (secs(pass.mlp) - secs(pass.lane_last)).max(0.0);
+        let slack = secs(pass.lane_idle) - behind;
+        let damping = if self.heads == 0 { 1.0 } else { 2.0 };
+        let toward = slack / (host + card).max(1e-9) / damping;
+        let step = if toward.abs() < 0.5 {
+            0
+        } else {
+            toward.round().clamp(-(most as f64), most as f64) as isize
+        };
+        let step = if step == 0 && toward.abs() >= 0.5 {
+            toward.signum() as isize
+        } else {
+            step
+        };
+        self.heads = (self.heads as isize + step).clamp(0, most as isize) as usize;
+        slack
+    }
 }
 
 /// A block's modulation for its per-token tail.
@@ -1108,6 +1424,65 @@ mod tests {
         // The frame axis' last pair: 10000^(-7/8).
         let f = 10000f64.powf(-7.0 / 8.0);
         assert!((t[7].1 - (3.0 * f).sin() as f32).abs() < 1e-6);
+    }
+
+    /// Every plan covers the picture's tokens exactly, in order; the taper
+    /// puts an eighth at each end in whole 64-token tiles.
+    #[test]
+    fn overlap_plans_cover_the_picture() {
+        assert_eq!(tapered_chunks(4096), vec![512, 1536, 1536, 512]);
+        assert_eq!(even_chunks(4096, 1024), vec![1024; 4]);
+        assert_eq!(even_chunks(4000, 1024), vec![1024, 1024, 1024, 928]);
+        for n in [4096usize, 4000, 6144, 9216, 3999] {
+            let t = tapered_chunks(n);
+            assert_eq!(t.iter().sum::<usize>(), n, "{n}: {t:?}");
+            assert_eq!(t[0], t[3]);
+            assert!(t[0].is_multiple_of(64) && t[0] <= n / 8, "{n}: {t:?}");
+            assert!(t[1] >= t[0] && t[2] >= t[0], "{n}: {t:?}");
+        }
+    }
+
+    /// The tuner moves half the way to the balance a pass's stages imply,
+    /// away from the card when the host waited on the lane, and stays put
+    /// at the balance.
+    #[test]
+    fn the_head_tuner_moves_toward_the_balance() {
+        let ms = Duration::from_millis;
+        let pass = |idle: u64, drain: u64, last: u64, heads_on_lane: u64| Stages {
+            attention: ms(32_000),
+            mlp: ms(drain),
+            lane_idle: ms(idle),
+            lane_last: ms(last),
+            lane_heads: ms(heads_on_lane),
+            ..Stages::default()
+        };
+        let mut tuner = HeadTuner::new();
+        // No heads yet: 1 s a head on the host, assumed the same on the
+        // card; 8 s of slack is 4 heads to the balance, all of it at once
+        // from none.
+        let slack = tuner.observe(&pass(8_000, 2_000, 2_000, 0), 32, 16);
+        assert!((slack - 8.0).abs() < 1e-9);
+        assert_eq!(tuner.heads, 4);
+        // From there, half the way: 4 more heads' worth of slack (the card
+        // as fast as the host) is 2 this pass.
+        tuner.observe(&pass(8_000, 2_000, 2_000, 4 * 1_000), 32, 16);
+        assert_eq!(tuner.heads, 6);
+        // The host waited 3 s past the last tail and the lane never did:
+        // back one at least.
+        tuner.heads = 8;
+        tuner.observe(&pass(0, 5_000, 2_000, 8 * 800), 32, 16);
+        assert!(tuner.heads < 8, "{}", tuner.heads);
+        // At the balance: no move.
+        tuner.heads = 6;
+        tuner.observe(&pass(300, 2_000, 2_000, 6 * 800), 32, 16);
+        assert_eq!(tuner.heads, 6);
+        // Bounded.
+        tuner.heads = 15;
+        tuner.observe(&pass(60_000, 2_000, 2_000, 15 * 100), 32, 16);
+        assert_eq!(tuner.heads, 16);
+        tuner.heads = 0;
+        tuner.observe(&pass(0, 9_000, 2_000, 0), 32, 16);
+        assert_eq!(tuner.heads, 0);
     }
 
     #[test]

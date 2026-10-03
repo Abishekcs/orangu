@@ -165,6 +165,24 @@ pub struct Stages {
     pub lora: Duration,
     /// Whole passes, so a caller can say "per pass".
     pub passes: u32,
+    /// Under the overlap, outside [`Self::total`]: the device lane's time
+    /// running chunks' tails, its time waiting for the next chunk's
+    /// attention, and the share of that wait that is the first chunk's
+    /// attention (which nothing can fill) — what says which side of the
+    /// overlap a pass waits on.
+    pub lane_busy: Duration,
+    pub lane_idle: Duration,
+    pub first_chunk: Duration,
+    /// The lane's busy time by phase: the output projection's call, the
+    /// feed-forward's call, and its own host work between them (the gated
+    /// adds, the norm, the scale).
+    pub lane_out: Duration,
+    pub lane_mlp: Duration,
+    /// The lane's time on the heads it runs on the card.
+    pub lane_heads: Duration,
+    /// The lane's time on each block's last chunk's tail — the part of the
+    /// host's final wait no balance can remove.
+    pub lane_last: Duration,
 }
 
 impl Stages {
@@ -181,6 +199,13 @@ impl Stages {
         self.other += other.other;
         self.lora += other.lora;
         self.passes += other.passes;
+        self.lane_busy += other.lane_busy;
+        self.lane_idle += other.lane_idle;
+        self.first_chunk += other.first_chunk;
+        self.lane_out += other.lane_out;
+        self.lane_mlp += other.lane_mlp;
+        self.lane_heads += other.lane_heads;
+        self.lane_last += other.lane_last;
     }
 }
 
@@ -880,6 +905,26 @@ pub(crate) fn attention(
     attention_blocked(q, n_q, k, v, n_kv, n_head, head_dim, scale, limits, false)
 }
 
+/// [`step_attention`] for the heads `heads` only — the other heads'
+/// columns zero, for another device to fill.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_attention_heads(
+    q: &[f32],
+    n_q: usize,
+    k: &[f32],
+    v: &[f32],
+    n_kv: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    heads: std::ops::Range<usize>,
+) -> Vec<f32> {
+    let int8 = int8_step_attention() && head_dim.is_multiple_of(8);
+    attention_blocked_heads(
+        q, n_q, k, v, n_kv, n_head, head_dim, scale, None, int8, heads,
+    )
+}
+
 /// [`attention`] for a denoising step's picture tokens, where attention is
 /// the part of a pass that grows with the square of the picture (39% of a
 /// Qwen-Image 2.1 step at 1024 x 1024, against 14% at 512): the scores
@@ -1191,6 +1236,39 @@ fn attention_blocked(
     limits: Option<&[usize]>,
     int8: bool,
 ) -> Vec<f32> {
+    attention_blocked_heads(
+        q,
+        n_q,
+        k,
+        v,
+        n,
+        n_head,
+        head_dim,
+        scale,
+        limits,
+        int8,
+        0..n_head,
+    )
+}
+
+/// [`attention_blocked`] for the heads `heads` only: the same rows for
+/// those heads' columns of the `[n_q][n_head · head_dim]` output, the other
+/// columns zero — what a step does when another device takes the rest of
+/// the heads. Each head's arithmetic is the whole call's, to the bit.
+#[allow(clippy::too_many_arguments)]
+fn attention_blocked_heads(
+    q: &[f32],
+    n_q: usize,
+    k: &[f32],
+    v: &[f32],
+    n: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    limits: Option<&[usize]>,
+    int8: bool,
+    heads: std::ops::Range<usize>,
+) -> Vec<f32> {
     use crate::engine::vecdot::{F32_ROWS, PairedI8, gemm_f32_rows, gemm_f32_rows_many};
     let dim = n_head * head_dim;
     debug_assert_eq!(q.len(), n_q * dim);
@@ -1198,12 +1276,15 @@ fn attention_blocked(
     debug_assert!(n_q <= n);
     debug_assert!(limits.is_none_or(|l| l.len() == n_q && l.iter().all(|&m| m >= 1 && m <= n)));
     debug_assert_eq!(head_dim % F32_ROWS, 0);
-    // Keys head-major, `[n_head][n][head_dim]`.
-    let mut k_heads = vec![0.0f32; n * dim];
+    debug_assert!(heads.end <= n_head && !heads.is_empty());
+    let nh = heads.len();
+    // The range's keys head-major, `[nh][n][head_dim]`.
+    let mut k_heads = vec![0.0f32; n * nh * head_dim];
     k_heads
         .par_chunks_mut(n * head_dim)
         .enumerate()
-        .for_each(|(h, block)| {
+        .for_each(|(hl, block)| {
+            let h = heads.start + hl;
             for (i, row) in block.chunks_mut(head_dim).enumerate() {
                 row.copy_from_slice(&k[i * dim + h * head_dim..i * dim + (h + 1) * head_dim]);
             }
@@ -1222,7 +1303,8 @@ fn attention_blocked(
     // For `bfmmla`: each head's values transposed (`[head_dim][n]`), in
     // `bf16`, packed once for every query block.
     let vt_bf16: Vec<crate::engine::vecdot::PackedBf16> = if bf16 {
-        (0..n_head)
+        heads
+            .clone()
             .into_par_iter()
             .map(|h| {
                 crate::engine::vecdot::PackedBf16::pack_transposed(
@@ -1237,7 +1319,8 @@ fn attention_blocked(
         Vec::new()
     };
     let v_packed: Vec<rten_gemm::PackedBMatrix<f32>> = if rten {
-        (0..n_head)
+        heads
+            .clone()
             .into_par_iter()
             .map(|h| {
                 let view = rten_tensor::NdTensorView::from_data_with_strides(
@@ -1255,11 +1338,12 @@ fn attention_blocked(
     // Otherwise values head-major and transposed, `[n_head][head_dim][n]`,
     // so the value product is a GEMM over `n` with each output dimension a
     // row.
-    let mut vt_heads = vec![0.0f32; if rten || bf16 { 0 } else { n * dim }];
+    let mut vt_heads = vec![0.0f32; if rten || bf16 { 0 } else { n * nh * head_dim }];
     vt_heads
         .par_chunks_mut(n * head_dim)
         .enumerate()
-        .for_each(|(h, block)| {
+        .for_each(|(hl, block)| {
+            let h = heads.start + hl;
             for (d, row) in block.chunks_mut(n).enumerate() {
                 for (j, slot) in row.iter_mut().enumerate() {
                     *slot = v[j * dim + h * head_dim + d];
@@ -1270,7 +1354,7 @@ fn attention_blocked(
     // For the `int8` scores: every head's keys, less their mean over the
     // sequence, quantized per row and paired for `smmla`.
     let k_i8: Vec<PairedI8> = if int8 {
-        (0..n_head)
+        (0..nh)
             .into_par_iter()
             .map(|h| {
                 let keys = &k_heads[h * n * head_dim..(h + 1) * n * head_dim];
@@ -1300,7 +1384,7 @@ fn attention_blocked(
     let mut out = vec![0.0f32; n_q * dim];
     let sink = SharedOut(out.as_mut_ptr());
     let k_pairs = n.div_ceil(2);
-    (0..n_head * n_blocks).into_par_iter().for_each_init(
+    (0..nh * n_blocks).into_par_iter().for_each_init(
         || {
             (
                 vec![0.0f32; queries * n],
@@ -1318,14 +1402,15 @@ fn attention_blocked(
         },
         move |(scores, tile, iscores, gemm, packed, q_scaled), task| {
             let sink = sink;
-            let (h, b) = (task / n_blocks, task % n_blocks);
+            let (hl, b) = (task / n_blocks, task % n_blocks);
+            let h = heads.start + hl;
             let q0 = b * queries;
             let nq = queries.min(n_q - q0);
-            let keys = &k_heads[h * n * head_dim..(h + 1) * n * head_dim];
+            let keys = &k_heads[hl * n * head_dim..(hl + 1) * n * head_dim];
             let values_t = if rten || bf16 {
                 &[][..]
             } else {
-                &vt_heads[h * n * head_dim..(h + 1) * n * head_dim]
+                &vt_heads[hl * n * head_dim..(hl + 1) * n * head_dim]
             };
 
             // Each row's maximum, taken as the `int8` scores are converted.
@@ -1344,7 +1429,7 @@ fn attention_blocked(
                 });
                 int8_block_scores(
                     &qs,
-                    &k_i8[h],
+                    &k_i8[hl],
                     BlockRows {
                         q0,
                         nq,
@@ -1417,7 +1502,7 @@ fn attention_blocked(
             let probs = &scores[..nq * n];
             if let Some(packed) = packed.as_ref() {
                 let block = &mut tile[..packed.rows * head_dim];
-                crate::engine::vecdot::bf16_tiles(packed, &vt_bf16[h], block);
+                crate::engine::vecdot::bf16_tiles(packed, &vt_bf16[hl], block);
                 for (t, row) in block.chunks_mut(head_dim).take(nq).enumerate() {
                     for v in row.iter_mut() {
                         *v *= inv[t];
@@ -1441,7 +1526,7 @@ fn attention_blocked(
                         [nq, n],
                         probs,
                     )),
-                    rten_gemm::GemmInputB::Packed(&v_packed[h]),
+                    rten_gemm::GemmInputB::Packed(&v_packed[hl]),
                     rten_gemm::GemmOptions::default(),
                 )
                 .expect("the value product's shapes agree");
@@ -1837,6 +1922,62 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(worst < 0.02, "causal worst {worst}");
+    }
+
+    /// Attention over a range of the heads is the whole call's, to the bit,
+    /// for those heads' columns, and zero elsewhere — so two ranges that
+    /// cover the heads put together are the whole call. Both score paths,
+    /// keys past the queries.
+    #[test]
+    fn attention_over_a_head_range_is_those_heads_of_the_whole() {
+        let (n_q, n_kv, n_head, head_dim) = (ATTN_QUERIES + 5, ATTN_QUERIES + 16, 4usize, 16usize);
+        let dim = n_head * head_dim;
+        let unit = |i: usize, salt: usize| ((i * 31 + salt * 17) % 29) as f32 / 14.0 - 1.0;
+        let q: Vec<f32> = (0..n_q * dim).map(|i| unit(i, 1)).collect();
+        let k: Vec<f32> = (0..n_kv * dim).map(|i| unit(i, 2)).collect();
+        let v: Vec<f32> = (0..n_kv * dim).map(|i| unit(i, 3)).collect();
+        for int8 in [false, true] {
+            let whole = attention_blocked(&q, n_q, &k, &v, n_kv, n_head, head_dim, 0.5, None, int8);
+            let first = attention_blocked_heads(
+                &q,
+                n_q,
+                &k,
+                &v,
+                n_kv,
+                n_head,
+                head_dim,
+                0.5,
+                None,
+                int8,
+                0..1,
+            );
+            let rest = attention_blocked_heads(
+                &q,
+                n_q,
+                &k,
+                &v,
+                n_kv,
+                n_head,
+                head_dim,
+                0.5,
+                None,
+                int8,
+                1..n_head,
+            );
+            for (i, w) in whole.iter().enumerate() {
+                let head = (i % dim) / head_dim;
+                let (mine, other) = if head == 0 {
+                    (&first, &rest)
+                } else {
+                    (&rest, &first)
+                };
+                assert_eq!(mine[i].to_bits(), w.to_bits(), "int8 {int8} at {i}");
+                assert_eq!(
+                    other[i], 0.0,
+                    "int8 {int8} at {i}: a column outside the range"
+                );
+            }
+        }
     }
 
     /// A query block's `int8` scores computed a key chunk at a time are the

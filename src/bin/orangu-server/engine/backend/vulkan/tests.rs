@@ -5884,6 +5884,79 @@ fn a_striped_matmul_batch_matches_the_cpu_on_pooled_buffers() {
     *vulkan.striped_secs_per_mac.lock().unwrap() = None;
 }
 
+/// Ops sharing one input on the integer-dot GEMM, wider than a stripe:
+/// the input crosses once and is quantized once a stripe, and every op's
+/// GEMM reads those rows. Each op against the exact product in `f64` over
+/// its dequantized weights, the last stripe a padded tail, every op a
+/// different width.
+#[test]
+fn ops_sharing_an_input_share_its_quantized_rows() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        eprintln!("skipping: ORANGU_Q4K_MMVQ disables the integer-dot GEMM");
+        return;
+    }
+    let in_dim = 512usize;
+    let n_tokens = 2 * crate::engine::backend::vulkan::max_matmul_tokens_per_submission() + 37;
+    let weights: Vec<QuantMatrix> = [128usize, 64, 192]
+        .iter()
+        .enumerate()
+        .map(|(salt, &out_dim)| {
+            let values: Vec<f32> = (0..in_dim * out_dim)
+                .map(|i| (((i * 7919 + salt * 104_729) % 2003) as f32 / 1001.0 - 1.0) * 0.06)
+                .collect();
+            let bytes = orangu::quantize::encode(GGML_TYPE_Q4_K, &values, in_dim);
+            test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim)
+        })
+        .collect();
+    assert!(
+        weights
+            .iter()
+            .all(|w| vulkan.mmq_for(w, max_matmul_tokens_per_submission())),
+        "the fixture must run on the integer-dot GEMM"
+    );
+    let x: Vec<f32> = (0..n_tokens * in_dim)
+        .map(|i| ((i * 31 % 97) as f32 / 48.0 - 0.7) * 2.0)
+        .collect();
+    let ops: Vec<MatmulOp<'_>> = weights
+        .iter()
+        .map(|w| MatmulOp { x: &x, n_tokens, w })
+        .collect();
+    let got = vulkan.matmul_batch(&ops);
+    for (o, (w, got)) in weights.iter().zip(got).enumerate() {
+        let dense =
+            crate::engine::quant::dequantize(w.ggml_type(), w.raw_bytes(), in_dim * w.out_dim)
+                .expect("Q4_K dequantizes");
+        assert_eq!(got.len(), n_tokens * w.out_dim);
+        for (t, (xt, have)) in x.chunks(in_dim).zip(got.chunks(w.out_dim)).enumerate() {
+            let want: Vec<f32> = dense
+                .chunks(in_dim)
+                .map(|row| {
+                    row.iter()
+                        .zip(xt)
+                        .map(|(a, b)| *a as f64 * *b as f64)
+                        .sum::<f64>() as f32
+                })
+                .collect();
+            let scale = want.iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
+            let worst = want
+                .iter()
+                .zip(have)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 0.02 * scale,
+                "op {o} token {t}: error {worst} against {scale}"
+            );
+        }
+        vulkan.recycle(got);
+    }
+}
+
 /// `n_tokens = 300` deliberately spans three of `Backend::matmul_batch`'s
 /// own token-range stripes (`MAX_MATMUL_TOKENS_PER_SUBMISSION = 128`:
 /// 0..128, 128..256, 256..300 — the last only partially full), so this
@@ -9129,6 +9202,20 @@ fn cross_check_fused_ffn_prefill(n_tokens: usize) {
 /// (`silu(up) · gate`) or a view one row off miss by tens of percent.
 #[test]
 fn a_fused_gate_up_runs_as_two_row_views_on_the_device() {
+    fused_gate_up_against_the_exact_ffn(37);
+}
+
+/// [`a_fused_gate_up_runs_as_two_row_views_on_the_device`] over three
+/// stripes, the last a padded tail: the stripes run two in flight, so each
+/// one's output must still land in its own rows.
+#[test]
+fn a_striped_fused_ffn_keeps_each_stripe_in_its_rows() {
+    fused_gate_up_against_the_exact_ffn(
+        2 * crate::engine::backend::vulkan::max_matmul_tokens_per_submission() + 37,
+    );
+}
+
+fn fused_gate_up_against_the_exact_ffn(n_tokens: usize) {
     let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
@@ -9138,7 +9225,7 @@ fn a_fused_gate_up_runs_as_two_row_views_on_the_device() {
         eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
         return;
     }
-    let (n_embd, ffn_len, n_tokens) = (256usize, 512usize, 37usize);
+    let (n_embd, ffn_len) = (256usize, 512usize);
     // Smooth weights of a trained layer's size, encoded to `Q4_K` — random
     // blocks would drive the outputs to ~1e13, where one rounding flip of
     // an activation block moves a token by percent.

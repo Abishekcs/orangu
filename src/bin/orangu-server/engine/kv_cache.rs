@@ -22,15 +22,38 @@
 use std::sync::Mutex;
 
 /// Converts a slice of `f32` KV values into little-endian `f16` bytes, for
-/// `LayerCache::sync_gpu`'s `f16` KV-mirror upload path. A plain
-/// per-element loop, not `bytemuck::cast_slice` — unlike the `f32` path,
-/// this genuinely *converts* values, not just reinterprets bytes.
+/// `LayerCache::sync_gpu`'s `f16` KV-mirror upload path — unlike the `f32`
+/// path, this genuinely *converts* values, not just reinterprets bytes.
 pub(crate) fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() * 2);
-    for &v in data {
-        out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+    #[cfg(target_endian = "little")]
+    {
+        use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
+        use rayon::prelude::*;
+        // `half`'s slice conversion (the CPU's own `f16` conversion where it
+        // has one, `F16C` or `fp16`), split across the pool when the rows
+        // are many: a picture step's heads upload a few million values a
+        // block. Rounds to nearest-even, as `f16::from_f32` does.
+        const PER_TASK: usize = 1 << 15;
+        let mut bits = vec![0u16; data.len()];
+        let halves: &mut [half::f16] = bits.reinterpret_cast_mut();
+        if data.len() > PER_TASK {
+            halves
+                .par_chunks_mut(PER_TASK)
+                .zip(data.par_chunks(PER_TASK))
+                .for_each(|(h, d)| h.convert_from_f32_slice(d));
+        } else {
+            halves.convert_from_f32_slice(data);
+        }
+        bytemuck::cast_slice(&bits).to_vec()
     }
-    out
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(data.len() * 2);
+        for &v in data {
+            out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+        }
+        out
+    }
 }
 
 /// Converts a slice of `f32` KV values into the
@@ -3957,6 +3980,41 @@ pub(crate) fn strided_dims(
 
 #[cfg(test)]
 mod tests {
+    /// The batched `f16` conversion is `f16::from_f32` value for value:
+    /// ordinary values, halfway cases, subnormals, overflow, infinities and
+    /// signed zeros, both below and above the parallel split.
+    #[test]
+    fn the_f16_upload_conversion_is_the_scalar_one() {
+        let mut values: Vec<f32> = (0..(1usize << 17) + 13)
+            .map(|i| {
+                let x = (i as f32 * 0.618_034).sin() * 10f32.powi((i % 13) as i32 - 6);
+                if i % 7 == 0 { -x } else { x }
+            })
+            .collect();
+        values.extend([
+            0.0,
+            -0.0,
+            65504.0,
+            65520.0,
+            1e9,
+            -1e9,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            5.96e-8,
+            2.98e-8,
+            1.0 + 1.0 / 2048.0,
+            1.0 + 3.0 / 2048.0,
+            6.1e-5,
+        ]);
+        for data in [&values[..37], &values[..]] {
+            let want: Vec<u8> = data
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect();
+            assert_eq!(super::f32_to_f16_bytes(data), want);
+        }
+    }
+
     /// The run split is the whole of the paged prefill write: a range that
     /// crosses a page boundary is contiguous on the host and in each page, but
     /// not across them, so getting the boundary wrong writes a chunk of a

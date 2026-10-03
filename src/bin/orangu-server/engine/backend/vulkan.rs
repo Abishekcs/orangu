@@ -7764,38 +7764,53 @@ impl VulkanBackend {
         #[allow(clippy::type_complexity)]
         let mmq_by_width: Vec<(
             usize,
-            Vec<
-                Option<(
-                    wgpu::Buffer,
-                    wgpu::BindGroup,
-                    u32,
-                    wgpu::Buffer,
-                    MmqDispatch,
-                )>,
-            >,
+            (
+                bool,
+                Vec<
+                    Option<(
+                        Option<(wgpu::Buffer, wgpu::BindGroup, u32, wgpu::Buffer)>,
+                        MmqDispatch,
+                    )>,
+                >,
+            ),
         )> = guards_by_width
             .iter()
             .map(|(w, guards)| {
+                let served = |(op, guard): (&MatmulOp<'_>, &MutexGuard<'_, CachedOpResources>)| {
+                    guard.mmvq.is_none() && self.mmq_for(op.w, *w)
+                };
+                // Ops sharing one input on the integer-dot GEMM all read the
+                // first op's quantized rows: one copy of the input over the
+                // bus and one quantize a stripe, not one an op.
+                let one_stage = shares_one_input && ops.iter().zip(guards.iter()).all(served);
+                let mut first_q8: Option<wgpu::Buffer> = None;
                 let mmq = ops
                     .iter()
                     .zip(guards.iter())
                     .map(|(op, guard)| {
-                        (guard.mmvq.is_none() && self.mmq_for(op.w, *w)).then(|| {
-                            let (q8, qbg, qwg, qmeta) = self.mmq_stage(
-                                BindSrc::Slice(
-                                    &guard.x_buffer,
-                                    guard.x_offset,
-                                    (*w * op.w.in_dim) as u64 * 4,
-                                ),
-                                *w,
-                                op.w.in_dim,
-                            );
-                            let dispatch = self.mmq_op(op.w, guard, &q8);
-                            (q8, qbg, qwg, qmeta, dispatch)
-                        })
+                        if !served((op, guard)) {
+                            return None;
+                        }
+                        if one_stage && let Some(q8) = &first_q8 {
+                            return Some((None, self.mmq_op(op.w, guard, q8)));
+                        }
+                        let (q8, qbg, qwg, qmeta) = self.mmq_stage(
+                            BindSrc::Slice(
+                                &guard.x_buffer,
+                                guard.x_offset,
+                                (*w * op.w.in_dim) as u64 * 4,
+                            ),
+                            *w,
+                            op.w.in_dim,
+                        );
+                        let dispatch = self.mmq_op(op.w, guard, &q8);
+                        if one_stage {
+                            first_q8 = Some(q8.clone());
+                        }
+                        Some((Some((q8, qbg, qwg, qmeta)), dispatch))
                     })
                     .collect();
-                (*w, mmq)
+                (*w, (one_stage, mmq))
             })
             .collect();
 
@@ -7896,13 +7911,16 @@ impl VulkanBackend {
                     .find(|(w, _)| *w == padded)
                     .expect("width planned above")
                     .1;
-                let mmq = &mmq_by_width
+                let (one_stage, mmq) = &mmq_by_width
                     .iter()
                     .find(|(w, _)| *w == padded)
                     .expect("width planned above")
                     .1;
 
                 for (i, (op, guard)) in ops.iter().zip(guards.iter()).enumerate() {
+                    if *one_stage && i > 0 {
+                        break;
+                    }
                     let staging = &stagings[if shares_one_input { 0 } else { i }].1;
                     encoder.copy_buffer_to_buffer(
                         staging,
@@ -7929,8 +7947,10 @@ impl VulkanBackend {
                         timestamp_writes: None,
                     });
                     for ((op, guard), mmq) in ops.iter().zip(guards.iter()).zip(mmq.iter()) {
-                        if let Some((_, qbg, qwg, _, dispatch)) = mmq {
-                            self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                        if let Some((stage, dispatch)) = mmq {
+                            if let Some((_, qbg, qwg, _)) = stage {
+                                self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                            }
                             self.record_mmq(&mut pass, &dispatch.0, dispatch.1, dispatch.2);
                             continue;
                         }
@@ -10132,6 +10152,16 @@ pub enum FfnActivation {
     Geglu,
     /// `silu(gate) * up` — Llama, Qwen2, Mistral, Phi.
     Swiglu,
+}
+
+/// A submitted chain's output on its way back: the readback it was copied
+/// into, its size, the map in flight, and how many values of it are real
+/// (the rest a padded stripe's).
+struct PendingReadback {
+    buffer: wgpu::Buffer,
+    bytes: u64,
+    wait: std::sync::Arc<MapWait>,
+    keep: usize,
 }
 
 /// [`VulkanBackend::conv_gather_matmul`]'s operands: the feature map
@@ -16404,25 +16434,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.submit_and_readback(encoder, &final_buf, final_offset, n_embd)
     }
 
-    /// Runs one stripe of a striped prefill call through `f`, widening it to
-    /// [`padded_stripe_len`] first and cutting the padding back off the
-    /// result. `row_len`/`out_row_len` are the input and output row widths.
-    fn padded_stripe(
-        &self,
-        x: &[f32],
-        len: usize,
-        total: usize,
-        row_len: usize,
-        out_row_len: usize,
-        f: impl FnOnce(&[f32], usize) -> Option<Vec<f32>>,
-    ) -> Option<Vec<f32>> {
-        let padded = padded_stripe_len(len, total);
-        let input = pad_rows(x, len, padded, row_len);
-        let mut out = f(&input, padded)?;
-        out.truncate(len * out_row_len);
-        Some(out)
-    }
-
     /// The whole device side of one recurrent layer's decode step after its
     /// projections — [`GatedDeltaInput`] in, the layer's `ssm_out` output
     /// back, the delta-net state updated in place — as **one submission**:
@@ -18446,24 +18457,72 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // bound; the widest flat dispatch left is a row of the model width.
         let stripe_tokens =
             max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(n_embd));
-        if n_tokens > stripe_tokens {
-            let mut out = Vec::with_capacity(n_tokens * n_embd);
-            let mut start = 0;
-            while start < n_tokens {
-                let end = (start + stripe_tokens).min(n_tokens);
-                let len = end - start;
-                out.extend(self.padded_stripe(
-                    &x[start * gate.in_dim..end * gate.in_dim],
-                    len,
-                    n_tokens,
-                    gate.in_dim,
-                    n_embd,
-                    |x, n| self.fused_ffn_prefill(x, n, gate, up, down, activation, mid_rotation),
-                )?);
-                start = end;
+        // Two stripes in flight: the next stripe is uploaded, recorded and
+        // submitted before the last one's readback is waited on and copied
+        // out, so the card runs while the host does both. The stripes share
+        // their op's regions, which the queue's order keeps apart.
+        let mut out = Vec::with_capacity(n_tokens * n_embd);
+        let mut pending: Option<PendingReadback> = None;
+        let mut start = 0;
+        while start < n_tokens {
+            let end = (start + stripe_tokens).min(n_tokens);
+            let len = end - start;
+            let padded = if n_tokens > stripe_tokens {
+                padded_stripe_len(len, n_tokens)
+            } else {
+                len
+            };
+            let input = pad_rows(
+                &x[start * gate.in_dim..end * gate.in_dim],
+                len,
+                padded,
+                gate.in_dim,
+            );
+            let submitted = self.fused_ffn_submit(
+                &input,
+                padded,
+                len * n_embd,
+                [gate, up, down],
+                activation,
+                mid_rotation,
+            );
+            let Some(submitted) = submitted else {
+                if let Some(last) = pending.take() {
+                    drop(self.finish_readback(last));
+                }
+                return None;
+            };
+            if let Some(last) = pending.replace(submitted) {
+                out.extend(self.finish_readback(last));
             }
-            return Some(out);
+            start = end;
         }
+        if let Some(last) = pending.take() {
+            out.extend(self.finish_readback(last));
+        }
+        if let Some(t_enter) = t_enter {
+            eprintln!(
+                "ffn trace: {n_tokens} tokens, total {:.2} ms",
+                t_enter.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Some(out)
+    }
+
+    /// One stripe of [`Self::fused_ffn_prefill`], `n_tokens` wide, recorded
+    /// and submitted; `keep` of its output values are read back by
+    /// [`Self::finish_readback`]. `None` where the stripe's width cannot
+    /// run the chain.
+    fn fused_ffn_submit(
+        &self,
+        x: &[f32],
+        n_tokens: usize,
+        keep: usize,
+        [gate, up, down]: [&QuantMatrix; 3],
+        activation: FfnActivation,
+        mid_rotation: Option<&crate::engine::hadamard::Rotation>,
+    ) -> Option<PendingReadback> {
+        let n_embd = down.out_dim;
         let ffn_len = gate.out_dim;
         debug_assert_eq!(up.out_dim, ffn_len);
         debug_assert_eq!(down.in_dim, ffn_len);
@@ -18485,7 +18544,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let trace = crate::engine::env::flag_on("ORANGU_FFN_TRACE");
         let t0 = std::time::Instant::now();
-        let t_enter = t_enter.unwrap_or(t0);
         let _region_guard = self.prefill_region_guard();
         self.make_room_for_streamed(&[gate, up, down].map(|w| MatmulOp { x, n_tokens, w }));
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_FFN);
@@ -18609,27 +18667,72 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
         let t3 = std::time::Instant::now();
-        let (out, split) = self.submit_and_readback_split(
+        let pending = self.submit_for_readback(
             encoder,
             &down_g.output_buffer,
             down_g.output_offset,
             n_tokens * n_embd,
+            keep,
         );
         if trace {
             eprintln!(
-                "ffn trace: pre {:.2} ms, entries {:.2} ms, upload {:.2} ms, record {:.2} ms, readback alloc {:.2} submit {:.2} wait {:.2} copy {:.2} ms, total {:.2} ms",
-                (t0 - t_enter).as_secs_f64() * 1e3,
+                "ffn trace: stripe {n_tokens}: entries {:.2} ms, upload {:.2} ms, record {:.2} ms, \
+                 submit {:.2} ms",
                 (t1 - t0).as_secs_f64() * 1e3,
                 (t2 - t1).as_secs_f64() * 1e3,
                 (t3 - t2).as_secs_f64() * 1e3,
-                split.alloc_ms,
-                split.submit_ms,
-                split.wait_ms,
-                split.copy_ms,
-                t_enter.elapsed().as_secs_f64() * 1e3,
+                t3.elapsed().as_secs_f64() * 1e3,
             );
         }
-        Some(out)
+        Some(pending)
+    }
+
+    /// Copies `len_f32` values at `src` into a pooled readback, submits the
+    /// encoder and starts the map — the first half of
+    /// [`Self::submit_and_readback_split`], for a caller with more work to
+    /// submit before it waits. [`Self::finish_readback`] is the second.
+    fn submit_for_readback(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        src: &wgpu::Buffer,
+        src_offset: u64,
+        len_f32: usize,
+        keep: usize,
+    ) -> PendingReadback {
+        let bytes = (len_f32 as u64) * 4;
+        let buffer = self.take_readback(bytes);
+        encoder.copy_buffer_to_buffer(src, src_offset, &buffer, 0, bytes);
+        self.queue.submit(Some(encoder.finish()));
+        self.submission_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
+        let wait = self.map_read(&buffer);
+        PendingReadback {
+            buffer,
+            bytes,
+            wait,
+            keep,
+        }
+    }
+
+    /// Waits for a [`Self::submit_for_readback`] and returns its first
+    /// `keep` values.
+    fn finish_readback(&self, pending: PendingReadback) -> Vec<f32> {
+        const CONTEXT: &str = "reading back a striped chain's output";
+        let PendingReadback {
+            buffer,
+            bytes,
+            wait,
+            keep,
+        } = pending;
+        self.wait_mapped(&wait, CONTEXT);
+        let data = self.mapped_bytes(&buffer, CONTEXT);
+        let values: &[f32] = bytemuck::cast_slice(&data);
+        let out = values[..keep].to_vec();
+        drop(data);
+        buffer.unmap();
+        self.put_readback(bytes, buffer);
+        out
     }
 
     /// A convolution on the card with its windows gathered there: the
@@ -18717,9 +18820,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .clamp(0, height as isize - 1) as usize;
             let phase = std::time::Instant::now();
             let band = &feature[first_in * width * cin..(last_in + 1) * width * cin];
-            let band_buf = self.scratch_buffer(band.len());
+            let band_buf = &self.scratch_buffer(band.len());
             self.queue
-                .write_buffer(&band_buf, 0, bytemuck::cast_slice(band));
+                .write_buffer(band_buf, 0, bytemuck::cast_slice(band));
             let (px0, px1) = (oy0 * out_width, oy1 * out_width);
             let readback_bytes = ((px1 - px0) * cout * 4) as u64;
             let readback = self.take_readback(readback_bytes);
@@ -18746,7 +18849,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.queue
                     .write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
                 let bg = self.elem4_bind_group(
-                    &band_buf,
+                    band_buf,
                     &p_buf,
                     BindSrc::Slice(&g.x_buffer, g.x_offset, x_len),
                     &meta,
@@ -18821,6 +18924,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// `prefill_fused_attn`.
     pub fn prefill_fused_attention_enabled(&self) -> bool {
         self.prefill_fused_attn
+    }
+
+    /// Brings `cache`'s device mirror up to date for `n_head` heads — what
+    /// [`Self::gpu_attention_prefill`] does first, as its own step, for a
+    /// caller that times the upload apart from the attention.
+    pub fn sync_kv_mirror(&self, cache: &mut crate::engine::kv_cache::LayerCache, n_head: usize) {
+        if cache.paged_device_refs(&self.queue).is_none() {
+            cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
