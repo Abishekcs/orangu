@@ -1302,7 +1302,14 @@ same seed drew the same composition and lettering, differing in fine
 detail (30.6 dB PSNR against the `f32` one; 29.1 dB for 2512) — the size of difference
 diffusers itself documents between two equally valid samples.
 `ORANGU_IMAGE_ATTENTION=f32` keeps the exact path, for an A/B on one
-binary. The value product itself runs on `bfmmla` where the CPU has `bf16`
+binary. A query block's `int8` scores are taken a key chunk at a time
+(`image::transformer::int8_block_scores`, 128 keys, 16 KiB of a 128-wide
+head): every quad of the block's queries passes over a chunk while it is
+in the first-level cache, and the chunk's scores are converted to `f32`
+while their integers are, the row maxima folded across chunks — where a
+quad at a time over every key read a head's keys (an L2's worth at
+1024 × 1024) once per four queries. The same scores to the bit
+(`int8_scores_by_key_chunks_are_the_whole_rows`). The value product itself runs on `bfmmla` where the CPU has `bf16`
 (probabilities and values rounded to `bf16`, summed in `f32`, sixteen
 multiply-adds an instruction; 1024² step 72.4 → 63.0 s), else on
 `rten-gemm`'s `f32` kernel (a packed 4 × 16 tile, ~150 G MAC/s at its
@@ -1343,7 +1350,29 @@ keep the float kernel. The host form remains for the CPU and the per-row
 `ORANGU_IMAGE_FUSED_FFN=0` selects it on a device. A block's query, key
 and value projections read the same rows and go to the backend as one
 `matmul_batch`, so a device stages that input once and runs the three in
-one sequence of submissions with one readback.
+one sequence of submissions with one readback. A batch wider than one
+submission's stripe (`VulkanBackend::matmul_batch_striped` — the
+picture's q/k/v and each chunk's output projection) runs each stripe on
+the integer-dot GEMM where it serves the op's shape (`mmq_for`): the
+stripe's rows quantized from the op's input region, then the GEMM, in the
+same encoder as the stripe's copies; other shapes keep the float kernel.
+
+**A transformer larger than its card streams its last blocks.** At load
+(`QwenImage21Transformer::plan_streaming`) the driver's free memory on the
+transformer's card, less a region of two blocks and a margin for the
+calls' own buffers, decides how many leading blocks stay resident; the
+rest are registered with `VulkanBackend::stream_weights`. Every op over a
+registered weight then takes the recyclable streaming region instead of
+the permanent arena — `op_entry_at` routes it, whichever chain builds the
+op — and each call makes room for its weights together before building
+any of them (`make_room_for_streamed`), so a call group's weights cross
+the bus once into the region. Without it those blocks sit wherever the
+driver puts what overflows the card — host memory — and every tile of
+every kernel reads them across the bus. The region stays for the model's
+life (`prompt_prefilled` keeps a region that serves weights); weights
+whose rows the card pads stay in the arena. The startup log says the
+split (`[image] transformer blocks 0–N resident on the card, …
+streamed`); `ORANGU_IMAGE_STREAM=0` turns it off.
 
 **Every one of these kernels exists on every architecture.** The
 `smmla` tile product has a portable twin (`vecdot::dot_k_rows_portable`,
@@ -2076,6 +2105,32 @@ gather_window` is that closure for a pixel's 3×3 window, and
 `CpuBackend::matmul_k_mm_into` runs the kernel on the result — a
 full-resolution band was 268 MiB of `f32` written and read back per
 convolution. Decode at 512 px went 10.6 → 2.7 s over the two steps.
+`ORANGU_VAE_CONV_TRACE=1` prints a line a convolution — its output size,
+channels, kernel, where it ran, multiply-adds and time — so a decode can be
+read convolution by convolution.
+
+The wide convolutions (`cout ≥ 512`: the decoder's low-resolution stages,
+which hold most of its multiply-adds) can run on the card with their
+windows gathered there, `vae::run_conv_gathered` over
+`VulkanBackend::conv_gather_matmul`. The feature map crosses the bus a
+band of input rows at a time (16 MiB, with the window's halo), never the
+9× larger `im2col` band. For each 512-pixel stripe, the `conv_gather`
+kernel writes the pixels' `(ky, kx, in)` rows straight into the matrix's
+input region. The integer-dot GEMM's quantizer and kernel follow, and the
+stripe's outputs are copied into the band's readback, all in one
+submission a band. Two bands are in flight: the next one is uploaded and
+submitted before the last one is waited on and copied out, so the host's
+upload and copy run beside the card. The bias is added on the host.
+`QwenImage21Vae::choose_wide` times the decoder's first wide convolution
+over a 64 × 64 map, gathered on the device against wherever the rest of
+the VAE runs (`[image] VAE wide convolutions: …`), and sends the wide class
+to the card only when it wins. Narrow convolutions stay where
+`choose_backend` put them. `ORANGU_VAE_GATHER=0` keeps every convolution
+there. `a_gathered_convolution_is_the_convolution` checks the chain
+against the exact `f64` convolution with both paddings, several stripes a
+band and several bands a picture. With `ORANGU_VAE_CONV_TRACE=1`, each
+gathered call also prints its bands and its split between recording,
+waiting on the card and copying out.
 
 `engine::image::Pipeline` is diffusers' `QwenImagePipeline`, step for step,
 over four parts that each map onto a piece of the reference:

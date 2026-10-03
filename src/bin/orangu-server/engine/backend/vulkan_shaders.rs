@@ -11011,6 +11011,66 @@ pub fn shader_source_silu_mul() -> String {
     format!("{ELEM_META}\n{SILU_MUL_SHADER_BODY}")
 }
 
+/// A convolution's `im2col` rows built on the device: for a stripe of
+/// output pixels, each pixel's `k × k × cin` window out of a band of the
+/// input feature map (`[rows][width][cin]`, `f32`), zero where a tap falls
+/// off the picture and in the columns past the window (the matrix's
+/// padding to whole super-blocks) — the host's `gather_window`, a pixel a
+/// row. Grid-stride over `em.len` = pixels × `in_dim`. `elem4` bindings:
+/// the band, the parameters (`u32`: width, height, cin, k, stride, offset
+/// (`i32`), out_width, first pixel, pixels in the conv, in_dim, the band's
+/// first input row), the rows, the meta.
+const CONV_GATHER_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> band: array<f32>;
+@group(0) @binding(1) var<storage, read> p: array<u32>;
+@group(0) @binding(2) var<storage, read_write> rows: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let width = p[0];
+    let height = p[1];
+    let cin = p[2];
+    let k = p[3];
+    let stride = i32(p[4]);
+    let offset = bitcast<i32>(p[5]);
+    let out_width = p[6];
+    let first = p[7];
+    let total = p[8];
+    let in_dim = p[9];
+    let row0 = i32(p[10]);
+    let cols = k * k * cin;
+    var i: u32 = gid.x;
+    let step = nwg.x * 64u;
+    loop {
+        if (i >= em.len) {
+            break;
+        }
+        let px = first + i / in_dim;
+        let col = i % in_dim;
+        var v: f32 = 0.0;
+        if (px < total && col < cols) {
+            let tap = col / cin;
+            let c = col % cin;
+            let iy = i32(px / out_width) * stride + offset + i32(tap / k);
+            let ix = i32(px % out_width) * stride + offset + i32(tap % k);
+            if (iy >= 0 && iy < i32(height) && ix >= 0 && ix < i32(width)) {
+                v = band[(u32(iy - row0) * width + u32(ix)) * cin + c];
+            }
+        }
+        rows[i] = v;
+        i = i + step;
+    }
+}
+"#;
+
+pub fn shader_source_conv_gather() -> String {
+    format!("{ELEM_META}\n{CONV_GATHER_SHADER_BODY}")
+}
+
 /// Squared ReLU — `y[i] = max(x[i], 0)²`, the gate-less expert activation
 /// (`nemotron_h_moe`'s `down(relu(up(x))²)`). Grid-stride like the paired
 /// activations, so one dispatch covers a routed batch of any width.

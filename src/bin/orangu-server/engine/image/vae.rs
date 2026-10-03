@@ -500,6 +500,85 @@ fn add_conv_time(clock: &std::sync::atomic::AtomicU64, since: std::time::Instant
 }
 
 pub(super) fn run_conv(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Feature {
+    traced(conv, "host", || Some(run_conv_untraced(backend, conv, x)))
+        .expect("the band path always answers")
+}
+
+/// [`run_conv`] on the card with the windows gathered there
+/// (`VulkanBackend::conv_gather_matmul`): the feature map crosses the bus,
+/// not the 9×-larger `im2col` band. `None` where the integer-dot GEMM
+/// does not serve the matrix.
+pub(super) fn run_conv_gathered(
+    vulkan: &crate::engine::backend::vulkan::VulkanBackend,
+    conv: &Conv,
+    x: &Feature,
+) -> Option<Feature> {
+    traced(conv, "device", || {
+        debug_assert_eq!(x.channels, conv.cin);
+        let (out_h, out_w, stride, offset) = match conv.padding {
+            Padding::Same => (x.height, x.width, 1, -((conv.kernel as isize - 1) / 2)),
+            Padding::HalveDownRight => (x.height / 2, x.width / 2, 2, 0),
+        };
+        let phase = std::time::Instant::now();
+        let mut out =
+            vulkan.conv_gather_matmul(crate::engine::backend::vulkan::ConvGatherInput {
+                feature: &x.data,
+                height: x.height,
+                width: x.width,
+                cin: conv.cin,
+                kernel: conv.kernel,
+                stride,
+                offset,
+                out_height: out_h,
+                out_width: out_w,
+                w: &conv.w,
+                band_bytes: GATHER_BAND_BYTES,
+            })?;
+        add_conv_time(&CONV_MATMUL_NS, phase);
+        CONV_MACS.fetch_add(
+            (out_h * out_w * conv.w.in_dim * conv.cout) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let phase = std::time::Instant::now();
+        out.par_chunks_mut(conv.cout)
+            .with_min_len(64)
+            .for_each(|row| {
+                for (o, b) in row.iter_mut().zip(&conv.bias) {
+                    *o += b;
+                }
+            });
+        add_conv_time(&CONV_REST_NS, phase);
+        Some(Feature::new(out_h, out_w, conv.cout, out))
+    })
+}
+
+/// Bytes of input rows a gathered convolution uploads a submission.
+const GATHER_BAND_BYTES: usize = 16 << 20;
+
+/// `ORANGU_VAE_CONV_TRACE=1`: a line a convolution — its shape, where it
+/// ran, its multiply-adds and its time — so a decode's convolutions can be
+/// read one by one.
+fn traced(conv: &Conv, place: &str, run: impl FnOnce() -> Option<Feature>) -> Option<Feature> {
+    if !crate::engine::env::flag_on("ORANGU_VAE_CONV_TRACE") {
+        return run();
+    }
+    let started = std::time::Instant::now();
+    let out = run()?;
+    let macs = (out.height * out.width * conv.w.in_dim * conv.cout) as f64;
+    eprintln!(
+        "orangu-server: [vae] conv {}x{} {}->{} k{} ({place}): {:.1} G MAC, {:.1} ms",
+        out.height,
+        out.width,
+        conv.cin,
+        conv.cout,
+        conv.kernel,
+        macs / 1e9,
+        started.elapsed().as_secs_f64() * 1e3
+    );
+    Some(out)
+}
+
+fn run_conv_untraced(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Feature {
     debug_assert_eq!(x.channels, conv.cin);
     let (out_h, out_w) = match conv.padding {
         Padding::Same => (x.height, x.width),

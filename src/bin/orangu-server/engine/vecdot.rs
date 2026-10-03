@@ -2741,6 +2741,9 @@ impl PairedI8 {
 /// `q` — against every key row of `k`: `out[r][j] = q_r · k_j` as `i32`
 /// (`out` rows at least `2 * k.pairs` long). Needs [`have_i8mm`] on
 /// `aarch64`; elsewhere, or without it, the scalar definition.
+// The serving path takes key ranges (`i8_scores_4rows_in`); the tests
+// check the whole-range form.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn i8_scores_4rows(q: &PairedI8, qa: usize, qb: usize, k: &PairedI8, out: [&mut [i32]; 4]) {
     i8_scores_4rows_in(q, qa, qb, k, 0..k.pairs, out)
 }

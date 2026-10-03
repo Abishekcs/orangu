@@ -2882,6 +2882,15 @@ ORANGU_DEVICE_SPLIT=3,1 orangu-server model.gguf  # this run, for a sweep
 | `cpu`  | Fill the devices with as many layers as fit, in order, and run the rest **on the CPU**. llama.cpp's partial offload (`-ngl`), decided from capacity rather than typed by hand. |
 | `3,1`  | Explicit proportions, one per selected device, in the order the inventory lists them. Relative, not absolute: `3,1` is three quarters and one quarter. `0` excludes a device.  |
 
+A picture model's text encoder counts its transformer as already on the
+selected device: whether the encoder must be split, and how much of it the
+first device may take, are decided against what the transformer leaves
+there, since the transformer runs every step and the encoder once a
+picture. The startup log says how much the head device held back and for
+what (`[vulkan] the head device plans against … after … for the picture
+transformer, which runs every step`). An explicit `device_split` ratio is
+honoured as given.
+
 Startup says what it did, and what it cost:
 
 ```
@@ -3693,7 +3702,10 @@ several devices, the transformer is timed on each of them and on the CPU
 and runs whole on the fastest (`[image] transformer placement: …`) — the
 device it runs fastest on, which need not be the one it fits on best. The
 VAE times one of its own convolutions on the device and on the CPU and
-keeps the faster (`[image] VAE placement: …`). An
+keeps the faster (`[image] VAE placement: …`). It then times one of its
+wide, low-resolution convolutions with the windows gathered on the device
+and, when that is faster, runs those there while the rest stay put
+(`[image] VAE wide convolutions: …`). An
 explicit `backend = vulkan` (or `--device`) is honoured as given,
 calibration or not.
 

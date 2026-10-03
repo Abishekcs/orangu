@@ -332,7 +332,70 @@ impl QwenImage21Transformer {
                 c.dim
             );
         }
+        model.plan_streaming();
         Ok(model)
+    }
+
+    /// On a card smaller than the transformer: the leading blocks stay
+    /// resident and the rest stream (`VulkanBackend::stream_weights`), each
+    /// call group's weights crossing the bus once into a region of two
+    /// blocks rather than living in host memory, where every tile of every
+    /// kernel would read them across the bus. Planned against what the
+    /// driver says the card has free now, less the region and
+    /// [`STREAM_MARGIN_BYTES`] for the activations and the calls' own
+    /// regions. Nothing on the host, with the per-row `int8` copy, when the
+    /// blocks fit, or with `ORANGU_IMAGE_STREAM=0`.
+    fn plan_streaming(&self) {
+        if self.rowi8.is_some()
+            || !crate::engine::env::flag_on_unless_disabled("ORANGU_IMAGE_STREAM")
+        {
+            return;
+        }
+        let Some(device) = self.blocks.first().map(|b| b.to_q.device()) else {
+            return;
+        };
+        let Some(vulkan) = self.backend.as_wgpu_on(device) else {
+            return;
+        };
+        let Some((budget, usage)) = vulkan.device_local_budget() else {
+            return;
+        };
+        let bytes = |b: &Block| -> u64 {
+            device_weights(b)
+                .iter()
+                .map(|w| w.raw_bytes().len() as u64)
+                .sum()
+        };
+        let sizes: Vec<u64> = self.blocks.iter().map(bytes).collect();
+        let region = 2 * sizes.iter().copied().max().unwrap_or(0);
+        let room = budget
+            .saturating_sub(usage)
+            .saturating_sub(region + STREAM_MARGIN_BYTES);
+        let mut placed = 0u64;
+        let resident = sizes
+            .iter()
+            .take_while(|&&b| {
+                placed += b;
+                placed <= room
+            })
+            .count();
+        if resident == self.blocks.len() {
+            return;
+        }
+        let streamed: Vec<&QuantMatrix> = self.blocks[resident..]
+            .iter()
+            .flat_map(device_weights)
+            .collect();
+        vulkan.stream_weights(&streamed, region);
+        log::info!(
+            "orangu-server: [image] transformer blocks 0–{} resident on the card, {}–{} streamed \
+             through a {} region ({} free)",
+            resident.saturating_sub(1),
+            resident,
+            self.blocks.len() - 1,
+            orangu::format::format_bytes(region),
+            orangu::format::format_bytes(budget.saturating_sub(usage)),
+        );
     }
 
     /// The stage account of every pass since the last call, and a fresh
@@ -820,6 +883,28 @@ const OVERLAP_CHUNKS: usize = 4;
 /// The narrowest chunk worth overlapping: below it the device's calls on
 /// a chunk cost more than the overlap saves.
 const OVERLAP_MIN_CHUNK: usize = 1024;
+
+/// What a streamed transformer leaves free on its card beyond the region:
+/// the activations, the calls' input and output regions, their scratch.
+const STREAM_MARGIN_BYTES: u64 = 512 << 20;
+
+/// The tensors a block's device calls read: q, k, v, the output
+/// projection, the feed-forward's gate and up (row views of a fused
+/// tensor, as the device takes them) and down.
+fn device_weights(block: &Block) -> Vec<&QuantMatrix> {
+    let (gate, up) = match &block.mlp_in {
+        MlpIn::Fused { gate, up, .. } | MlpIn::Split { gate, up } => (gate, up),
+    };
+    vec![
+        &block.to_q,
+        &block.to_k,
+        &block.to_v,
+        &block.to_out,
+        gate,
+        up,
+        &block.mlp_out,
+    ]
+}
 
 /// A block's modulation for its per-token tail.
 struct Gates<'a> {

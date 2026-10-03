@@ -5399,7 +5399,13 @@ fn image_attention_on_the_device() {
             Some((it.next()??, it.next()??))
         })
         .unwrap_or((4096, 4200));
-    const N_HEAD: usize = 32;
+    // `ORANGU_PROBE_HEADS`: fewer heads, as a share of a block's would run.
+    let n_head_probe: usize = std::env::var("ORANGU_PROBE_HEADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(32);
+    #[allow(non_snake_case)]
+    let N_HEAD = n_head_probe;
     const HEAD_DIM: usize = 128;
     let dim = N_HEAD * HEAD_DIM;
     let mut seed = 0x1A77_0E5D_u64;
@@ -5469,6 +5475,178 @@ fn image_attention_on_the_device() {
 /// submissions, readback). The gap between the two is the host's side of
 /// a device linear. `cargo test --release --bin orangu-server
 /// image_linears_on_the_device -- --ignored --nocapture`.
+/// Where a picture step's fused feed-forward call spends its time
+/// (`--ignored --nocapture`): the fused FFN at a stripe's width on a 1024²
+/// step's shapes, called back to back on warm weights — the card never
+/// idles, so the wall time is the call's own cost — then the same with a
+/// host gap between calls, as the step's device lane has, and the shader
+/// time alone at the integer kernel's rate for scale.
+#[test]
+#[ignore]
+fn image_ffn_call_cost() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let (dim, ffn, n) = (4096usize, 12288usize, 512usize);
+    let mut seed = 0x00FF_C057_u64;
+    let mut q4k = |in_dim: usize, out_dim: usize| {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / 256) {
+            bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+        }
+        test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim)
+    };
+    let (gate, up, down) = (q4k(dim, ffn), q4k(dim, ffn), q4k(ffn, dim));
+    let x: Vec<f32> = (0..n * dim)
+        .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
+        .collect();
+    let call = || {
+        vulkan
+            .fused_ffn_prefill(
+                &x,
+                n,
+                &gate,
+                &up,
+                &down,
+                crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                None,
+            )
+            .expect("fused path")
+    };
+    let _ = call();
+    let macs = (3 * dim * ffn * n) as f64;
+    for (label, gap_ms, hold) in [
+        ("back to back", 0u64, false),
+        ("200 ms apart", 200, false),
+        ("200 ms apart, clock held", 200, true),
+    ] {
+        vulkan.hold_clock(hold);
+        let mut times = Vec::new();
+        for _ in 0..8 {
+            if gap_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+            }
+            let t = std::time::Instant::now();
+            let y = call();
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+            vulkan.recycle(y);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "fused FFN {n} tokens, {label}: median {:.1} ms, best {:.1} ms (shader at 3500 G MAC/s: {:.1} ms)",
+            times[4],
+            times[0],
+            macs / 3.5e12 * 1e3
+        );
+    }
+    vulkan.hold_clock(false);
+}
+
+/// The integer-dot GEMM's rate on the picture VAE's convolutions, as
+/// `Q6_K` matrices of a 3×3 window's width (padded to 256) by the output
+/// channels (padded to 64), a 512-pixel stripe (`--ignored --nocapture`):
+/// what a decode on the card would run at, the gather aside.
+#[test]
+#[ignore]
+fn vae_convolutions_on_the_device() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let n = 512usize;
+    for (cin, cout) in [(144usize, 144usize), (288, 288), (576, 576), (1152, 1152)] {
+        let in_dim = (9 * cin).div_ceil(256) * 256;
+        let out_dim = cout.div_ceil(64) * 64;
+        let mut seed = 0x00C0_4E5D_u64;
+        let weights: Vec<QuantMatrix> = (0..4)
+            .map(|_| {
+                let mut bytes = Vec::new();
+                for _ in 0..out_dim * (in_dim / 256) {
+                    bytes.extend(build_block(GGML_TYPE_Q6_K, &mut seed));
+                }
+                test_quant_matrix(&bytes, GGML_TYPE_Q6_K, in_dim, out_dim)
+            })
+            .collect();
+        let x: Vec<f32> = (0..n * in_dim)
+            .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
+            .collect();
+        let macs = (in_dim * out_dim * n) as f64;
+        let rate = |r: Option<(f64, &'static str)>| {
+            r.map_or("-".to_string(), |(us, name)| {
+                format!("{name} {:.0} G MAC/s", macs / us / 1e3)
+            })
+        };
+        eprintln!(
+            "  {cin}->{cout} k3 ({in_dim}x{out_dim}) x {n}: integer {}, float {}",
+            rate(vulkan.mmq_kernel_us_tokens_rotating(&x, n, &weights, 8)),
+            rate(vulkan.matmul_kernel_us_tokens(&x, n, &weights[0], 8)),
+        );
+    }
+}
+
+/// The gathered convolution's rate at the decoder's wide shapes, against
+/// the integer-dot GEMM alone (`vae_convolutions_on_the_device`): what the
+/// gather, the band uploads and the readbacks cost on top. `ORANGU_PROBE_SIDE`
+/// sets the feature map's side (default 256).
+#[test]
+#[ignore]
+fn gathered_convolutions_on_the_device() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let side: usize = std::env::var("ORANGU_PROBE_SIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    for (cin, cout) in [(576usize, 576usize), (1152, 1152)] {
+        let in_dim = (9 * cin).div_ceil(256) * 256;
+        let values: Vec<f32> = (0..in_dim * cout)
+            .map(|i| (((i * 7919) % 2003) as f32 / 1001.0 - 1.0) * 0.06)
+            .collect();
+        let bytes = orangu::quantize::encode(GGML_TYPE_Q6_K, &values, in_dim);
+        let w = test_quant_matrix(&bytes, GGML_TYPE_Q6_K, in_dim, cout);
+        let feature: Vec<f32> = (0..side * side * cin)
+            .map(|i| ((i * 31 % 97) as f32 / 48.0 - 1.0) * 1.5)
+            .collect();
+        for band_mib in [8usize, 16, 32, 64] {
+            let run = || {
+                vulkan
+                    .conv_gather_matmul(crate::engine::backend::vulkan::ConvGatherInput {
+                        feature: &feature,
+                        height: side,
+                        width: side,
+                        cin,
+                        kernel: 3,
+                        stride: 1,
+                        offset: -1,
+                        out_height: side,
+                        out_width: side,
+                        w: &w,
+                        band_bytes: band_mib << 20,
+                    })
+                    .expect("served")
+            };
+            let _ = run();
+            let started = std::time::Instant::now();
+            let reps = 3;
+            for _ in 0..reps {
+                std::hint::black_box(run());
+            }
+            let s = started.elapsed().as_secs_f64() / reps as f64;
+            eprintln!(
+                "  {side}x{side} {cin}->{cout} band {band_mib} MiB: {:.1} ms, {:.0} G MAC/s",
+                s * 1e3,
+                (side * side * in_dim * cout) as f64 / s / 1e9
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn image_linears_on_the_device() {
@@ -9025,6 +9203,108 @@ fn a_fused_gate_up_runs_as_two_row_views_on_the_device() {
             worst <= 0.1 * scale,
             "token {t}: error {worst} against {scale}"
         );
+    }
+}
+
+/// The gathered convolution against the exact one: `kernel × kernel`
+/// windows over a feature map, in `f64` over the dequantized weights, with
+/// both paddings the decoder uses (`Same`: offset −1; down-sampling: offset
+/// 0, stride 2, the bottom/right edge zero), several stripes a band and
+/// several bands a picture.
+#[test]
+fn a_gathered_convolution_is_the_convolution() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        eprintln!("skipping: ORANGU_Q4K_MMVQ disables the integer-dot GEMM");
+        return;
+    }
+    let (height, width, cin, cout, kernel) = (23usize, 37usize, 64usize, 128usize, 3usize);
+    let in_dim = (kernel * kernel * cin).div_ceil(256) * 256;
+    let values: Vec<f32> = (0..in_dim * cout)
+        .map(|i| {
+            if i % in_dim >= kernel * kernel * cin {
+                0.0
+            } else {
+                (((i * 7919) % 2003) as f32 / 1001.0 - 1.0) * 0.06
+            }
+        })
+        .collect();
+    let bytes = orangu::quantize::encode(GGML_TYPE_Q6_K, &values, in_dim);
+    let w = test_quant_matrix(&bytes, GGML_TYPE_Q6_K, in_dim, cout);
+    let dense = crate::engine::quant::dequantize(GGML_TYPE_Q6_K, w.raw_bytes(), in_dim * cout)
+        .expect("Q6_K dequantizes");
+    // A nonzero mean, so a dropped tap or a shifted window moves every pixel.
+    let feature: Vec<f32> = (0..height * width * cin)
+        .map(|i| ((i * 31 % 97) as f32 / 48.0 - 0.6) * 1.5)
+        .collect();
+    let row_bytes = width * cin * 4;
+    for (stride, offset, band_bytes) in [
+        (1usize, -1isize, usize::MAX / 2),
+        (1, -1, row_bytes * 6),
+        (2, 0, usize::MAX / 2),
+        (2, 0, row_bytes * 5),
+    ] {
+        let (out_height, out_width) = if stride == 1 {
+            (height, width)
+        } else {
+            (height.div_ceil(2), width.div_ceil(2))
+        };
+        let mut expected = Vec::with_capacity(out_height * out_width * cout);
+        for oy in 0..out_height {
+            for ox in 0..out_width {
+                let mut patch = vec![0.0f64; in_dim];
+                for tap in 0..kernel * kernel {
+                    let iy = (oy * stride) as isize + offset + (tap / kernel) as isize;
+                    let ix = (ox * stride) as isize + offset + (tap % kernel) as isize;
+                    if iy < 0 || ix < 0 || iy >= height as isize || ix >= width as isize {
+                        continue;
+                    }
+                    let at = (iy as usize * width + ix as usize) * cin;
+                    for c in 0..cin {
+                        patch[tap * cin + c] = feature[at + c] as f64;
+                    }
+                }
+                expected.extend((0..cout).map(|o| {
+                    dense[o * in_dim..(o + 1) * in_dim]
+                        .iter()
+                        .zip(&patch)
+                        .map(|(a, b)| *a as f64 * b)
+                        .sum::<f64>() as f32
+                }));
+            }
+        }
+        let got = vulkan
+            .conv_gather_matmul(crate::engine::backend::vulkan::ConvGatherInput {
+                feature: &feature,
+                height,
+                width,
+                cin,
+                kernel,
+                stride,
+                offset,
+                out_height,
+                out_width,
+                w: &w,
+                band_bytes,
+            })
+            .expect("the integer-dot GEMM serves a 128-row Q6_K matrix");
+        assert_eq!(got.len(), expected.len());
+        let scale = expected.iter().map(|v| v.abs()).fold(1e-6f32, f32::max);
+        for (px, (want, have)) in expected.chunks(cout).zip(got.chunks(cout)).enumerate() {
+            let worst = want
+                .iter()
+                .zip(have)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 0.02 * scale,
+                "stride {stride} band {band_bytes} pixel {px}: error {worst} against {scale}"
+            );
+        }
     }
 }
 

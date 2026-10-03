@@ -78,6 +78,9 @@ pub const Z_DIM: usize = 64;
 pub const SPATIAL_COMPRESSION: usize = 16;
 /// Picture channels: red, green, blue and alpha.
 pub const CHANNELS: usize = 4;
+/// Output channels from which a convolution counts as wide — the
+/// low-resolution stages' (`QwenImage21Vae::choose_wide`).
+const WIDE_CHANNELS: usize = 512;
 
 /// diffusers' `QwenImage21ResidualBlock`: `conv_shortcut(x) + conv2(silu(
 /// norm2(conv1(silu(norm1(x))))))`.
@@ -143,6 +146,10 @@ struct Tower {
 
 pub struct QwenImage21Vae {
     backend: Arc<dyn Backend>,
+    /// The card the wide convolutions run on, windows gathered there
+    /// (`vae::run_conv_gathered`), when [`Self::choose_backend`] timed it
+    /// faster than `backend` on one of them.
+    wide_device: Option<Arc<dyn Backend>>,
     encoder: Tower,
     decoder: Tower,
     /// `quant_conv`: the 128-channel `(mean | logvar)` mixing after the
@@ -205,8 +212,70 @@ impl QwenImage21Vae {
             host.as_secs_f64() * 1e3,
             if cpu_wins { "the CPU" } else { "the device" }
         );
+        let device_backend = self.backend.clone();
         if cpu_wins {
             self.backend = cpu;
+        }
+        self.choose_wide(device_backend);
+    }
+
+    /// Whether the wide convolutions (`cout ≥ WIDE_CHANNELS`, the decoder's
+    /// low-resolution stages, where nearly all of its multiply-adds are)
+    /// gather their windows on `device` instead of running where the rest
+    /// do: timed on the decoder's first such convolution over a 64 × 64
+    /// feature map, each side warmed once.
+    fn choose_wide(&mut self, device: Arc<dyn Backend>) {
+        if !crate::engine::env::flag_on_unless_disabled("ORANGU_VAE_GATHER") {
+            return;
+        }
+        let conv = &self.decoder.middle.first.conv1;
+        if conv.cout < WIDE_CHANNELS {
+            return;
+        }
+        let Some(vulkan) = device.as_wgpu_on(conv.w.device()) else {
+            return;
+        };
+        let side = 64usize;
+        let x = Feature::new(
+            side,
+            side,
+            conv.cin,
+            (0..side * side * conv.cin)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+                .collect(),
+        );
+        let time = |run: &dyn Fn() -> Option<Feature>| {
+            run()?;
+            let started = std::time::Instant::now();
+            run()?;
+            Some(started.elapsed())
+        };
+        let Some(gathered) = time(&|| super::vae::run_conv_gathered(vulkan, conv, &x)) else {
+            return;
+        };
+        let rest = time(&|| Some(run_conv(&*self.backend, conv, &x))).expect("always answers");
+        let _ = super::vae::take_conv_clock();
+        let device_wins = gathered < rest;
+        log::info!(
+            "orangu-server: [image] VAE wide convolutions: one {side}x{side}, {}->{} channels: \
+             gathered on the device {:.0} ms, {} {:.0} ms — {}",
+            conv.cin,
+            conv.cout,
+            gathered.as_secs_f64() * 1e3,
+            if self.backend.is_cpu() {
+                "cpu"
+            } else {
+                "device band"
+            },
+            rest.as_secs_f64() * 1e3,
+            if device_wins {
+                "gathered on the device"
+            } else {
+                "kept with the rest"
+            }
+        );
+        if device_wins {
+            self.wide_device = Some(device);
         }
     }
 
@@ -325,6 +394,7 @@ impl QwenImage21Vae {
         }
         Ok(Self {
             backend,
+            wide_device: None,
             encoder,
             decoder,
             quant,
@@ -476,6 +546,15 @@ impl QwenImage21Vae {
     }
 
     fn conv(&self, conv: &Conv, x: &Feature) -> Feature {
+        if conv.cout >= WIDE_CHANNELS
+            && let Some(out) = self
+                .wide_device
+                .as_ref()
+                .and_then(|device| device.as_wgpu_on(conv.w.device()))
+                .and_then(|vulkan| super::vae::run_conv_gathered(vulkan, conv, x))
+        {
+            return out;
+        }
         run_conv(&*self.backend, conv, x)
     }
 }

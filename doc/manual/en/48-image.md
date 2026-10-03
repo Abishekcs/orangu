@@ -87,19 +87,29 @@ the transformer runs on the CPU and the machine has at least 21 GB (`image_weigh
 server* chapter); without it a step is about twice as long at 512 × 512. A discrete GPU is faster; an integrated one usually is not, and the
 server measures before it commits: under `backend = auto` it times one
 transformer linear on the device and on the CPU and keeps whichever wins,
-saying so at startup (`[image] calibration …`). When the text encoder is
-split across several devices, the transformer is timed on each of them
+saying so at startup (`[image] calibration …`). When the text encoder has
+to be split across several devices, it is planned against what the
+transformer leaves on the selected one — the transformer runs every step,
+the encoder once a picture, so the transformer is given the faster
+memory first (`[vulkan] the head device plans against … for the picture
+transformer`). The transformer is then timed on each of the devices
 and on the CPU and runs whole on the fastest (`[image] transformer
 placement …`) — not necessarily the device it fits on best. The VAE is
 timed the same way, on one of its own convolutions, and runs on the CPU
-when the CPU is faster there (`[image] VAE placement …`). With the
+when the CPU is faster there (`[image] VAE placement …`). Its wide,
+low-resolution convolutions are timed again on the device, and run there
+when the device is faster for them (`[image] VAE wide convolutions …`). With the
 transformer on a device, each block's attention runs on the CPU in
 chunks of the picture's tokens while the device runs the output
 projection and the feed-forward layers of the chunks already done, so
 the two work at the same time; the picture is the same, bit for bit
 (`ORANGU_IMAGE_OVERLAP=0` runs them one after the other). Each block's
 feed-forward layers run on the device as one submission, their
-intermediate never coming back to the host. The wait is never a
+intermediate never coming back to the host. A transformer larger than its
+card keeps as many leading blocks on it as fit and streams the rest
+through a region of the card's memory, a block's weights crossing the bus
+once a call rather than being read from host memory by every kernel
+(`[image] transformer blocks … streamed`). The wait is never a
 surprise: the startup log says what a picture at the defaults costs on
 this machine, and the console counts it down.
 

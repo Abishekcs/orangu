@@ -1098,6 +1098,86 @@ unsafe fn convert_scores_avx2(
     max
 }
 
+/// Key pairs per chunk of a query block's `int8` scores
+/// ([`int8_block_scores`]): 128 keys, 16 KiB of a 128-wide head — the chunk
+/// and the block's queries stay in the first-level cache while every quad
+/// of the block passes over it.
+const INT8_KEY_PAIRS: usize = 64;
+
+/// Where a query block sits: its first query `q0`, `nq` queries against
+/// `n` keys, the softmax `scale`, and each query's key limit, if any.
+struct BlockRows<'a> {
+    q0: usize,
+    nq: usize,
+    n: usize,
+    scale: f32,
+    limits: Option<&'a [usize]>,
+}
+
+/// A query block's `int8` scores against its keys, converted to `f32` into
+/// `scores` (`[nq][n]`, each row up to its limit) with each row's maximum
+/// into `row_max` (which starts at `-∞`). Key chunks of `chunk_pairs` pairs
+/// outermost and the block's quads inside: a head's keys are read once a
+/// block rather than once a quad (a 1024² picture's are 512 KiB of `int8`,
+/// an L2), and each chunk is converted while its integers are in cache.
+/// The same scores, to the bit, at any chunk — a maximum does not depend on
+/// the order it is taken in, and each score converts on its own.
+/// `iscores` holds at least `4 · 2 · chunk_pairs` integers.
+#[allow(clippy::too_many_arguments)]
+fn int8_block_scores(
+    qs: &crate::engine::vecdot::PairedI8,
+    kq: &crate::engine::vecdot::PairedI8,
+    rows: BlockRows<'_>,
+    chunk_pairs: usize,
+    iscores: &mut [i32],
+    scores: &mut [f32],
+    row_max: &mut [f32],
+) {
+    use crate::engine::vecdot::{F32_ROWS, i8_scores_4rows_in};
+    let BlockRows {
+        q0,
+        nq,
+        n,
+        scale,
+        limits,
+    } = rows;
+    let quads = nq.div_ceil(F32_ROWS);
+    let k_pairs = n.div_ceil(2);
+    let mut p = 0;
+    while p < k_pairs {
+        let pe = (p + chunk_pairs).min(k_pairs);
+        let width = 2 * (pe - p);
+        for quad in 0..quads {
+            let (i0, rest) = iscores.split_at_mut(width);
+            let (i1, rest) = rest.split_at_mut(width);
+            let (i2, rest) = rest.split_at_mut(width);
+            let i3 = &mut rest[..width];
+            i8_scores_4rows_in(qs, 2 * quad, 2 * quad + 1, kq, p..pe, [i0, i1, i2, i3]);
+            for r in 0..F32_ROWS {
+                let row = quad * F32_ROWS + r;
+                if row >= nq {
+                    break;
+                }
+                let limit = limits.map_or(n, |l| l[q0 + row]);
+                let (k0, k1) = (2 * p, (2 * pe).min(limit));
+                if k0 >= k1 {
+                    continue;
+                }
+                // The softmax's `scale` folded in here.
+                let sq = qs.scales[row] * scale;
+                let max = convert_scores(
+                    &mut scores[row * n + k0..row * n + k1],
+                    &iscores[r * width..r * width + (k1 - k0)],
+                    &kq.scales[k0..k1],
+                    sq,
+                );
+                row_max[row] = row_max[row].max(max);
+            }
+        }
+        p = pe;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attention_blocked(
     q: &[f32],
@@ -1111,9 +1191,7 @@ fn attention_blocked(
     limits: Option<&[usize]>,
     int8: bool,
 ) -> Vec<f32> {
-    use crate::engine::vecdot::{
-        F32_ROWS, PairedI8, gemm_f32_rows, gemm_f32_rows_many, i8_scores_4rows,
-    };
+    use crate::engine::vecdot::{F32_ROWS, PairedI8, gemm_f32_rows, gemm_f32_rows_many};
     let dim = n_head * head_dim;
     debug_assert_eq!(q.len(), n_q * dim);
     debug_assert_eq!(k.len(), n * dim);
@@ -1264,29 +1342,21 @@ fn attention_blocked(
                         &zeros
                     }
                 });
-                let kq = &k_i8[h];
-                for quad in 0..padded / F32_ROWS {
-                    let (i0, rest) = iscores.split_at_mut(2 * k_pairs);
-                    let (i1, rest) = rest.split_at_mut(2 * k_pairs);
-                    let (i2, i3) = rest.split_at_mut(2 * k_pairs);
-                    i8_scores_4rows(&qs, 2 * quad, 2 * quad + 1, kq, [i0, i1, i2, i3]);
-                    for r in 0..F32_ROWS {
-                        let row = quad * F32_ROWS + r;
-                        if row >= nq {
-                            break;
-                        }
-                        // The softmax's `scale` folded in here.
-                        let sq = qs.scales[row] * scale;
-                        let limit = limits.map_or(n, |l| l[q0 + row]);
-                        let ints = &iscores[r * 2 * k_pairs..r * 2 * k_pairs + limit];
-                        row_max[row] = convert_scores(
-                            &mut scores[row * n..row * n + limit],
-                            ints,
-                            &kq.scales[..limit],
-                            sq,
-                        );
-                    }
-                }
+                int8_block_scores(
+                    &qs,
+                    &k_i8[h],
+                    BlockRows {
+                        q0,
+                        nq,
+                        n,
+                        scale,
+                        limits,
+                    },
+                    INT8_KEY_PAIRS,
+                    iscores,
+                    scores,
+                    &mut row_max,
+                );
             }
 
             // Scores, the whole block against every key in one pass: the
@@ -1767,6 +1837,66 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(worst < 0.02, "causal worst {worst}");
+    }
+
+    /// A query block's `int8` scores computed a key chunk at a time are the
+    /// whole-row computation's, to the bit — scores and row maxima — at any
+    /// chunk: one pair, three, more than the keys; an odd key count; a
+    /// partial last quad; and causal limits that end inside a chunk.
+    #[test]
+    fn int8_scores_by_key_chunks_are_the_whole_rows() {
+        use crate::engine::vecdot::PairedI8;
+        let (nq, n, head_dim) = (7usize, 29usize, 16usize);
+        let unit = |i: usize, salt: usize| ((i * 31 + salt * 17) % 29) as f32 / 14.0 - 1.0;
+        let qv: Vec<f32> = (0..8 * head_dim).map(|i| unit(i, 1)).collect();
+        let kv: Vec<f32> = (0..n * head_dim).map(|i| unit(i, 2)).collect();
+        let qs = PairedI8::quantize(8, head_dim, |r| &qv[r * head_dim..(r + 1) * head_dim]);
+        let kq = PairedI8::quantize(n, head_dim, |r| &kv[r * head_dim..(r + 1) * head_dim]);
+        let limits: Vec<usize> = (0..nq).map(|r| 3 + r * 4).collect();
+        for lim in [None, Some(&limits[..])] {
+            let run = |chunk: usize| {
+                let mut iscores = vec![0i32; 8 * chunk.max(n)];
+                let mut scores = vec![0f32; nq * n];
+                let mut row_max = vec![f32::NEG_INFINITY; nq];
+                let rows = BlockRows {
+                    q0: 0,
+                    nq,
+                    n,
+                    scale: 0.25,
+                    limits: lim,
+                };
+                int8_block_scores(
+                    &qs,
+                    &kq,
+                    rows,
+                    chunk,
+                    &mut iscores,
+                    &mut scores,
+                    &mut row_max,
+                );
+                (scores, row_max)
+            };
+            let (whole, whole_max) = run(n.div_ceil(2));
+            for chunk in [1usize, 3, 64] {
+                let (got, got_max) = run(chunk);
+                for r in 0..nq {
+                    let limit = lim.map_or(n, |l| l[r]);
+                    for j in 0..limit {
+                        assert_eq!(
+                            got[r * n + j].to_bits(),
+                            whole[r * n + j].to_bits(),
+                            "chunk {chunk} row {r} key {j}"
+                        );
+                    }
+                    assert_eq!(
+                        got_max[r].to_bits(),
+                        whole_max[r].to_bits(),
+                        "chunk {chunk} row {r}"
+                    );
+                }
+            }
+            assert!(whole_max.iter().all(|m| m.is_finite()));
+        }
     }
 
     /// A step's attention cut into query chunks — what a step overlapping

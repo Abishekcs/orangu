@@ -1500,6 +1500,15 @@ fn prepare(args: Args) -> Result<Prepared> {
             .unwrap_or((u64::MAX, 0));
         weights_device_bytes + kv + kv_pool_scratch_reserve_bytes() <= budget
     };
+    // A picture model's transformer runs every step and its text encoder
+    // once a picture, so where both want the selected device the
+    // transformer is served first: the encoder is split as though the
+    // transformer's weights were already on it, and plans against the
+    // rest. `None` when the pictures run on the CPU (no device in hand).
+    let transformer_reserve_bytes: Option<u64> = transformer_opened
+        .as_ref()
+        .filter(|_| backend.as_wgpu().is_some())
+        .map(|t| engine::backend::device_resident_split(t.resident_tensor_sizes()).0);
     let split_mode = if partial && requested.is_off() {
         // Whether this node's share fits its device is the plan's question
         // (`workers::plan`), not the whole model's.
@@ -1507,7 +1516,10 @@ fn prepare(args: Args) -> Result<Prepared> {
     } else if requested.is_off()
         && split_flag.is_none()
         && conf.device_split.is_off()
-        && overflows_selected_device(backend.as_ref(), weights_device_bytes)
+        && overflows_selected_device(
+            backend.as_ref(),
+            weights_device_bytes + transformer_reserve_bytes.unwrap_or(0),
+        )
     {
         log::warn!(
             "orangu-server: the weights are larger than the selected device — spreading \
@@ -1535,7 +1547,10 @@ fn prepare(args: Args) -> Result<Prepared> {
         &split_mode,
         &per_layer_bytes,
         weights_device_bytes,
-        context_kv_bytes.map(|(_, kv)| kv + kv_pool_scratch_reserve_bytes()),
+        head_reserve(
+            context_kv_bytes.map(|(_, kv)| kv + kv_pool_scratch_reserve_bytes()),
+            transformer_reserve_bytes,
+        ),
     )?;
     // A model with layers on the host is never prefilled narrower than the
     // width at which those layers stream to the card — see `CHUNK_FLOOR`.
@@ -5348,6 +5363,21 @@ fn requested_context(flag: Option<usize>, configured: Option<usize>) -> Option<u
     .or(configured)
 }
 
+/// What the head device holds back from a split's weights, and why: the
+/// requested context's KV cache and scratch, and a picture model's
+/// transformer — whichever apply, summed.
+fn head_reserve(context: Option<u64>, transformer: Option<u64>) -> Option<(u64, &'static str)> {
+    match (context, transformer) {
+        (None, None) => None,
+        (Some(kv), None) => Some((kv, "the requested context and its scratch")),
+        (None, Some(t)) => Some((t, "the picture transformer, which runs every step")),
+        (Some(kv), Some(t)) => Some((
+            kv + t,
+            "the requested context and its scratch, and the picture transformer",
+        )),
+    }
+}
+
 fn overflows_selected_device(backend: &dyn Backend, weights_bytes: u64) -> bool {
     backend
         .as_wgpu()
@@ -5448,7 +5478,7 @@ fn apply_device_split(
     mode: &SplitMode,
     per_layer_bytes: &[u64],
     weights_bytes: u64,
-    head_reserve_bytes: Option<u64>,
+    head_reserve_bytes: Option<(u64, &'static str)>,
 ) -> Result<(Arc<dyn Backend>, String, Option<SplitReport>)> {
     /// The share of a device's memory a fill-in-order placement will put
     /// weights into, leaving the rest for the KV cache and the transient
@@ -5505,7 +5535,9 @@ fn apply_device_split(
     // A requested context replaces the head card's share heuristic with
     // the bytes that context needs: what is left after them is what the
     // weights may take.
-    if let (Some(reserve), Some(Some(head))) = (head_reserve_bytes, capacities.first_mut()) {
+    if let (Some((reserve, reason)), Some(Some(head))) =
+        (head_reserve_bytes, capacities.first_mut())
+    {
         let free = set
             .first()
             .and_then(|c| {
@@ -5516,8 +5548,7 @@ fn apply_device_split(
             .unwrap_or(*head);
         *head = free.saturating_sub(reserve);
         log::info!(
-            "orangu-server: [{}] the head device plans against {} after {} for the requested \
-             context and its scratch",
+            "orangu-server: [{}] the head device plans against {} after {} for {reason}",
             wgpu.api_tag(),
             orangu::format::format_bytes(*head),
             orangu::format::format_bytes(reserve)
@@ -6455,10 +6486,27 @@ mod tests {
     }
 
     use super::{
-        Args, Command, DeviceClass, SplitReport, gate, label_carries_tag, resolve_model_spec,
-        resolve_workspace, terminal_title,
+        Args, Command, DeviceClass, SplitReport, gate, head_reserve, label_carries_tag,
+        resolve_model_spec, resolve_workspace, terminal_title,
     };
     use crate::engine::placement::SplitPlan;
+
+    /// The head device holds back the requested context and a picture
+    /// model's transformer together, summed, and the log line names what
+    /// it held back for; nothing to hold back is no reserve at all.
+    #[test]
+    fn the_head_reserve_sums_the_context_and_the_picture_transformer() {
+        assert_eq!(head_reserve(None, None), None);
+        let (kv, why) = head_reserve(Some(300), None).unwrap();
+        assert_eq!(kv, 300);
+        assert!(why.contains("context") && !why.contains("transformer"));
+        let (t, why) = head_reserve(None, Some(4000)).unwrap();
+        assert_eq!(t, 4000);
+        assert!(why.contains("transformer") && !why.contains("context"));
+        let (both, why) = head_reserve(Some(300), Some(4000)).unwrap();
+        assert_eq!(both, 4300);
+        assert!(why.contains("context") && why.contains("transformer"));
+    }
 
     /// A deployment-gate row is a value and nothing else — the banner is a
     /// table, and a cell that sometimes grows a sentence of advice is what

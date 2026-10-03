@@ -745,6 +745,10 @@ pub struct VulkanBackend {
     /// exact same buffers do, which is also the only case where
     /// serializing them is actually required for correctness.
     op_cache: Mutex<HashMap<OpCacheKey, Arc<Mutex<CachedOpResources>>>>,
+    /// Weights a model asked to stream rather than place
+    /// ([`Self::stream_weights`]), by cache key: every op over one takes the
+    /// recyclable streaming region, whichever path builds it.
+    streamed_weights: Mutex<HashSet<(usize, usize)>>,
     /// Per-`batch_slot` cached GPU-sample scratch — see
     /// `ArgmaxSampleResources`. Lets `record_argmax_sample` reuse its buffers
     /// and bind groups across every decode token instead of allocating a
@@ -859,6 +863,9 @@ pub struct VulkanBackend {
     /// Row-strided (`n_tokens` workgroups) norms, used only by the fused
     /// prefill chain — see `vulkan_shaders::RMSNORM_ROWS_SHADER_BODY`.
     rmsnorm_rows_pipeline: wgpu::ComputePipeline,
+    /// A convolution's `im2col` rows built on the device
+    /// ([`Self::conv_gather_matmul`]).
+    conv_gather_pipeline: wgpu::ComputePipeline,
     rmsnorm_add_rows_pipeline: wgpu::ComputePipeline,
     /// `rmsnorm_add_rows` with the per-layer output scale folded in — see
     /// `vulkan_shaders::shader_source_rmsnorm_add_scale_rows`.
@@ -2503,6 +2510,9 @@ const ROLE_POST_ATTN: usize = 300;
 const ROLE_PLE: usize = 400;
 /// [`VulkanBackend::moe_head_rows`]'s five ops.
 const ROLE_MOE_HEAD: usize = 500;
+/// A convolution's matrix over its gathered windows
+/// ([`VulkanBackend::conv_gather_matmul`]).
+const ROLE_CONV: usize = 600;
 
 /// Rows a submission will produce, not yet waited for — the MoE shared
 /// MLP's, running on the card while the host runs the experts. Taken with
@@ -5043,6 +5053,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_rows(),
         );
+        let conv_gather_pipeline = build_elem_pipeline(
+            &elem4_pipeline_layout,
+            vulkan_shaders::shader_source_conv_gather(),
+        );
         let rmsnorm_add_rows_pipeline = build_elem_pipeline(
             &elem5_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_add_rows(),
@@ -5854,6 +5868,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             fused_ple_x3_arena: Mutex::new(ScratchArena::new()),
             fused_scale_arena: Mutex::new(ScratchArena::new()),
             op_cache: Mutex::new(HashMap::new()),
+            streamed_weights: Mutex::new(HashSet::new()),
             argmax_sample_cache: Mutex::new(HashMap::new()),
             ple_projection_cache: Mutex::new(HashMap::new()),
             uniform_arena: Mutex::new(ScratchArena::new()),
@@ -5896,6 +5911,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             add_rmsnorm_wide_pipeline,
             rmsnorm_add_pipeline,
             rmsnorm_rows_pipeline,
+            conv_gather_pipeline,
             rmsnorm_add_rows_pipeline,
             rmsnorm_add_scale_rows_pipeline,
             ple_inputs_pipeline,
@@ -7679,6 +7695,7 @@ impl VulkanBackend {
         // to take at the top: nothing below re-enters a guarded path
         // (`matmul`/`matmul_batch` fan *into* here, never out of it).
         let _region_guard = self.prefill_region_guard();
+        self.make_room_for_streamed(ops);
         let shares_one_input = ops.len() > 1
             && ops[1..].iter().all(|op| {
                 std::ptr::eq(op.x.as_ptr(), ops[0].x.as_ptr()) && op.x.len() == ops[0].x.len()
@@ -7738,6 +7755,49 @@ impl VulkanBackend {
                     )
                 })
                 .collect();
+
+        // The integer-dot GEMM for every op whose shape it serves
+        // (`mmq_for`), per width: the stripe's rows quantized from the op's
+        // own input region, then the GEMM — `fused_post_attention_prefill`'s
+        // form, a stripe at a time. Built once, as the guards are; `None`
+        // keeps an op on the float kernel.
+        #[allow(clippy::type_complexity)]
+        let mmq_by_width: Vec<(
+            usize,
+            Vec<
+                Option<(
+                    wgpu::Buffer,
+                    wgpu::BindGroup,
+                    u32,
+                    wgpu::Buffer,
+                    MmqDispatch,
+                )>,
+            >,
+        )> = guards_by_width
+            .iter()
+            .map(|(w, guards)| {
+                let mmq = ops
+                    .iter()
+                    .zip(guards.iter())
+                    .map(|(op, guard)| {
+                        (guard.mmvq.is_none() && self.mmq_for(op.w, *w)).then(|| {
+                            let (q8, qbg, qwg, qmeta) = self.mmq_stage(
+                                BindSrc::Slice(
+                                    &guard.x_buffer,
+                                    guard.x_offset,
+                                    (*w * op.w.in_dim) as u64 * 4,
+                                ),
+                                *w,
+                                op.w.in_dim,
+                            );
+                            let dispatch = self.mmq_op(op.w, guard, &q8);
+                            (q8, qbg, qwg, qmeta, dispatch)
+                        })
+                    })
+                    .collect();
+                (*w, mmq)
+            })
+            .collect();
 
         // Each distinct input staged once, whole, in a pooled mappable buffer
         // the host writes directly — every stripe is then a device copy out
@@ -7836,6 +7896,11 @@ impl VulkanBackend {
                     .find(|(w, _)| *w == padded)
                     .expect("width planned above")
                     .1;
+                let mmq = &mmq_by_width
+                    .iter()
+                    .find(|(w, _)| *w == padded)
+                    .expect("width planned above")
+                    .1;
 
                 for (i, (op, guard)) in ops.iter().zip(guards.iter()).enumerate() {
                     let staging = &stagings[if shares_one_input { 0 } else { i }].1;
@@ -7863,7 +7928,12 @@ impl VulkanBackend {
                         label: Some("orangu-server striped matmul pass"),
                         timestamp_writes: None,
                     });
-                    for (op, guard) in ops.iter().zip(guards.iter()) {
+                    for ((op, guard), mmq) in ops.iter().zip(guards.iter()).zip(mmq.iter()) {
+                        if let Some((_, qbg, qwg, _, dispatch)) = mmq {
+                            self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                            self.record_mmq(&mut pass, &dispatch.0, dispatch.1, dispatch.2);
+                            continue;
+                        }
                         if let Some(mmvq) = &guard.mmvq
                             && let Some((pipeline, _)) = self.mmvq_pipeline_for(op.w, padded)
                         {
@@ -8176,6 +8246,7 @@ impl VulkanBackend {
         if ops.is_empty() {
             return Vec::new();
         }
+        self.make_room_for_streamed(ops);
         // Named up front rather than left to the first thing that trips on
         // it: an activation left on the device (an empty host `x`) used to
         // reach the MMQ stage as a zero-byte arena slice and panic inside
@@ -9033,7 +9104,7 @@ impl VulkanBackend {
         // region decides which cache namespace this op belongs in. One that
         // does not fit fell back to the permanent arena, where its binding is
         // fixed, so it is an ordinary weight-keyed entry like any other.
-        let streamed_weight = streamed
+        let streamed_weight = (streamed || self.is_streamed(op.w))
             .then(|| self.weight_buffer_streamed(op.w))
             .flatten();
         let (waddr, wlen) = match streamed_weight {
@@ -10061,6 +10132,25 @@ pub enum FfnActivation {
     Geglu,
     /// `silu(gate) * up` — Llama, Qwen2, Mistral, Phi.
     Swiglu,
+}
+
+/// [`VulkanBackend::conv_gather_matmul`]'s operands: the feature map
+/// (`[height][width][cin]`), the convolution's geometry, its matrix
+/// (`[cout][in_dim]`, `in_dim` the window's `kernel² · cin` padded), and
+/// how many bytes of input rows a band may upload at once.
+#[derive(Clone, Copy)]
+pub struct ConvGatherInput<'a> {
+    pub feature: &'a [f32],
+    pub height: usize,
+    pub width: usize,
+    pub cin: usize,
+    pub kernel: usize,
+    pub stride: usize,
+    pub offset: isize,
+    pub out_height: usize,
+    pub out_width: usize,
+    pub w: &'a QuantMatrix,
+    pub band_bytes: usize,
 }
 
 pub struct FusedPostAttentionInput<'a> {
@@ -12324,6 +12414,58 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    /// Marks `weights` to stream through the streaming region instead of
+    /// taking the permanent arena, and creates the region at `region_bytes`
+    /// now — before the weights that do stay are placed, so the region is
+    /// the card's and not what overflows it. For a dense model larger than
+    /// the card (a picture transformer on a 4 GiB card): its leading blocks
+    /// stay resident, the rest cross the bus **once a call group** into
+    /// the region (`reserve_stream_space`) where they would otherwise sit in
+    /// host memory and be read across the bus by every tile of every
+    /// kernel. A weight whose rows the card would pad (`device_row_stride`)
+    /// is left to the arena: the region holds rows as the file has them.
+    pub fn stream_weights(&self, weights: &[&QuantMatrix], region_bytes: u64) {
+        let mut set = self
+            .streamed_weights
+            .lock()
+            .expect("streamed weights poisoned");
+        for w in weights {
+            if Self::device_row_stride(w.row_bytes()) == w.row_bytes() {
+                set.insert(w.cache_key());
+            }
+        }
+        drop(set);
+        self.reserve_stream_region(region_bytes);
+    }
+
+    /// Whether `w` was marked by [`Self::stream_weights`].
+    fn is_streamed(&self, w: &QuantMatrix) -> bool {
+        let set = self
+            .streamed_weights
+            .lock()
+            .expect("streamed weights poisoned");
+        !set.is_empty() && set.contains(&w.cache_key())
+    }
+
+    /// Makes room in the streaming region for a call's streamed weights
+    /// together, before any of the call's ops is built — so no placement
+    /// within the call can find the region full and rewind it under a
+    /// weight the same submission reads. Nothing when none is streamed.
+    fn make_room_for_streamed(&self, ops: &[MatmulOp<'_>]) {
+        let streamed: Vec<MatmulOp<'_>> = ops
+            .iter()
+            .filter(|op| self.is_streamed(op.w))
+            .map(|op| MatmulOp {
+                x: op.x,
+                n_tokens: op.n_tokens,
+                w: op.w,
+            })
+            .collect();
+        if !streamed.is_empty() {
+            self.reserve_stream_space(&streamed);
+        }
+    }
+
     /// Creates (or grows) the streaming region to `bytes` ahead of use —
     /// see `GemmaModel::load_with_backend` for why a model with routed
     /// experts asks for it at load time.
@@ -12458,7 +12600,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.report_device_memory("prefill");
         let mut region = self.stream_region.lock().expect("stream region poisoned");
         region.1 = false;
-        if region.0 == 0 || !expert_region_release() {
+        // A region that streamed weights read every call (`stream_weights`)
+        // is the model's, not a prompt's: it stays.
+        let serves_weights = !self
+            .streamed_weights
+            .lock()
+            .expect("streamed weights poisoned")
+            .is_empty();
+        if region.0 == 0 || !expert_region_release() || serves_weights {
             return;
         }
         drop(region);
@@ -18338,6 +18487,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let t0 = std::time::Instant::now();
         let t_enter = t_enter.unwrap_or(t0);
         let _region_guard = self.prefill_region_guard();
+        self.make_room_for_streamed(&[gate, up, down].map(|w| MatmulOp { x, n_tokens, w }));
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_FFN);
         let up_entry = self.op_entry_at(&up_op, 0, ROLE_FFN + 1);
         let down_entry = self.op_entry_at(&down_op, 0, ROLE_FFN + 2);
@@ -18477,6 +18627,172 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 split.wait_ms,
                 split.copy_ms,
                 t_enter.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        Some(out)
+    }
+
+    /// A convolution on the card with its windows gathered there: the
+    /// input feature map crosses the bus a band of rows at a time (with the
+    /// window's halo), and for each 512-pixel stripe the `conv_gather`
+    /// kernel builds the pixels' `im2col` rows straight into the matrix's
+    /// input region, the integer-dot GEMM quantizes and multiplies them,
+    /// and the stripe's outputs are copied to the band's readback — one
+    /// submission and one readback a band, no `im2col` band on the host or
+    /// on the bus. Returns `[out_height · out_width][cout]`, no bias.
+    ///
+    /// `None` where the integer-dot GEMM does not serve the matrix at a
+    /// stripe's width (`mmq_for`), or under `ORANGU_Q4K_MMVQ`.
+    pub fn conv_gather_matmul(&self, input: ConvGatherInput<'_>) -> Option<Vec<f32>> {
+        const CONTEXT: &str = "reading back a gathered convolution";
+        let ConvGatherInput {
+            feature,
+            height,
+            width,
+            cin,
+            kernel,
+            stride,
+            offset,
+            out_height,
+            out_width,
+            w,
+            band_bytes,
+        } = input;
+        let stripe = max_matmul_tokens_per_submission();
+        if self.q4_k_mmvq || !self.mmq_for(w, stripe) || w.in_dim < kernel * kernel * cin {
+            return None;
+        }
+        debug_assert_eq!(feature.len(), height * width * cin);
+        let cout = w.out_dim;
+        let op = MatmulOp {
+            x: &[],
+            n_tokens: stripe,
+            w,
+        };
+        let _region_guard = self.prefill_region_guard();
+        self.make_room_for_streamed(std::slice::from_ref(&op));
+        let entry = self.op_entry_at(&op, 0, ROLE_CONV);
+        let g = entry.lock().unwrap_or_else(|p| p.into_inner());
+        let x_len = ((stripe * w.in_dim) as u64) * 4;
+        let (q8, qbg, qwg, _qmeta) = self.mmq_stage(
+            BindSrc::Slice(&g.x_buffer, g.x_offset, x_len),
+            stripe,
+            w.in_dim,
+        );
+        let mm = self.mmq_op(w, &g, &q8);
+        let meta = self.elem_meta_buffer((stripe * w.in_dim) as u32, 0.0);
+
+        // Output rows a band, from the input rows a band may upload: a band
+        // of `rows` output rows reads `(rows − 1) · stride + kernel` input rows.
+        let in_rows = (band_bytes / (width * cin * 4).max(1)).max(kernel);
+        let band_rows = ((in_rows - kernel) / stride + 1).clamp(1, out_height);
+        let mut out = Vec::with_capacity(out_height * out_width * cout);
+        // `ORANGU_VAE_CONV_TRACE=1`: where a call's wall time went — the
+        // recording and upload, the wait on the card, the copy out.
+        let trace = crate::engine::env::flag_on("ORANGU_VAE_CONV_TRACE");
+        let (mut record, mut wait_s, mut copy_s, mut bands) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+        // Two bands in flight: the next band is uploaded, recorded and
+        // submitted before the last one's readback is waited on and copied
+        // out, so the card runs while the host does both. The bands share the
+        // op's regions, which the queue's order keeps apart.
+        let mut pending: Option<(wgpu::Buffer, u64, std::sync::Arc<MapWait>)> = None;
+        let mut finish = |(readback, bytes, wait): (wgpu::Buffer, u64, std::sync::Arc<MapWait>),
+                          out: &mut Vec<f32>| {
+            let phase = std::time::Instant::now();
+            self.wait_mapped(&wait, CONTEXT);
+            wait_s += phase.elapsed().as_secs_f64();
+            let phase = std::time::Instant::now();
+            let data = self.mapped_bytes(&readback, CONTEXT);
+            out.extend_from_slice(bytemuck::cast_slice(&data));
+            drop(data);
+            readback.unmap();
+            self.put_readback(bytes, readback);
+            copy_s += phase.elapsed().as_secs_f64();
+        };
+        let mut oy0 = 0;
+        while oy0 < out_height {
+            let oy1 = (oy0 + band_rows).min(out_height);
+            let first_in = (oy0 as isize * stride as isize + offset).max(0) as usize;
+            let last_in = ((oy1 - 1) as isize * stride as isize + offset + kernel as isize - 1)
+                .clamp(0, height as isize - 1) as usize;
+            let phase = std::time::Instant::now();
+            let band = &feature[first_in * width * cin..(last_in + 1) * width * cin];
+            let band_buf = self.scratch_buffer(band.len());
+            self.queue
+                .write_buffer(&band_buf, 0, bytemuck::cast_slice(band));
+            let (px0, px1) = (oy0 * out_width, oy1 * out_width);
+            let readback_bytes = ((px1 - px0) * cout * 4) as u64;
+            let readback = self.take_readback(readback_bytes);
+            let mut encoder = self.new_encoder("orangu-server gathered convolution encoder");
+            // Kept alive until the submission: each stripe's parameters
+            // and the bind group naming them.
+            let mut held = Vec::new();
+            for s0 in (px0..px1).step_by(stripe) {
+                let n = stripe.min(px1 - s0);
+                let params: [u32; 11] = [
+                    width as u32,
+                    height as u32,
+                    cin as u32,
+                    kernel as u32,
+                    stride as u32,
+                    offset as i32 as u32,
+                    out_width as u32,
+                    s0 as u32,
+                    px1 as u32,
+                    w.in_dim as u32,
+                    first_in as u32,
+                ];
+                let p_buf = self.scratch_buffer(params.len());
+                self.queue
+                    .write_buffer(&p_buf, 0, bytemuck::cast_slice(&params));
+                let bg = self.elem4_bind_group(
+                    &band_buf,
+                    &p_buf,
+                    BindSrc::Slice(&g.x_buffer, g.x_offset, x_len),
+                    &meta,
+                );
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("orangu-server gathered convolution pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.conv_gather_pipeline);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.dispatch_workgroups(self.strided_workgroups(stripe * w.in_dim), 1, 1);
+                    self.record_mmq_quantize(&mut pass, &qbg, qwg);
+                    self.record_mmq(&mut pass, &mm.0, mm.1, mm.2);
+                }
+                encoder.copy_buffer_to_buffer(
+                    &g.output_buffer,
+                    g.output_offset,
+                    &readback,
+                    ((s0 - px0) * cout * 4) as u64,
+                    (n * cout * 4) as u64,
+                );
+                held.push((p_buf, bg));
+            }
+            self.queue.submit(Some(encoder.finish()));
+            self.submission_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let wait = self.map_read(&readback);
+            drop(held);
+            record += phase.elapsed().as_secs_f64();
+            if let Some(last) = pending.replace((readback, readback_bytes, wait)) {
+                finish(last, &mut out);
+            }
+            bands += 1;
+            oy0 = oy1;
+        }
+        if let Some(last) = pending.take() {
+            finish(last, &mut out);
+        }
+        if trace {
+            eprintln!(
+                "orangu-server: [vae] gathered {out_height}x{out_width} {cin}->{cout}: {bands} \
+                 band(s), record {:.1} ms, wait {:.1} ms, copy out {:.1} ms",
+                record * 1e3,
+                wait_s * 1e3,
+                copy_s * 1e3
             );
         }
         Some(out)
