@@ -258,8 +258,11 @@ fn extract_ooxml_runs(bytes: &[u8]) -> Option<String> {
 
     let mut parts: Vec<(String, String)> = Vec::new();
     for i in 0..zip.len() {
-        let name = match zip.by_index(i) {
-            Ok(f) => f.name().to_string(),
+        let name = match zip
+            .by_index(i)
+            .and_then(|f| f.name().map(|n| n.into_owned()))
+        {
+            Ok(name) => name,
             Err(_) => continue,
         };
         let is_doc = name == "word/document.xml";
