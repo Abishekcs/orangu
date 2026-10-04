@@ -1339,10 +1339,16 @@ own host work between), its wait on the attention (and how much of that
 was the first chunks'), and the host's wait on the last tails.
 `ORANGU_IMAGE_OVERLAP` sets even chunks of that many tokens; `0` turns
 the overlap off; `ORANGU_IMAGE_OVERLAP_TAPER=0` keeps the default four
-even.
+even. `ORANGU_IMAGE_PASS_TRACE=1` prints a line a pass, stamped with the
+wall clock — the attention, the lane's feed-forward and output
+projection, the wait on the last tails and q/k/v — to line a slow pass up
+against what the machine was doing then.
 
-**The card takes a share of the attention's heads.** In an overlapped
-pass the lane first runs the last few heads' attention on the card
+**The card can take a share of the attention's heads** — off by
+default, `ORANGU_IMAGE_DEVICE_HEADS=auto` (tuned) or a count (fixed):
+measured on a quiet machine, the lane's feed-forward ran slower with them
+on, and the step came out no faster and less steady. In an overlapped pass the lane first runs the last few
+heads' attention on the card
 (`device_attention` over `VulkanBackend::gpu_attention_prefill`: the
 queries' columns gathered in parallel, the keys' and values' pushed
 straight from their columns into a cache kept from block to block, so its
@@ -1350,24 +1356,25 @@ device mirror is allocated once), while the host runs the other heads by
 query chunks (`step_attention_heads` over `attention_blocked_heads`, each
 head's arithmetic the whole call's to the bit,
 `attention_over_a_head_range_is_those_heads_of_the_whole`); each chunk's
-card columns are filled in before its tail. How many heads is measured,
-not set: `HeadTuner` reads each pass's stages — the lane's wait on the
-attention less the host's wait past the last chunk's own tail is the
-lane's slack, a head moved to the card costs its lane time per head (the
-host's, before the card has run one) and returns the host's — and moves
-the count half the way to where the slack would be none, a head at least,
-up to half the heads, kept from picture to picture. From none it goes the
-whole way: a server's first pass is the measurement, priced with the
-card's heads at the host's rate, which errs toward too few, so the second
-pass already runs near the balance. The heads' cache is kept from pass
+card columns are filled in before its tail. Under `auto`, how many heads
+is measured, not set: `HeadTuner` gives the card as many as it finishes
+while the host computes the block's first query chunk — the lane's only
+idle time in a block, before any tail reaches the card, so the heads
+never share the card with the feed-forward. Each pass gives the first
+chunk's host time per host head and the lane's time per card head (a
+server's first pass on the card runs one head to measure it; the rate is
+then remembered), and the count is the largest that fits nine tenths of
+the window, up to half the heads, kept from picture to picture. The heads' cache is kept from pass
 to pass, so its device mirror is allocated once (on a card at its driver
 budget, allocating it every pass made the driver move buffers mid-step),
 and released before the VAE decodes
 (`QwenImage21Transformer::release_pass_scratch`).
-`ORANGU_IMAGE_DEVICE_HEADS` fixes the count (`0`: all on the host);
+`ORANGU_IMAGE_DEVICE_HEADS` takes `auto` or a count (unset or `0`: all on
+the host);
 `ORANGU_IMAGE_HEADS_TRACE=1` prints the card's gather, cache fill, key
 and value upload (`VulkanBackend::sync_kv_mirror`, run apart for the
-timing) and call per block, and each pass's slack and next count. An
+timing) and call per block, and each pass's window headroom and next
+count. An
 `f16` mirror's rows are converted with `half`'s slice conversion (the
 CPU's own `f16` conversion where it has one), split across the pool for
 large uploads — the same bytes as `f16::from_f32` value for value

@@ -180,9 +180,6 @@ pub struct Stages {
     pub lane_mlp: Duration,
     /// The lane's time on the heads it runs on the card.
     pub lane_heads: Duration,
-    /// The lane's time on each block's last chunk's tail — the part of the
-    /// host's final wait no balance can remove.
-    pub lane_last: Duration,
 }
 
 impl Stages {
@@ -205,7 +202,6 @@ impl Stages {
         self.lane_out += other.lane_out;
         self.lane_mlp += other.lane_mlp;
         self.lane_heads += other.lane_heads;
-        self.lane_last += other.lane_last;
     }
 }
 

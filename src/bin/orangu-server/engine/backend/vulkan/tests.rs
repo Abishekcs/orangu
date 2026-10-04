@@ -5447,6 +5447,14 @@ fn image_attention_on_the_device() {
     }
     let got = run(&mut fresh);
     let device = started.elapsed();
+    // Again on the synced cache: the queries' upload, the kernel and the
+    // readback, without the keys' and values' upload.
+    let started = std::time::Instant::now();
+    let reps = 3;
+    for _ in 0..reps {
+        std::hint::black_box(run(&mut fresh));
+    }
+    let warm = started.elapsed() / reps;
     let started = std::time::Instant::now();
     let want = crate::engine::image::transformer::step_attention_f32_for_probe(
         &q, n_q, &k, &v, n_kv, N_HEAD, HEAD_DIM, scale,
@@ -5458,6 +5466,11 @@ fn image_attention_on_the_device() {
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
     let macs = 2.0 * (n_q * n_kv * dim) as f64;
+    eprintln!(
+        "  synced cache: {:.1} ms ({:.0} G MAC/s)",
+        warm.as_secs_f64() * 1e3,
+        macs / warm.as_secs_f64() / 1e9
+    );
     eprintln!(
         "{}: {n_q} queries x {n_kv} keys x {N_HEAD}x{HEAD_DIM}: device {:.0} ms ({:.0} G MAC/s), host f32 {:.0} ms ({:.0} G MAC/s), worst |diff| {worst:.2e}",
         vulkan.device_in_use().name,

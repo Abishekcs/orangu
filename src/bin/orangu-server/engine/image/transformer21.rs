@@ -626,10 +626,10 @@ impl QwenImage21Transformer {
     }
 
     /// How many of a block's heads (the last ones) the card takes in an
-    /// overlapped pass: `ORANGU_IMAGE_DEVICE_HEADS` fixes the count (`0`
-    /// keeps them all on the host); unset, [`HeadTuner`] picks it from the
-    /// passes before. None without a Vulkan card holding the block, and at
-    /// most half of the block's heads.
+    /// overlapped pass: none unless `ORANGU_IMAGE_DEVICE_HEADS` asks
+    /// ([`fixed_device_heads`]: a count, or `auto` for [`HeadTuner`] to pick
+    /// it from the passes before). None without a Vulkan card holding the
+    /// block, and at most half of the block's heads.
     fn device_heads(&self, block: &Block) -> usize {
         if self.backend.as_wgpu_on(block.to_q.device()).is_none() {
             return 0;
@@ -962,7 +962,6 @@ impl QwenImage21Transformer {
                         lane_pool().install(move || {
                             let (mut busy, mut idle) = (Duration::ZERO, Duration::ZERO);
                             let (mut out, mut mlp) = (Duration::ZERO, Duration::ZERO);
-                            let mut last = Duration::ZERO;
                             let ran = Instant::now();
                             let device = (device_heads > 0).then(|| {
                                 self.device_attention(
@@ -1006,12 +1005,11 @@ impl QwenImage21Transformer {
                                 }
                                 t0 += n;
                                 let (o, m) = self.block_tail(block, &gates, rows, attn);
-                                last = ran.elapsed();
-                                busy += last;
+                                busy += ran.elapsed();
                                 out += o;
                                 mlp += m;
                             }
-                            (busy, idle, out, mlp, heads, last)
+                            (busy, idle, out, mlp, heads)
                         })
                     });
                     let attention_started = Instant::now();
@@ -1042,9 +1040,8 @@ impl QwenImage21Transformer {
                     drop(send);
                     clock.lap(|s| &mut s.attention);
                     match lane.join() {
-                        Ok((busy, idle, out, mlp, heads, last)) => {
+                        Ok((busy, idle, out, mlp, heads)) => {
                             clock.stages.lane_heads += heads;
-                            clock.stages.lane_last += last;
                             clock.stages.lane_busy += busy;
                             clock.stages.lane_idle += idle;
                             clock.stages.lane_out += out;
@@ -1096,11 +1093,30 @@ impl QwenImage21Transformer {
             let slack = tuner.observe(&clock.stages, c.n_head, c.n_head / 2);
             if crate::engine::env::flag_on("ORANGU_IMAGE_HEADS_TRACE") {
                 eprintln!(
-                    "orangu-server: [image] pass with {heads} heads on the device: lane slack \
+                    "orangu-server: [image] pass with {heads} heads on the device: window headroom \
                      {:+.2}s, next pass {}",
                     slack, tuner.heads
                 );
             }
+        }
+        // `ORANGU_IMAGE_PASS_TRACE=1`: a line a pass, stamped with the wall
+        // clock, with the lane's feed-forward and output projection — to
+        // line a slow pass up against what the card was doing then.
+        if overlap.is_some() && crate::engine::env::flag_on("ORANGU_IMAGE_PASS_TRACE") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let st = &clock.stages;
+            eprintln!(
+                "orangu-server: [image] pass ended at {:.1}: attention {:.2}s, feed-forward \
+                 {:.2}s, output projection {:.2}s, wait on the last tails {:.2}s, q/k/v {:.2}s",
+                now.as_secs_f64(),
+                st.attention.as_secs_f64(),
+                st.lane_mlp.as_secs_f64(),
+                st.lane_out.as_secs_f64(),
+                st.mlp.as_secs_f64(),
+                st.qkv.as_secs_f64(),
+            );
         }
         *self
             .modulation
@@ -1161,64 +1177,62 @@ fn device_weights(block: &Block) -> Vec<&QuantMatrix> {
     ]
 }
 
-/// `ORANGU_IMAGE_DEVICE_HEADS`, read once: the heads the card takes, fixed.
+/// `ORANGU_IMAGE_DEVICE_HEADS`, read once: `None` for `auto` (the
+/// [`HeadTuner`] picks the count), else the count, fixed — unset is `0`.
+/// Off by default: with the card's heads on, the lane's feed-forward ran
+/// slower and the step no faster and less steady, on the cards measured.
 fn fixed_device_heads() -> Option<usize> {
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("ORANGU_IMAGE_DEVICE_HEADS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
+    *N.get_or_init(|| match std::env::var("ORANGU_IMAGE_DEVICE_HEADS") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("auto") => None,
+        Ok(v) => Some(v.trim().parse().unwrap_or(0)),
+        Err(_) => Some(0),
     })
 }
 
-/// Picks how many heads the card takes from how one pass's overlap went,
-/// measured inside the pass — so a machine's drifting clocks, which move
-/// whole passes, do not steer it. The lane's slack is its time waiting on
-/// the host's attention less the host's time waiting on the lane past the
-/// last chunk's own tail; a head moved to the card takes its time on the
-/// lane (`lane_heads` per head; before the card has run one, the host's)
-/// from that slack and gives back the host's time per head
-/// (`attention` over the host's heads). The count goes half the way to
-/// where the slack would be none, a head at least, each pass, and is kept
-/// from one picture to the next. From none it goes the whole way: the
-/// first pass is the measurement, and pricing the card's heads at the
-/// host's rate errs toward too few.
+/// Picks how many heads the card takes: as many as it finishes while the
+/// host computes the block's first query chunk — the lane's only idle time
+/// in a block, before any tail reaches the card, so the heads do not run
+/// beside the lane's feed-forward. Measured each pass: `a`, the first chunk's host time
+/// per host head; `c`, the lane's time per card head (a first pass on the
+/// card runs one head to measure it). The count is the largest `h` with
+/// `h · c ≤ FILL · a · (n − h)`, kept from one picture to the next.
 struct HeadTuner {
     heads: usize,
+    /// The last measured lane time per card head, seconds over a pass.
+    card: Option<f64>,
 }
+
+/// The share of the first chunk's window the card's heads may fill.
+const FILL: f64 = 0.9;
 
 impl HeadTuner {
     fn new() -> Self {
-        Self { heads: 0 }
+        Self {
+            heads: 0,
+            card: None,
+        }
     }
 
     /// One pass's stages at the current count of a block's `n_head` heads;
-    /// moves the count for the next pass, within `0..=most`. Returns the
-    /// lane's slack, seconds.
+    /// sets the count for the next pass, within `0..=most`. Returns the
+    /// window's headroom, seconds over the pass: the first chunks' host
+    /// time less the card's heads' lane time.
     fn observe(&mut self, pass: &Stages, n_head: usize, most: usize) -> f64 {
         let secs = |d: Duration| d.as_secs_f64();
-        let host = secs(pass.attention) / (n_head - self.heads).max(1) as f64;
-        let card = if self.heads > 0 {
-            secs(pass.lane_heads) / self.heads as f64
-        } else {
-            host
+        let window = secs(pass.first_chunk);
+        let headroom = window - secs(pass.lane_heads);
+        if self.heads > 0 {
+            self.card = Some(secs(pass.lane_heads) / self.heads as f64);
+        }
+        let Some(c) = self.card else {
+            self.heads = 1.min(most);
+            return headroom;
         };
-        let behind = (secs(pass.mlp) - secs(pass.lane_last)).max(0.0);
-        let slack = secs(pass.lane_idle) - behind;
-        let damping = if self.heads == 0 { 1.0 } else { 2.0 };
-        let toward = slack / (host + card).max(1e-9) / damping;
-        let step = if toward.abs() < 0.5 {
-            0
-        } else {
-            toward.round().clamp(-(most as f64), most as f64) as isize
-        };
-        let step = if step == 0 && toward.abs() >= 0.5 {
-            toward.signum() as isize
-        } else {
-            step
-        };
-        self.heads = (self.heads as isize + step).clamp(0, most as isize) as usize;
-        slack
+        let a = FILL * window / (n_head - self.heads).max(1) as f64;
+        let fits = (a * n_head as f64 / (c + a).max(1e-9)).floor();
+        self.heads = (fits.max(0.0) as usize).min(most);
+        headroom
     }
 }
 
@@ -1442,46 +1456,35 @@ mod tests {
         }
     }
 
-    /// The tuner moves half the way to the balance a pass's stages imply,
-    /// away from the card when the host waited on the lane, and stays put
-    /// at the balance.
+    /// The tuner probes with one head, then fits the card's heads into the
+    /// first chunk's window, and follows the card's measured rate.
     #[test]
-    fn the_head_tuner_moves_toward_the_balance() {
+    fn the_head_tuner_fills_the_first_chunk_window() {
         let ms = Duration::from_millis;
-        let pass = |idle: u64, drain: u64, last: u64, heads_on_lane: u64| Stages {
-            attention: ms(32_000),
-            mlp: ms(drain),
-            lane_idle: ms(idle),
-            lane_last: ms(last),
-            lane_heads: ms(heads_on_lane),
+        let pass = |first: u64, on_card: u64| Stages {
+            first_chunk: ms(first),
+            lane_heads: ms(on_card),
             ..Stages::default()
         };
         let mut tuner = HeadTuner::new();
-        // No heads yet: 1 s a head on the host, assumed the same on the
-        // card; 8 s of slack is 4 heads to the balance, all of it at once
-        // from none.
-        let slack = tuner.observe(&pass(8_000, 2_000, 2_000, 0), 32, 16);
-        assert!((slack - 8.0).abs() < 1e-9);
-        assert_eq!(tuner.heads, 4);
-        // From there, half the way: 4 more heads' worth of slack (the card
-        // as fast as the host) is 2 this pass.
-        tuner.observe(&pass(8_000, 2_000, 2_000, 4 * 1_000), 32, 16);
-        assert_eq!(tuner.heads, 6);
-        // The host waited 3 s past the last tail and the lane never did:
-        // back one at least.
-        tuner.heads = 8;
-        tuner.observe(&pass(0, 5_000, 2_000, 8 * 800), 32, 16);
-        assert!(tuner.heads < 8, "{}", tuner.heads);
-        // At the balance: no move.
-        tuner.heads = 6;
-        tuner.observe(&pass(300, 2_000, 2_000, 6 * 800), 32, 16);
-        assert_eq!(tuner.heads, 6);
-        // Bounded.
-        tuner.heads = 15;
-        tuner.observe(&pass(60_000, 2_000, 2_000, 15 * 100), 32, 16);
+        tuner.observe(&pass(3_200, 0), 32, 16);
+        assert_eq!(tuner.heads, 1, "a probe head first");
+        // 31 host heads took 3.1 s of first chunk: 0.09 s a head with the
+        // fill; the card took 0.2 s for its one. h ≤ 0.09·32/0.29 = 9.9.
+        tuner.observe(&pass(3_100, 200), 32, 16);
+        assert_eq!(tuner.heads, 9);
+        // A slower card fits fewer.
+        tuner.observe(&pass(2_300, 9 * 600), 32, 16);
+        assert!(tuner.heads < 9, "{}", tuner.heads);
+        // Bounded by `most`, and a card far slower than the window takes none
+        // — and stays at none on its remembered rate, no probe again.
+        tuner.heads = 4;
+        tuner.observe(&pass(100_000, 4), 32, 16);
         assert_eq!(tuner.heads, 16);
-        tuner.heads = 0;
-        tuner.observe(&pass(0, 9_000, 2_000, 0), 32, 16);
+        tuner.heads = 4;
+        tuner.observe(&pass(1, 4 * 10_000), 32, 16);
+        assert_eq!(tuner.heads, 0);
+        tuner.observe(&pass(3_200, 0), 32, 16);
         assert_eq!(tuner.heads, 0);
     }
 
