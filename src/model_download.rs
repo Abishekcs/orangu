@@ -685,8 +685,10 @@ pub fn latest_commits(repos: &[String]) -> std::collections::HashMap<String, Str
 /// `"unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL"` ->
 /// `("unsloth/gemma-4-26B-A4B-it-qat-GGUF", Some("UD-Q4_K_XL"))`. `repo`
 /// must have exactly one `/`, the same `<user>/<model>` shape llama.cpp's
-/// own `-hf` flag requires.
+/// own `-hf` flag requires. A Hub page URL is accepted too — see
+/// [`strip_hub_url`].
 fn split_repo_tag(spec: &str) -> Result<(String, Option<String>)> {
+    let spec = strip_hub_url(spec);
     let (repo, tag) = match spec.split_once(':') {
         Some((repo, tag)) => (repo.to_string(), Some(tag.to_string())),
         None => (spec.to_string(), None),
@@ -695,6 +697,23 @@ fn split_repo_tag(spec: &str) -> Result<(String, Option<String>)> {
         bail!("'{spec}' is not a valid <user>/<model>[:quant] reference");
     }
     Ok((repo, tag))
+}
+
+/// Reduces a model's Hub page URL, as copied from the browser, to the
+/// `<user>/<model>[:quant]` reference `download` takes:
+/// `"https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF"` ->
+/// `"unsloth/Qwen-Image-2.1-GGUF"`. Anything else comes back unchanged.
+pub fn strip_hub_url(spec: &str) -> &str {
+    let spec = spec.trim();
+    let rest = spec
+        .strip_prefix("https://")
+        .or_else(|| spec.strip_prefix("http://"))
+        .unwrap_or(spec);
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    match rest.strip_prefix("huggingface.co/") {
+        Some(repo) => repo.trim_end_matches('/'),
+        None => spec,
+    }
 }
 
 /// `models--<user>--<model>`, the Hugging Face hub cache's own directory
@@ -2479,6 +2498,25 @@ mod tests {
     fn split_repo_tag_rejects_anything_without_exactly_one_slash() {
         assert!(split_repo_tag("no-slash-at-all").is_err());
         assert!(split_repo_tag("too/many/slashes").is_err());
+    }
+
+    #[test]
+    fn split_repo_tag_accepts_a_hub_page_url() {
+        assert_eq!(
+            split_repo_tag("https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF").unwrap(),
+            ("unsloth/Qwen-Image-2.1-GGUF".to_string(), None)
+        );
+        assert_eq!(
+            split_repo_tag("http://www.huggingface.co/unsloth/Qwen-Image-2.1-GGUF/").unwrap(),
+            ("unsloth/Qwen-Image-2.1-GGUF".to_string(), None)
+        );
+        assert_eq!(
+            split_repo_tag("https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF:Q4_K_M").unwrap(),
+            (
+                "unsloth/Qwen-Image-2.1-GGUF".to_string(),
+                Some("Q4_K_M".to_string())
+            )
+        );
     }
 
     #[test]

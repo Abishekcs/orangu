@@ -4184,6 +4184,7 @@ fn run_command(
         }
         Command::Download { repo, yes } => {
             let conf = load_config(config_arg, None, false)?;
+            let repo = orangu::model_download::strip_hub_url(&repo).to_string();
             if !plan_before_download(&repo, yes)? {
                 println!("Nothing downloaded.");
                 return Ok(());
