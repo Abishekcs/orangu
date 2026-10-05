@@ -122,7 +122,7 @@ Please refer to the upstream documentation for full installation and configurati
 
 **orangu** selects the CLI based on the `[orangu].platform` setting: `github` (the default) uses `gh`, and `gitlab` uses `glab` (see [GitLab CLI](#glab) below). The descriptions here apply to `gh`; the GitLab equivalents are described in the next section.
 
-If it is installed, **orangu** will use it for `/pull` to check out pull requests, for `/rebase` to determine the default branch, for `/merge` to merge pull requests, and to detect the default branch for the startup sync (see below). Without it, **orangu** falls back to plain Git for all of these. The `/comment` command requires `gh` and runs `gh issue comment` to add a comment to a GitHub issue; there is no plain Git fallback for it. The `/pull_request` command also requires `gh` and runs `gh pr create` to open a pull request from the current branch; there is no plain Git fallback for it. The `/issue` command likewise requires `gh` and runs `gh pr edit` / `gh issue edit` to add a reviewer, assignee, or label; there is no plain Git fallback for it.
+If it is installed, **orangu** will use it for `/pull` to check out pull requests, for `/rebase` to determine the default branch, for `/merge` to merge pull requests, and to detect the default branch for the startup sync (see below). Without it, **orangu** falls back to plain Git for all of these. The `/comment` command requires `gh` and runs `gh issue comment` to add a comment to a GitHub issue, or `gh pr list` and `gh pr comment` for `/comment all` to comment on every open pull request; there is no plain Git fallback for it. The `/pull_request` command also requires `gh` and runs `gh pr create` to open a pull request from the current branch; there is no plain Git fallback for it. The `/issue` command likewise requires `gh` and runs `gh pr edit` / `gh issue edit` to add a reviewer, assignee, or label; there is no plain Git fallback for it.
 
 **Installation**
 
@@ -155,6 +155,7 @@ Set `platform = gitlab` in the `[orangu]` section to drive `glab` instead of `gh
 | `/pull_request` | `glab mr create --title … --description … --source-branch … --target-branch … --yes` |
 | `/merge <branch>` | `glab mr merge <branch> --yes` |
 | `/comment <number> "…"` | `glab issue note <number> --message "…"` |
+| `/comment all <file>` | `glab mr list`, then `glab mr note <number> --message "…"` for each open merge request |
 | `/issue reviewer <n> <user>` | `glab mr update <n> --reviewer <user>` |
 | `/issue assignee <n> <user>` | `glab mr update <n> --assignee <user>` / `glab issue update <n> --assignee <user>` |
 | `/issue label <n> <label>` | `glab mr update <n> --label <label>` / `glab issue update <n> --label <label>` |

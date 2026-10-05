@@ -41,6 +41,12 @@ pub fn fetch_active_pull_requests(workspace: &Path, forge: Forge) -> Result<Vec<
     let Some(repo_root) = discover_git_root(workspace) else {
         return Ok(Vec::new());
     };
+    Ok(list_open_pull_requests(&repo_root, forge)?.unwrap_or_default())
+}
+
+/// List the open pull/merge requests of the repository at `repo_root`.
+/// `Ok(None)` when the forge CLI is not installed.
+fn list_open_pull_requests(repo_root: &Path, forge: Forge) -> Result<Option<Vec<PullRequest>>> {
     let cli = forge.cli();
     let request = match forge {
         Forge::GitHub => "pr",
@@ -54,11 +60,11 @@ pub fn fetch_active_pull_requests(workspace: &Path, forge: Forge) -> Result<Vec<
     };
     let output = match crate::askpass::apply(&mut std::process::Command::new(cli))
         .args(&args)
-        .current_dir(&repo_root)
+        .current_dir(repo_root)
         .output()
     {
         Ok(output) => output,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).context(format!("failed to run {cli}")),
     };
     if !output.status.success() {
@@ -72,7 +78,7 @@ pub fn fetch_active_pull_requests(workspace: &Path, forge: Forge) -> Result<Vec<
             }
         ));
     }
-    parse_pull_request_list(&output.stdout, forge)
+    parse_pull_request_list(&output.stdout, forge).map(Some)
 }
 
 /// Parse the JSON array printed by `gh pr list --json number,title` /
@@ -296,16 +302,10 @@ pub struct ReviewReports<'a> {
     pub last_was_auto: bool,
 }
 
-pub fn comment_output(
-    workspace: &Path,
-    issue_number: u64,
-    body: &CommentBody<'_>,
-    reports: ReviewReports<'_>,
-    forge: Forge,
-) -> Result<String> {
-    let repo_root = discover_git_root(workspace)
-        .ok_or_else(|| anyhow!("comment is only available inside a Git repository"))?;
-    let body_text: String = match body {
+/// The text a [`CommentBody`] stands for: the inline body, the template
+/// file's content, or the matching review report.
+fn comment_body_text(body: &CommentBody<'_>, reports: ReviewReports<'_>) -> Result<String> {
+    Ok(match body {
         CommentBody::Inline(s) => s.to_string(),
         CommentBody::File(filename) => {
             let path = home::home_dir()
@@ -323,17 +323,132 @@ pub fn comment_output(
             .auto_review
             .ok_or_else(|| anyhow!("no auto review report available — run /auto_review first"))?
             .to_string(),
-    };
+    })
+}
+
+pub fn comment_output(
+    workspace: &Path,
+    issue_number: u64,
+    body: &CommentBody<'_>,
+    reports: ReviewReports<'_>,
+    forge: Forge,
+) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("comment is only available inside a Git repository"))?;
+    let body_text = comment_body_text(body, reports)?;
+    let stdout = post_comment(
+        &repo_root,
+        CommentOn::Issue,
+        issue_number,
+        &body_text,
+        forge,
+    )?;
+    Ok(if stdout.is_empty() {
+        format!("Added comment on issue #{issue_number}")
+    } else {
+        stdout
+    })
+}
+
+/// What `/comment all` did: the requests commented on and those that failed,
+/// each with the forge CLI's error.
+pub struct CommentAllOutcome {
+    pub commented: Vec<u64>,
+    pub failed: Vec<(u64, String)>,
+}
+
+impl CommentAllOutcome {
+    /// One line per request, the failures last.
+    pub fn summary(&self) -> String {
+        if self.commented.is_empty() && self.failed.is_empty() {
+            return "No open pull requests to comment on".to_string();
+        }
+        self.commented
+            .iter()
+            .map(|number| format!("Added comment on pull request #{number}"))
+            .chain(
+                self.failed.iter().map(|(number, err)| {
+                    format!("Failed to comment on pull request #{number}: {err}")
+                }),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Post the same comment on every open pull/merge request. The body is
+/// resolved once; a request the forge refuses is reported and the rest are
+/// still commented on.
+pub fn comment_all_output(
+    workspace: &Path,
+    body: &CommentBody<'_>,
+    reports: ReviewReports<'_>,
+    forge: Forge,
+) -> Result<CommentAllOutcome> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("comment is only available inside a Git repository"))?;
+    let body_text = comment_body_text(body, reports)?;
     let cli = forge.cli();
-    let number = issue_number.to_string();
-    // GitHub: `gh issue comment N --body B`. GitLab: `glab issue note N --message B`.
-    let args: Vec<&str> = match forge {
-        Forge::GitHub => vec!["issue", "comment", &number, "--body", &body_text],
-        Forge::GitLab => vec!["issue", "note", &number, "--message", &body_text],
+    let requests = list_open_pull_requests(&repo_root, forge)?
+        .ok_or_else(|| anyhow!("comment requires the {cli} CLI to be installed"))?;
+    let mut outcome = CommentAllOutcome {
+        commented: Vec::new(),
+        failed: Vec::new(),
+    };
+    for request in requests {
+        match post_comment(
+            &repo_root,
+            CommentOn::PullRequest,
+            request.number,
+            &body_text,
+            forge,
+        ) {
+            Ok(_) => outcome.commented.push(request.number),
+            Err(err) => outcome.failed.push((request.number, format!("{err:#}"))),
+        }
+    }
+    Ok(outcome)
+}
+
+/// Whether a comment goes on an issue or a pull/merge request. GitHub takes
+/// either through `gh issue comment`, but GitLab numbers issues and merge
+/// requests separately.
+#[derive(Clone, Copy)]
+enum CommentOn {
+    Issue,
+    PullRequest,
+}
+
+/// Post `body` on issue or request `number` through the forge CLI; returns
+/// its trimmed stdout.
+fn post_comment(
+    repo_root: &Path,
+    on: CommentOn,
+    number: u64,
+    body: &str,
+    forge: Forge,
+) -> Result<String> {
+    let cli = forge.cli();
+    let number = number.to_string();
+    // GitHub: `gh issue comment N --body B` / `gh pr comment N --body B`.
+    // GitLab: `glab issue note N --message B` / `glab mr note N --message B`.
+    let (kind, args): (&str, Vec<&str>) = match (forge, on) {
+        (Forge::GitHub, CommentOn::Issue) => {
+            ("issue", vec!["issue", "comment", &number, "--body", body])
+        }
+        (Forge::GitHub, CommentOn::PullRequest) => {
+            ("pr", vec!["pr", "comment", &number, "--body", body])
+        }
+        (Forge::GitLab, CommentOn::Issue) => {
+            ("issue", vec!["issue", "note", &number, "--message", body])
+        }
+        (Forge::GitLab, CommentOn::PullRequest) => {
+            ("mr", vec!["mr", "note", &number, "--message", body])
+        }
     };
     let output = match std::process::Command::new(cli)
         .args(&args)
-        .current_dir(&repo_root)
+        .current_dir(repo_root)
         .output()
     {
         Ok(output) => output,
@@ -345,7 +460,7 @@ pub fn comment_output(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(anyhow!(
-            "{cli} issue comment failed{}",
+            "{cli} {kind} comment failed{}",
             if stderr.is_empty() {
                 String::new()
             } else {
@@ -353,12 +468,7 @@ pub fn comment_output(
             }
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(if stdout.is_empty() {
-        format!("Added comment on issue #{issue_number}")
-    } else {
-        stdout
-    })
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn close_output(workspace: &Path, target: &CloseTarget, forge: Forge) -> Result<String> {
@@ -1986,6 +2096,27 @@ mod tests {
         let (behind, base_ref) = behind_default_branch(workspace.path()).expect("behind");
         assert_eq!((behind, base_ref.as_str()), (1, "main"));
     }
+    #[test]
+    fn comment_all_summary_lists_failures_last() {
+        use crate::git::CommentAllOutcome;
+
+        let none = CommentAllOutcome {
+            commented: Vec::new(),
+            failed: Vec::new(),
+        };
+        assert_eq!(none.summary(), "No open pull requests to comment on");
+        let mixed = CommentAllOutcome {
+            commented: vec![12, 14],
+            failed: vec![(13, "gh pr comment failed: locked".to_string())],
+        };
+        assert_eq!(
+            mixed.summary(),
+            "Added comment on pull request #12\n\
+             Added comment on pull request #14\n\
+             Failed to comment on pull request #13: gh pr comment failed: locked"
+        );
+    }
+
     #[test]
     fn comment_report_keywords_error_without_a_stored_report() {
         use crate::commands::CommentBody;

@@ -191,10 +191,30 @@ pub fn parse_pull_pr_number(input: &str) -> Option<u64> {
     None
 }
 
+/// Parses the arguments of a comment command into either a single numbered
+/// target ([`LocalCommand::Comment`]) or, when the first word is `all`
+/// (optionally after `on`, as in `/comment on all <body>`), every open
+/// pull/merge request ([`LocalCommand::CommentAll`]).
+pub fn parse_comment_command(input: &str) -> LocalCommand<'_> {
+    let input = input.trim();
+    let input = strip_ascii_prefix(input, "on ").map_or(input, str::trim_start);
+    let (first, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+    if first.eq_ignore_ascii_case(COMMENT_ALL_KEYWORD) {
+        return LocalCommand::CommentAll(parse_comment_body(rest));
+    }
+    LocalCommand::Comment(parse_comment_args(input))
+}
+
 pub fn parse_comment_args(input: &str) -> Option<(u64, CommentBody<'_>)> {
     let input = input.trim();
     let (number, rest) = input.split_once(char::is_whitespace)?;
     let number = number.trim_start_matches('#').parse::<u64>().ok()?;
+    parse_comment_body(rest).map(|body| (number, body))
+}
+
+/// Parses a comment body: a report keyword, a quoted inline body, or a
+/// `~/.orangu/comments/` template filename. `None` when it is empty.
+fn parse_comment_body(rest: &str) -> Option<CommentBody<'_>> {
     let rest = rest.trim();
     if rest.is_empty() {
         return None;
@@ -202,19 +222,19 @@ pub fn parse_comment_args(input: &str) -> Option<(u64, CommentBody<'_>)> {
     // The report keywords match the whole argument only; anything else stays
     // an inline body or a `~/.orangu/comments/` template filename.
     if rest.eq_ignore_ascii_case(COMMENT_AUTO_REVIEW_KEYWORD) {
-        return Some((number, CommentBody::AutoReview));
+        return Some(CommentBody::AutoReview);
     }
     if rest.eq_ignore_ascii_case(COMMENT_REVIEW_KEYWORD) {
-        return Some((number, CommentBody::Review));
+        return Some(CommentBody::Review);
     }
     if rest.starts_with('"') || rest.starts_with('\'') {
         let body = strip_matching_quotes(rest);
         if body.is_empty() {
             return None;
         }
-        Some((number, CommentBody::Inline(Cow::Borrowed(body))))
+        Some(CommentBody::Inline(Cow::Borrowed(body)))
     } else {
-        Some((number, CommentBody::File(Cow::Borrowed(rest))))
+        Some(CommentBody::File(Cow::Borrowed(rest)))
     }
 }
 
@@ -375,7 +395,7 @@ pub fn get_comments_usage_message() -> &'static str {
 }
 
 pub fn comment_usage_message() -> &'static str {
-    "Usage: /comment <number> \"<comment>\", /comment <number> <file>, or /comment <number> with [auto] review. Use /help to see available commands."
+    "Usage: /comment <number> \"<comment>\", /comment <number> <file>, /comment <number> with [auto] review, or /comment all <file> for every open pull request. Use /help to see available commands."
 }
 
 pub fn merge_usage_message() -> &'static str {

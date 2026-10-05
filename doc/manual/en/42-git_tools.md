@@ -786,16 +786,24 @@ new pr
 
 ## /comment
 
-Adds a comment to a GitHub issue or GitLab issue. Requires the `gh` or `glab` CLI.
+Adds a comment to a GitHub issue or GitLab issue, or to every open pull/merge request. Requires the `gh` or `glab` CLI.
 
 ```text
 /comment <number> "<comment>"
 /comment <number> <file>
 /comment <number> with review
 /comment <number> with auto review
+/comment all <file>
+/comment on all <file>
 ```
 
 It runs `gh issue comment <number> --body <body>` (or the GitLab equivalent). Without the CLI installed it reports an error, since there is no plain Git equivalent. When the third argument is a quoted string it is used as the comment body directly. When it is a bare word it is treated as a filename relative to `~/.orangu/comments/` and the file contents become the body — Tab completion after `/comment <number> ` (without a leading `"`) lists files in that directory.
+
+### Commenting on every open pull request
+
+`/comment all <file>` (also written `/comment on all <file>`) posts the same comment on every open pull request — every open merge request on GitLab. The open requests are listed with `gh pr list --state open` (`glab mr list`), and each one gets `gh pr comment <number> --body <body>` (`glab mr note <number> --message <body>`). The body is read once and takes the same forms as for a single number: a template file from `~/.orangu/comments/`, a quoted inline body, or `with review` / `with auto review`.
+
+The output has one `Added comment on pull request #<number>` line per request. A request the forge refuses (locked, no permission) does not stop the rest: it is listed last as `Failed to comment on pull request #<number>: <error>`, and the output is shown as an error. With no open requests it reports `No open pull requests to comment on`. `all` is matched case-insensitively as the first word only, so `/comment 51 all.md` still posts the template `all.md` on #51. Tab completion after `/comment all ` lists the template files, as after a number.
 
 ### Submitting a review as the comment
 
@@ -824,6 +832,12 @@ The last review or auto review report as the body:
 /comment 48 with auto review
 ```
 
+The same template on every open pull request:
+
+```text
+/comment all rebase-needed.md
+```
+
 Natural-language forms:
 
 ```text
@@ -832,6 +846,8 @@ add comment to 51 "My comment"
 comment on 51 "My comment"
 comment on 48 with review
 comment on 48 with auto review
+comment on all rebase-needed.md
+add comment on all rebase-needed.md
 ```
 
 \newpage

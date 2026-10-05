@@ -205,7 +205,7 @@ pub(crate) fn available_report_keywords() -> Vec<&'static str> {
 /// `w` — keeps its completion (and ghost) priority; the keywords follow, offered
 /// only once the matching report exists in the session (a missing directory does
 /// not suppress them). Handles both `/comment` and the natural-language forms
-/// (`add comment on`, `add comment to`, `comment on`).
+/// (`add comment on`, `add comment to`, `comment on`), with a number or `all`.
 pub fn comment_file_completion_candidates(prefix: &str) -> Option<(usize, Vec<String>)> {
     let rest = if let Some(rest) = prefix.strip_prefix("/comment ") {
         rest
@@ -219,8 +219,10 @@ pub fn comment_file_completion_candidates(prefix: &str) -> Option<(usize, Vec<St
         }
         found?
     };
+    // `/comment on all <file>` reads like the natural form; skip the `on`.
     let rest = rest.trim_start();
-    // skip the issue number token
+    let rest = strip_ascii_prefix(rest, "on ").map_or(rest, str::trim_start);
+    // skip the issue number (or `all`) token
     let (_, after_number) = rest.split_once(char::is_whitespace)?;
     let file_prefix = after_number.trim_start();
     // quoted argument = inline comment body, not a file
@@ -433,5 +435,13 @@ mod tests {
         // A quoted argument is an inline body — no candidates.
         assert!(comment_file_completion_candidates("/comment 48 \"w").is_none());
         set_available_review_reports(false, false);
+    }
+
+    #[test]
+    fn comment_all_completes_like_a_number() {
+        for prefix in ["/comment all ", "/comment on all ", "comment on all "] {
+            let (start, _) = comment_file_completion_candidates(prefix).expect("candidates");
+            assert_eq!(start, prefix.len(), "{prefix}");
+        }
     }
 }

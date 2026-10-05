@@ -853,6 +853,53 @@ fn parses_comment_report_keywords() {
 }
 
 #[test]
+fn parses_comment_all_commands() {
+    for input in [
+        "/comment all merged.md",
+        "/comment on all merged.md",
+        "/comment ALL merged.md",
+        "comment on all merged.md",
+        "add comment on all merged.md",
+        "add comment to all merged.md",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::CommentAll(Some(CommentBody::File(ref name)))) if name == "merged.md"
+            ),
+            "{input}"
+        );
+    }
+    assert!(matches!(
+        parse_local_command("/comment all \"Rebase please\""),
+        Some(LocalCommand::CommentAll(Some(CommentBody::Inline(ref body))))
+            if body == "Rebase please"
+    ));
+    assert!(matches!(
+        parse_local_command("/comment all with review"),
+        Some(LocalCommand::CommentAll(Some(CommentBody::Review)))
+    ));
+    assert!(matches!(
+        parse_local_command("/comment all"),
+        Some(LocalCommand::CommentAll(None))
+    ));
+    assert!(matches!(
+        parse_local_command("/comment on all"),
+        Some(LocalCommand::CommentAll(None))
+    ));
+    // `on` before a number is the same single-issue comment.
+    assert!(matches!(
+        parse_local_command("/comment on 51 merged.md"),
+        Some(LocalCommand::Comment(Some((51, CommentBody::File(ref name))))) if name == "merged.md"
+    ));
+    // A template named `all…` after a number is still a filename.
+    assert!(matches!(
+        parse_local_command("/comment 51 all.md"),
+        Some(LocalCommand::Comment(Some((51, CommentBody::File(ref name))))) if name == "all.md"
+    ));
+}
+
+#[test]
 fn parses_close_commands() {
     assert!(matches!(
         parse_local_command("/close -i 69"),

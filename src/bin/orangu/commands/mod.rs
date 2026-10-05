@@ -309,6 +309,10 @@ pub const COMMENT_REVIEW_KEYWORD: &str = "with review";
 /// comment body.
 pub const COMMENT_AUTO_REVIEW_KEYWORD: &str = "with auto review";
 
+/// The `/comment` target that posts on every open pull/merge request instead
+/// of one numbered issue (`/comment all <body>`, `comment on all <body>`).
+pub const COMMENT_ALL_KEYWORD: &str = "all";
+
 pub enum CommentBody<'a> {
     /// An inline comment body supplied directly in the command (`"..."` or bare text).
     Inline(Cow<'a, str>),
@@ -572,6 +576,9 @@ pub enum LocalCommand<'a> {
     AddRepository(Option<(Cow<'a, str>, Option<Cow<'a, str>>)>),
     Pull(Option<u64>),
     Comment(Option<(u64, CommentBody<'a>)>),
+    /// `/comment all <body>`: post the same comment on every open pull/merge
+    /// request. `None` is a usage error (missing or empty body).
+    CommentAll(Option<CommentBody<'a>>),
     Close(Option<CloseTarget>),
     /// `/issue <reviewer|assignee|label> <number> <value>`: add a reviewer,
     /// assignee, or label to an issue or pull/merge request. `None` is a usage

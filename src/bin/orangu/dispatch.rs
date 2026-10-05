@@ -1976,6 +1976,24 @@ pub(crate) fn handle_command(
                 Err(err) => Ok(local_command_error(err)),
             }
         }
+        LocalCommand::CommentAll(None) => Ok(CommandOutcome::OutputError(
+            comment_usage_message().to_string(),
+        )),
+        LocalCommand::CommentAll(Some(body)) => {
+            match comment_all_output(workspace, &body, review_reports, forge) {
+                Ok(outcome) => {
+                    for &number in &outcome.commented {
+                        completion::flow::note_comment(number);
+                    }
+                    if outcome.failed.is_empty() {
+                        Ok(CommandOutcome::Output(outcome.summary()))
+                    } else {
+                        Ok(CommandOutcome::OutputError(outcome.summary()))
+                    }
+                }
+                Err(err) => Ok(local_command_error(err)),
+            }
+        }
         LocalCommand::Close(None) => Ok(CommandOutcome::OutputError(
             close_usage_message().to_string(),
         )),

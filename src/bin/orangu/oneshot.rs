@@ -538,6 +538,7 @@ fn invalid_static_arguments(command: &LocalCommand<'_>) -> bool {
             | LocalCommand::Search(None)
             | LocalCommand::Pull(None)
             | LocalCommand::Comment(None)
+            | LocalCommand::CommentAll(None)
             | LocalCommand::Close(None)
             | LocalCommand::Issue(None)
             | LocalCommand::GetComments(None)

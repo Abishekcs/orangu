@@ -676,7 +676,7 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     for prefix in ["add comment on ", "add comment to ", "comment on "] {
         if let Some(rest) = strip_ascii_prefix(input, prefix) {
-            return Some(LocalCommand::Comment(parse_comment_args(rest.trim())));
+            return Some(parse_comment_command(rest));
         }
     }
     if matches_ci(

@@ -307,7 +307,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 return Some(LocalCommand::Pull(args.trim().parse::<u64>().ok()));
             }
             if let Some(args) = input.strip_prefix("/comment ") {
-                return Some(LocalCommand::Comment(parse_comment_args(args.trim())));
+                return Some(parse_comment_command(args));
             }
             if let Some(args) = input.strip_prefix("/close ") {
                 return Some(LocalCommand::Close(parse_close_args(args.trim())));
