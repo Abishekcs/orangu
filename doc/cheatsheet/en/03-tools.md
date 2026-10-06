@@ -38,7 +38,7 @@ beside the built-in ones. orangu connects; it does not launch them.
 | `orangu-server` | `list` what is installed — `delete`, `refresh`, `-d` detached; `bundle` ships server and model as one file. |
 | `orangu-bench` | Benchmark a model or a server — throughput, latency, and quality. |
 | `orangu-gguf` | Build a model: train one from a manifest, or re-quantize one you have. |
-| Web console | `orangu-server -i` offers it on port 8101: models, load and requests, in a browser. |
+| Web console | `orangu-server -i` offers it on port 8200: models, load and requests, in a browser. |
 | GPU backends | Vulkan, Metal, CUDA, ROCm, OpenCL — or plain CPU. Pure Rust either way. |
 
 ## When something looks off

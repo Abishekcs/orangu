@@ -12,7 +12,7 @@ Four listeners exist, and they are separate sockets with separate rules:
 | Listener | Default | Configured by | What is on it |
 | :-- | :-- | :-- | :-- |
 | `orangu-server` API | `127.0.0.1:8100` | `[orangu-server].host`/`port` | OpenAI-compatible, native, diagnostic and file-lifecycle endpoints |
-| `orangu-server` web console | `127.0.0.1:8101` | `[web].host`/`port` | the chat page, its `/api/…` surface, and the model manager |
+| `orangu-server` web console | `127.0.0.1:8200` | `[web].host`/`port` | the chat page, its `/api/…` surface, and the model manager |
 | `orangu-coordinator` | `all:9000` | `[orangu-coordinator].host`/`port` | two coordinator endpoints, a shutdown endpoint, and a proxy for everything else |
 | `orangu-bench` console | `127.0.0.1:8300` | `--host`/`--port` | the benchmark console and its `/api/…` surface |
 

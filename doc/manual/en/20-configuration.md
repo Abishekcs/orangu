@@ -356,7 +356,7 @@ approval_mode = writes
 | `required` | No | Make a failed connection abort workspace startup instead of disabling the service with a warning. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `enabled_tools` | No | Comma-separated allowlist of tool names. Empty (the default) offers every discovered tool |
 | `disabled_tools` | No | Comma-separated denylist of tool names. The denylist wins over `enabled_tools` |
-| `approval_mode` | No | How tool calls are confirmed. Defaults to `auto`. Options: `auto`, `prompt`, `writes`, `deny` |
+| `approval_mode` | No | How tool calls are confirmed. Defaults to `auto`. Options: `auto` (or its alias `approve`), `prompt`, `writes`, `deny` |
 
 The section name after `mcp.` is the service name used in the
 `mcp__<server>__<tool>` prefix, and it accepts ASCII letters, digits, `_` and

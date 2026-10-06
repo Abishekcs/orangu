@@ -19,7 +19,7 @@ use crate::config::{
     DEFAULT_DRAFT_TOKENS, DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, KvCache, PROMETHEUS_SECTION,
     Role, WEB_SECTION, WORKERS_SECTION, WorkerAddress, default_delete, default_host,
     default_npu_cache_gb, default_npu_precompile, default_port, default_prometheus_port,
-    default_reexec, default_workers_port, parse_workers_list,
+    default_reexec, default_web_port, default_workers_port, parse_workers_list,
 };
 use crate::workers::protocol::ActivationFormat;
 use anyhow::{Context, Result, anyhow};
@@ -47,11 +47,6 @@ use std::path::{Path, PathBuf};
 /// and each `--init` wizard is its own self-contained binary.
 const GHOST_TEXT: &str = "\x1b[38;2;120;120;120m";
 
-/// The web console port `-i` offers: the `8200` a bundle's console takes, clear
-/// of the `8101`, `8102`, … a machine running several servers gives their
-/// APIs. Written into the `[web]` section, so it holds whatever the loader's
-/// own default for a section without a port.
-const INIT_WEB_PORT: u16 = 8200;
 const ANSI_RESET: &str = "\x1b[0m";
 
 pub fn run_init() -> Result<()> {
@@ -129,7 +124,7 @@ pub fn run_init() -> Result<()> {
         // Enter through this section puts the console wherever the API is,
         // and answering differently is how the two get separated.
         let web_host = prompt_host(&host)?;
-        let web_port = prompt_line("port", &INIT_WEB_PORT.to_string())?;
+        let web_port = prompt_line("port", &default_web_port().to_string())?;
         let reexec = prompt_bool("reexec", default_reexec())?;
         let delete = prompt_bool("delete", default_delete())?;
         Some((web_host, web_port, reexec, delete))

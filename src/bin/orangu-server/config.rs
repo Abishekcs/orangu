@@ -113,11 +113,11 @@ pub fn default_web() -> u16 {
     0
 }
 
-/// The port a `[web]` section that doesn't name one gets. Adjacent to the
-/// API's own default so the pair reads as one server, and the value the
-/// manual's example has always used.
+/// The port a `[web]` section that doesn't name one gets: the `8200` a
+/// bundle's console takes, clear of the `8101`, `8102`, … a machine running
+/// several servers gives their APIs. `-i`/`--init` offers the same.
 pub fn default_web_port() -> u16 {
-    8101
+    8200
 }
 
 /// The resolved Prometheus-listener port when there is no `[prometheus]`
@@ -126,15 +126,15 @@ pub fn default_metrics() -> u16 {
     0
 }
 
-/// The port a `[prometheus]` section that doesn't name one gets. Adjacent to
-/// the API's and web console's own defaults (`8100`/`8101`) so the trio reads
-/// as one server, and the value `-i`/`--init` has always offered.
+/// The port a `[prometheus]` section that doesn't name one gets. Next in the
+/// series after the API's and web console's own defaults (`8100`/`8200`), and
+/// the value `-i`/`--init` offers.
 pub fn default_prometheus_port() -> u16 {
     8300
 }
 
 /// The port a `[workers]` section that doesn't name one gets. Next in the
-/// `8100`/`8101`/`8300` series, and clear of a bundle's `8200` console.
+/// `8100`/`8200`/`8300` series.
 pub fn default_workers_port() -> u16 {
     8400
 }
@@ -3316,7 +3316,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu-server]\nmodels = /srv/models\n\n[web]\nport = 8200\n"
+            "[orangu-server]\nmodels = /srv/models\n\n[web]\nport = 8101\n"
         )
         .unwrap();
 
@@ -3324,7 +3324,7 @@ mod tests {
             load_server_configuration(file.path(), None, false)
                 .unwrap()
                 .web,
-            8200
+            8101
         );
     }
 
@@ -3351,7 +3351,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu-server]\nmodels = /srv/models\nweb = 9999\n\n[web]\nport = 8200\n"
+            "[orangu-server]\nmodels = /srv/models\nweb = 9999\n\n[web]\nport = 8101\n"
         )
         .unwrap();
 
@@ -3359,7 +3359,7 @@ mod tests {
             load_server_configuration(file.path(), None, false)
                 .unwrap()
                 .web,
-            8200
+            8101
         );
     }
 

@@ -1070,7 +1070,7 @@ role = all
 log_type = console
 
 [web]
-port = 8101
+port = 8200
 reexec = yes
 
 [prometheus]
@@ -1383,14 +1383,14 @@ no section at all.
 ```ini
 [web]
 host = 127.0.0.1
-port = 8101
+port = 8200
 reexec = yes
 delete = yes
 ```
 
 - `port` — where the console listens, bound alongside `[orangu-server].port`
-  rather than instead of it. Defaults to `8101` when the section is present
-  but says nothing; `-i`/`--init` offers `8200` and writes it.
+  rather than instead of it. Defaults to `8200` when the section is present
+  but says nothing, which is also what `-i`/`--init` offers.
 - `host` — the address it binds, prompted for with the same interface
   completion and ghost suggestion `[orangu-server].host` gets, and defaulting
   to whatever that was just answered. **When the key is absent it falls back
