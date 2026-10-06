@@ -31,7 +31,7 @@
 //!
 //! * **Per token** (`glm-dsa`) — one key per position, and the cut is over
 //!   positions directly.
-//! * **Pooled** ([`KeyPool`], `glm5next`) — positions are grouped into
+//! * **Pooled** ([`KeyPool`], `glm5-next`) — positions are grouped into
 //!   `attention.indexer.kpool` fixed pools, and one pooled key stands for
 //!   each. The pool key is a per-channel convex mix of its members' keys,
 //!   `softmax(gate + ape)` over the members, where the gate is a second,
@@ -173,7 +173,7 @@ pub(crate) struct KeyPool {
     gate: QuantMatrix,
     /// `[kpool, indexer.key_length]` — added to the gate before the
     /// softmax, selected by a position's offset *within* its pool. With no
-    /// rotation anywhere in `glm5next`, this is the only ordering signal in
+    /// rotation anywhere in `glm5-next`, this is the only ordering signal in
     /// the pooled key.
     ape: Vec<f32>,
     /// `attention.indexer.kpool` — how many positions one pool holds.

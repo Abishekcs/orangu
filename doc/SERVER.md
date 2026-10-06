@@ -540,7 +540,7 @@ NR  MODEL                                        QUANT   SIZE        LAST_USED  
  2  unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF  Q4_K_M  270.14 GiB  Never             Yes (qwen3)
  3  ggml-org/gemma-4-12B-it-GGUF                 Q4_K_M  7.14 GiB    2026-08-21 09:16  Yes (gemma4)
  4  unsloth/GLM-5.2-GGUF                         Q4_K_M  433.83 GiB  Never             Yes (glm-dsa)
- 5  unsloth/GLM-5.3-Flash-GGUF                   IQ1_M   90.88 GiB   Never             Yes (glm5next)
+ 5  unsloth/GLM-5.3-Flash-GGUF                   IQ1_M   90.88 GiB   Never             Yes (glm5-next)
  6  unsloth/GLM-4.6-GGUF                         Q4_K_M  204.15 GiB  Never             No (glm4moe)
 ```
 
@@ -2719,7 +2719,7 @@ _text-only_ input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
 > > > > > > > attention blocks on top of a sliding window, and hash-routed experts),
 > > > > > > > GLM-5 (`glm-dsa`, e.g. `unsloth/GLM-5.2-GGUF` — absorbed multi-head latent
 > > > > > > > attention over a compressed key/value cache, with a lightning indexer
-> > > > > > > choosing which positions each layer attends), GLM-5.3-Flash (`glm5next`,
+> > > > > > > choosing which positions each layer attends), GLM-5.3-Flash (`glm5-next`,
 > > > > > > > e.g. `unsloth/GLM-5.3-Flash-GGUF` — three-in-four Kimi Delta Attention
 > > > > > > > layers alternating with that same absorbed latent attention, on a
 > > > > > > > `hyper_connection.count`-stream residual bundle rather than a residual
@@ -2955,9 +2955,10 @@ selection cannot change the answer — every visible position is chosen — so
 the scoring pass is skipped there. The multi-token-prediction block these
 files carry (`blk.78` in GLM-5.2) is a draft head and is not run.
 
-GLM-5.3-Flash (`glm5next`) runs on the CPU path only, and is the model in
+GLM-5.3-Flash (`glm5-next`) runs on the CPU path only, and is the model in
 this server assembled most nearly out of parts other models here already
-brought. Its trunk is the `kimi-k3` / `bailingmoe3` pair — three Kimi Delta
+brought. A file that declares `glm5next` carries the same tensors and keys
+under that prefix, and loads as the same model. Its trunk is the `kimi-k3` / `bailingmoe3` pair — three Kimi Delta
 Attention layers to every one absorbed latent attention layer, read from the
 per-layer `attention.head_count_kv` array where `0` marks a recurrent one —
 with the KDA output gate factored through a `kda.head_dim` bottleneck the

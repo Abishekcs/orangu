@@ -1644,7 +1644,7 @@ pub(crate) fn swiglu_ffn_into(
 
 /// [`swiglu_ffn_into`] under a [`SwigluLimit`] — the dense arm of a model
 /// whose `swiglu_clamp_*` applies to its leading dense blocks as well as to
-/// its experts (`glm5next`). Plain [`swiglu_ffn_into`] is this with
+/// its experts (`glm5-next`). Plain [`swiglu_ffn_into`] is this with
 /// [`SwigluLimit::None`], so there is one implementation and no second
 /// place for the two to drift.
 #[allow(clippy::too_many_arguments)]
@@ -1733,7 +1733,7 @@ pub(crate) struct SwigluMoe<'a> {
 ///
 /// The up branch is clamped to `[-limit, limit]` either way. The gate is
 /// not, and upstream branches on the architecture for it
-/// (`arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT || …` in both
+/// (`arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || …` in both
 /// `build_ffn` and `build_moe_ffn`), so the choice cannot be read off the
 /// file. The two agree except where `silu(gate)` crosses the limit, which
 /// makes picking the wrong one a small, quiet accuracy loss rather than an
@@ -1747,7 +1747,7 @@ pub(crate) enum SwigluLimit {
     /// activation.
     Activated(f32),
     /// `silu(min(gate, limit)) * clamp(up)` — the clamp lands on the gate
-    /// before the activation. `deepseek4` and `glm5next`.
+    /// before the activation. `deepseek4` and `glm5-next`.
     PreActivation(f32),
 }
 

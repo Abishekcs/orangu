@@ -121,7 +121,7 @@ pub enum ArchFamily {
     /// attends, leading dense layers, and sigmoid-routed experts. See
     /// `engine::arch::glm`.
     GlmDsa,
-    /// GLM-5.3-Flash (`glm5next`) — a hybrid whose trunk alternates three
+    /// GLM-5.3-Flash (`glm5-next`) — a hybrid whose trunk alternates three
     /// Kimi Delta Attention layers with one absorbed multi-head latent
     /// attention layer, strung on a `hyper_connection.count`-stream
     /// residual bundle rather than a residual vector, over sigmoid-routed
@@ -289,13 +289,17 @@ const DEEPSEEK4_ARCHITECTURES: &[&str] = &["deepseek4"];
 /// `glm4moe` are *not* here: they are ordinary GQA models with none of
 /// this module's MLA or indexer machinery.
 const GLM_DSA_ARCHITECTURES: &[&str] = &["glm-dsa"];
-/// `glm5next` (e.g. `unsloth/GLM-5.3-Flash-GGUF`) — GLM-5.3-Flash. Named
+/// `glm5-next` (e.g. `unsloth/GLM-5.3-Flash-GGUF`) — GLM-5.3-Flash. Named
 /// for what the file declares rather than for the release, as `qwen4exp`
 /// is: `general.name` is `GLM 5.3 Flash`. It shares `glm-dsa`'s lightning
 /// indexer and absorbed latent attention and almost nothing else — see
 /// [`ArchFamily::Glm5Next`] and `engine::arch::glm5`. The `mmproj-*.gguf`
 /// shipped alongside is a separate vision model and is not this.
-const GLM5NEXT_ARCHITECTURES: &[&str] = &["glm5next"];
+///
+/// `glm5next` is the same model as converted before the architecture had
+/// its upstream name: identical tensors and metadata keys, only the
+/// `general.architecture` string (and so the key prefix) differs.
+const GLM5NEXT_ARCHITECTURES: &[&str] = &["glm5-next", "glm5next"];
 /// `kimi-k3` (e.g. `unsloth/Kimi-K3-GGUF`). `kimi-linear` is *not* here:
 /// it shares the delta-net attention but none of K3's cross-layer
 /// residuals, latent MoE, or situ activation.
@@ -2753,7 +2757,7 @@ mod tests {
             (ArchFamily::Qwen3Next, "qwen3next"),
             (ArchFamily::Qwen4Exp, "qwen4exp"),
             (ArchFamily::GlmDsa, "glm-dsa"),
-            (ArchFamily::Glm5Next, "glm5next"),
+            (ArchFamily::Glm5Next, "glm5-next"),
             (ArchFamily::KimiK3, "kimi-k3"),
             (ArchFamily::DFlash, "dflash"),
             (ArchFamily::Deepseek4, "deepseek4"),
@@ -3390,6 +3394,10 @@ mod tests {
     #[test]
     fn resolve_arch_family_accepts_kimi_k3() {
         assert_eq!(resolve_arch_family("kimi-k3").unwrap(), ArchFamily::KimiK3);
+        assert_eq!(
+            resolve_arch_family("glm5-next").unwrap(),
+            ArchFamily::Glm5Next
+        );
         assert_eq!(
             resolve_arch_family("glm5next").unwrap(),
             ArchFamily::Glm5Next

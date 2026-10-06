@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! GLM-5.3-Flash (`general.architecture = "glm5next"`), e.g.
+//! GLM-5.3-Flash (`general.architecture = "glm5-next"`, or `"glm5next"`
+//! in files converted before that name), e.g.
 //! `unsloth/GLM-5.3-Flash-GGUF`.
 //!
 //! Four things this engine already had, strung together in a way it had
@@ -50,9 +51,9 @@
 //!   clamp ([`super::SwigluLimit::PreActivation`]), the same branch
 //!   DeepSeek-V4 takes, and it applies to the dense blocks too.
 //!
-//! Transcribed from the `glm5next` graph proposed upstream, cross-read
-//! against the two independent implementations of it, which agree on every
-//! formula used here.
+//! Transcribed from the upstream `glm5-next` graph, cross-read against two
+//! independent implementations of it, which agree on every formula used
+//! here.
 //!
 //! Deliberately **not** implemented: the NextN/multi-token-prediction block
 //! this file ships inside its `block_count`, trimmed the way every other
@@ -166,7 +167,7 @@ impl Glm5Model {
         // wrong rather than a load failure.
         anyhow::ensure!(
             rope_dim == 0,
-            "glm5next is position-free: rope.dimension_count must be 0, not {rope_dim}"
+            "GLM-5.3-Flash is position-free: rope.dimension_count must be 0, not {rope_dim}"
         );
 
         // `block_count` counts the NextN/MTP block; the trunk stops before

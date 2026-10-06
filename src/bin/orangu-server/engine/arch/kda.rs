@@ -107,7 +107,7 @@ pub(crate) const BAILINGMOE3_KDA_NAMES: KdaNames = KdaNames {
     a_is_negated: false,
 };
 
-/// `glm5next`: both gates factored through a `head_dim` bottleneck, and
+/// `glm5-next`: both gates factored through a `head_dim` bottleneck, and
 /// `ssm_a` already negated.
 pub(crate) const GLM5NEXT_KDA_NAMES: KdaNames = KdaNames {
     f_a: "ssm_f_a.weight",
@@ -131,7 +131,7 @@ pub(crate) struct KdaShape {
     pub eps: f32,
     /// The epsilon of the L2 normalization applied to the query and key
     /// before the delta rule. Usually the model's own RMS epsilon, but
-    /// `glm5next`'s reference hard-codes `1e-6` regardless of it, and the
+    /// `glm5-next`'s reference hard-codes `1e-6` regardless of it, and the
     /// two differ there by an order of magnitude. Only ever visible on a
     /// head whose vector is near zero, which is exactly why it is declared
     /// rather than assumed.
