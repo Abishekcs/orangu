@@ -119,6 +119,13 @@ fn readiness(device_lost: bool, queued: usize, limit: usize) -> (StatusCode, &'s
     }
 }
 
+/// `GET /version`: which build this process is — version, commit, compiler,
+/// profile, target. See `orangu::build_info::json`. Nothing in it depends on
+/// the model, so it answers the same before, during and after a load.
+pub async fn version() -> impl IntoResponse {
+    Json(orangu::build_info::json())
+}
+
 pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(props_json(&state))
 }

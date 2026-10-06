@@ -39,6 +39,14 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=.git/{}", reference.trim());
     }
+    // And when the sources do, which is what `-dirty` is about: without this an
+    // edit after the last build-script run recompiles the crate but keeps the
+    // clean hash, and a modified binary claims to be the commit it is not.
+    // `.git/index` covers a `git add`/`git checkout -- file` that changes the
+    // answer without touching `src` mtimes the way an edit would.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=.git/index");
     // A packager building from a tarball has no `.git` but does know the
     // commit; this is how they say so.
     println!("cargo:rerun-if-env-changed=ORANGU_BUILD_COMMIT");

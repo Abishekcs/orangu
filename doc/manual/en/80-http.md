@@ -156,6 +156,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
 | `GET /ready` | readiness: would a request sent now be served |
 | `GET /v1/workers` | this node's place in its `[workers]` tree: role, layers, plan, workers |
+| `GET /version` | which build this is: version, commit, compiler, profile, target |
 | `GET /props` | model and server metadata: backend, devices, build, slot count, workspace |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache |
@@ -620,6 +621,31 @@ a readiness probe that needed a credential would fail closed exactly when a
 balancer most needs an answer. It is a deliberate widening of what an
 unauthenticated caller can see: `/ready` does disclose load, where `/health`
 discloses nothing. That one fact is the price of being routable.
+
+#### `GET /version`
+
+Exactly which build is answering. The version alone is every build between two
+releases; the commit is what tells them apart:
+
+```json
+{
+  "name": "orangu",
+  "version": "2.0.0",
+  "commit": "fd48326ff",
+  "build": "2.0.0 (fd48326ff)",
+  "rustc": "1.91.0",
+  "profile": "release",
+  "target": "x86_64-unknown-linux-gnu",
+  "frame_pointers": false
+}
+```
+
+`commit` is the short hash the binary was built from, with `-dirty` appended
+when tracked files differed from it, and `unknown` when there was no git to ask
+— a source tarball. A packager who knows the commit sets `ORANGU_BUILD_COMMIT`
+at build time. `build` is the same string every binary prints for `--version`.
+Nothing here depends on the model, so it answers the same while one is loading.
+It needs the `api_key` like every endpoint but `/health` and `/ready`.
 
 #### `GET /props`
 
@@ -1565,6 +1591,8 @@ client can probe it to tell the three apart:
 {
   "orangu_coordinator": true,
   "version": "0.12.0",
+  "commit": "fd48326ff",
+  "build": "0.12.0 (fd48326ff)",
   "models": {
     "all": "bartowski/gemma-4-12B-it-GGUF",
     "code": "bartowski/gemma-4-12B-it-GGUF",
@@ -1574,6 +1602,10 @@ client can probe it to tell the three apart:
   }
 }
 ```
+
+`version`, `commit` and `build` are the coordinator's own build, as on a
+server's `GET /version` — `/version` itself is proxied through to the active
+backend, so it answers for the server behind the coordinator.
 
 `models` reports the model each conventional role currently resolves to, so a
 caller can see what `model` to send for a given role without needing its own

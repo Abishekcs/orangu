@@ -70,7 +70,7 @@ use orangu::shell_completions;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "orangu-bench",
-    version = orangu::build_info::VERSION,
+    version = orangu::build_info::id(),
     about = "Measure throughput of an OpenAI-compatible server"
 )]
 struct Args {

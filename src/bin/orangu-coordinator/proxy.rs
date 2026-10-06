@@ -48,6 +48,11 @@ pub async fn coordinator_info(State(coordinator): State<Arc<Coordinator>>) -> Js
     Json(json!({
         "orangu_coordinator": true,
         "version": crate::VERSION,
+        // The commit this coordinator was built from, and the two together —
+        // see `orangu::build_info`. The coordinator's own build: `/version`
+        // is proxied like any other path and answers for the backend.
+        "commit": orangu::build_info::COMMIT,
+        "build": orangu::build_info::id(),
         "models": models,
         // The roles a profile is actually *configured* for, which `models`
         // cannot express: every conventional role resolves to something there,

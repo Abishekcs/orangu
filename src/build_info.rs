@@ -68,12 +68,37 @@ pub const TARGET: &str = match option_env!("ORANGU_BUILD_TARGET") {
 /// "(unknown)" reads as a failure, when in fact it is an ordinary release
 /// build from a source tarball, and the version alone is the whole truth
 /// available about it.
-pub fn id() -> String {
-    if is_known() {
-        format!("{VERSION} ({COMMIT})")
-    } else {
-        VERSION.to_string()
-    }
+///
+/// `&'static str` so it can be a clap `version` — every binary's `--version`
+/// prints this, not the bare package version.
+pub fn id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        if is_known() {
+            format!("{VERSION} ({COMMIT})")
+        } else {
+            VERSION.to_string()
+        }
+    })
+}
+
+/// Everything above as one JSON document — what `orangu-server`'s
+/// `GET /version` answers with, so a client, a supervisor or a benchmark can
+/// ask a running process exactly which build it is.
+///
+/// `commit` stays `unknown` here rather than being left out as [`id`] does:
+/// a machine reading the field wants it present and comparable.
+pub fn json() -> serde_json::Value {
+    serde_json::json!({
+        "name": NAME,
+        "version": VERSION,
+        "commit": COMMIT,
+        "build": id(),
+        "rustc": RUSTC,
+        "profile": PROFILE,
+        "target": TARGET,
+        "frame_pointers": frame_pointers(),
+    })
 }
 
 /// Whether this build keeps frame pointers.
@@ -194,5 +219,13 @@ mod tests {
         assert!(id.starts_with(VERSION), "{id}");
         assert_eq!(id.contains('('), is_known(), "{id}");
         assert!(!id.contains("unknown"), "{id}");
+    }
+
+    #[test]
+    fn the_json_document_carries_the_commit() {
+        let doc = json();
+        assert_eq!(doc["version"], VERSION);
+        assert_eq!(doc["commit"], COMMIT);
+        assert_eq!(doc["build"], id());
     }
 }

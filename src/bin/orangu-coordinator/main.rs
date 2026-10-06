@@ -76,7 +76,7 @@ impl Drop for TerminalTitleGuard {
 #[derive(Parser, Debug)]
 #[command(
     name = "orangu-coordinator",
-    version = VERSION,
+    version = orangu::build_info::id(),
     about = "Start orangu-server instances on demand and route to them"
 )]
 struct Args {
@@ -347,7 +347,10 @@ async fn run(
     let listener = tokio::net::TcpListener::from_std(std_listener)
         .context("failed to hand the bound listener off to the async runtime")?;
 
-    log::info!("orangu-coordinator {VERSION} listening on {listen}");
+    log::info!(
+        "orangu-coordinator {} listening on {listen}",
+        orangu::build_info::id()
+    );
     for (name, model) in profile_summary {
         log::info!("  {name}: {model}");
     }

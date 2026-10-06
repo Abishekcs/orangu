@@ -262,7 +262,7 @@ impl ListenFlags {
 #[derive(Parser, Debug)]
 #[command(
     name = "orangu-server",
-    version = VERSION,
+    version = orangu::build_info::id(),
     about = "Serve a GGUF model over a llama.cpp-compatible HTTP API",
     // Without this, `--help` promotes the `Command` enum's doc comment — an
     // internal note about subcommand parsing — into the top-level long help.
@@ -3756,7 +3756,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
             model_path,
             models_dir,
             workspace,
-            version: VERSION,
+            version: orangu::build_info::id(),
             jobs: Default::default(),
             catalog: Default::default(),
             handover,

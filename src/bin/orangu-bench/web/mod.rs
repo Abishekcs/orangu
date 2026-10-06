@@ -456,7 +456,7 @@ pub fn serve(host: &str, port: u16) -> anyhow::Result<()> {
         root,
         exe: std::env::current_exe()
             .map_err(|e| anyhow::anyhow!("could not find this executable: {e}"))?,
-        version: env!("CARGO_PKG_VERSION"),
+        version: orangu::build_info::id(),
         current: Mutex::new(None),
     });
 

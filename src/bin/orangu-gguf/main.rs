@@ -103,7 +103,7 @@ Options:
 #[derive(Parser, Debug)]
 #[command(
     name = "orangu-gguf",
-    version = orangu::build_info::VERSION,
+    version = orangu::build_info::id(),
     about = "Build a model from a manifest, or convert one to another weight format",
     // Nothing sensible happens with no arguments — there is no manifest to
     // read and no model to convert — so show what the arguments are rather

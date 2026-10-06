@@ -274,6 +274,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .route("/health", get(native::health))
         .route("/ready", get(native::ready))
+        .route("/version", get(native::version))
         .route("/props", get(native::props).post(native::set_props))
         .route("/gpu-timings", get(native::gpu_timings))
         .route("/moe-stats", get(native::moe_stats))

@@ -139,7 +139,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Parser, Debug)]
 #[command(
     name = "orangu",
-    version = VERSION,
+    version = orangu::build_info::id(),
     about = "A coding environment for OpenAI-compatible servers"
 )]
 struct Args {
