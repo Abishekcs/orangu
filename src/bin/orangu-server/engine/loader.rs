@@ -268,7 +268,20 @@ const GRANITE_ARCHITECTURES: &[&str] = &["granite"];
 /// (confirmed directly against upstream `llama.cpp`'s `src/models/
 /// gemma-embedding.cpp`: `hparams.causal_attn = false` is hardcoded per-arch
 /// there, not read from GGUF metadata or a runtime flag).
-const GEMMA_ARCHITECTURES: &[&str] = &["gemma", "gemma2", "gemma3", "gemma4", "gemma-embedding"];
+///
+/// `gemma-embedding2` (e.g. `unsloth/embeddinggemma-2-GGUF`) is the same
+/// idea on gemma4's block: per-layer KV head counts and head widths, a
+/// weightless V norm, `layer_output_scale`, and per-layer inputs taken from
+/// the projection alone (no `per_layer_token_embd`). Its `output.weight`
+/// projects the hidden state to the embedding width rather than to logits.
+const GEMMA_ARCHITECTURES: &[&str] = &[
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "gemma4",
+    "gemma-embedding",
+    "gemma-embedding2",
+];
 const QWEN35MOE_ARCHITECTURES: &[&str] = &["qwen35moe"];
 /// `qwen35` (e.g. `unsloth/Ornith-1.0-9B-GGUF`) — the dense sibling of
 /// `qwen35moe`; see [`ArchFamily::Qwen35`].

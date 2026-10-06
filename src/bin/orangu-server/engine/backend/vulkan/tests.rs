@@ -9781,7 +9781,9 @@ fn cross_check_fused_attention_prefill_paged_float_mode(
         want_attn_out_host: !deferred,
     };
     let got = if deferred {
-        let mut stage = vulkan.kv_readback_stage((n_tokens * kv_dim * 2 * 4) as u64);
+        let mut stage = vulkan
+            .kv_readback_stage((n_tokens * kv_dim * 2 * 4) as u64)
+            .expect("a test chunk's rows fit one buffer");
         let (mut out, pending) = vulkan
             .fused_attention_prefill_deferred(input, &mut cache.layers[0], &mut stage)
             .expect("fused prefill attention returned None on a supported path");

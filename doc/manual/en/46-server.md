@@ -3172,10 +3172,10 @@ before it through a KV cache, so a long input to a causal embedding model
 (the Qwen3 embedding family, served by the llama-family architecture) stays
 under the timeout exactly as a prompt does: on the card measured above,
 Qwen3-Embedding-0.6B embeds 23 000 tokens, where a single pass resets the
-device at 8 192. A **bidirectional** model — `gemma-embedding` (embeddinggemma), every
-token attending to every other — cannot be split without changing its
-vectors, so it runs in one pass; its 2 048-token context keeps that pass
-short.
+device at 8 192. A **bidirectional** model — `gemma-embedding` and
+`gemma-embedding2` (embeddinggemma), every token attending to every other —
+cannot be split without changing its vectors, so it runs in one pass, with
+a full-context mirror on its sliding-window layers too.
 
 Under `orangu-coordinator` that is the whole recovery: it restarts a
 profile whose `orangu-server` has stopped on the very next request, so the
@@ -3979,7 +3979,7 @@ which is the `qwen3` block with softmax top-k routed experts in place of
 the dense feed-forward and no shared expert), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
 the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
 top-k experts per MoE layer — plus the bidirectional-attention,
-embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
+embeddings-only `gemma-embedding` and `gemma-embedding2`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
 `unsloth/Qwen3.6-35B-A3B-GGUF`), Qwen3.5-family dense (`qwen35`, e.g.
 `unsloth/Qwen3.8-27B-GGUF` — the same hybrid full-attention/gated-DeltaNet
 layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing — and

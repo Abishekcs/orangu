@@ -238,6 +238,14 @@ pub(crate) fn swa_full() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_SWA_FULL"))
 }
 
+/// The embeddings-only members of the family, which attend both ways. A
+/// pass over one is a single chunk of the whole input, so a sliding-window
+/// layer's keys are all in view at once and its device mirror cannot be a
+/// ring of the window plus one prompt chunk.
+fn bidirectional(architecture: &str) -> bool {
+    matches!(architecture, "gemma-embedding" | "gemma-embedding2")
+}
+
 pub(crate) fn kv_elements_per_token(loaded: &LoadedModel) -> usize {
     kv_estimate(loaded, None)
 }
@@ -257,7 +265,7 @@ pub(crate) fn kv_fixed_elements(loaded: &LoadedModel, context: usize) -> usize {
 fn kv_estimate(loaded: &LoadedModel, ring_for: Option<usize>) -> usize {
     let n_layer = loaded.config.n_layer;
     let n_swa = loaded.metadata_u64("attention.sliding_window").unwrap_or(0) as usize;
-    let ringed = n_swa > 0 && !swa_full();
+    let ringed = n_swa > 0 && !swa_full() && !bidirectional(&loaded.config.architecture);
     let ring_rows = |context: usize| {
         (n_swa + crate::engine::generate::prefill_chunk_ceiling())
             .max(1)
@@ -347,7 +355,8 @@ pub struct GemmaModel {
     is_moe: bool,
     attention_scale: f32,
     final_logit_softcapping: Option<f32>,
-    /// `false` only for `gemma-embedding` — every other Gemma family member
+    /// `false` only for `gemma-embedding` and `gemma-embedding2` — every
+    /// other Gemma family member
     /// is a causal decoder. Gates attention masking (causal window vs. full/
     /// symmetric-windowed bidirectional, see [`GemmaModel::run_layers_cpu`])
     /// and whether [`ModelForward::forward`] (generation) is even allowed.
@@ -360,6 +369,13 @@ pub struct GemmaModel {
     /// in upstream `llama.cpp`, `TENSOR_NOT_REQUIRED`).
     dense_2: Option<QuantMatrix>,
     dense_3: Option<QuantMatrix>,
+    /// `gemma-embedding2`'s `output.weight`: the final hidden state to the
+    /// embedding width (`embedding_length_out`), applied to the pooled
+    /// vector by [`ModelForward::post_pool_projection`] — the same result
+    /// as projecting every token and pooling after, since both are linear.
+    /// `None` for every other Gemma family member, whose `output.weight`
+    /// is the logit head.
+    embd_out: Option<QuantMatrix>,
     /// Shared across every full-attention (non-SWA) layer — one tensor in
     /// the file, per `llama.cpp`'s `TENSOR_DUPLICATED` handling.
     rope_freqs: Option<Vec<f32>>,
@@ -451,7 +467,8 @@ gemma 4 checkpoint."
         let rope_freq_base_full = loaded.metadata_f32("rope.freq_base").unwrap_or(10000.0);
         let rope_freq_base_swa = loaded.metadata_f32("rope.freq_base_swa").unwrap_or(10000.0);
 
-        let is_embedding_arch = config.architecture == "gemma-embedding";
+        let is_embedding2 = config.architecture == "gemma-embedding2";
+        let is_embedding_arch = bidirectional(&config.architecture);
         let is_swa: Vec<bool> = loaded
             .metadata_array_u64("attention.sliding_window_pattern")
             .map(|arr| arr.iter().map(|&v| v != 0).collect())
@@ -501,7 +518,11 @@ gemma 4 checkpoint."
         let (output_norm, _) = loaded
             .tensor("output_norm.weight")
             .context("loading output_norm.weight")?;
-        let output_weight = if loaded.has_tensor("output.weight") {
+        let embd_out = is_embedding2
+            .then(|| loaded.matrix("output.weight"))
+            .transpose()
+            .context("loading output.weight")?;
+        let output_weight = if !is_embedding2 && loaded.has_tensor("output.weight") {
             loaded
                 .matrix("output.weight")
                 .context("loading output.weight")?
@@ -526,7 +547,9 @@ gemma 4 checkpoint."
             .context("loading dense_3.weight")?;
 
         let n_embd_per_layer_total = n_embd_per_layer * n_layer;
-        let per_layer_tok_embd = if n_embd_per_layer > 0 {
+        // `gemma-embedding2` takes its per-layer inputs from the projection
+        // alone and has no table.
+        let per_layer_tok_embd = if n_embd_per_layer > 0 && !is_embedding2 {
             Some(
                 loaded
                     .matrix("per_layer_token_embd.weight")
@@ -776,13 +799,14 @@ gemma 4 checkpoint."
             n_swa,
             n_expert_used,
             is_moe,
-            // Gemma4 uses self.scaling = 1.0 (no 1/sqrt(head_dim) scaling).
-            // `gemma-embedding` is the one exception: `hparams.
+            // Gemma4 uses self.scaling = 1.0 (no 1/sqrt(head_dim) scaling),
+            // and so does `gemma-embedding2`, whose QK-norm makes it
+            // unnecessary. `gemma-embedding` is the one exception: `hparams.
             // f_attention_scale = 1/sqrt(n_embd_head_k)`, applied via an
             // explicit `ggml_scale` on Q in upstream `llama.cpp`'s
             // `src/models/gemma-embedding.cpp` (confirmed directly against
             // that file, not guessed).
-            attention_scale: if is_embedding_arch {
+            attention_scale: if is_embedding_arch && !is_embedding2 {
                 1.0 / (head_dim_full as f32).sqrt()
             } else {
                 1.0
@@ -791,6 +815,7 @@ gemma 4 checkpoint."
             causal: !is_embedding_arch,
             dense_2,
             dense_3,
+            embd_out,
             rope_freqs,
             n_embd_per_layer,
             per_layer_tok_embd,
@@ -1477,7 +1502,7 @@ gemma 4 checkpoint."
         let mut kv_stage = backend
             .as_wgpu()
             .filter(|_| one.is_some() && !prefill_kv_wait())
-            .map(|v| {
+            .and_then(|v| {
                 let bytes: usize = self
                     .layers
                     .iter()
@@ -1507,6 +1532,7 @@ gemma 4 checkpoint."
         // of the buffer; a layer that has to land on the host (or a device
         // that declines) reads the host form, computed on demand.
         let inp_per_layer_dev = if has_ple
+            && self.per_layer_tok_embd.is_some()
             && prefill_stream_ple_inputs()
             && backend
                 .as_wgpu()
@@ -2867,7 +2893,7 @@ impl ModelForward for GemmaModel {
             .map(|(il, dim)| if layers.contains(&il) { dim } else { 0 })
             .collect();
         let mut cache = KvCache::new_with_dims(capacity, &dims);
-        if self.n_swa > 0 && !swa_full() {
+        if self.causal && self.n_swa > 0 && !swa_full() {
             let write = crate::engine::generate::prefill_chunk_ceiling();
             for (il, layer) in self.layers.iter().enumerate() {
                 if layers.contains(&il) && layer.has_kv && layer.is_swa {
@@ -2982,8 +3008,9 @@ impl ModelForward for GemmaModel {
         // A sliding-window layer's attention never reaches past its window,
         // so its device mirror keeps the window and the chunk being written
         // rather than the whole context — on this family that is five of
-        // six layers. `ORANGU_SWA_FULL` keeps every layer's mirror whole.
-        if self.n_swa > 0 && !swa_full() {
+        // six layers. `ORANGU_SWA_FULL` keeps every layer's mirror whole,
+        // as does a bidirectional model (`bidirectional`).
+        if self.causal && self.n_swa > 0 && !swa_full() {
             let write = crate::engine::generate::prefill_chunk_ceiling();
             for (i, layer) in self.layers.iter().enumerate() {
                 if layer.has_kv && layer.is_swa {
@@ -3479,6 +3506,9 @@ impl ModelForward for GemmaModel {
     }
 
     fn post_pool_projection(&self, pooled: Vec<f32>) -> Result<Vec<f32>> {
+        if let Some(embd_out) = &self.embd_out {
+            return Ok(self.backend.matmul(&pooled, 1, embd_out));
+        }
         let Some(dense_2) = &self.dense_2 else {
             return Ok(pooled);
         };
@@ -3574,10 +3604,7 @@ impl GemmaModel {
             .as_ref()
             .expect("checked by caller");
 
-        // First, gather each token's per-layer embedding row, scaled.
-        let gathered = self.gather_per_layer_tok_embd(tokens, n_tokens);
-
-        // Then project the (already sqrt(n_embd)-scaled) hidden state.
+        // Project the (already sqrt(n_embd)-scaled) hidden state.
         let mut proj = backend.matmul(x_scaled_embd, n_tokens, per_layer_model_proj);
         for v in proj.iter_mut() {
             *v *= per_layer_projection_scale;
@@ -3590,10 +3617,15 @@ impl GemmaModel {
             self.rms_eps(),
         );
 
-        // Finally, combine and scale.
-        tensor::add_inplace(&mut proj, &gathered);
-        for v in proj.iter_mut() {
-            *v *= per_layer_input_scale;
+        // Finally, combine with each token's per-layer embedding row and
+        // scale — a model without the table (`gemma-embedding2`) takes the
+        // projection as it is.
+        if self.per_layer_tok_embd.is_some() {
+            let gathered = self.gather_per_layer_tok_embd(tokens, n_tokens);
+            tensor::add_inplace(&mut proj, &gathered);
+            for v in proj.iter_mut() {
+                *v *= per_layer_input_scale;
+            }
         }
         proj
     }
@@ -4796,6 +4828,72 @@ mod real_model_tests {
         assert!(
             cosine > 0.85,
             "cosine similarity to real llama.cpp's embedding was only {cosine}, expected > 0.85"
+        );
+    }
+
+    /// `gemma-embedding2` against upstream `llama.cpp`'s `llama-embedding
+    /// --pooling mean --embd-normalize 2` on `unsloth/embeddinggemma-2-GGUF:
+    /// Q8_0`, same sentence and token ids as the test above. Exercises the
+    /// gemma4-style block run bidirectionally, per-layer inputs from the
+    /// projection alone, and `output.weight` applied after pooling. Both
+    /// sides read the same Q8_0 weights, so the vectors agree to ~0.9996 —
+    /// the bar is set just under that. Run with
+    /// `ORANGU_TEST_EMBEDDING2_MODEL=/path/to/embeddinggemma-2-Q8_0.gguf
+    /// cargo test --release --bin orangu-server real_model_tests -- --ignored`.
+    #[test]
+    #[ignore]
+    fn gemma_embedding2_matches_real_llama_cpp() {
+        let path = std::env::var("ORANGU_TEST_EMBEDDING2_MODEL")
+            .expect("set ORANGU_TEST_EMBEDDING2_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model =
+            GemmaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build model");
+        assert_eq!(loaded.config.architecture, "gemma-embedding2");
+
+        let tokens: Vec<u32> = vec![2, 818, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799, 1];
+        let n_embd = model.config().n_embd;
+        let hidden = model
+            .forward_hidden_states(&tokens)
+            .expect("forward_hidden_states");
+        assert_eq!(hidden.len(), tokens.len() * n_embd);
+
+        let mut pooled = vec![0f32; n_embd];
+        for row in hidden.chunks(n_embd) {
+            for (p, v) in pooled.iter_mut().zip(row.iter()) {
+                *p += v;
+            }
+        }
+        for v in pooled.iter_mut() {
+            *v /= tokens.len() as f32;
+        }
+        let mut pooled = model
+            .post_pool_projection(pooled)
+            .expect("post_pool_projection");
+        let norm = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for v in pooled.iter_mut() {
+            *v /= norm;
+        }
+
+        let Some(csv) =
+            crate::engine::arch::read_reference_fixture("embeddinggemma2_reference.csv")
+        else {
+            return;
+        };
+        let reference: Vec<f32> = csv
+            .trim()
+            .split(',')
+            .map(|v| v.parse().expect("reference fixture value"))
+            .collect();
+        assert_eq!(
+            reference.len(),
+            pooled.len(),
+            "reference fixture has wrong length"
+        );
+        let cosine: f32 = pooled.iter().zip(&reference).map(|(a, b)| a * b).sum();
+        assert!(
+            cosine > 0.999,
+            "cosine similarity to real llama.cpp's embedding was only {cosine}, expected > 0.999"
         );
     }
 }

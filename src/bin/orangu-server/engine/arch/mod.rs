@@ -3229,9 +3229,11 @@ pub(crate) fn run_layers_resident<'a>(
     let n_embd = x.len() / n_tokens.max(1);
     let kv_dim = n_head_kv * head_dim;
     // The chunk's stage for every layer's K/V rows; declined when the
-    // chain must wait per layer (`ORANGU_PREFILL_KV_WAIT`).
+    // chain must wait per layer (`ORANGU_PREFILL_KV_WAIT`) or the rows do
+    // not fit one buffer.
     let Some(mut kv_stage) = (!gemma::prefill_kv_wait())
         .then(|| vulkan.kv_readback_stage((layers.len() * n_tokens * kv_dim * 2 * 4) as u64))
+        .flatten()
     else {
         return Ok(None);
     };

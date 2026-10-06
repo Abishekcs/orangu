@@ -19193,9 +19193,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ))
     }
 
-    /// A stage for one chunk's deferred K/V rows, holding at least `bytes`.
-    pub fn kv_readback_stage(&self, bytes: u64) -> KvReadbackStage {
+    /// A stage for one chunk's deferred K/V rows, holding at least `bytes`,
+    /// or `None` when that is more than one buffer may hold — a long
+    /// bidirectional pass runs as a single chunk — and the caller waits
+    /// for each layer's rows instead.
+    pub fn kv_readback_stage(&self, bytes: u64) -> Option<KvReadbackStage> {
         let cap = bytes.max(1 << 20).next_power_of_two();
+        if cap > self.max_buffer_size() {
+            return None;
+        }
         let pooled = self.kv_stage_pool.lock().ok().and_then(|mut pool| {
             let at = pool.iter().position(|b| b.size() >= cap)?;
             Some(pool.swap_remove(at))
@@ -19208,11 +19214,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 mapped_at_creation: false,
             })
         });
-        KvReadbackStage {
+        Some(KvReadbackStage {
             cap: buffer.size(),
             buffer,
             used: 0,
-        }
+        })
     }
 
     /// Parks a chunk's K/V readback on its cache for a later
