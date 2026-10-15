@@ -43,7 +43,7 @@ _orangu_bench() {
     COMPREPLY=()
 
     case "$prev" in
-        --history|--chart|--table|--storage-file|--flamegraph|--image-init|--compare-profiles|--bundle|--read-bundle|--render-profile|--report)
+        --history|--chart|--table|--storage-file|--download-dir|--flamegraph|--image-init|--compare-profiles|--bundle|--read-bundle|--render-profile|--report)
             COMPREPLY=( $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
@@ -56,7 +56,7 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
             return 0
             ;;
     esac
@@ -66,7 +66,7 @@ _orangu_bench() {
             "--url --depths --pp --pp-continue --pg --decode-cpu --streams --shared-prefix --shared-prefix-tokens \
              --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
-             --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
+             --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png --flamegraph-keep-data \
              --flamegraph-layers --flamegraph-duration --flamegraph-watch \
              --compare-profiles --bundle --read-bundle --sweep --sweep-cmd --sweep-env --sweep-start-timeout \
@@ -126,6 +126,10 @@ _orangu_bench() {
         '--storage-file[File the storage probe reads (default: the server'"'"'s largest shard)]:path:_files' \
         '--storage-span[MiB to read at each request size, per pass]:mib:' \
         '--storage-ramp[MiB read and discarded before timing starts, at each size]:mib:' \
+        '--download-probe[Download mode: comma-separated connection counts to sweep]:list:' \
+        '--download-file[Hub file the download probe fetches, as <user>/<repo>:<path>]:spec:' \
+        '--download-seconds[Seconds to download for at each connection count, per pass]:secs:' \
+        '--download-dir[Directory the download probe writes into]:path:_files -/' \
         '--cap[Run each --sweep server under this memory cap (e.g. 4G)]:size:' \
         '--chart-png[Also render a PNG beside the chart SVG]' \
         '--chart-scale[Pin the chart'"'"'s tok/s axis to MIN:MAX so a pair of charts compare]:min\:max:' \
@@ -209,6 +213,10 @@ complete -c orangu-bench -l storage-probe          -x -d 'Storage mode: comma-se
 complete -c orangu-bench -l storage-file           -r -d 'File the storage probe reads (default: the server\'s largest shard)'
 complete -c orangu-bench -l storage-span           -x -d 'MiB to read at each request size, per pass'
 complete -c orangu-bench -l storage-ramp           -x -d 'MiB read and discarded before timing starts, at each size'
+complete -c orangu-bench -l download-probe         -x -d 'Download mode: comma-separated connection counts to sweep'
+complete -c orangu-bench -l download-file          -x -d 'Hub file the download probe fetches, as <user>/<repo>:<path>'
+complete -c orangu-bench -l download-seconds       -x -d 'Seconds to download for at each connection count, per pass'
+complete -c orangu-bench -l download-dir           -r -d 'Directory the download probe writes into'
 complete -c orangu-bench -l cap                    -x -d 'Run each --sweep server under this memory cap (e.g. 4G)'
 complete -c orangu-bench -l chart-png                 -d 'Also render a PNG beside the chart SVG'
 complete -c orangu-bench -l chart-scale            -x -d 'Pin the chart\'s tok/s axis to MIN:MAX so a pair of charts compare'
@@ -301,6 +309,10 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--storage-file', 'File the storage probe reads (default: the server''s largest shard)'),
         @('--storage-span', 'MiB to read at each request size, per pass'),
         @('--storage-ramp', 'MiB read and discarded before timing starts, at each size'),
+        @('--download-probe', 'Download mode: comma-separated connection counts to sweep'),
+        @('--download-file', 'Hub file the download probe fetches, as <user>/<repo>:<path>'),
+        @('--download-seconds', 'Seconds to download for at each connection count, per pass'),
+        @('--download-dir', 'Directory the download probe writes into'),
         @('--cap', 'Run each --sweep server under this memory cap (e.g. 4G)'),
         @('--chart-png', 'Also render a PNG beside the chart SVG'),
         @('--chart-scale', 'Pin the chart''s tok/s axis to MIN:MAX so a pair of charts compare'),
@@ -346,10 +358,10 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
 
     switch ($prev) {
         # A path: PowerShell's own completion takes over.
-        { $_ -in '--history', '--chart', '--table', '--storage-file', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
+        { $_ -in '--history', '--chart', '--table', '--storage-file', '--download-dir', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

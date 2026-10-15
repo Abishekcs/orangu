@@ -291,6 +291,12 @@ pub fn render_labelled(
             "Storage — read throughput against request size",
             "read request size (KiB)",
         ),
+        (
+            // `n` is a connection count, so the same explicit label.
+            "download_mb_s",
+            "Download — throughput against connections",
+            "connections",
+        ),
     ] {
         if nothing_read && mode.starts_with("io_") {
             continue;
@@ -721,6 +727,7 @@ mod tests {
             ("io_mb_per_token", "MiB read from disk per token"),
             ("io_majflt", "major faults per repetition (all models)"),
             ("storage_mb_s", "read throughput against request size"),
+            ("download_mb_s", "throughput against connections"),
         ] {
             let recs = [
                 rec("2026-08-08", "orangu", mode, 128, 1.4),

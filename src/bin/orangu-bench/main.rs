@@ -51,6 +51,7 @@ use clap::Parser;
 
 mod bundle;
 mod chart;
+mod download;
 mod history;
 mod image;
 mod moe;
@@ -263,6 +264,26 @@ struct Args {
     /// MiB read and discarded before timing starts, at each size.
     #[arg(long, default_value_t = 32, value_name = "MIB")]
     storage_ramp: u64,
+
+    /// Download mode: comma-separated connection counts to sweep.
+    #[arg(long, value_name = "LIST")]
+    download_probe: Option<String>,
+
+    /// Hub file the download probe fetches, as `<user>/<repo>:<path>`.
+    #[arg(
+        long,
+        default_value = "unsloth/Qwen3-8B-GGUF:Qwen3-8B-BF16.gguf",
+        value_name = "SPEC"
+    )]
+    download_file: String,
+
+    /// Seconds to download for at each connection count, per pass.
+    #[arg(long, default_value_t = 20, value_name = "SECS")]
+    download_seconds: u64,
+
+    /// Directory the download probe writes into (and clears after each point).
+    #[arg(long, value_name = "PATH")]
+    download_dir: Option<String>,
 
     /// Run each `--sweep` server under this memory cap (e.g. `4G`).
     #[arg(long, value_name = "SIZE")]
@@ -1197,6 +1218,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
     // `--storage-file`, or the largest shard the server reports.
     if let Some(sizes) = &args.storage_probe {
         return storage_probe(args, sizes);
+    }
+    // The same: the subject is the link, and no server is involved.
+    if let Some(counts) = &args.download_probe {
+        return download_probe(args, counts);
     }
 
     // Same shape as `--chart-only`: reads artifacts, touches no server.
@@ -3306,6 +3331,78 @@ fn storage_probe(args: &Args, sizes: &str) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| device_label(&path).unwrap_or_else(|| "storage".to_string()));
     record_and_chart(args, &storage::records(&points, &label))
+}
+
+/// `--download-probe`: download throughput against connection count, the
+/// curve `ORANGU_DOWNLOAD_CONNECTIONS` is set from.
+///
+/// Fetches `--download-file` through the server's own download code for
+/// `--download-seconds` at each count, into `--download-dir` (the system
+/// temporary directory unless given — on a machine whose temporary directory
+/// sits on a slow disk, the disk is what gets measured), clearing up after
+/// every point.
+fn download_probe(args: &Args, counts: &str) -> anyhow::Result<()> {
+    let counts: Vec<u32> = counts
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| match s.parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(anyhow::anyhow!(
+                "--download-probe wants positive connection counts, got {s:?}"
+            )),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if counts.is_empty() {
+        anyhow::bail!("--download-probe needs at least one connection count");
+    }
+    let dir = args
+        .download_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let target = orangu::model_download::probe_target(&args.download_file)?;
+    let window = std::time::Duration::from_secs(args.download_seconds.max(1));
+    if !args.json {
+        println!(
+            "  probe    {}:{} ({})",
+            target.repo,
+            target.path,
+            orangu::format::format_bytes(target.size)
+        );
+        println!("  into     {}", dir.display());
+        println!(
+            "  sweep    {} counts x 2 passes x {}s",
+            counts.len(),
+            window.as_secs()
+        );
+    }
+
+    let json = args.json;
+    let points = download::sweep(&target, &dir, &counts, window, |pass, n, mb_s| {
+        if !json {
+            println!("  {pass:>4}     {n:>3} connections  {mb_s:8.1} MB/s");
+        }
+    })?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "repo": target.repo,
+                "file": target.path,
+                "seconds": window.as_secs(),
+                "points": points.iter().map(|p| serde_json::json!({
+                    "connections": p.connections, "mb_s": p.mean(), "up": p.up, "down": p.down,
+                })).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        print!("{}", download::table(&points));
+    }
+
+    let label = args.label.clone().unwrap_or_else(|| "download".to_string());
+    record_and_chart(args, &download::records(&points, &label))
 }
 
 /// The biggest file backing the running model, from `/model-cache`.

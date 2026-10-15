@@ -44,12 +44,14 @@
 //! so a head nobody downloaded is a feature that silently never happens. See
 //! `engine::arch::qwen4exp_mtp`.
 //!
-//! A multi-part model's shards (and its `mmproj`/MTP sidecars, when present)
-//! download concurrently rather than one at a time — bounded by rayon's
-//! global thread pool — each reporting its own progress line on a shared
-//! [`ProgressBoard`]. Every file gets a line from the first draw onwards,
-//! whether or not a thread has picked it up yet, so all of them stay visible
-//! at once until the last one is done.
+//! Every file is fetched in 64 MiB pieces, each a ranged request of its own,
+//! over a shared set of connections (`ORANGU_DOWNLOAD_CONNECTIONS`, 8 by
+//! default) — so even a single-file model streams over several at once, and
+//! an interrupted download resumes from the pieces it finished. Each file
+//! reports its own progress line on a shared [`ProgressBoard`]. Every file
+//! gets a line from the first draw onwards, whether or not a connection has
+//! picked it up yet, so all of them stay visible at once until the last one
+//! is done.
 
 use crate::gguf::GgufFile;
 
@@ -227,15 +229,10 @@ pub fn download_model_reporting(
         let already_downloaded =
             blob_path.is_file() && fs::metadata(&blob_path)?.len() == file.size;
         // What an interrupted earlier run left behind, which this one resumes
-        // from rather than re-fetches. Measured against the file's real size
-        // from the repository listing, never against anything on disk: a
-        // `.part` at or past that size is a stale leftover that
-        // `download_attempt` throws away and re-fetches from zero, so it's
-        // worth nothing here either.
-        let resumed = match fs::metadata(part_path(&blob_path)).map(|m| m.len()) {
-            Ok(len) if len < file.size => len,
-            _ => 0,
-        };
+        // from rather than re-fetches: the pieces of its `.part` it recorded
+        // as complete, measured against the file's real size from the
+        // repository listing.
+        let resumed = resumed_bytes(&blob_path, file.size);
 
         slots.push(Slot {
             label: file.path.clone(),
@@ -480,10 +477,7 @@ pub fn download_repo_file(
 
     let blob_path = blobs_dir.join(&file.oid);
     let already_downloaded = blob_path.is_file() && fs::metadata(&blob_path)?.len() == file.size;
-    let resumed = match fs::metadata(part_path(&blob_path)).map(|m| m.len()) {
-        Ok(len) if len < file.size => len,
-        _ => 0,
-    };
+    let resumed = resumed_bytes(&blob_path, file.size);
     let slots = vec![Slot {
         label: file.path.clone(),
         size: file.size,
@@ -1148,7 +1142,7 @@ struct DownloadTask {
 
 /// Where one file is in its own download, which is what its line on the
 /// [`ProgressBoard`] says. A file that hasn't started yet is [`Queued`], not
-/// blank: rayon runs only as many downloads at once as it has threads, so a
+/// blank: only so many connections run at once, so a
 /// 34-shard model otherwise showed a couple of dozen empty lines between the
 /// handful actually in flight.
 ///
@@ -1561,179 +1555,601 @@ fn terminal_rows() -> Option<usize> {
     terminal_size::terminal_size().map(|(_, terminal_size::Height(rows))| usize::from(rows))
 }
 
-/// Downloads every task concurrently — bounded by rayon's global thread
-/// pool rather than one thread per file, so a model with dozens of shards
-/// doesn't open dozens of simultaneous connections — each reporting into its
-/// own line of the shared `board` (which already has a line for every
-/// selected file, this run's tasks and the files it had nothing to do
-/// among them) so every file's progress stays visible at once until all are
-/// done. Returns the first error encountered, if any; other in-flight
-/// downloads still run to completion (each writes its own `.part` file, so a
-/// later retry only re-fetches whatever actually failed).
+/// How much of a file one request fetches. Every file is cut into pieces of
+/// this size and every piece is a ranged request of its own, so a single
+/// large GGUF streams over several connections at once rather than one —
+/// a CDN caps what one connection carries well below what a fast link can
+/// take. Large enough that the request (and the Hub's redirect) in front of
+/// each piece costs nothing next to its transfer; small enough that an
+/// interrupted run loses little, since a piece is recorded only once whole.
+const DOWNLOAD_CHUNK: u64 = 64 * 1024 * 1024;
+
+/// How many connections a download keeps open when
+/// `ORANGU_DOWNLOAD_CONNECTIONS` does not say: enough to fill a link several
+/// times what one connection to the Hub carries, few enough to stay polite.
+const DEFAULT_DOWNLOAD_CONNECTIONS: usize = 8;
+const MAX_DOWNLOAD_CONNECTIONS: usize = 64;
+
+/// How many requests a download runs at once, across every file it fetches:
+/// `ORANGU_DOWNLOAD_CONNECTIONS` when set to a positive number, else
+/// [`DEFAULT_DOWNLOAD_CONNECTIONS`]. A link one connection already fills
+/// gains nothing from more; `1` fetches one piece at a time.
+fn download_connections() -> usize {
+    std::env::var("ORANGU_DOWNLOAD_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_DOWNLOAD_CONNECTIONS)
+        .min(MAX_DOWNLOAD_CONNECTIONS)
+}
+
+/// The size of the buffer a piece is read into and written out of: whole
+/// megabytes per `write`, rather than whatever a TLS record happened to
+/// carry.
+const DOWNLOAD_BUFFER: usize = 1024 * 1024;
+
+/// How often a piece in flight notes how far it has got, so an interrupted
+/// run loses at most this much of each piece rather than all of it — with
+/// several connections streaming, every one of them is partway through a
+/// piece nearly all the time.
+const DOWNLOAD_CHECKPOINT: u64 = 8 * 1024 * 1024;
+
+/// Beside a blob's `.part`, how far each of its pieces has got — `<piece>
+/// <bytes>` a line, appended as they land, the furthest one counting — so a
+/// later run fetches only the rest.
+fn chunks_path(blob: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.part.chunks", blob.display()))
+}
+
+/// The byte range `[start, end)` of piece `chunk` of a `size`-byte file.
+fn chunk_range(chunk: u64, size: u64, chunk_size: u64) -> (u64, u64) {
+    let start = chunk * chunk_size;
+    (start, (start + chunk_size).min(size))
+}
+
+/// How many bytes from the start of each piece of a `size`-byte blob are
+/// already on disk in its `.part`.
+///
+/// What the record says, or — for a `.part` with no record, which an earlier
+/// version wrote front to back by appending — whatever lies inside it. Either
+/// way only within the `.part`'s actual length: a record whose `.part` has
+/// gone, or was never sized, vouches for nothing.
+fn chunk_progress(blob: &Path, size: u64, chunk_size: u64) -> Vec<u64> {
+    let count = size.div_ceil(chunk_size);
+    let Ok(len) = fs::metadata(part_path(blob)).map(|m| m.len()) else {
+        return vec![0; count as usize];
+    };
+    let on_disk = |chunk: u64, bytes: u64| {
+        let (start, end) = chunk_range(chunk, size, chunk_size);
+        bytes.min(end - start).min(len.saturating_sub(start))
+    };
+    match fs::read_to_string(chunks_path(blob)) {
+        Ok(record) => {
+            let mut progress = vec![0; count as usize];
+            for line in record.lines() {
+                let Some((chunk, bytes)) = line.trim().split_once(' ') else {
+                    continue;
+                };
+                let (Ok(chunk), Ok(bytes)) = (chunk.parse::<u64>(), bytes.parse::<u64>()) else {
+                    continue;
+                };
+                if chunk < count {
+                    let slot = &mut progress[chunk as usize];
+                    *slot = (*slot).max(on_disk(chunk, bytes));
+                }
+            }
+            progress
+        }
+        Err(_) => (0..count).map(|chunk| on_disk(chunk, u64::MAX)).collect(),
+    }
+}
+
+/// How much of the blob at `blob` an earlier run already left on disk, as
+/// [`chunk_progress`] counts it — what this run resumes from rather than
+/// re-fetches.
+fn resumed_bytes(blob: &Path, size: u64) -> u64 {
+    chunk_progress(blob, size, DOWNLOAD_CHUNK).iter().sum()
+}
+
+/// One file of a [`download_all`] run, opened for its pieces to be written
+/// into: its `.part` sized in full, its record of how far each piece has
+/// got, and the counters every connection working on it shares.
+struct PartFile<'a> {
+    task: &'a DownloadTask,
+    part: PathBuf,
+    record: Mutex<Option<fs::File>>,
+    /// The pieces still to fetch, in file order, each with how many of its
+    /// bytes are already on disk.
+    pending: Vec<(u64, u64)>,
+    /// Pieces not yet complete; whoever completes the last finalizes it.
+    remaining: AtomicU64,
+    /// Bytes on disk, the resumed ones included — this file's board line.
+    downloaded: AtomicU64,
+    /// The whole percentage last put on the board, so a redraw happens per
+    /// percent rather than per buffer.
+    reported: AtomicU64,
+    /// When to stop fetching, part-way or not — set only by a timed probe.
+    deadline: Option<std::time::Instant>,
+}
+
+impl<'a> PartFile<'a> {
+    /// Sizes `task`'s `.part` to the whole file — sparse where nothing is
+    /// written yet — after first making sure its record says what is already
+    /// there: a `.part` an earlier version wrote by appending has no record,
+    /// and once sized in full its length would no longer say how far it got.
+    fn open(
+        task: &'a DownloadTask,
+        chunk_size: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        let part = part_path(&task.blob_path);
+        let record_path = chunks_path(&task.blob_path);
+        let progress = chunk_progress(&task.blob_path, task.size, chunk_size);
+        let listed: String = progress
+            .iter()
+            .enumerate()
+            .filter(|(_, bytes)| **bytes > 0)
+            .map(|(chunk, bytes)| format!("{chunk} {bytes}\n"))
+            .collect();
+        fs::write(&record_path, listed)
+            .with_context(|| format!("failed to write {}", record_path.display()))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&part)
+            .with_context(|| format!("failed to open {}", part.display()))?;
+        file.set_len(task.size)
+            .with_context(|| format!("failed to size {}", part.display()))?;
+        let record = OpenOptions::new()
+            .append(true)
+            .open(&record_path)
+            .with_context(|| format!("failed to open {}", record_path.display()))?;
+        let pending: Vec<(u64, u64)> = (0..progress.len() as u64)
+            .map(|chunk| (chunk, progress[chunk as usize]))
+            .filter(|&(chunk, bytes)| {
+                let (start, end) = chunk_range(chunk, task.size, chunk_size);
+                bytes < end - start
+            })
+            .collect();
+        Ok(Self {
+            task,
+            part,
+            record: Mutex::new(Some(record)),
+            remaining: AtomicU64::new(pending.len() as u64),
+            pending,
+            downloaded: AtomicU64::new(progress.iter().sum()),
+            reported: AtomicU64::new(u64::MAX),
+            deadline,
+        })
+    }
+
+    /// Puts this file's byte count on its board line, but only when that
+    /// moves it to a new whole percent: the board redraws every line on
+    /// every update. Read under the board's lock, so two connections
+    /// reporting at once can never put the smaller count up last.
+    fn report(&self, board: &Mutex<ProgressBoard>, force: bool) {
+        let size = self.task.size.max(1);
+        let percent = (self.downloaded.load(Ordering::Relaxed) * 100 / size).min(100);
+        if self.reported.swap(percent, Ordering::Relaxed) != percent || force {
+            let mut board = board.lock().unwrap();
+            board.progress(self.task.slot, self.downloaded.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Records that the first `bytes` of piece `chunk` are on disk. Called
+    /// only after they are written, so the record never runs ahead of the
+    /// `.part`.
+    fn note(&self, chunk: u64, bytes: u64) -> Result<()> {
+        if let Some(record) = self.record.lock().unwrap().as_mut() {
+            writeln!(record, "{chunk} {bytes}").with_context(|| {
+                format!(
+                    "failed to write {}",
+                    chunks_path(&self.task.blob_path).display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Notes piece `chunk` (`len` bytes) as complete — on disk first, so a
+    /// run that dies now still has it — and, if it was the last one,
+    /// finalizes the file.
+    fn complete(&self, chunk: u64, len: u64, board: &Mutex<ProgressBoard>) -> Result<()> {
+        self.note(chunk, len)?;
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.finalize(board)?;
+        }
+        Ok(())
+    }
+
+    /// Moves the complete `.part` into place as the blob and drops its record.
+    fn finalize(&self, board: &Mutex<ProgressBoard>) -> Result<()> {
+        // Closed before it's removed: Windows refuses to delete an open file.
+        drop(self.record.lock().unwrap().take());
+        fs::rename(&self.part, &self.task.blob_path)
+            .with_context(|| format!("failed to finalize {}", self.task.blob_path.display()))?;
+        fs::remove_file(chunks_path(&self.task.blob_path)).ok();
+        board.lock().unwrap().finished(self.task.slot);
+        Ok(())
+    }
+}
+
+/// Downloads every task, each cut into [`DOWNLOAD_CHUNK`] pieces fetched over
+/// [`download_connections`] connections at once — shared by every file
+/// rather than per file, so a model with dozens of shards doesn't open
+/// hundreds of simultaneous connections, and a single-file model still gets
+/// all of them. Pieces are taken in file order, so the files complete about
+/// one after another rather than all near the end.
+///
+/// Each file reports into its own line of the shared `board` (which already
+/// has a line for every selected file, this run's tasks and the files it had
+/// nothing to do among them) so every file's progress stays visible at once
+/// until all are done. Returns the first error encountered, if any; pieces
+/// already in flight still run to completion, and how far every piece got is
+/// recorded, so a later run only re-fetches what is actually missing.
 fn download_all(
     client: &reqwest::blocking::Client,
     tasks: &[DownloadTask],
     token: Option<&str>,
     board: &Mutex<ProgressBoard>,
 ) -> Result<()> {
-    tasks
-        .par_iter()
-        .try_for_each(|task| download_with_resume(client, task, token, task.slot, board))
+    download_chunked(
+        client,
+        tasks,
+        token,
+        board,
+        DOWNLOAD_CHUNK,
+        download_connections(),
+        None,
+    )
 }
 
-/// How many times a single file's download is retried after a transient
-/// failure (a dropped connection, a rate limit, a truncated stream) before
-/// giving up, and how long to wait between attempts. A large multi-shard
-/// model streams for long enough that at least one shard hitting a blip is
-/// the norm, not the exception; each retry resumes from the `.part` file via
-/// a `Range` request rather than restarting, so a blip near the end costs
-/// only the tail, not the whole file.
-const DOWNLOAD_RETRIES: u32 = 5;
-const DOWNLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Downloads `task.url` into `task.blob_path`, resuming from a `.part` file
-/// left over from an interrupted attempt (via an HTTP `Range` request), and
-/// reporting percentage progress against `task.size` into `board`'s `slot`
-/// line as it goes.
-///
-/// A failed attempt is retried quietly up to [`DOWNLOAD_RETRIES`] times with
-/// [`DOWNLOAD_RETRY_DELAY`] between tries — each retry picks up where the
-/// last left off, since the partial bytes are already on disk. The retry
-/// status shows in place on this file's own progress line rather than
-/// scrolling new output, so a stall stays visible without becoming noise.
-/// Only once every retry is exhausted does the error propagate and fail the
-/// whole command.
-fn download_with_resume(
+fn download_chunked(
     client: &reqwest::blocking::Client,
-    task: &DownloadTask,
+    tasks: &[DownloadTask],
     token: Option<&str>,
-    slot: usize,
     board: &Mutex<ProgressBoard>,
+    chunk_size: u64,
+    connections: usize,
+    deadline: Option<std::time::Instant>,
 ) -> Result<()> {
-    let DownloadTask {
-        blob_path: dest, ..
-    } = task;
-    let part_path = part_path(dest);
+    let files = tasks
+        .iter()
+        .map(|task| PartFile::open(task, chunk_size, deadline))
+        .collect::<Result<Vec<_>>>()?;
+    // An empty file, or one an earlier run got all of without moving into
+    // place, has no piece to fetch and so no connection to finalize it.
+    for file in files.iter().filter(|f| f.pending.is_empty()) {
+        file.finalize(board)?;
+    }
+    let pieces: Vec<(&PartFile, u64, u64)> = files
+        .iter()
+        .flat_map(|file| {
+            file.pending
+                .iter()
+                .map(move |&(chunk, already)| (file, chunk, already))
+        })
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    // Taken once: every connection adds to it per buffer without going
+    // anywhere near the board's mutex.
+    let transferred = board.lock().unwrap().transferred.clone();
+    std::thread::scope(|scope| {
+        for _ in 0..connections.min(pieces.len()) {
+            scope.spawn(|| {
+                while failed.lock().unwrap().is_none() && !past(deadline) {
+                    let Some(&(file, chunk, already)) =
+                        pieces.get(next.fetch_add(1, Ordering::Relaxed))
+                    else {
+                        break;
+                    };
+                    let (start, end) = chunk_range(chunk, file.task.size, chunk_size);
+                    let result = fetch_chunk(
+                        client,
+                        file,
+                        chunk,
+                        (start, end),
+                        already,
+                        token,
+                        board,
+                        &transferred,
+                    )
+                    .and_then(|()| file.complete(chunk, end - start, board));
+                    match result {
+                        Err(err) if err.is::<Stopped>() => break,
+                        Err(err) => {
+                            failed.lock().unwrap().get_or_insert(err);
+                        }
+                        Ok(()) => {}
+                    }
+                }
+            });
+        }
+    });
+    match failed.into_inner().unwrap() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
 
+/// How many times a single piece is retried after a transient failure (a
+/// dropped connection, a rate limit, a truncated stream) before giving up.
+/// A large multi-shard model streams for long enough that at least one piece
+/// hitting a blip is the norm, not the exception; each retry resumes from
+/// the last byte written rather than restarting the piece.
+const DOWNLOAD_RETRIES: u32 = 8;
+/// The wait before the first retry, doubling with each one after up to
+/// [`DOWNLOAD_RETRY_MAX_DELAY`]: a blip is over in a second and costs only
+/// that, while a Hub that is really struggling still gets minutes to recover
+/// before the download gives up.
+const DOWNLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const DOWNLOAD_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long to wait before retry `attempt` (1-based).
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    DOWNLOAD_RETRY_DELAY
+        .saturating_mul(1 << (attempt - 1).min(16))
+        .min(DOWNLOAD_RETRY_MAX_DELAY)
+}
+
+/// Why a piece stopped short on purpose: its run's deadline passed. Not a
+/// failure — never retried, never reported.
+#[derive(Debug)]
+struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stopped at the deadline")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+fn past(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
+/// A file on the Hub to time downloads against — what `orangu-bench
+/// --download-probe` fetches, resolved once rather than per point.
+pub struct ProbeTarget {
+    pub repo: String,
+    pub path: String,
+    pub size: u64,
+    url: String,
+    token: Option<String>,
+}
+
+/// Resolves `spec` — `<user>/<repo>:<path>`, the file's path inside the
+/// repository — to a [`ProbeTarget`] at the repository's current commit.
+pub fn probe_target(spec: &str) -> Result<ProbeTarget> {
+    let (repo, path) = split_repo_tag(spec)?;
+    let path = path.with_context(|| format!("{spec} names no file: want <user>/<repo>:<path>"))?;
+    let client = build_client(None)?;
+    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
+    let commit = resolve_commit(&client, &repo, token.as_deref())?;
+    let files = list_repo_files(&client, &repo, &commit, token.as_deref())?;
+    let file = files
+        .iter()
+        .find(|f| f.path == path)
+        .ok_or_else(|| anyhow!("{repo} has no file {path}"))?;
+    Ok(ProbeTarget {
+        url: format!(
+            "{HUB_ENDPOINT}/{repo}/resolve/{commit}/{}",
+            urlencode_path(&path)
+        ),
+        size: file.size,
+        repo,
+        path,
+        token,
+    })
+}
+
+/// Downloads `target` for at most `window` the way `orangu-server download`
+/// would — the same pieces, the same connections, written into `dir` — then
+/// throws away what it wrote. Returns how many bytes arrived and how long
+/// that took: the window, or less when the whole file arrived first.
+pub fn probe_download(
+    target: &ProbeTarget,
+    dir: &Path,
+    connections: usize,
+    window: std::time::Duration,
+) -> Result<(u64, std::time::Duration)> {
+    let blob_path = dir.join(format!("orangu-download-probe-{}", std::process::id()));
+    let clear = || {
+        for path in [
+            blob_path.clone(),
+            part_path(&blob_path),
+            chunks_path(&blob_path),
+        ] {
+            fs::remove_file(path).ok();
+        }
+    };
+    // Never resumed: each point starts from nothing, or it would be timing
+    // the bytes the previous one left.
+    clear();
+    let task = DownloadTask {
+        label: target.path.clone(),
+        url: target.url.clone(),
+        blob_path: blob_path.clone(),
+        size: target.size,
+        slot: 0,
+    };
+    let slots = vec![Slot {
+        label: task.label.clone(),
+        size: task.size,
+        downloaded: 0,
+        state: SlotState::Queued,
+    }];
+    // A sink, so the board stays quiet: the bench prints its own table.
+    let board = Mutex::new(ProgressBoard::new(
+        slots,
+        Some(Arc::new(DownloadProgress::default())),
+    ));
+    let transferred = board.lock().unwrap().transferred.clone();
+    let client = build_client(None)?;
+    let started = std::time::Instant::now();
+    let result = download_chunked(
+        &client,
+        &[task],
+        target.token.as_deref(),
+        &board,
+        DOWNLOAD_CHUNK,
+        connections.clamp(1, MAX_DOWNLOAD_CONNECTIONS),
+        Some(started + window),
+    );
+    let elapsed = started.elapsed();
+    clear();
+    result?;
+    Ok((transferred.load(Ordering::Relaxed), elapsed))
+}
+
+/// Fetches piece `chunk` of `file` — bytes `[start, end)`, the first
+/// `already` of them on disk from an earlier run — into its place in the
+/// `.part`, retrying a failed attempt quietly up to [`DOWNLOAD_RETRIES`]
+/// times with [`retry_delay`] between tries — each picking up at the last
+/// byte the one before wrote. The retry status shows in place on the file's
+/// own progress line rather than scrolling new output, so a stall stays
+/// visible without becoming noise. Only once every retry is exhausted does
+/// the error propagate and fail the whole command.
+#[allow(clippy::too_many_arguments)]
+fn fetch_chunk(
+    client: &reqwest::blocking::Client,
+    file: &PartFile,
+    chunk: u64,
+    (start, end): (u64, u64),
+    already: u64,
+    token: Option<&str>,
+    board: &Mutex<ProgressBoard>,
+    transferred: &AtomicU64,
+) -> Result<()> {
+    let mut written = already;
     let mut attempt = 0;
+    file.report(board, true);
     loop {
-        match download_attempt(client, task, token, slot, board, &part_path) {
-            Ok(()) => break,
+        match fetch_chunk_attempt(
+            client,
+            file,
+            chunk,
+            start,
+            end,
+            token,
+            board,
+            transferred,
+            &mut written,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.is::<Stopped>() => return Err(err),
             Err(_) if attempt < DOWNLOAD_RETRIES => {
                 attempt += 1;
-                let secs = DOWNLOAD_RETRY_DELAY.as_secs();
-                board.lock().unwrap().set_retry(slot, attempt, secs);
-                std::thread::sleep(DOWNLOAD_RETRY_DELAY);
+                let delay = retry_delay(attempt);
+                board
+                    .lock()
+                    .unwrap()
+                    .set_retry(file.task.slot, attempt, delay.as_secs());
+                std::thread::sleep(delay);
             }
             Err(err) => return Err(err),
         }
     }
-
-    board.lock().unwrap().finished(slot);
-
-    fs::rename(&part_path, dest)
-        .with_context(|| format!("failed to finalize {}", dest.display()))?;
-    Ok(())
 }
 
-/// One attempt at fetching `task` into `part_path` — sends the request
-/// (resuming from any existing partial bytes), streams the body to disk, and
-/// verifies the finished `.part` is the expected size. Returns an error on
-/// any network, HTTP, I/O, or short-read failure so [`download_with_resume`]
-/// can retry it; the partial bytes it leaves behind are what the next
-/// attempt resumes from.
-fn download_attempt(
+/// One attempt at the rest of piece `chunk` of `file` — bytes `[start, end)`,
+/// the first `written` of them already on disk: a ranged request whose body
+/// is written where it belongs, a megabyte at a time, with `written` advanced
+/// only past what is actually written — so the retry after a failure resumes
+/// exactly there — and noted in the record every [`DOWNLOAD_CHECKPOINT`], so
+/// the next run does too. A server that ignores the range and sends the
+/// whole file still works, by skipping to where the piece resumes.
+#[allow(clippy::too_many_arguments)]
+fn fetch_chunk_attempt(
     client: &reqwest::blocking::Client,
-    task: &DownloadTask,
+    file: &PartFile,
+    chunk: u64,
+    start: u64,
+    end: u64,
     token: Option<&str>,
-    slot: usize,
     board: &Mutex<ProgressBoard>,
-    part_path: &Path,
+    transferred: &AtomicU64,
+    written: &mut u64,
 ) -> Result<()> {
-    let DownloadTask {
-        label,
-        url,
-        size: expected_size,
-        ..
-    } = task;
-    let expected_size = *expected_size;
-    let mut resume_from = fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
-    if resume_from >= expected_size && expected_size > 0 {
-        // A stale/complete .part from an interrupted run that never got
-        // renamed; nothing left to fetch.
-        resume_from = 0;
-        fs::remove_file(part_path).ok();
-    }
-
-    let mut request = authed_get(client, url, token);
-    if resume_from > 0 {
-        request = request.header("Range", format!("bytes={resume_from}-"));
-    }
-    let mut response = request
+    use std::io::{Seek, SeekFrom};
+    let from = start + *written;
+    let label = &file.task.label;
+    let response = authed_get(client, &file.task.url, token)
+        .header("Range", format!("bytes={from}-{}", end - 1))
         .send()
-        .with_context(|| format!("failed to download {label}"))?;
-
-    if resume_from > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        // Server ignored the Range request; restart from scratch.
-        resume_from = 0;
-        fs::remove_file(part_path).ok();
-        response = authed_get(client, url, token)
-            .send()
-            .with_context(|| format!("failed to download {label}"))?;
-    }
-    let response = response
+        .with_context(|| format!("failed to download {label}"))?
         .error_for_status()
         .with_context(|| format!("failed to download {label}"))?;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(part_path)
-        .with_context(|| format!("failed to open {}", part_path.display()))?;
-
-    let mut downloaded = resume_from;
-    let mut buf = [0u8; 65536];
-    let mut last_printed = None;
+    let ranged = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let mut body = response;
-    // Taken once: the read loop adds to it per chunk without going anywhere
-    // near the board's mutex, which every other download thread is also
-    // contending for.
-    let transferred = board.lock().unwrap().transferred.clone();
-    loop {
-        let read = body
-            .read(&mut buf)
+    if !ranged && from > 0 {
+        let skipped = std::io::copy(&mut (&mut body).take(from), &mut std::io::sink())
             .with_context(|| format!("failed to download {label}"))?;
-        if read == 0 {
-            break;
+        if skipped != from {
+            bail!("download of {label} ended early — will retry");
         }
-        file.write_all(&buf[..read])
-            .with_context(|| format!("failed to write {}", part_path.display()))?;
-        downloaded += read as u64;
-        // Only what this attempt actually pulled down — bytes a previous run
-        // left in the `.part` (`resume_from`) are not this run's throughput.
-        transferred.fetch_add(read as u64, Ordering::Relaxed);
+    }
+    let mut body = body.take(end - from);
 
-        // Reported on each whole percent rather than each chunk: the board
-        // redraws every line on every update, and 64 KiB at a time would be
-        // tens of thousands of redraws a shard. The byte count is what's
-        // handed over, though — `Total` subtracts it from the real total.
-        if let Some(percent) = (downloaded * 100)
-            .checked_div(expected_size)
-            .map(|p| p.min(100))
-            && last_printed != Some(percent)
-        {
-            board.lock().unwrap().progress(slot, downloaded);
-            last_printed = Some(percent);
+    let mut out = OpenOptions::new()
+        .write(true)
+        .open(&file.part)
+        .with_context(|| format!("failed to open {}", file.part.display()))?;
+    out.seek(SeekFrom::Start(from))
+        .with_context(|| format!("failed to seek {}", file.part.display()))?;
+    let mut buf = vec![0u8; DOWNLOAD_BUFFER];
+    loop {
+        // Filled as far as the body allows before each write. A read that
+        // fails part-way still has its bytes written first, so the retry
+        // doesn't fetch them again.
+        let mut filled = 0;
+        let mut failure = None;
+        while filled < buf.len() {
+            match body.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        if filled > 0 {
+            out.write_all(&buf[..filled])
+                .with_context(|| format!("failed to write {}", file.part.display()))?;
+            let before = *written;
+            *written += filled as u64;
+            if *written / DOWNLOAD_CHECKPOINT != before / DOWNLOAD_CHECKPOINT {
+                file.note(chunk, *written)?;
+            }
+            file.downloaded.fetch_add(filled as u64, Ordering::Relaxed);
+            // Only what this run actually pulled down — bytes a previous
+            // run left in the `.part` are not this run's throughput.
+            transferred.fetch_add(filled as u64, Ordering::Relaxed);
+            file.report(board, false);
+        }
+        if past(file.deadline) {
+            return Err(Stopped.into());
+        }
+        if let Some(err) = failure {
+            return Err(err).with_context(|| format!("failed to download {label}"));
+        }
+        if filled < buf.len() {
+            break;
         }
     }
 
-    // A connection that drops mid-stream often ends with a clean `read == 0`
-    // rather than an error, leaving a truncated `.part`. Treat a short file
-    // as a failure so it's retried (and resumed) rather than finalized as if
-    // it were complete.
-    if expected_size > 0 && downloaded != expected_size {
+    // A connection that drops mid-stream often ends with a clean end of body
+    // rather than an error. Treat a short piece as a failure so it's retried
+    // (and resumed) rather than recorded as if it were complete.
+    if body.limit() > 0 {
         bail!(
-            "download of {label} ended early ({downloaded} of {expected_size} bytes) — will retry"
+            "download of {label} ended early ({} bytes short of {end}) — will retry",
+            body.limit()
         );
     }
     Ok(())
@@ -2135,6 +2551,107 @@ mod tests {
         (url, sent)
     }
 
+    /// Fetches `body` from `url` into a blob in `dir` the way `download_all`
+    /// does, in 1000-byte pieces over four connections.
+    fn fetch_chunked(dir: &Path, url: &str, body: &[u8]) -> PathBuf {
+        let blob = dir.join("blob");
+        let task = DownloadTask {
+            label: "m.gguf".to_string(),
+            url: url.to_string(),
+            blob_path: blob.clone(),
+            size: body.len() as u64,
+            slot: 0,
+        };
+        let slots = vec![Slot {
+            label: task.label.clone(),
+            size: task.size,
+            downloaded: resumed_bytes(&blob, task.size),
+            state: SlotState::Queued,
+        }];
+        let board = Mutex::new(ProgressBoard::new(
+            slots,
+            Some(Arc::new(DownloadProgress::default())),
+        ));
+        download_chunked(
+            &build_client(None).unwrap(),
+            &[task],
+            None,
+            &board,
+            1000,
+            4,
+            None,
+        )
+        .unwrap();
+        blob
+    }
+
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    /// A file arrives whole over several connections, every piece in its
+    /// place, and leaves neither its `.part` nor its record behind.
+    #[test]
+    fn a_file_downloads_in_pieces() {
+        let body = patterned(10_500);
+        let (url, sent) = serve(body.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let blob = fetch_chunked(dir.path(), &url, &body);
+        assert_eq!(fs::read(&blob).unwrap(), body);
+        assert_eq!(sent.load(Ordering::Relaxed), body.len() as u64);
+        assert!(!part_path(&blob).exists());
+        assert!(!chunks_path(&blob).exists());
+    }
+
+    /// A resumed download fetches only what its record does not cover: the
+    /// pieces it never started, and the rest of the one it got partway into.
+    #[test]
+    fn a_resumed_download_fetches_only_what_is_missing() {
+        let body = patterned(10_000);
+        let (url, sent) = serve(body.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let mut part = vec![0u8; body.len()];
+        for (from, to) in [(0, 1000), (2000, 3000), (5000, 6000), (7000, 7400)] {
+            part[from..to].copy_from_slice(&body[from..to]);
+        }
+        fs::write(part_path(&blob), &part).unwrap();
+        // The furthest line for a piece counts; one past the piece is capped.
+        fs::write(
+            chunks_path(&blob),
+            "0 1000\n2 1000\n5 1000\n7 200\n7 400\n9 0\n",
+        )
+        .unwrap();
+        let progress = chunk_progress(&blob, 10_000, 1000);
+        assert_eq!(progress, [1000, 0, 1000, 0, 0, 1000, 0, 400, 0, 0]);
+        fetch_chunked(dir.path(), &url, &body);
+        assert_eq!(fs::read(&blob).unwrap(), body);
+        assert_eq!(sent.load(Ordering::Relaxed), 6600);
+    }
+
+    /// A `.part` an earlier version appended to, with no record, keeps
+    /// every byte it holds.
+    #[test]
+    fn an_appended_part_resumes_where_it_ended() {
+        let body = patterned(10_000);
+        let (url, sent) = serve(body.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        fs::write(part_path(&blob), &body[..3500]).unwrap();
+        fetch_chunked(dir.path(), &url, &body);
+        assert_eq!(fs::read(&blob).unwrap(), body);
+        assert_eq!(sent.load(Ordering::Relaxed), 6500);
+    }
+
+    /// Retries start at a second and back off to half a minute.
+    #[test]
+    fn retries_back_off() {
+        let secs: Vec<u64> = (1..=DOWNLOAD_RETRIES)
+            .map(|attempt| retry_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
+    }
+
     /// A partial model fetches its header, then only the tensors asked
     /// for — each where it belongs, the rest left as zeros — and a reopened
     /// one keeps what was fetched.
@@ -2236,8 +2753,8 @@ mod tests {
     const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Every file has a line from the very first draw, before any of them
-    /// has started — rayon runs only as many downloads at once as it has
-    /// threads, and the waiting ones used to render as blank lines.
+    /// has started — only so many connections run at once, and the waiting
+    /// ones used to render as blank lines.
     #[test]
     fn every_file_has_a_line_before_anything_starts() {
         let board = board_of(34);
@@ -2279,7 +2796,7 @@ mod tests {
                 // A file already on disk is downloaded, however it got there.
                 "Downloaded model-00001-of-00003.gguf: 100% [1/3]",
                 "Downloading model-00002-of-00003.gguf: 50% [2/3]",
-                "Downloading model-00003-of-00003.gguf: 25% (retry 2/5 in 30s) [3/3]",
+                "Downloading model-00003-of-00003.gguf: 25% (retry 2/8 in 30s) [3/3]",
                 "Total 58%: 1/3 files (1.75 MiB of 3.00 MiB), 2 active, 0 queued, ETA 1m",
             ]
         );
@@ -2294,7 +2811,7 @@ mod tests {
         board.set_retry(0, 1, 30);
         assert_eq!(
             board.slots[0].line(1, 1),
-            "Downloading model-00001-of-00001.gguf: 50% (retry 1/5 in 30s) [1/1]"
+            "Downloading model-00001-of-00001.gguf: 50% (retry 1/8 in 30s) [1/1]"
         );
         assert_eq!(board.slots[0].downloaded, MIB / 2, "no bytes were dropped");
 

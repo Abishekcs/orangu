@@ -228,8 +228,10 @@ Downloading mmproj-BF16.gguf: 100% [2/2]
 A multi-part model's every shard (and a bundled `mmproj`) downloads
 concurrently rather than one at a time, each printing its own progress line
 in place until all are done — a smaller sidecar file like `mmproj-BF16.gguf`
-above typically finishes well before the main model. An interrupted download
-resumes from where it left off next time, and a file already fully present
+above typically finishes well before the main model. Every file is fetched in
+64 MiB pieces over several connections at once (8 by default; set
+`ORANGU_DOWNLOAD_CONNECTIONS` to change it). An interrupted download picks up
+where each piece left off next time, and a file already fully present
 (matching the repository's own reported size) is skipped rather than
 re-fetched. Set `HF_TOKEN` in the environment for a private or gated
 repository, and `HF_ENDPOINT` to download from a mirror instead of

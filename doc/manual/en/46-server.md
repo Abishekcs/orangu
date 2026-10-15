@@ -283,14 +283,20 @@ same best-matching one orangu-server's own `-hf` would auto-fetch on first
 launch anyway, so `LLAMA_CACHE=<models>` already has it ready offline
 instead of needing a live fetch the first time a vision-capable model is
 launched. A multi-part model's every shard (and a bundled `mmproj`)
-downloads concurrently rather than one at a time; an interrupted download
-resumes from where it left off next time. Set `HF_TOKEN` in the environment
+downloads concurrently rather than one at a time, and every file is fetched
+in 64 MiB pieces over several connections at once — 8 by default, or
+`ORANGU_DOWNLOAD_CONNECTIONS` — which on a fast link is several times what
+one connection to the Hub carries; on a link one connection already fills,
+`ORANGU_DOWNLOAD_CONNECTIONS=1` loses nothing (`orangu-bench --download-probe`
+measures which a link is; see the *Benchmarking* chapter). An interrupted download
+picks up where each piece left off next time, and a failed request is
+retried after 1 s, backing off to 30 s. Set `HF_TOKEN` in the environment
 for a private or gated repository, and `HF_ENDPOINT` to download from a
 mirror instead of huggingface.co.
 
 A sharded model shows **one line per file**, all of them from the start and
 all of them in one block, closed by a `Total` line for the run as a whole.
-A file is `Queued` until a thread picks it up, `Downloading` while it
+A file is `Queued` until a connection picks it up, `Downloading` while it
 streams, and `Downloaded` once it's on disk — including a file that was
 already there when the command started, which is simply downloaded as far as
 anything else is concerned. Those three are the whole vocabulary: an attempt
@@ -302,11 +308,11 @@ Every line is rewritten in place as that file's own state changes:
 ```
 Downloaded UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00001-of-00034.gguf: 100% [1/35]
 Downloading UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00002-of-00034.gguf: 63% [2/35]
-Downloading UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00003-of-00034.gguf: 12% (retry 1/5 in 30s) [3/35]
+Downloading UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00003-of-00034.gguf: 12% (retry 1/8 in 1s) [3/35]
 Queued UD-Q8_K_XL/Kimi-K3-UD-Q8_K_XL-00004-of-00034.gguf [4/35]
 ...
 Downloaded mmproj-BF16.gguf: 100% [35/35]
-Total 12%: 2/35 files (7.12 GiB of 58.30 GiB), 15 active, 18 queued, ETA 2h:47m
+Total 12%: 2/35 files (7.12 GiB of 58.30 GiB), 2 active, 31 queued, ETA 2h:47m
 ```
 
 `Total` is **bytes**, not an average of the per-file percentages: how much

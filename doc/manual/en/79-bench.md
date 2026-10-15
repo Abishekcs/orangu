@@ -709,6 +709,46 @@ Read that as: 8 MiB reads hold ~306 MB/s whether measured first or last, while
 slow state and large ones never do.** That is the argument for a large
 `read_size`, and it is a stronger one than "clear a threshold".
 
+### Download mode (`--download-probe`) — how many connections a link wants
+
+`orangu-server download` fetches every file in 64 MiB pieces over several
+connections at once (`ORANGU_DOWNLOAD_CONNECTIONS`, 8 by default). Whether
+that helps depends on the link: a CDN caps what one connection carries, so on
+a fast line more connections are faster, while a slow line is already full
+with one. This measures which kind of line you are on:
+
+```sh
+orangu-bench --download-probe 1,2,4,8,16 --download-seconds 20 \
+  --download-dir /path/on/the/models/disk \
+  --history download-history.tsv --chart download-curve.svg
+```
+
+Counts are connections. Each point runs the server's own download code
+against `--download-file` (`<user>/<repo>:<path>`, by default a 15 GiB file
+large enough that no link finishes it inside the window) for
+`--download-seconds`, writes into `--download-dir` (the system temporary
+directory unless given — put it on the disk the models go to, or a slow
+temporary disk is what gets measured) and deletes what it wrote. No server is
+involved, and `HF_TOKEN` and `HF_ENDPOINT` apply as they do to a download.
+
+As with the storage probe, every count is measured **ascending then
+descending** and both passes are reported, since a shared link changes over
+the minutes a probe takes:
+
+```text
+  conns |     MB/s |       up |     down |  spread
+--------------------------------------------------
+      1 |      4.5 |      4.5 |      4.6 |    1.4%
+      2 |      4.8 |      4.8 |      4.8 |    1.2%
+      8 |      4.9 |      4.8 |      5.0 |    4.7%
+     16 |      4.6 |      4.6 |      4.6 |    0.6%
+```
+
+That is a ~40 Mbit/s line one connection already fills: the default costs
+nothing there, but gains nothing either. A curve that keeps rising past 8
+says to raise `ORANGU_DOWNLOAD_CONNECTIONS`; one that peaks early says to
+lower it.
+
 ### Capped runs (`--cap`) — the regime a large model actually meets
 
 A model smaller than RAM is served from the page cache, so a benchmark of it
