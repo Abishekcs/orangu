@@ -249,17 +249,21 @@ network is not mistaken for a fast part of the tree: handing a sequence
 back to decode alone moves every prompt position's keys and values over
 it, and moving the head moves a row of logits a token.
 
-A node with a `[workers]` section never reads, uploads or times the whole
-model at startup. It skips:
+A node with a `[workers]` section reads and uploads a layer's weights the
+first time the layer runs, not at startup. It skips:
 
-- the probes that time a decode step;
+- the probe that times decode on the CPU against the GPU;
 - the host preload;
 - the NPU's precompile of every block;
 - the automatic split of a model too big for its GPU;
 - the prefix warm-up.
 
-Weights are read, and uploaded to a GPU, the first time a layer runs. When
-a new plan moves layers away from a node, it lets go of their pages.
+It still chooses its GPU kernels as any server does. A choice an earlier
+start kept in the probe cache is taken as it is; one that was not kept is
+timed, which reads the whole model once. A node that fetches its model in
+ranges (`download = range`) skips the timing, since reading the model is a
+download there. When a new plan moves layers away from a node, it lets go
+of their pages.
 
 While `beta` and `gamma` work for their parent, their own APIs are off:
 everything but `/health`, `/ready`, `/metrics` and `/v1/workers` answers
@@ -426,8 +430,8 @@ without. Nodes like that keep each other's cores busy anyway.
   pipelining off.
   On one board, a pipelined tree of three 4-thread nodes prefilled a
   2041-token prompt 2.2× faster than without pipelining.
-  `ORANGU_DECODE_BATCH=1` sends one decode step of every slot as a single
-  message per worker.
+  One decode step of every slot goes as a single message per worker
+  (`ORANGU_DECODE_BATCH=0` sends them one by one).
 - On a GPU, a node runs its layers of a decode step as one recorded
   submission, as a whole model does: a Llama-3.2-3B step split in three
   took 67.8 ms against 65.5 ms whole. A prompt chunk still runs layer by

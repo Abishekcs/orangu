@@ -110,8 +110,7 @@ pub fn prompts_on_cpu() -> Option<bool> {
 const PROBE_TOKENS: usize = 64;
 
 /// Seconds for one prompt-shaped pass of the whole model — a
-/// [`PROBE_TOKENS`]-wide chunk through its own forward, with the logits
-/// skipped exactly as every chunk of a real prompt but the last skips them.
+/// [`PROBE_TOKENS`]-wide chunk through its own forward.
 ///
 /// The counterpart to `decode_backend::seconds_per_token`, and needed for
 /// the same reason that one is: **a decode measurement says nothing about a
@@ -119,19 +118,31 @@ const PROBE_TOKENS: usize = 64;
 /// discrete card they can point opposite ways — measured on a delta-net
 /// mixture whose cores beat the card by 1.05–1.22× at decode while the card
 /// beat the cores by 1.9× at prefill.
+pub fn seconds_per_prompt_pass(model: &Arc<dyn ModelForward>) -> Option<f64> {
+    seconds_per_prompt_pass_of(model, PROBE_TOKENS)
+}
+
+/// [`seconds_per_prompt_pass`] at `width` tokens.
+///
+/// Through `forward`, logits and all, not `forward_no_logits`: a chunk that
+/// skips its logits may leave its work queued on the device — the resident
+/// stream parks its K/V readback for the next chunk — and returns before
+/// the device has finished, so its wall time is the submission's alone.
+/// Timed that way, a 64-token pass on a card that prefills at 600 tok/s read
+/// 15 ms. The last row's logits are one row of the vocabulary projection.
 ///
 /// One untimed pass first, so pipelines, the clock and first-touch are not
 /// in the number; each pass gets a fresh cache so both do identical work.
 /// Two passes rather than a median of eight because a prompt pass costs
 /// hundreds of milliseconds and this runs at startup — it is a comparison
-/// between two backends that differ by a lot, not a rate to quote.
-pub fn seconds_per_prompt_pass(model: &Arc<dyn ModelForward>) -> Option<f64> {
+/// between two choices that differ by a lot, not a rate to quote.
+pub fn seconds_per_prompt_pass_of(model: &Arc<dyn ModelForward>, width: usize) -> Option<f64> {
     let token = 1u32.min(model.config().n_vocab.saturating_sub(1) as u32);
-    let tokens = vec![token; PROBE_TOKENS];
+    let tokens = vec![token; width.max(1)];
     let once = || -> Option<f64> {
-        let mut cache = model.new_kv_cache(PROBE_TOKENS + 1);
+        let mut cache = model.new_kv_cache(tokens.len() + 1);
         let started = Instant::now();
-        model.forward_no_logits(&mut cache, &tokens, 0, 0).ok()?;
+        model.forward(&mut cache, &tokens, 0, 0).ok()?;
         Some(started.elapsed().as_secs_f64())
     };
     once()?;

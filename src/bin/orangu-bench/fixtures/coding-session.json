@@ -1,0 +1,104 @@
+{
+ "system": "You are a coding agent working inside a developer's repository. You read code, explain it, and change it. Follow these rules on every turn.\n\n1. Read before you write. When the user shows you a file, base every statement about it on the text you were given. Do not guess at code you have not seen; ask for the file instead.\n2. Keep changes small. Prefer the smallest edit that solves the problem. Do not reformat code you were not asked to touch, and do not rename things for taste.\n3. Explain the why. When you propose a change, say in one or two sentences what was wrong and why the change fixes it. Name the function and the line.\n4. Match the surrounding code. Use the naming, error handling and comment style the file already uses. A new helper should look like it was always there.\n5. Be precise about types. In Rust, say whether a value is owned, borrowed or shared, and what the lifetime of a borrow is when it matters. In C, say who frees a pointer.\n6. Test what you change. When you change behaviour, propose a test that fails before the change and passes after it. Name the test after the behaviour, not the bug.\n7. Use the tools. To see a file, call read_file. To search, call search. To run the tests, call run_command. To change a file, call write_file with the whole new content. Never claim to have run something you did not run.\n8. Report honestly. If a command fails, show the error. If you are unsure, say what you would check next.\n9. Keep answers short. Lead with the answer. Use a code block for code and a list only when the items are parallel.\n10. Never touch files outside the repository, never print secrets, and never run destructive commands without asking.\n\nThe repository is a small Rust service called ledger that records account transfers. Its modules are store (an append-only log on disk), account (balances), transfer (validation and application), and http (the request handlers). The tests live beside each module.",
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "read_file",
+    "description": "Read a file from the repository and return its contents.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "Path relative to the repository root."
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "write_file",
+    "description": "Replace a file's contents. The whole new content must be given.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "Path relative to the repository root."
+      },
+      "content": {
+       "type": "string",
+       "description": "The complete new file content."
+      }
+     },
+     "required": [
+      "path",
+      "content"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "search",
+    "description": "Search the repository for a regular expression and return matching lines with their paths.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "pattern": {
+       "type": "string",
+       "description": "A regular expression."
+      },
+      "glob": {
+       "type": "string",
+       "description": "Optional glob limiting which files are searched."
+      }
+     },
+     "required": [
+      "pattern"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "run_command",
+    "description": "Run a shell command in the repository and return its exit code and output.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "command": {
+       "type": "string",
+       "description": "The command line to run."
+      },
+      "timeout_seconds": {
+       "type": "integer",
+       "description": "How long to wait before giving up."
+      }
+     },
+     "required": [
+      "command"
+     ]
+    }
+   }
+  }
+ ],
+ "turns": [
+  "Here is src/store.rs. What does `append` guarantee if the process is killed halfway through a write?\n\n```rust\nuse std::fs::{File, OpenOptions};\nuse std::io::{self, BufRead, BufReader, Write};\nuse std::path::{Path, PathBuf};\n\npub struct Store {\n    path: PathBuf,\n    file: File,\n    entries: u64,\n}\n\nimpl Store {\n    pub fn open(path: &Path) -> io::Result<Store> {\n        let file = OpenOptions::new().create(true).append(true).read(true).open(path)?;\n        let entries = BufReader::new(File::open(path)?).lines().count() as u64;\n        Ok(Store { path: path.to_path_buf(), file, entries })\n    }\n\n    pub fn append(&mut self, record: &str) -> io::Result<u64> {\n        assert!(!record.contains('\\n'), \"a record is one line\");\n        self.file.write_all(record.as_bytes())?;\n        self.file.write_all(b\"\\n\")?;\n        self.entries += 1;\n        Ok(self.entries)\n    }\n\n    pub fn replay(&self) -> io::Result<Vec<String>> {\n        let reader = BufReader::new(File::open(&self.path)?);\n        reader.lines().collect()\n    }\n}\n```",
+  "Right. Now src/account.rs. Why can `withdraw` leave a negative balance under concurrent use?\n\n```rust\nuse std::collections::HashMap;\nuse std::sync::{Arc, Mutex};\n\n#[derive(Clone, Default)]\npub struct Accounts {\n    balances: Arc<Mutex<HashMap<String, i64>>>,\n}\n\nimpl Accounts {\n    pub fn balance(&self, id: &str) -> i64 {\n        *self.balances.lock().unwrap().get(id).unwrap_or(&0)\n    }\n\n    pub fn deposit(&self, id: &str, amount: i64) {\n        let mut map = self.balances.lock().unwrap();\n        *map.entry(id.to_string()).or_insert(0) += amount;\n    }\n\n    pub fn withdraw(&self, id: &str, amount: i64) -> Result<(), String> {\n        if self.balance(id) < amount {\n            return Err(format!(\"{id}: insufficient funds\"));\n        }\n        let mut map = self.balances.lock().unwrap();\n        *map.entry(id.to_string()).or_insert(0) -= amount;\n        Ok(())\n    }\n}\n```",
+  "Make `withdraw` check and subtract under one lock, and write a test that runs two threads withdrawing from the same account and asserts the balance never goes below zero.",
+  "Next, src/transfer.rs. A transfer is supposed to be all-or-nothing. Point out every way it is not.\n\n```rust\nuse crate::account::Accounts;\nuse crate::store::Store;\n\npub struct Transfer<'a> {\n    pub from: &'a str,\n    pub to: &'a str,\n    pub amount: i64,\n}\n\npub fn apply(accounts: &Accounts, store: &mut Store, t: &Transfer<'_>) -> Result<u64, String> {\n    if t.amount <= 0 {\n        return Err(\"amount must be positive\".into());\n    }\n    if t.from == t.to {\n        return Err(\"cannot transfer to the same account\".into());\n    }\n    accounts.withdraw(t.from, t.amount)?;\n    accounts.deposit(t.to, t.amount);\n    let line = format!(\"{}\\t{}\\t{}\", t.from, t.to, t.amount);\n    store.append(&line).map_err(|e| e.to_string())\n}\n\npub fn replay(accounts: &Accounts, store: &Store) -> Result<usize, String> {\n    let lines = store.replay().map_err(|e| e.to_string())?;\n    for line in &lines {\n        let mut parts = line.split('\\t');\n        let from = parts.next().ok_or(\"missing from\")?;\n        let to = parts.next().ok_or(\"missing to\")?;\n        let amount: i64 = parts.next().ok_or(\"missing amount\")?.parse().map_err(|_| \"bad amount\")?;\n        accounts.withdraw(from, amount)?;\n        accounts.deposit(to, amount);\n    }\n    Ok(lines.len())\n}\n```",
+  "The store write can fail after the balances already moved. Rewrite `apply` so the log is written first and the balances are only changed once the line is durable. Keep the signature.",
+  "Here is the HTTP handler in src/http.rs. The amount comes in as a JSON number. What happens with `1e3`, `-0`, `9223372036854775808` and `12.5`?\n\n```rust\nuse serde::Deserialize;\n\n#[derive(Deserialize)]\npub struct TransferBody {\n    pub from: String,\n    pub to: String,\n    pub amount: f64,\n}\n\npub fn parse_amount(body: &TransferBody) -> Result<i64, String> {\n    if !body.amount.is_finite() {\n        return Err(\"amount must be finite\".into());\n    }\n    let cents = (body.amount * 100.0).round();\n    if cents <= 0.0 {\n        return Err(\"amount must be positive\".into());\n    }\n    Ok(cents as i64)\n}\n```",
+  "Change `TransferBody::amount` to a string holding a decimal with at most two fractional digits, parse it without floating point, and list the test cases you would add, one line each.",
+  "Last one. Search the repository for every other place that turns money into a float, and summarise what you would change in a short list. You can use the search tool."
+ ]
+}

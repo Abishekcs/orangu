@@ -528,3 +528,40 @@ pub(super) fn elem6_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupL
         ],
     })
 }
+
+/// Bind group layout for `record_recurrent_rows`'s two kernels:
+/// `elem6_bind_group_layout`'s six, and a seventh read-write binding for the
+/// state behind each row (`VulkanStateMirror::row_states`). See
+/// `vulkan_shaders::shader_source_gated_delta_rows`.
+pub(super) fn recurrent_rows_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |read_only: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty,
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("orangu-server recurrent rows bind group layout"),
+        entries: &[
+            entry(0, storage(true)),
+            entry(1, storage(true)),
+            entry(2, storage(true)),
+            entry(3, storage(false)),
+            entry(4, storage(false)),
+            entry(
+                5,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            ),
+            entry(6, storage(false)),
+        ],
+    })
+}

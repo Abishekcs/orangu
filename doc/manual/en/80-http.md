@@ -164,6 +164,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `POST /completion` | native, streaming; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /embedding` | native embeddings |
 | `POST /tokenize`, `POST /detokenize` | text to token ids and back |
+| `POST /logits` | teacher-forced next-token log-probabilities after every prefix of a text |
 | `POST /apply-template` | renders the chat template without generating |
 | `POST /v1/create_file` … `/v1/delete_directory` | the eight file-lifecycle endpoints |
 | `GET /moe-stats` | mixture-of-experts counters since the previous call, and reset |
@@ -356,9 +357,9 @@ not implemented; the type is honoured rather than ignored so that a caller
 asking for it is not silently given free text.
 
 Two limits worth knowing. A constrained request cannot use the GPU's argmax
-fast path or prompt-lookup speculation, because both pick tokens without
-consulting the constraint — so constrained decoding is somewhat slower than
-unconstrained. And a constraint makes invalid output unreachable; it cannot
+fast path, which picks tokens without consulting the constraint, so each step
+reads its logits back to the host. Speculation still runs: each drafted token
+is checked against what the constrained sampler picks there. And a constraint makes invalid output unreachable; it cannot
 make a model cooperate. Told *"reply with the single word hello, do not use
 JSON"*, the model spends its budget on whitespace and returns no document at
 all — the response is then not valid JSON, and `finish_reason` is `length`.
@@ -603,7 +604,7 @@ flips a status code leaves an operator with the alert and none of the reason:
 - **`"queue full"`** — the admission queue is at `queue_limit`. A new unpinned
   request would be refused with `503` anyway, so saying so up front lets a
   balancer send it somewhere that can take it instead of spending a round trip
-  to find out. With no `queue_limit` set the queue never refuses, so the
+  to find out. With `queue_limit = 0` the queue never refuses, so the
   server is never unready for this reason however deep the queue gets.
 - **`"device lost"`** — the GPU device was lost and this process is on its way
   out. It has not stopped being *alive*, and a supervisor restarting it is
@@ -890,6 +891,30 @@ the model's own BOS-style framing) and answers `{"tokens": [...]}`.
 `detokenize` takes `{"tokens": [...]}` and answers `{"content": "…"}`, with
 the model's tokenization-space cleanup applied — so a round trip gives back
 readable text rather than the tokenizer's internal spelling.
+
+#### `POST /logits`
+
+```sh
+curl -s localhost:8100/logits -H 'Content-Type: application/json' \
+  -d '{"content": "fn main() {", "rows": 1, "top": 8}'
+```
+
+Runs a fixed token sequence through the model and answers, after every
+prefix of it, the `top` most likely next tokens with their log-probabilities
+over the whole vocabulary. Nothing is sampled: two servers given the same
+`tokens` see the same input at every position, so their answers differ only
+in arithmetic. `orangu-bench --kl` compares two such answers.
+
+| Field | Default | Meaning |
+|:--|:--|:--|
+| `content` | — | text, tokenised with the model's special tokens |
+| `tokens` | — | the exact token ids to run; wins over `content` |
+| `rows` | 1 | positions a pass: 1 runs each as a decode step, 2–64 in multi-position passes, the path speculative verification takes |
+| `top` | 32 | candidates per position, 1–256 |
+
+The answer is `{"tokens": [...], "rows": N, "positions": [[[id, logprob], …], …], "seconds": S}`,
+one entry per token. The run takes a request slot and waits for one like any
+other request; its cache is its own and is not kept.
 
 #### `POST /apply-template`
 

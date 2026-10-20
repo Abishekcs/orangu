@@ -97,6 +97,33 @@ pub(crate) fn f32_to_q8_0_bytes(data: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Rows in a device KV storage width back to `f32` — the inverse of
+/// [`f32_to_f16_bytes`] and [`f32_to_q8_0_bytes`] (a `Q8_0` block is an `f32`
+/// scale and 32 signed bytes).
+pub(crate) fn device_rows_to_f32(
+    raw: &[u8],
+    storage: crate::engine::backend::vulkan_shaders::KvStorage,
+) -> Vec<f32> {
+    use crate::engine::backend::vulkan_shaders::KvStorage;
+    match storage {
+        KvStorage::F32 => bytemuck::pod_collect_to_vec(raw),
+        KvStorage::F16 => raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| half::f16::from_le_bytes(b).to_f32())
+            .collect(),
+        KvStorage::Q8_0 => {
+            let mut out = Vec::with_capacity(raw.len() / 36 * 32);
+            for block in raw.as_chunks::<36>().0 {
+                let d = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+                out.extend(block[4..].iter().map(|&q| f32::from(q as i8) * d));
+            }
+            out
+        }
+    }
+}
+
 pub struct LayerCache {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -178,6 +205,8 @@ pub struct LayerCache {
 /// coordinate through it.
 struct SequencePages {
     pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+    /// The most pages the sequence can grow to — its cache's capacity.
+    max_pages: usize,
     /// Where this sequence's block table lives in the pool's shared table
     /// buffer, and how many entries were reserved — `None` when the pool has no
     /// device, or when the table buffer was full, in which case this sequence
@@ -198,6 +227,11 @@ struct SequencePages {
 struct SeqPages {
     /// Physical page per logical page, in order — the block table.
     pages: Vec<u32>,
+    /// Pages of a shared prefix this sequence took a reference to when it
+    /// was admitted (`KvPool::try_reserve_sharing`), waiting for
+    /// `LayerCache::adopt_pages` to install them. Released on drop if they
+    /// never are.
+    preacquired: Vec<u32>,
     /// Pages this sequence was promised by the pool and has not taken yet.
     ///
     /// Counted down by every page it takes and handed back on drop, so the
@@ -230,24 +264,89 @@ struct SeqPages {
 }
 
 impl SequencePages {
-    /// A sequence that has been promised room for `max_pages`, or `None` when
-    /// the pool has no such room to promise.
+    /// A sequence of up to `max_pages` that has been promised its first
+    /// `first_pages`, or `None` when the pool has no such room to promise.
     ///
-    /// The promise is the admission decision, and it is made **here**, once,
-    /// while there is still a caller that can act on the answer — see
+    /// The promise is the admission decision, and it is made **here**, while
+    /// there is still a caller that can act on the answer — see
     /// [`KvPool::try_reserve`]. Everything downstream of it (`page_for`,
     /// `adopt_pages`) is a sequence growing one page at a time with no way to
     /// report "the pool is full", which is why it used to say so by aborting
-    /// the process.
+    /// the process. A sequence promised less than its whole length is
+    /// promised the rest step by step, before each one ([`Self::ensure_room`]).
     ///
     /// [`KvPool::try_reserve`]: crate::engine::kv_pool::KvPool::try_reserve
+    ///
+    /// `held` is a promise its caller already has (an admission's), which
+    /// this one replaces in the same step — see
+    /// [`KvPool::try_reserve_trading`]. Refused, it stands. `age` is the
+    /// caller's [`Occupant::age`], if it is one.
+    ///
+    /// [`KvPool::try_reserve_trading`]: crate::engine::kv_pool::KvPool::try_reserve_trading
+    /// [`Occupant::age`]: crate::engine::kv_pool::Occupant::age
     fn reserve(
         pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
         max_pages: usize,
+        first_pages: usize,
+        held: usize,
+        age: Option<u64>,
     ) -> Option<Self> {
-        if !pool.try_reserve(max_pages) {
+        let first = first_pages.min(max_pages);
+        if !pool.try_reserve_aged(first, held, age) {
             return None;
         }
+        Self::promised(pool, max_pages, first, Vec::new(), held)
+    }
+
+    /// [`Self::reserve`] for a sequence that will adopt the pages behind
+    /// `tags`, promised only the pages beyond them when another sequence
+    /// holds them all (`KvPool::try_reserve_sharing`); `None` otherwise.
+    fn reserve_sharing(
+        pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        max_pages: usize,
+        first_pages: usize,
+        tags: &[u64],
+        held: usize,
+        age: Option<u64>,
+    ) -> Option<Self> {
+        let first = first_pages.min(max_pages);
+        let shared = pool.try_reserve_sharing_trading(tags, first, held, age)?;
+        let promised = first.saturating_sub(shared.len());
+        Self::promised(pool, max_pages, promised, shared, held)
+    }
+
+    /// Promises the pages the sequence's first `tokens` positions need
+    /// beyond those it holds or was promised; `false`, promising nothing,
+    /// when the pool cannot. `age` as for [`Self::reserve`].
+    fn ensure_room(&self, tokens: usize, age: Option<u64>) -> bool {
+        let needed = self.pool.pages_for(tokens).min(self.max_pages);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let have = inner.pages.len() + inner.preacquired.len() + inner.promised;
+        if have >= needed {
+            return true;
+        }
+        let more = needed - have;
+        if !self.pool.try_reserve_aged(more, 0, age) {
+            return false;
+        }
+        inner.promised += more;
+        true
+    }
+
+    /// The sequence once its promise is made: `promised` pages reserved, and
+    /// `preacquired` already held, for `max_pages` in all; `held`, the
+    /// promise this one replaced, goes back to its holder if the sequence is
+    /// declined after all.
+    fn promised(
+        pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        max_pages: usize,
+        promised: usize,
+        preacquired: Vec<u32>,
+        held: usize,
+    ) -> Option<Self> {
         // Reserved up front, for the whole sequence's possible length: growing
         // it later would move the region, and the base is baked into every
         // dispatch's meta uniform. A pool with device pages and no table
@@ -259,7 +358,9 @@ impl SequencePages {
             Some(_) => match pool.alloc_table(max_pages) {
                 Some(base) => Some((base, max_pages)),
                 None => {
-                    pool.release_reserved(max_pages);
+                    pool.release_reserved(promised);
+                    pool.release(&preacquired);
+                    pool.restore_reserved(held);
                     return None;
                 }
             },
@@ -267,9 +368,11 @@ impl SequencePages {
         };
         Some(Self {
             pool,
+            max_pages,
             table,
             inner: Mutex::new(SeqPages {
-                promised: max_pages,
+                promised,
+                preacquired,
                 ..SeqPages::default()
             }),
         })
@@ -463,6 +566,64 @@ impl SequencePages {
             .tags = tags.to_vec();
     }
 
+    /// The first `complete` pages that no layer has written on the host —
+    /// the ones decode built, whose rows exist on the device only — with the
+    /// layers that write them. Only pages with no host fill at all: a page
+    /// some layer did write on the host was built by prefill, and is sealed
+    /// (or not) by the ordinary path.
+    fn unfilled_pages(&self, complete: usize) -> (Vec<(usize, u32)>, Vec<usize>) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if crate::engine::env::flag_on("ORANGU_KV_TRACE") {
+            eprintln!(
+                "[kv-trace] decoded pages: {complete} complete, {} held, filled {:?}",
+                inner.pages.len(),
+                inner.filled,
+            );
+        }
+        let todo = (0..complete.min(inner.pages.len()))
+            .filter(|&i| inner.filled[i] == 0 && !self.pool.is_sealed(inner.pages[i]))
+            .map(|i| (i, inner.pages[i]))
+            .collect();
+        (todo, inner.participants.iter().copied().collect())
+    }
+
+    /// Records `pages` as written by every participating layer and seals
+    /// them — after their host rows have been filled from the device.
+    fn seal_filled(&self, pages: &[(usize, u32)]) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let participants = inner.participants.len();
+        for &(i, page) in pages {
+            inner.filled[i] = participants;
+            self.pool.seal(page);
+        }
+    }
+
+    /// Names every sealed page past the tags this sequence was given — the
+    /// ones decode built — with its entry in `tags`, the identities of the
+    /// whole sequence now that its tokens are known.
+    fn name_sealed(&self, tags: &[u64]) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let named = inner.tags.len();
+        for (i, &tag) in tags.iter().enumerate().skip(named) {
+            let Some(&page) = inner.pages.get(i) else {
+                break;
+            };
+            if !self.pool.name_sealed(page, tag) {
+                break;
+            }
+            inner.tags.push(tag);
+        }
+    }
+
     fn pages(&self) -> Vec<u32> {
         self.inner
             .lock()
@@ -482,6 +643,7 @@ impl Drop for SequencePages {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.pool.release(&inner.pages);
+        self.pool.release(&inner.preacquired);
         // And the length this sequence was admitted for but never reached —
         // every request that stops before `max_tokens`, which is most of them.
         self.pool.release_reserved(inner.promised);
@@ -1254,6 +1416,97 @@ impl LayerCache {
             Some(n) => pos & (n - 1),
             None => pos,
         }
+    }
+
+    /// Brings home the rows the device mirror holds and the host does not —
+    /// the ones [`Self::advance_gpu_only`] counted — so a pass that reads
+    /// this layer on the host sees every position. One copy and one wait;
+    /// `true` once the host holds every row. `false`, with nothing changed,
+    /// for a paged layer (its pages come home through the pool), a mirror
+    /// whose ring has already written over the rows, or a storage this does
+    /// not decode (`Q8_0`).
+    pub fn fetch_device_rows(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        use crate::engine::backend::vulkan_shaders::KvStorage;
+        if self.paged.is_some() || self.pending_rows > 0 {
+            return false;
+        }
+        let kv_dim = self.kv_dim.max(1);
+        let host_rows = self.k.len() / kv_dim;
+        let missing = self.len.saturating_sub(host_rows);
+        if missing == 0 {
+            return true;
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return false;
+        };
+        if matches!(gpu.kv_storage, KvStorage::Q8_0)
+            || self.mirror_ring().is_some_and(|ring| missing > ring)
+        {
+            return false;
+        }
+        let storage = gpu.kv_storage;
+        let half = row_bytes(missing, self.kv_dim, storage);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server kv rows home"),
+            size: (2 * half).max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("orangu-server kv rows home"),
+        });
+        // The runs come in position order, so the staging holds the rows in
+        // that order too: keys in its first half, values in its second.
+        let mut at = 0u64;
+        for run in self.mirror_write_runs(host_rows, missing) {
+            let from = row_bytes(run.dst_row as usize, self.kv_dim, storage);
+            let bytes = row_bytes(run.rows as usize, self.kv_dim, storage);
+            encoder.copy_buffer_to_buffer(&gpu.kv_buffer, gpu.k_off + from, &staging, at, bytes);
+            encoder.copy_buffer_to_buffer(
+                &gpu.kv_buffer,
+                gpu.v_off + from,
+                &staging,
+                half + at,
+                bytes,
+            );
+            at += bytes;
+        }
+        queue.submit(Some(encoder.finish()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        const CONTEXT: &str = "bringing a layer's device-only rows home";
+        if let Err(err) = device.poll(wgpu::PollType::wait_indefinitely()) {
+            crate::device_lost::fail(CONTEXT, err);
+        }
+        if !matches!(rx.recv(), Ok(Ok(()))) {
+            return false;
+        }
+        {
+            let view = staging
+                .slice(..)
+                .get_mapped_range()
+                .unwrap_or_else(|err| crate::device_lost::fail(CONTEXT, err));
+            let decode = |bytes: &[u8]| -> Vec<f32> {
+                match storage {
+                    KvStorage::F32 => bytemuck::cast_slice(bytes).to_vec(),
+                    _ => bytemuck::cast_slice::<u8, u16>(bytes)
+                        .iter()
+                        .map(|&b| half::f16::from_bits(b).to_f32())
+                        .collect(),
+                }
+            };
+            let half = half as usize;
+            let k = decode(&view[..half]);
+            let v = decode(&view[half..2 * half]);
+            self.k.extend_from_slice(&k);
+            self.v.extend_from_slice(&v);
+        }
+        staging.unmap();
+        true
     }
 
     /// The device rows `n` positions from `pos` are written to, as runs
@@ -2211,7 +2464,32 @@ impl LayerCache {
         // Taken once for the sequence, by layer 0; later layers read the list
         // it recorded. Acquiring per layer would take one reference per layer
         // for a page that is one page.
-        if paged.layer == 0 {
+        let preacquired = if paged.layer == 0 {
+            std::mem::take(
+                &mut paged
+                    .seq
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .preacquired,
+            )
+        } else {
+            Vec::new()
+        };
+        if !preacquired.is_empty() {
+            // Taken when the sequence was admitted, for exactly these tags
+            // (`KvCache::try_into_paged_sharing_promising`); its promise does not cover
+            // them, so they are installed as they are.
+            if preacquired.len() != tags.len() {
+                debug_assert!(
+                    false,
+                    "a sharing sequence adopted other tags than it reserved"
+                );
+                paged.seq.pool.release(&preacquired);
+                return None;
+            }
+            paged.seq.adopt(&preacquired);
+        } else if paged.layer == 0 {
             // Adopted pages become live and held by this sequence exactly like
             // built ones, so they come out of the same promise.
             let claim = {
@@ -2226,11 +2504,13 @@ impl LayerCache {
             };
             let got = match paged.seq.pool.acquire_for(tags, claim) {
                 Ok(got) => got,
-                Err(_) => {
-                    // Nothing was taken (the pool is all-or-nothing), so the
-                    // promise goes straight back and the request prefills the
-                    // prefix itself.
-                    paged.seq.pool.release_reserved(claim);
+                Err(e) => {
+                    if crate::engine::env::flag_on("ORANGU_KV_TRACE") {
+                        eprintln!("[kv-trace] adoption of {} pages refused: {e:?}", tags.len());
+                    }
+                    // Nothing was taken (the pool is all-or-nothing, the
+                    // claim included), so the promise is the sequence's again
+                    // and the request prefills the prefix itself.
                     let mut inner = paged
                         .seq
                         .inner
@@ -2241,15 +2521,21 @@ impl LayerCache {
                 }
             };
             if !got.iter().all(|a| a.hit) {
+                if crate::engine::env::flag_on("ORANGU_KV_TRACE") {
+                    eprintln!(
+                        "[kv-trace] adoption of {} pages found {} reclaimed",
+                        tags.len(),
+                        got.iter().filter(|a| !a.hit).count()
+                    );
+                }
                 // Something was reclaimed between the index promising it and
                 // this call. Give back what was taken rather than filling the
                 // gaps: a half-adopted prefix is not a prefix.
+                // The promise they were claimed against stays the
+                // sequence's: it still has its full length ahead of it, it
+                // just has to build the prefix itself.
                 let pages: Vec<u32> = got.iter().map(|a| a.page).collect();
-                paged.seq.pool.release(&pages);
-                // Released, so the promise these pages were claimed against is
-                // owed back as well — the sequence still has its full length
-                // ahead of it, it just has to build the prefix itself.
-                paged.seq.pool.release_reserved(claim);
+                paged.seq.pool.unclaim(&pages, claim);
                 let mut inner = paged
                     .seq
                     .inner
@@ -2714,6 +3000,16 @@ impl KvCache {
         Self::build(capacity, kv_dims, &[])
     }
 
+    /// [`Self::try_into_paged_promising`] promised its whole length at once.
+    #[cfg(test)]
+    pub fn try_into_paged(
+        self,
+        pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        held: usize,
+    ) -> Result<Self, Self> {
+        self.try_into_paged_promising(pool, held, usize::MAX, None)
+    }
+
     /// A cache whose layers draw their rows from `pool`.
     ///
     /// The pool's geometry must be this model's: it is built from a probe cache
@@ -2739,7 +3035,8 @@ impl KvCache {
     /// all-or-nothing reuse on it. So it is carried across untouched, and only
     /// the positional layers change where their rows live.
     /// **`Err` hands the cache back unchanged** when the pool has no room to
-    /// promise this sequence its whole length. That is not a failure to
+    /// promise this sequence its first `tokens` positions (the rest is
+    /// promised as it reaches them, [`Self::ensure_room`]). That is not a failure to
     /// report: the caller keeps the ordinary contiguous cache it built, which
     /// grows on demand and answers the request exactly as it did before there
     /// was a pool. What it costs is prefix *sharing* for that one request —
@@ -2751,9 +3048,20 @@ impl KvCache {
     /// modest one that is a five-figure token count — while a single
     /// `/auto_review` request carrying a few thousand lines of source is
     /// several times that.
-    pub fn try_into_paged(
-        mut self,
+    ///
+    /// `held` is a promise of the pool's its caller already has (a request's
+    /// admission, `generate::wait_for_prompt_pages`), which the sequence's
+    /// promise replaces in the same step; on `Err` it stands. `0` for none.
+    /// `age` is the caller's [`Occupant::age`], and orders it against the
+    /// pool's other occupants.
+    ///
+    /// [`Occupant::age`]: crate::engine::kv_pool::Occupant::age
+    pub fn try_into_paged_promising(
+        self,
         pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        held: usize,
+        tokens: usize,
+        age: Option<u64>,
     ) -> Result<Self, Self> {
         assert_eq!(
             self.layers.len(),
@@ -2774,9 +3082,81 @@ impl KvCache {
             );
         }
         let max_pages = pool.pages_for(self.layers.first().map_or(0, |l| l.capacity * l.stride));
-        let Some(seq) = SequencePages::reserve(pool.clone(), max_pages) else {
+        let first = pool.pages_for(tokens.min(max_pages * pool.page_tokens()));
+        let Some(seq) = SequencePages::reserve(pool.clone(), max_pages, first, held, age) else {
             return Err(self);
         };
+        Ok(self.into_paged(pool, seq))
+    }
+
+    /// [`Self::try_into_paged_sharing_promising`] promised its whole length
+    /// at once.
+    #[cfg(test)]
+    pub fn try_into_paged_sharing(
+        self,
+        pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        tags: &[u64],
+        held: usize,
+    ) -> Result<Self, Self> {
+        self.try_into_paged_sharing_promising(pool, tags, held, usize::MAX, None)
+    }
+
+    /// [`Self::try_into_paged_promising`] for a cache that is about to adopt
+    /// the pages behind `tags` ([`Self::adopt_shared_pages`], with these same
+    /// tags): when another sequence holds them all, they are taken now and
+    /// only the rest of the first `tokens` positions is promised, so a pool
+    /// too small for two whole copies of a shared prompt still admits the
+    /// second request. `Err` hands the cache back, untouched, when that is
+    /// not the case — the caller then reserves in full. `held` and `age` as
+    /// for [`Self::try_into_paged_promising`].
+    pub fn try_into_paged_sharing_promising(
+        self,
+        pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        tags: &[u64],
+        held: usize,
+        tokens: usize,
+        age: Option<u64>,
+    ) -> Result<Self, Self> {
+        if tags.is_empty() || self.has_recurrent() {
+            return Err(self);
+        }
+        assert_eq!(
+            self.layers.len(),
+            pool.layers().len(),
+            "the pool was built for a different model's layer count"
+        );
+        let max_pages = pool.pages_for(self.layers.first().map_or(0, |l| l.capacity * l.stride));
+        let first = pool.pages_for(tokens.min(max_pages * pool.page_tokens()));
+        let Some(seq) =
+            SequencePages::reserve_sharing(pool.clone(), max_pages, first, tags, held, age)
+        else {
+            return Err(self);
+        };
+        Ok(self.into_paged(pool, seq))
+    }
+
+    /// Whether this cache's rows live in the shared pool.
+    pub fn is_paged(&self) -> bool {
+        self.layers.iter().any(|l| l.paged.is_some())
+    }
+
+    /// Promises the pages this cache's first `tokens` positions need, beyond
+    /// those it holds or was promised — before a step that writes them;
+    /// `false`, promising nothing, when the pool cannot. Always `true` for a
+    /// cache off the pool. `age` as for [`Self::try_into_paged_promising`].
+    pub fn ensure_room(&self, tokens: usize, age: Option<u64>) -> bool {
+        self.layers
+            .iter()
+            .find_map(|l| l.paged.as_ref())
+            .is_none_or(|p| p.seq.ensure_room(tokens, age))
+    }
+
+    /// Moves every layer onto `seq`'s pages.
+    fn into_paged(
+        mut self,
+        pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        seq: SequencePages,
+    ) -> Self {
         let seq = std::sync::Arc::new(seq);
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let geom = pool.layers()[i];
@@ -2803,7 +3183,7 @@ impl KvCache {
                 joined: false,
             });
         }
-        Ok(self)
+        self
     }
 
     /// Publishes every page whose positions are complete, making them
@@ -2826,6 +3206,223 @@ impl KvCache {
     /// Set before the forward pass, from `engine::prefix_index::page_tags` over
     /// the prompt. A cache without them still pages — it just keeps everything
     /// to itself.
+    /// Names the sealed pages decode built, so the next request whose prompt
+    /// repeats this one's prompt *and reply* can share them. `tags` covers the
+    /// whole sequence (`prefix_index::page_tags` of every token); the pages
+    /// [`Self::set_page_tags`] already named keep their names.
+    /// Copies the rows only the device mirror holds — the ones the fused
+    /// decode chain wrote there and nowhere else — into the host buffers, so
+    /// the host holds the whole sequence.
+    ///
+    /// For a cache that outlives its request in the slot store or the prefix
+    /// cache: those reuse a prefix only as far as the host rows reach, so
+    /// without this the next turn re-prefills the reply — and a recurrent
+    /// model, whose state has run the reply, reuses nothing. One submission
+    /// and one wait for every layer. Contiguous, per-token layers without a
+    /// ring only; any other layer keeps its gap, which bounds reuse as before.
+    pub fn pull_decoded_rows(&mut self, vulkan: &crate::engine::backend::vulkan::VulkanBackend) {
+        struct Pull {
+            layer: usize,
+            first: usize,
+            rows: usize,
+            at: u64,
+            bytes: u64,
+        }
+        let mut pulls = Vec::new();
+        let mut total = 0u64;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let Some(gpu) = layer.gpu.as_ref() else {
+                continue;
+            };
+            if layer.paged.is_some() || layer.mirror_ring.is_some() || layer.stride != 1 {
+                continue;
+            }
+            let first = layer.host_len();
+            let last = layer.len.min(gpu.synced_len).min(gpu.rows);
+            if last <= first {
+                continue;
+            }
+            let rows = last - first;
+            let bytes = row_bytes(rows, layer.kv_dim, gpu.kv_storage);
+            pulls.push(Pull {
+                layer: i,
+                first,
+                rows,
+                at: total,
+                bytes,
+            });
+            total += bytes * 2;
+        }
+        if pulls.is_empty() {
+            return;
+        }
+        let (device, _) = vulkan.device_and_queue();
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server kv decoded rows readback"),
+            size: total,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = vulkan.new_encoder("orangu-server kv decoded rows readback encoder");
+        for p in &pulls {
+            let layer = &self.layers[p.layer];
+            let gpu = layer.gpu.as_ref().expect("selected above");
+            let skip = row_bytes(p.first, layer.kv_dim, gpu.kv_storage);
+            encoder.copy_buffer_to_buffer(
+                &gpu.kv_buffer,
+                gpu.k_off + skip,
+                &staging,
+                p.at,
+                p.bytes,
+            );
+            encoder.copy_buffer_to_buffer(
+                &gpu.kv_buffer,
+                gpu.v_off + skip,
+                &staging,
+                p.at + p.bytes,
+                p.bytes,
+            );
+        }
+        let words = vulkan.submit_and_read_at(encoder, &staging, 0, (total / 4) as usize);
+        let raw: &[u8] = bytemuck::cast_slice(&words);
+        for p in &pulls {
+            let layer = &mut self.layers[p.layer];
+            let storage = layer.gpu.as_ref().expect("selected above").kv_storage;
+            let (at, n) = (p.at as usize, p.bytes as usize);
+            let k = device_rows_to_f32(&raw[at..at + n], storage);
+            let v = device_rows_to_f32(&raw[at + n..at + 2 * n], storage);
+            debug_assert_eq!(k.len(), p.rows * layer.kv_dim);
+            layer.k.extend_from_slice(&k);
+            layer.v.extend_from_slice(&v);
+        }
+    }
+
+    /// Makes the pages this cache's decode built shareable, at the end of the
+    /// request that built them: their rows exist on the device only, so they
+    /// are read back into the pool's host pages and the pages sealed.
+    ///
+    /// A layer's rows come from wherever its device copy is: the pool's
+    /// device pages, or — for a windowed layer, whose device copy is this
+    /// request's ring — the ring, while the page's positions are still in it.
+    /// One submission and one wait for all of it. Nothing is sealed if any
+    /// layer cannot supply a page: a page is shareable only whole.
+    pub fn fill_decoded_pages(
+        &self,
+        vulkan: &crate::engine::backend::vulkan::VulkanBackend,
+        page_tokens: usize,
+    ) {
+        let Some(paged) = self.layers.first().and_then(|l| l.paged.as_ref()) else {
+            return;
+        };
+        let pool = paged.seq.pool.clone();
+        let Some(device_pages) = pool.device_pages() else {
+            return;
+        };
+        let complete = self.committed_len() / page_tokens.max(1);
+        let (todo, writers) = paged.seq.unfilled_pages(complete);
+        if todo.is_empty() || writers.is_empty() {
+            return;
+        }
+        // One source run per (layer, page): the buffer, and K and V offsets
+        // for each contiguous stretch of rows.
+        struct Source<'a> {
+            buffer: &'a wgpu::Buffer,
+            runs: Vec<(u64, u64, u64)>,
+            storage: crate::engine::backend::vulkan_shaders::KvStorage,
+        }
+        let mut sources: Vec<(usize, u32, Source<'_>)> = Vec::new();
+        for &(index, page) in &todo {
+            for &l in &writers {
+                let layer = &self.layers[l];
+                if layer.stride != 1 {
+                    return;
+                }
+                if pool.layers()[l].ring.is_none() {
+                    let Some((k, v, stride)) = pool.device_page_offsets(l, page) else {
+                        return;
+                    };
+                    sources.push((
+                        l,
+                        page,
+                        Source {
+                            buffer: &device_pages.layers[l],
+                            runs: vec![(k, v, stride)],
+                            storage: device_pages.storage,
+                        },
+                    ));
+                    continue;
+                }
+                let (Some(gpu), Some(ring)) = (layer.gpu.as_ref(), layer.mirror_ring()) else {
+                    return;
+                };
+                let first = index * page_tokens;
+                if first + ring < layer.len || first + page_tokens > layer.len {
+                    return;
+                }
+                let runs = layer
+                    .mirror_write_runs(first, page_tokens)
+                    .iter()
+                    .map(|run| {
+                        let at = row_bytes(run.dst_row as usize, layer.kv_dim, gpu.kv_storage);
+                        let len = row_bytes(run.rows as usize, layer.kv_dim, gpu.kv_storage);
+                        (gpu.k_off + at, gpu.v_off + at, len)
+                    })
+                    .collect();
+                sources.push((
+                    l,
+                    page,
+                    Source {
+                        buffer: &gpu.kv_buffer,
+                        runs,
+                        storage: gpu.kv_storage,
+                    },
+                ));
+            }
+        }
+        let total: u64 = sources
+            .iter()
+            .flat_map(|(_, _, s)| s.runs.iter().map(|r| r.2 * 2))
+            .sum();
+        let (device, _) = vulkan.device_and_queue();
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server kv decoded pages readback"),
+            size: total.max(4),
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = vulkan.new_encoder("orangu-server kv decoded pages readback encoder");
+        // K runs then V runs per source, back to back.
+        let mut at = 0u64;
+        let mut placed = Vec::with_capacity(sources.len());
+        for (_, _, src) in &sources {
+            let k_at = at;
+            for &(k, _, len) in &src.runs {
+                encoder.copy_buffer_to_buffer(src.buffer, k, &staging, at, len);
+                at += len;
+            }
+            let v_at = at;
+            for &(_, v, len) in &src.runs {
+                encoder.copy_buffer_to_buffer(src.buffer, v, &staging, at, len);
+                at += len;
+            }
+            placed.push((k_at as usize, v_at as usize, (v_at - k_at) as usize));
+        }
+        let words = vulkan.submit_and_read_at(encoder, &staging, 0, (total / 4) as usize);
+        let raw: &[u8] = bytemuck::cast_slice(&words);
+        for ((l, page, src), (k_at, v_at, n)) in sources.iter().zip(placed) {
+            let k = device_rows_to_f32(&raw[k_at..k_at + n], src.storage);
+            let v = device_rows_to_f32(&raw[v_at..v_at + n], src.storage);
+            pool.fill(*l, *page, &k, &v);
+        }
+        paged.seq.seal_filled(&todo);
+    }
+
+    pub fn name_sealed_pages(&self, tags: &[u64]) {
+        if let Some(paged) = self.layers.first().and_then(|l| l.paged.as_ref()) {
+            paged.seq.name_sealed(tags);
+        }
+    }
+
     pub fn set_page_tags(&mut self, tags: &[u64]) {
         if let Some(paged) = self.layers.first().and_then(|l| l.paged.as_ref()) {
             paged.seq.set_tags(tags);
@@ -2842,9 +3439,17 @@ impl KvCache {
     /// All layers or none. A cache whose layer 3 adopted a prefix and whose
     /// layer 4 did not is not in a state any forward pass can describe, so the
     /// failure is handled here rather than left to be discovered mid-pass.
+    ///
+    /// A cache with recurrent layers adopts nothing. A page holds positional
+    /// rows only; the recurrent state after the prefix is not in the pool, so
+    /// adopting the rows would start every linear-attention layer from the
+    /// zero state at the reused position.
     pub fn adopt_shared_pages(&mut self, tags: &[u64], page_tokens: usize) -> Option<usize> {
         if tags.is_empty() {
             return Some(0);
+        }
+        if self.has_recurrent() {
+            return None;
         }
         let mut adopted = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
@@ -3022,6 +3627,38 @@ impl KvCache {
         self.recent_tokens.clone_from(&src.recent_tokens);
     }
 
+    /// [`Self::copy_prefix_from`] for a paged cache, which is filled by
+    /// pushing rows rather than by copying a flat prefix over its buffers:
+    /// `src`'s first `len` positions are pushed into every layer, sealing
+    /// pages as they fill, as a prefill would. `false`, with nothing pushed,
+    /// for a cache this cannot fill that way: one with recurrent state, one
+    /// whose rows stand for several tokens, or a `len` past `src`'s host rows.
+    pub fn push_prefix_from(&mut self, src: &KvCache, len: usize) -> bool {
+        if !self.recurrent.is_empty()
+            || !src.recurrent.is_empty()
+            || self.layers.len() != src.layers.len()
+            || self.layers.iter().any(|l| l.stride != 1 || l.len != 0)
+            || src.layers.iter().any(|l| l.stride != 1)
+            || len > src.host_committed_len()
+        {
+            return false;
+        }
+        for (dst, src_layer) in self.layers.iter_mut().zip(src.layers.iter()) {
+            // A layer that holds nothing by design (a cross-layer KV donor)
+            // stays empty here too.
+            if src_layer.len == 0 {
+                continue;
+            }
+            let (k, v) = src_layer.flatten(len);
+            let d = dst.kv_dim;
+            for (k, v) in k.chunks_exact(d).zip(v.chunks_exact(d)) {
+                dst.push(k, v);
+            }
+        }
+        self.recent_tokens.clone_from(&src.recent_tokens);
+        true
+    }
+
     /// Takes `src`'s first `len` token positions as this cache's own, moving
     /// the buffers instead of copying them.
     ///
@@ -3051,7 +3688,8 @@ impl KvCache {
         // roll back, so `reusable_prefix_len` forces all-or-nothing there and
         // `truncate` refuses recurrent caches outright.
         if src.committed_len() > len {
-            src.truncate(len);
+            src.truncate(len)
+                .expect("a recurrent cache is only reused at its full length");
         }
         for (dst, s) in self.layers.iter_mut().zip(src.layers.iter_mut()) {
             dst.adopt(s);
@@ -3276,17 +3914,139 @@ impl KvCache {
         true
     }
 
+    /// Copies of every recurrent layer's state as it stands — a checkpoint
+    /// the cache can later be rewound to with [`Self::rewind_to_checkpoint`].
+    /// State only: the attention rows behind it are this cache's own and are
+    /// cut back to the same position instead.
+    pub fn recurrent_checkpoint(&self) -> Vec<RecurrentLayerState> {
+        self.recurrent
+            .iter()
+            .map(RecurrentLayerState::duplicate)
+            .collect()
+    }
+
+    /// Rewinds this cache to `len` positions with `state` — a
+    /// [`Self::recurrent_checkpoint`] taken when it held exactly `len` — as
+    /// its recurrent state: the one rollback a recurrent cache has, since it
+    /// restores the state rather than trying to unwind it. `false`, with
+    /// nothing changed, for a cache this cannot describe: rows held remotely
+    /// or in a pool, or a checkpoint of another shape.
+    pub fn rewind_to_checkpoint(&mut self, len: usize, state: Vec<RecurrentLayerState>) -> bool {
+        if self.remote.is_some()
+            || self.layers.iter().any(|l| l.paged.is_some())
+            || state.len() != self.recurrent.len()
+            || self.committed_len() < len
+        {
+            return false;
+        }
+        for layer in &mut self.layers {
+            layer.truncate(len);
+        }
+        self.recurrent = state;
+        true
+    }
+
+    /// Whether this cache carries recurrent (SSM / gated-delta-net) state —
+    /// one evolving value per layer with no per-position history, which no
+    /// rollback or partial prefix can describe.
+    pub fn has_recurrent(&self) -> bool {
+        !self.recurrent.is_empty()
+    }
+
     /// Rolls every attention layer back to `new_len` positions (see
-    /// [`LayerCache::truncate`]). Only valid for a cache with no recurrent
-    /// (SSM / gated-delta-net) layers: those carry a single evolving state with
-    /// no per-position history to roll back, so a partial rollback can't be
-    /// expressed — the caller (speculative decoding) is gated to architectures
-    /// without them, and this asserts that precondition.
-    pub fn truncate(&mut self, new_len: usize) {
-        debug_assert!(
-            self.recurrent.is_empty(),
-            "KvCache::truncate is not valid for architectures with recurrent layers"
+    /// [`LayerCache::truncate`]).
+    ///
+    /// An error, with nothing changed, for a cache with recurrent layers:
+    /// their state already holds every position pushed into it, so rolling
+    /// back the attention rows alone would leave the two disagreeing about
+    /// which tokens were seen. Speculative decoding, the caller, is not built
+    /// for such a cache.
+    pub fn truncate(&mut self, new_len: usize) -> anyhow::Result<()> {
+        if self.has_recurrent() {
+            anyhow::bail!("a cache with recurrent layers cannot be rolled back");
+        }
+        self.truncate_attention(new_len);
+        Ok(())
+    }
+
+    /// [`LayerCache::fetch_device_rows`] on every attention layer: `true`
+    /// once the host holds every position of every one.
+    pub fn fetch_device_rows(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        self.layers
+            .iter_mut()
+            .all(|layer| layer.fetch_device_rows(device, queue))
+    }
+
+    /// Whether [`Self::rollback_point`] and [`Self::rollback`] can
+    /// return this cache to an earlier position: every layer is local, so
+    /// nothing of its state is held elsewhere.
+    pub fn can_roll_back(&self) -> bool {
+        self.remote.is_none()
+    }
+
+    /// Every recurrent layer's state as it stands at `len` positions — for
+    /// [`Self::rollback`] to return to after a pass this cache will take
+    /// back. The attention rows need no copy: they are cut back instead.
+    pub fn rollback_point(&self, len: usize) -> anyhow::Result<RollbackPoint> {
+        anyhow::ensure!(
+            self.can_roll_back(),
+            "a cache whose layers other nodes hold cannot be rolled back"
         );
+        Ok(RollbackPoint {
+            layers: self
+                .recurrent
+                .iter()
+                .map(RecurrentLayerState::checkpoint)
+                .collect(),
+            recent_tokens: self.recent_tokens.clone(),
+            len,
+        })
+    }
+
+    /// Back to `checkpoint`: every recurrent layer's state as it was saved
+    /// and every attention layer cut back to the position it was saved at,
+    /// as if nothing since had been pushed.
+    /// Keeps the first `kept` tokens of the verify run from `checkpoint`
+    /// without running them again: every recurrent state goes back to the
+    /// one behind its `kept`-th row (`DeviceStateMirror::restore_row`) and
+    /// the attention rows past them are cut. `false` where some state has
+    /// no such row on the device, or the verify extended
+    /// [`Self::recent_tokens`]; the cache is then for
+    /// [`Self::rollback`], which puts every state back whatever this
+    /// restored.
+    pub fn keep_verified(&mut self, checkpoint: &RollbackPoint, kept: usize) -> bool {
+        if kept == 0
+            || self.recent_tokens.len() != checkpoint.recent_tokens.len()
+            || checkpoint.layers.len() != self.recurrent.len()
+        {
+            return false;
+        }
+        for state in &mut self.recurrent {
+            if !state.restore_row(kept - 1) {
+                return false;
+            }
+        }
+        self.truncate_attention(checkpoint.len + kept);
+        true
+    }
+
+    pub fn rollback(&mut self, checkpoint: &RollbackPoint) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            checkpoint.layers.len() == self.recurrent.len(),
+            "a checkpoint of {} recurrent layers does not fit {}",
+            checkpoint.layers.len(),
+            self.recurrent.len()
+        );
+        for (state, saved) in self.recurrent.iter_mut().zip(&checkpoint.layers) {
+            state.restore(saved)?;
+        }
+        self.recent_tokens.clone_from(&checkpoint.recent_tokens);
+        self.truncate_attention(checkpoint.len);
+        Ok(())
+    }
+
+    /// [`Self::truncate`]'s attention half.
+    fn truncate_attention(&mut self, new_len: usize) {
         for layer in &mut self.layers {
             layer.truncate(new_len);
         }
@@ -3694,8 +4454,46 @@ pub trait DeviceStateMirror: Send + Sync {
     /// `delta_state`) and its conv history into `conv` (the whole
     /// `conv_history`), blocking until they are there.
     fn download(&self, state: &mut [f32], conv: &mut [f32]);
+    /// A copy of the device's state matrices and conv history made on the
+    /// device, ordered after everything submitted before it, for
+    /// [`Self::restore`] to put back. `None` where the backend keeps no such
+    /// copy, and the caller saves the host's instead.
+    fn checkpoint(&self) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+    /// Puts back a [`Self::checkpoint`] of this mirror, ordered before
+    /// anything submitted after it. `false`, with nothing changed, for a
+    /// checkpoint of another mirror.
+    fn restore(&self, _checkpoint: &(dyn std::any::Any + Send + Sync)) -> bool {
+        false
+    }
+    /// Puts back the state behind row `row` of the multi-token pass that
+    /// stepped this mirror last, where the backend kept one, ordered before
+    /// anything submitted after it. `false`, with nothing changed, where it
+    /// kept none — another step came since, or the pass had no row past
+    /// `row`.
+    fn restore_row(&self, _row: usize) -> bool {
+        false
+    }
     /// The concrete mirror, for the backend that made it.
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// One recurrent layer's state as it stood — [`RecurrentLayerState::
+/// checkpoint`]: on the device where the state is current there and the
+/// backend copies it there, on the host otherwise.
+enum StateCheckpoint {
+    Device(Box<dyn std::any::Any + Send + Sync>),
+    Host { conv: Vec<f32>, state: Vec<f32> },
+}
+
+/// Every recurrent layer's state at one position — [`KvCache::
+/// rollback_point`], for [`KvCache::rollback`] to return to.
+pub struct RollbackPoint {
+    layers: Vec<StateCheckpoint>,
+    /// [`KvCache::recent_tokens`] as it stood: a verify appends to it too.
+    recent_tokens: Vec<u32>,
+    len: usize,
 }
 
 /// Which copy of a mirrored state is current — see
@@ -3886,6 +4684,52 @@ impl RecurrentLayerState {
         self.delta_state.copy_from_slice(&src.state);
         // The host wrote; a device copy of ours is stale until re-uploaded.
         self.fresh = Fresh::Host;
+    }
+
+    /// This state as it stands, for [`Self::restore`].
+    fn checkpoint(&self) -> StateCheckpoint {
+        if let (Some(mirror), Fresh::Device) = (&self.mirror, self.fresh)
+            && let Some(saved) = mirror.checkpoint()
+        {
+            return StateCheckpoint::Device(saved);
+        }
+        let snapshot = self.host_snapshot();
+        StateCheckpoint::Host {
+            conv: snapshot.conv.into_owned(),
+            state: snapshot.state.into_owned(),
+        }
+    }
+
+    /// Back to a [`Self::checkpoint`] of this state.
+    fn restore(&mut self, saved: &StateCheckpoint) -> anyhow::Result<()> {
+        match saved {
+            StateCheckpoint::Device(saved) => {
+                anyhow::ensure!(
+                    self.mirror
+                        .as_ref()
+                        .is_some_and(|mirror| mirror.restore(saved.as_ref())),
+                    "a recurrent state left the device it was saved on"
+                );
+                self.fresh = Fresh::Device;
+            }
+            StateCheckpoint::Host { conv, state } => {
+                self.conv_history.copy_from_slice(conv);
+                self.delta_state.copy_from_slice(state);
+                self.fresh = Fresh::Host;
+            }
+        }
+        Ok(())
+    }
+
+    /// Back to the state behind row `row` of the last multi-token pass on
+    /// the device — [`DeviceStateMirror::restore_row`]. `false`, with
+    /// nothing changed, where the device keeps no such row.
+    fn restore_row(&mut self, row: usize) -> bool {
+        self.fresh == Fresh::Device
+            && self
+                .mirror
+                .as_ref()
+                .is_some_and(|mirror| mirror.restore_row(row))
     }
 
     /// Whether this state holds nothing: a layer another node of a tree
@@ -4441,13 +5285,13 @@ mod tests {
         let dims = strided_dims(&pool);
 
         let small = KvCache::new_with_strided_dims(8, &dims)
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .unwrap_or_else(|_| panic!("eight tokens fit a sixteen-token pool"));
         assert!(small.layers[0].paged.is_some());
 
         // Twice the pool: refused, and the caller gets its cache back intact.
         let big = KvCache::new_with_strided_dims(32, &dims)
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .err()
             .expect("a sequence twice the pool cannot be promised");
         assert!(
@@ -4483,7 +5327,7 @@ mod tests {
             Policy::Lru,
         ));
         let mut paged = KvCache::new_with_strided_dims(capacity, &strided_dims(&pool))
-            .try_into_paged(pool)
+            .try_into_paged(pool, 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         let mut plain = KvCache::new_with_strided_dims(capacity, &[(kv_dim, stride)]);
 
@@ -4560,7 +5404,7 @@ mod tests {
             }];
             let pool = Arc::new(KvPool::with_policy(64, PAGE, geom, Policy::Lru));
             let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-                .try_into_paged(pool.clone())
+                .try_into_paged(pool.clone(), 0)
                 .unwrap_or_else(|_| panic!("test pool has room"));
             let mut plain = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
             for r in 0..12usize {
@@ -4569,8 +5413,8 @@ mod tests {
                 paged.layers[0].push(&k, &v);
                 plain.layers[0].push(&k, &v);
             }
-            paged.truncate(cut);
-            plain.truncate(cut);
+            paged.truncate(cut).unwrap();
+            plain.truncate(cut).unwrap();
             assert_eq!(paged.layers[0].len, plain.layers[0].len, "cut {cut}");
 
             // And writing continues correctly afterwards, which is what a
@@ -4605,7 +5449,7 @@ mod tests {
         let pool = Arc::new(KvPool::with_policy(16, 4, geom, Policy::Lru));
         {
             let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-                .try_into_paged(pool.clone())
+                .try_into_paged(pool.clone(), 0)
                 .unwrap_or_else(|_| panic!("test pool has room"));
             for r in 0..9usize {
                 cache.layers[0].push(&[r as f32; 4], &[r as f32; 4]);
@@ -4616,6 +5460,61 @@ mod tests {
             pool.stats().live_pages,
             0,
             "a dropped sequence left its pages held"
+        );
+    }
+
+    /// A restored conversation reaches a paged cache by pushing its rows:
+    /// the paged cache then holds exactly the source's prefix, sealing the
+    /// pages it fills, and one that cannot be filled that way is refused
+    /// whole rather than half-filled.
+    #[test]
+    fn a_paged_cache_takes_a_prefix_by_pushing_its_rows() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+        const KV: usize = 8;
+        let geom = vec![LayerGeometry {
+            kv_dim: KV,
+            stride: 1,
+            ring: None,
+        }];
+        let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
+        let mut src = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
+        for r in 0..11usize {
+            let k: Vec<f32> = (0..KV).map(|d| (r * KV + d) as f32).collect();
+            let v: Vec<f32> = k.iter().map(|x| -x).collect();
+            src.layers[0].push(&k, &v);
+        }
+        let mut want = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
+        want.copy_prefix_from(&src, 9);
+
+        let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone(), 0)
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        assert!(paged.push_prefix_from(&src, 9));
+        assert_eq!(paged.committed_len(), 9);
+        assert_eq!(
+            paged.to_bytes(),
+            want.to_bytes(),
+            "the paged cache holds other rows than the source's prefix"
+        );
+        assert_eq!(
+            pool.stats().live_pages,
+            2,
+            "nine rows of four-row pages seal two; the tail stays on the host"
+        );
+
+        let mut too_far = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone(), 0)
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        assert!(
+            !too_far.push_prefix_from(&src, 12),
+            "past the source's rows"
+        );
+        assert_eq!(too_far.committed_len(), 0, "a refusal pushed rows");
+        let mut strided = KvCache::new_with_strided_dims(64, &[(KV, 2)]);
+        assert!(
+            !strided.push_prefix_from(&src, 4),
+            "rows standing for two tokens"
         );
     }
 
@@ -4634,7 +5533,7 @@ mod tests {
         }];
         let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
         let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-            .try_into_paged(pool)
+            .try_into_paged(pool, 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         let mut plain = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
         for r in 0..11usize {
@@ -4672,7 +5571,7 @@ mod tests {
         }];
         let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
         let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-            .try_into_paged(pool)
+            .try_into_paged(pool, 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         for r in 0..9usize {
             paged.layers[0].push(&[r as f32; KV], &[-(r as f32); KV]);
@@ -4714,7 +5613,7 @@ mod tests {
         let prompt: Vec<u32> = (0..8).collect();
         let tags = page_tags(&prompt, PAGE);
         let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         cache.set_page_tags(&tags);
         // The chunk's pages exist before its rows, as `paged_range_refs`
@@ -4766,7 +5665,7 @@ mod tests {
         let first_prompt: Vec<u32> = (0..4).collect();
         let first_tags = page_tags(&first_prompt, PAGE);
         let mut first = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         first.set_page_tags(&first_tags);
         for r in 0..4 {
@@ -4784,7 +5683,7 @@ mod tests {
         let resolved = index.resolve(&second_prompt, false);
         assert_eq!(resolved.shared.len(), 1);
         let mut second = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         second.set_page_tags(&second_tags);
         assert_eq!(second.adopt_shared_pages(&resolved.shared, PAGE), Some(4));
@@ -4842,7 +5741,7 @@ mod tests {
         // First sequence: builds the shared prefix itself.
         let tags = page_tags(&shared, PAGE);
         let mut first = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         first.set_page_tags(&tags);
         for r in 0..shared.len() {
@@ -4865,7 +5764,7 @@ mod tests {
         let resolved = index.resolve(&shared, false);
         assert_eq!(resolved.shared.len(), 3, "the whole prompt is known");
         let mut second = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         let adopted = second
             .adopt_shared_pages(&resolved.shared, PAGE)
@@ -4925,6 +5824,69 @@ mod tests {
         }
     }
 
+    /// A pool with room for one whole sequence and a bit admits a second one
+    /// that shares the first's prefix, promised only the rest of its length,
+    /// and that second sequence then grows to its full length.
+    #[test]
+    fn a_shared_prefix_is_not_promised_twice() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use crate::engine::prefix_index::page_tags;
+        use std::sync::Arc;
+        const KV: usize = 4;
+        const PAGE: usize = 4;
+        let geom = vec![LayerGeometry {
+            kv_dim: KV,
+            stride: 1,
+            ring: None,
+        }];
+        let pool = Arc::new(KvPool::with_policy(20, PAGE, geom, Policy::Lru));
+        let prompt: Vec<u32> = (0..12).collect();
+        let tags = page_tags(&prompt, PAGE);
+        let row = |r: usize, d: usize| (r * KV + d) as f32;
+        let push = |cache: &mut KvCache, r: usize| {
+            let k: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
+            let v: Vec<f32> = k.iter().map(|x| -x).collect();
+            cache.layers[0].push(&k, &v);
+        };
+        // The builder: admitted for 10 pages, holding the 3 of its prompt.
+        let mut first = KvCache::new_with_strided_dims(40, &strided_dims(&pool))
+            .try_into_paged(pool.clone(), 0)
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        first.set_page_tags(&tags);
+        for r in 0..prompt.len() {
+            push(&mut first, r);
+        }
+        first.commit_pages();
+        assert_eq!(pool.available(), 10);
+
+        // 12 pages do not fit beside it; 9 beyond the shared 3 do.
+        let second = KvCache::new_with_strided_dims(48, &strided_dims(&pool));
+        let second = second
+            .try_into_paged(pool.clone(), 0)
+            .map(|_| ())
+            .unwrap_err();
+        let mut second = second
+            .try_into_paged_sharing(pool.clone(), &tags, 0)
+            .unwrap_or_else(|_| panic!("the prefix is held, so the rest fits"));
+        assert_eq!(second.adopt_shared_pages(&tags, PAGE), Some(12));
+        assert_eq!(pool.stats().live_pages, 3, "the prefix is one copy");
+        for r in prompt.len()..48 {
+            push(&mut second, r);
+        }
+        for r in [0, 11, 12, 47] {
+            let expect: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
+            assert_eq!(second.layers[0].key_at(r, 0, KV), &expect[..], "row {r}");
+        }
+        drop(second);
+        drop(first);
+        assert_eq!(
+            pool.stats().live_pages,
+            0,
+            "every page and promise came back"
+        );
+        assert_eq!(pool.available(), 20);
+    }
+
     /// A prefix the pool has since reclaimed must be declined, not
     /// half-adopted — the caller prefills instead, which is correct and slow
     /// rather than fast and wrong.
@@ -4942,7 +5904,7 @@ mod tests {
         // the length it might reach, so a cache asking for more than the pool
         // holds is refused outright now rather than discovering it mid-flight.
         let mut cache = KvCache::new_with_strided_dims(16, &strided_dims(&pool))
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         // Tags nothing ever sealed.
         assert!(cache.adopt_shared_pages(&[11, 22], 4).is_none());
@@ -4951,6 +5913,15 @@ mod tests {
             0,
             "a refused adoption left pages held"
         );
+        // And the sequence is still promised its whole length, which nobody
+        // else may then be promised too.
+        assert_eq!(
+            pool.available(),
+            0,
+            "a refused adoption gave its promise away"
+        );
+        drop(cache);
+        assert_eq!(pool.available(), 4);
     }
 
     /// The block table is what the paged kernel reads to turn a position into
@@ -4972,7 +5943,7 @@ mod tests {
         ));
         // 32 tokens: eight pages of four, which is exactly this pool.
         let mut cache = KvCache::new_with_strided_dims(32, &strided_dims(&pool))
-            .try_into_paged(pool)
+            .try_into_paged(pool, 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         assert!(cache.layers[0].block_table().is_empty());
         for r in 0..9usize {
@@ -5017,7 +5988,7 @@ mod tests {
         let pool = Arc::new(pool);
 
         let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
-            .try_into_paged(pool)
+            .try_into_paged(pool, 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         for r in 0..12usize {
             cache.layers[0].push(&[r as f32; KV], &[r as f32; KV]);
@@ -5028,7 +5999,7 @@ mod tests {
         assert_eq!(cache.layers[0].device_synced_pages(), 3);
 
         // Roll back into the first page and write again.
-        cache.truncate(2);
+        cache.truncate(2).unwrap();
         assert!(cache.layers[0].block_table().is_empty());
         assert_eq!(
             cache.layers[0].device_synced_pages(),
@@ -5089,7 +6060,7 @@ mod tests {
         assert_eq!(built.recurrent.len(), 1);
 
         let paged = built
-            .try_into_paged(pool)
+            .try_into_paged(pool, 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
         assert_eq!(
             paged.recurrent.len(),
@@ -5121,7 +6092,7 @@ mod tests {
             Policy::Lru,
         ));
         let _ = KvCache::new_with_strided_dims(32, &[(16, 1)])
-            .try_into_paged(pool)
+            .try_into_paged(pool, 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
     }
 
@@ -5190,7 +6161,7 @@ mod tests {
         }
         assert_eq!(cache.committed_len(), 8);
         assert_eq!(cache.layers[1].len, 2);
-        cache.truncate(5);
+        cache.truncate(5).unwrap();
         assert_eq!(cache.layers[0].len, 5);
         assert_eq!(cache.layers[1].len, 1);
     }

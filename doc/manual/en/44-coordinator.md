@@ -26,9 +26,11 @@ several `orangu-server` processes side by side (one per port) — which most
 single-GPU setups can't afford — or manually stopping and restarting
 `orangu-server` yourself every time you switch tasks.
 
-`orangu-coordinator` automates that: it owns exactly one `orangu-server` child
-process, and swaps it out for a different model the moment a request needs
-one, entirely transparently to orangu.
+`orangu-coordinator` automates that: by default it owns one `orangu-server`
+child process, and swaps it out for a different model the moment a request
+needs one, entirely transparently to orangu. A machine with room for more —
+a second device, or the CPU beside the card — can keep several resident
+(`resident`), and moving between those swaps nothing.
 
 The trade-off is latency, not capability: swapping pays the cost of a fresh
 model load, so this suits a single-GPU/single-model machine well, but isn't
@@ -96,9 +98,13 @@ Neither profile sets `host`/`port` here — both default to `all:8100` (the
 same default `orangu-server` itself uses: `all` means every network
 interface, and the coordinator reaches the profile it started over
 loopback). Sharing one address across profiles is fine even though they're
-identical: only one profile's `orangu-server` is ever active at a time, and
-swapping always fully stops the old one before starting the new one, so
-there's never a real conflict over the port. Set a profile's `host` to
+identical: profiles on one address are never running at the same time (see
+`resident`), and swapping always fully stops the old one before starting
+the new one, so
+there's never a real conflict over the port. Before it stops the old one, the
+coordinator lets every response still streaming from it finish (for up to two
+minutes), so a swap requested by one client never cuts off another client's
+answer. Set a profile's `host` to
 `127.0.0.1` if you want its `orangu-server` reachable from this machine
 only.
 
@@ -110,6 +116,7 @@ only.
 | `startup_timeout` | `[orangu-coordinator]` | No | Seconds to wait for a newly started `orangu-server` to answer `GET /v1/models` before giving up. Defaults to `180` |
 | `max_body_bytes` | `[orangu-coordinator]` | No | Request/response body size cap in bytes. Defaults to `67108864` (64 MiB) |
 | `idle_timeout` | `[orangu-coordinator]` | No | Seconds of inactivity before automatically unloading the active model to free system resources (RAM/VRAM). Disabled by default. |
+| `resident` | `[orangu-coordinator]` | No | How many profiles' `orangu-server`s may run at once. Defaults to `1`: every swap stops the running one. Above one, see Keeping several models resident |
 | `shutdown_token` | `[orangu-coordinator]` | No | Shared secret that enables the `GET /v1/coordinator/shutdown` endpoint. The caller must pass `?token=<value>` and connect from localhost. Disabled by default when absent. |
 | `log_type` | `[orangu-coordinator]` | No | Where the coordinator's output goes: `console` (the default — exactly what it printed before the key existed) or `file`, which appends every line to `log_path` instead, stamped with a time and a level. Forwarded to every profile's `orangu-server`, which then logs into the same file — without the once-a-second progress line a request rewrites on a terminal, which a file has no use for |
 | `log_path` | `[orangu-coordinator]` | No | The file `log_type = file` writes to. Defaults to `orangu-coordinator.log` in the directory the coordinator was started from; a leading `~` is expanded. Ignored under `log_type = console` |
@@ -118,6 +125,7 @@ only.
 | `host` | profile | No | Host this profile's `orangu-server` listens on — written straight into its generated config, so it takes the same `all`/`*`/address spellings. Defaults to `all` |
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
 | `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`dx12`/`cuda`/`opencl`/`rocm`/`npu`) when set |
+| `device` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].device` when set — which of the machine's devices it runs on |
 | `slots` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].slots` when set |
 | `web` | profile | No | Forwarded to this profile's `orangu-server` as `[web].port` when set, exposing that profile's own web console while it's active |
 
@@ -201,9 +209,38 @@ Every request orangu sends already says what it's for — `/review` and
 `explorer`, semantic `/search` asks for `embeddings`, and ordinary chat asks
 for `code` (or `all` if you haven't configured a dedicated `code` profile).
 The coordinator reads that and starts (or keeps running) whichever
-`orangu-server` actually backs the requested role, stopping anything else
-that happens to be running first. You never pick a model yourself when a
-coordinator is in charge — that's the whole point.
+`orangu-server` actually backs the requested role, stopping first whatever
+it cannot run beside (with the default `resident = 1`, anything else that is
+running). You never pick a model yourself when a coordinator is in charge —
+that's the whole point.
+
+### Keeping several models resident
+
+With `resident` above one, a profile that has a place of its own starts
+beside the ones already running instead of replacing them, and going back
+to any of them restarts nothing. A profile has a place of its own when it
+listens on its own `port` and runs on the CPU (`backend = cpu`) or on a
+`device` no running profile names. Two profiles that name no device both
+use the default one, and two servers on one card would each size their
+memory as if they had it alone, so those still swap. When the set is full,
+the least recently used profile is the one stopped. A server stopped either
+way finishes what it is streaming and saves its slots first, exactly as a
+swap does.
+
+```ini
+[orangu-coordinator]
+models = ~/.cache/huggingface/hub
+resident = 2
+
+[main]
+model = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+device = 5500M
+
+[explorer]
+model = unsloth/Qwen3-1.7B-GGUF
+backend = cpu
+port = 8101
+```
 
 If a role you're using has no dedicated profile in
 `orangu-coordinator.conf`, the coordinator falls back to the `all` profile
@@ -231,9 +268,16 @@ the first one pays the same cold start as any other request.
 
 ## Things to know while using it
 
+- A request that needs a different model while another client's answer is
+  still streaming waits for that answer to finish before the swap starts.
 - The first request after a swap waits for the new model to finish loading —
   swapping to a role you haven't used yet in this session pays a real
   cold-load cost, same as starting `orangu-server` fresh.
+- A swap saves the outgoing model's conversations to disk first, and the
+  model's next start loads them back, so a conversation picks up where it
+  was instead of reading its whole history again. Saving a long conversation
+  adds a few seconds to the swap away from it (a 4 800-token one on a 3B
+  model is a 1.1 GB file).
 - Once connected to a coordinator, orangu shows "Automatic" for the model
   everywhere in the UI (the header banner, the status line, `/review` and
   `/auto_review`) instead of a specific model id, since the coordinator — not

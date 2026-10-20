@@ -151,6 +151,11 @@ pub struct CoordinatorConfiguration {
     pub max_body_bytes: usize,
     /// How long to wait before unloading an idle model. Defaults to None (disabled).
     pub idle_timeout_seconds: Option<u64>,
+    /// How many profiles' `orangu-server`s may run at once (`resident`,
+    /// default 1). Above one, a profile that can run beside the others
+    /// ([`CoordinatorLlmEntry::can_reside_with`]) starts without stopping
+    /// them, and the least recently used is stopped when the set is full.
+    pub resident: usize,
     /// Shared secret required to use `GET /v1/coordinator/shutdown`. When
     /// absent the endpoint is disabled entirely.
     pub shutdown_token: Option<String>,
@@ -241,6 +246,10 @@ pub struct CoordinatorLlmEntry {
     /// re-validated here. `None` leaves `orangu-server`'s own default
     /// (`auto`) in place by simply omitting the key.
     pub backend: Option<String>,
+    /// Forwarded verbatim to this profile's generated `[orangu-server].device`
+    /// key when set — which of the machine's devices the server runs on.
+    /// `None` leaves `orangu-server`'s own choice in place.
+    pub device: Option<String>,
     /// Forwarded to this profile's generated `[orangu-server].slots` key
     /// when set. `None` leaves `orangu-server`'s own role-based default in
     /// place (see `orangu-server`'s `config::Role::default_slots`).
@@ -271,8 +280,25 @@ impl CoordinatorLlmEntry {
             && self.host == other.host
             && self.port == other.port
             && self.backend == other.backend
+            && self.device == other.device
             && self.slots == other.slots
             && self.web == other.web
+    }
+
+    /// Whether this profile's `orangu-server` can run while `other`'s does:
+    /// a listener of its own, and a place of its own — the CPU, or a device
+    /// named differently. Two servers on one card would each size their
+    /// memory as if they had it alone, so a profile that names no device
+    /// shares the default one with every other that names none.
+    pub fn can_reside_with(&self, other: &Self) -> bool {
+        let place = |e: &Self| {
+            if e.backend.as_deref() == Some("cpu") {
+                Some("cpu".to_string())
+            } else {
+                e.device.as_ref().map(|d| d.trim().to_lowercase())
+            }
+        };
+        self.origin() != other.origin() && self.port != other.port && place(self) != place(other)
     }
 
     /// The origin (`http://host:port`) requests are proxied to once this
@@ -419,6 +445,23 @@ pub fn load_coordinator_configuration(path: &Path) -> Result<CoordinatorConfigur
             None => None,
         };
 
+    let resident = match client
+        .get("resident")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    {
+        Some(value) => {
+            let n = value
+                .parse::<usize>()
+                .map_err(|err| anyhow!("invalid value for [{CLIENT_SECTION}].resident: {err}"))?;
+            if n == 0 {
+                return Err(anyhow!("[{CLIENT_SECTION}].resident must be at least 1"));
+            }
+            n
+        }
+        None => 1,
+    };
+
     let shutdown_token = client
         .get("shutdown_token")
         .map(|value| value.trim().to_string())
@@ -457,6 +500,7 @@ pub fn load_coordinator_configuration(path: &Path) -> Result<CoordinatorConfigur
         startup_timeout_seconds,
         max_body_bytes,
         idle_timeout_seconds,
+        resident,
         shutdown_token,
         log,
         llms,
@@ -516,6 +560,11 @@ fn parse_llm_profiles(
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
 
+            let device = values
+                .get("device")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+
             let slots = match values
                 .get("slots")
                 .map(|v| v.trim())
@@ -540,6 +589,7 @@ fn parse_llm_profiles(
                     host,
                     port,
                     backend,
+                    device,
                     slots,
                     web,
                 },
@@ -1007,6 +1057,7 @@ mod tests {
             host: "all".to_string(),
             port: 8100,
             backend: None,
+            device: None,
             slots: None,
             web: None,
         };
@@ -1060,6 +1111,7 @@ mod tests {
             },
             CoordinatorLlmEntry {
                 backend: Some("cpu".to_string()),
+                device: None,
                 ..code.clone()
             },
             CoordinatorLlmEntry {
@@ -1087,5 +1139,60 @@ mod tests {
         assert_eq!(role_server_flag("explorer"), Some("--explorer"));
         assert_eq!(role_server_flag("embeddings"), Some("--embedding"));
         assert_eq!(role_server_flag("nonexistent"), None);
+    }
+
+    #[test]
+    fn resident_defaults_to_one_and_refuses_zero() {
+        let load = |client: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu-coordinator]\nmodels = /srv/models\n{client}\n[main]\nmodel = org/a\ndevice = igpu\n"
+            )
+            .unwrap();
+            load_coordinator_configuration(file.path())
+        };
+        let conf = load("").unwrap();
+        assert_eq!(conf.resident, 1);
+        assert_eq!(conf.llms["main"].device.as_deref(), Some("igpu"));
+        assert_eq!(load("resident = 3").unwrap().resident, 3);
+        assert!(load("resident = 0").is_err());
+    }
+
+    /// Two profiles run side by side only on listeners and places of their
+    /// own: the CPU, or devices named differently.
+    #[test]
+    fn profiles_reside_together_only_on_their_own_port_and_device() {
+        let base = CoordinatorLlmEntry {
+            name: "a".to_string(),
+            role: "all".to_string(),
+            model: "org/a".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8100,
+            backend: None,
+            device: None,
+            slots: None,
+            web: None,
+        };
+        let with = |port: u16, backend: Option<&str>, device: Option<&str>| CoordinatorLlmEntry {
+            name: "b".to_string(),
+            port,
+            backend: backend.map(str::to_string),
+            device: device.map(str::to_string),
+            ..base.clone()
+        };
+        // The same port: never.
+        assert!(!base.can_reside_with(&with(8100, Some("cpu"), None)));
+        // Its own port on the same default card: no.
+        assert!(!base.can_reside_with(&with(8101, None, None)));
+        // Its own port, on the CPU or a named device: yes.
+        assert!(base.can_reside_with(&with(8101, Some("cpu"), None)));
+        assert!(base.can_reside_with(&with(8101, None, Some("igpu"))));
+        // Two naming the same device, however spelt: no.
+        let on = |d: &str| CoordinatorLlmEntry {
+            device: Some(d.to_string()),
+            ..base.clone()
+        };
+        assert!(!on("5500M").can_reside_with(&with(8101, None, Some("5500m"))));
     }
 }

@@ -56,7 +56,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// The tag of the empty prefix — the seed every chain starts from.
 ///
@@ -122,13 +123,149 @@ impl Resolved {
 pub struct PrefixIndex {
     page_tokens: usize,
     known: Mutex<HashMap<u64, Vec<u32>>>,
+    /// Pages a request is building right now, by tag, with the claim that
+    /// builds each — see [`Self::wait_or_claim`].
+    in_flight: Mutex<InFlight>,
+    /// Signalled whenever a page becomes known or a claim ends.
+    changed: Condvar,
 }
+
+#[derive(Default)]
+struct InFlight {
+    builders: HashMap<u64, u64>,
+    next_claim: u64,
+}
+
+/// The pages one request is building, so a request that needs them waits
+/// for them rather than building them too. Dropping it ends the claim and
+/// wakes the waiters, whether the pages were published or not.
+pub struct Claim {
+    index: Arc<PrefixIndex>,
+    id: u64,
+    tags: Vec<u64>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut flight = self.index.lock_in_flight();
+        for tag in &self.tags {
+            if flight.builders.get(tag) == Some(&self.id) {
+                flight.builders.remove(tag);
+            }
+        }
+        drop(flight);
+        self.index.changed.notify_all();
+    }
+}
+
+/// The longest a request waits for another's pages. A builder that is still
+/// going after this long is left to finish alone, and the waiter builds its
+/// own.
+const LONGEST_WAIT: Duration = Duration::from_secs(600);
 
 impl PrefixIndex {
     pub fn new(page_tokens: usize) -> Self {
         Self {
             page_tokens,
             known: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(InFlight::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock_in_flight(&self) -> std::sync::MutexGuard<'_, InFlight> {
+        self.in_flight.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The index of the first page of `tokens` (tagged `tags`) the index
+    /// does not have, or `tags.len()` when it has them all.
+    fn first_unknown(&self, tokens: &[u32], tags: &[u64]) -> usize {
+        let known = self.known.lock().expect("prefix index poisoned");
+        tags.iter()
+            .enumerate()
+            .position(|(i, tag)| {
+                let page = &tokens[i * self.page_tokens..(i + 1) * self.page_tokens];
+                known.get(tag).is_none_or(|stored| stored != page)
+            })
+            .unwrap_or(tags.len())
+    }
+
+    /// Waits while another request is building the first page of `tokens`
+    /// this index does not have yet, then claims every page from there on
+    /// that nobody else is building.
+    ///
+    /// Several agents handed one new prompt arrive together, before any of
+    /// it is published, and each would prefill all of it: four of them took
+    /// six times as long as one. With this, the first claims the prefix and
+    /// the others wait for it to be published ([`Self::remember`]), then
+    /// resolve it and build only their own suffix. The check and the claim
+    /// are one step under one lock, so requests arriving together cannot all
+    /// see nothing claimed.
+    ///
+    /// A request waits only for its **first** missing page: a page means
+    /// nothing without the ones before it. It stops waiting when the builder
+    /// publishes, when its claim ends, after [`LONGEST_WAIT`], or when
+    /// `cancelled` says its client has gone.
+    ///
+    /// It blocks, so it must not run on a CPU-pool worker: see
+    /// `generate::Engine::generate`.
+    ///
+    /// `room(shared)` says whether this request could be paged beside the
+    /// builder if it shares `shared` leading pages — those it would find
+    /// known or being built. A pool without that room admits it as a
+    /// contiguous cache, which shares nothing, so waiting would only put its
+    /// prefill after the builder's instead of beside it; such a request
+    /// neither waits nor claims.
+    pub fn wait_or_claim(
+        self: &Arc<Self>,
+        tokens: &[u32],
+        cancelled: impl Fn() -> bool,
+        room: impl Fn(usize) -> bool,
+    ) -> Claim {
+        let tags = page_tags(tokens, self.page_tokens);
+        let deadline = Instant::now() + LONGEST_WAIT;
+        let mut flight = self.lock_in_flight();
+        let first = loop {
+            let first = self.first_unknown(tokens, &tags);
+            let blocked = tags
+                .get(first)
+                .is_some_and(|tag| flight.builders.contains_key(tag));
+            if !blocked || cancelled() || Instant::now() >= deadline {
+                break first;
+            }
+            let would_share = first
+                + tags[first..]
+                    .iter()
+                    .take_while(|tag| flight.builders.contains_key(tag))
+                    .count();
+            if !room(would_share) {
+                return Claim {
+                    index: self.clone(),
+                    id: 0,
+                    tags: Vec::new(),
+                };
+            }
+            // Woken by a publish or a claim's end; the timeout only re-checks
+            // `cancelled`.
+            flight = self
+                .changed
+                .wait_timeout(flight, Duration::from_millis(250))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        };
+        flight.next_claim += 1;
+        let id = flight.next_claim;
+        let mut claimed = Vec::new();
+        for &tag in &tags[first..] {
+            if let std::collections::hash_map::Entry::Vacant(e) = flight.builders.entry(tag) {
+                e.insert(id);
+                claimed.push(tag);
+            }
+        }
+        Claim {
+            index: self.clone(),
+            id,
+            tags: claimed,
         }
     }
 
@@ -183,6 +320,11 @@ impl PrefixIndex {
         );
         let mut known = self.known.lock().expect("prefix index poisoned");
         known.insert(tag, page.to_vec());
+        drop(known);
+        // Taken and released so a waiter between its check and its wait
+        // cannot miss this.
+        drop(self.lock_in_flight());
+        self.changed.notify_all();
     }
 
     /// Drops a tag — for a page the pool has reclaimed, whose content is gone.
@@ -210,6 +352,69 @@ impl PrefixIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request whose prefix another is building waits for it to be
+    /// published, then finds it known and claims only what is left.
+    #[test]
+    fn a_peer_waits_for_a_prefix_being_built_and_then_shares_it() {
+        let index = Arc::new(PrefixIndex::new(4));
+        let prompt: Vec<u32> = (0..16).collect();
+        let mut peer = prompt.clone();
+        peer.extend([100, 101, 102, 103]);
+        let builder = index.wait_or_claim(&prompt, || false, |_| true);
+        assert_eq!(builder.tags.len(), 4, "the builder claims every page");
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let claim = index.wait_or_claim(&peer, || false, |_| true);
+                (index.resolve(&peer, true).shared.len(), claim.tags.len())
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !waiter.is_finished(),
+                "the peer waits while the prefix is built"
+            );
+            for (i, tag) in page_tags(&prompt, 4).into_iter().enumerate() {
+                index.remember(tag, &prompt[i * 4..(i + 1) * 4]);
+            }
+            drop(builder);
+            let (shared, claimed) = waiter.join().unwrap();
+            assert_eq!(shared, 4, "the peer shares the published prefix");
+            assert_eq!(claimed, 1, "and builds only its own page");
+        });
+    }
+
+    /// A builder that ends without publishing frees its waiters to build the
+    /// pages themselves; a request on another prefix never waits.
+    #[test]
+    fn a_claim_that_ends_unpublished_hands_the_pages_on() {
+        let index = Arc::new(PrefixIndex::new(4));
+        let prompt: Vec<u32> = (0..8).collect();
+        let other: Vec<u32> = (50..58).collect();
+        let builder = index.wait_or_claim(&prompt, || false, |_| true);
+        assert_eq!(
+            index.wait_or_claim(&other, || false, |_| true).tags.len(),
+            2
+        );
+        std::thread::scope(|scope| {
+            let waiter =
+                scope.spawn(|| index.wait_or_claim(&prompt, || false, |_| true).tags.len());
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiter.is_finished());
+            drop(builder);
+            assert_eq!(waiter.join().unwrap(), 2, "the waiter claims the pages");
+        });
+        let _held = index.wait_or_claim(&prompt, || false, |_| true);
+        let gave_up = index.wait_or_claim(&prompt, || true, |_| true);
+        assert!(
+            gave_up.tags.is_empty(),
+            "a cancelled waiter claims nothing held"
+        );
+        let no_room = index.wait_or_claim(&prompt, || false, |_| false);
+        assert!(
+            no_room.tags.is_empty(),
+            "a request the pool cannot page beside the builder does not wait"
+        );
+    }
 
     #[test]
     fn a_shared_token_prefix_produces_shared_page_tags() {

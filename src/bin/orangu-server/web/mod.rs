@@ -837,7 +837,7 @@ async fn send_message(
         return send_image_message(state, session, req.content, extracted, init_picture).await;
     }
 
-    let Some(template_source) = state.engine.chat_template_source.clone() else {
+    let Some(template) = state.engine.chat_template.clone() else {
         return (
             StatusCode::NOT_IMPLEMENTED,
             "model has no tokenizer.chat_template; the web UI needs one",
@@ -845,15 +845,24 @@ async fn send_message(
             .into_response();
     };
 
-    let prompt = match render_prompt(&state, &template_source, &session, &req.content, &extracted) {
-        Ok(prompt) => prompt,
+    let (prompt, head) = match render_prompt(&state, &template, &session, &req.content, &extracted)
+    {
+        Ok(rendered) => rendered,
         // {err:#} (anyhow's "alternate" chain format) rather than {err} —
         // the latter only prints the outermost context, losing exactly the
         // detail (which template line, which variable) that makes a
         // template-rendering error diagnosable at all.
         Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
     };
-    let tokens = state.engine.tokenizer.encode(&prompt, false);
+    let tokens = crate::http::encode_off_runtime(&state.engine.tokenizer, prompt, false).await;
+    // As for an OpenAI chat request: see `GenerateRequest::cache_point`.
+    let cache_point = match head {
+        Some(head) => {
+            let head = crate::http::encode_off_runtime(&state.engine.tokenizer, head, false).await;
+            crate::http::openai::cache_point_of(&head, &tokens)
+        }
+        None => None,
+    };
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
 
     let mut rx = state
@@ -868,6 +877,8 @@ async fn send_message(
             // The console is served by this process and has no coordinator
             // in front of it, so it is this server's own role.
             role: None,
+            cache_point,
+            background: false,
             cache_prompt: true,
             // The web console keeps one conversation per session but has no
             // notion of a slot; any free one is right.
@@ -1129,13 +1140,16 @@ fn html_delta<'a>(sent: &str, current: &'a str) -> (usize, &'a str) {
     (keep_utf16, &current[keep_bytes..])
 }
 
+/// The prompt for this turn and, for a model whose state cannot be rewound,
+/// the same conversation rendered without the generation prompt when that
+/// is a prefix of it — the end of the turn the next one repeats.
 fn render_prompt(
     state: &WebState,
-    template_source: &str,
+    template: &ChatTemplate,
     session: &Session,
     new_message: &str,
     new_attachments: &[Attachment],
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<String>)> {
     // Each message's stored attachments (with their extracted text) are
     // folded back into its content here rather than being persisted inline,
     // so the transcript stays clean while the model still sees the document
@@ -1178,19 +1192,23 @@ fn render_prompt(
     // reach the stream regardless (the generate loop drops special tokens),
     // so a suppressing role gives a direct answer and a thinking role shows
     // its reasoning prose without the literal tags.
-    let mut prompt = ChatTemplate::new(template_source.to_string()).render(
-        &messages,
-        true,
-        bos,
-        eos,
-        state.engine.reasoning(),
-    )?;
+    let mut prompt = template.render(&messages, true, bos, eos, state.engine.reasoning())?;
     crate::http::openai::append_reasoning_suppression(
         &mut prompt,
         state.engine.role,
         &state.engine.tokenizer,
     );
-    Ok(prompt)
+    let head = state
+        .engine
+        .recurrent
+        .then(|| {
+            template
+                .render(&messages, false, bos, eos, state.engine.reasoning())
+                .ok()
+        })
+        .flatten()
+        .filter(|head| prompt.starts_with(head.as_str()) && head.len() < prompt.len());
+    Ok((prompt, head))
 }
 
 #[cfg(test)]

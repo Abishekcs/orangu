@@ -228,6 +228,8 @@ pub async fn warm_up(
                 id_slot: None,
                 timings_per_token: false,
                 role: None,
+                cache_point: None,
+                background: true,
             })
             .await;
         let mut ok = false;

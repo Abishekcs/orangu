@@ -77,6 +77,13 @@ pub(crate) fn flag_on_unless_disabled(name: &str) -> bool {
     }
 }
 
+/// A boolean flag as set, `None` when the variable is unset — for a feature
+/// whose default someone else decides (a model's own answer, say). Same
+/// off-list as [`flag_on`].
+pub(crate) fn flag_setting(name: &str) -> Option<bool> {
+    std::env::var_os(name).map(|_| flag_on(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

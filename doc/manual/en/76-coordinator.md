@@ -130,8 +130,18 @@ write that profile's own generated `orangu-server.conf`
 `orangu-server` executable to run (`resolve_server_binary`), spawn it with
 `--config <that path> <role flag> <model>`, piped stdout/stderr captured
 into the rolling tail, record `current_pid` immediately (before the
-possibly-long health check), then poll `GET /v1/models` on the new origin
-every 500ms until it succeeds or `startup_timeout` elapses. A profile's
+possibly-long health check), then poll `GET /health` on the new origin —
+after 50 ms, doubling up to every 500 ms — until it succeeds or
+`startup_timeout` elapses. A swap first waits for the proxied responses still
+streaming (`Coordinator::in_flight`, counted by an `InFlight` guard carried in
+each response body's stream and dropped with it), bounded by `DRAIN_TIMEOUT`
+(two minutes), and then saves each of the outgoing server's slots
+(`Coordinator::save_slots`: `GET /slots`, then `POST /slots/{id}?action=save`
+per slot, each bounded by `SLOT_FILE_TIMEOUT`) to `coordinator-<profile>-<slot>.bin`
+in that model's slot directory. Every server the coordinator starts gets
+`ORANGU_SLOT_RESTORE=coordinator-<profile>` and restores those files at start,
+before its prefix warm-up, so a conversation the swap stopped is still
+cached when its model comes back. A profile's
 `host` travels into that generated config verbatim, so it takes exactly the
 spellings `orangu-server`'s own `host` does — including the default, `all`.
 `config.rs` resolves that wildcard in the two directions it has to:

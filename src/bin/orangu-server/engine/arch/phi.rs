@@ -740,6 +740,8 @@ impl PhiModel {
                     q_bias: None,
                     k_bias: None,
                     v_bias: None,
+                    q_norm: None,
+                    k_norm: None,
                     pairing: tensor::RopeLayout::Neox,
                     yarn,
                     rope_dim: cfg.rope_dim,
@@ -810,6 +812,8 @@ impl PhiModel {
                     q_bias: None,
                     k_bias: None,
                     v_bias: None,
+                    q_norm: None,
+                    k_norm: None,
                     pairing: tensor::RopeLayout::Neox,
                     yarn,
                     rope_dim: cfg.rope_dim,
@@ -1193,7 +1197,7 @@ impl ModelForward for PhiModel {
                 // The same chunk again on the step path, into a copy of the
                 // cache, and the two residuals compared.
                 let mut again = cache.duplicate();
-                again.truncate(start_pos);
+                again.truncate(start_pos)?;
                 let step = self.run_layers(&mut again, tokens, start_pos)?;
                 super::report_resident_check(&x, &step, n_embd, start_pos);
                 x

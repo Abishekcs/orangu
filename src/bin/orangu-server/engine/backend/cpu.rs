@@ -111,6 +111,40 @@ impl CpuBackend {
         let raw = w.raw_bytes();
         let row_bytes = w.row_bytes();
 
+        // A pass of a few tokens — a speculative verify — reads each raw
+        // row once and dots it against every token (`dot_k_row_tokens`),
+        // so each token's output is bit for bit what a decode step of it
+        // gives. The GEMMs below unpack and re-interleave every row first,
+        // a cost one token tile cannot spread.
+        if n_tokens > 1
+            && n_tokens <= narrow_row_tokens()
+            && vecdot::supports_k_row(ggml_type, in_dim)
+        {
+            // A token each, in parallel: serially, the pass's tokens one
+            // after another were the pool's wait.
+            let acts: Vec<vecdot::ActQ8KRow> = (0..n_tokens)
+                .into_par_iter()
+                .map(|t| vecdot::quantize_act_k_row(&x[t * in_dim..(t + 1) * in_dim]))
+                .collect();
+            // Passes over the row as even as the kernel's limit allows: 17
+            // tokens as 6 + 6 + 5 rather than 8 + 8 + 1. A pass of 8 keeps
+            // more accumulators than the registers hold, and a lone token
+            // pays a whole pass for one dot.
+            let per_pass = n_tokens.div_ceil(n_tokens.div_ceil(vecdot::K_ROW_TOKENS_MAX));
+            let mut yt = vec![0f32; out_dim * n_tokens];
+            yt.par_chunks_mut(n_tokens)
+                .with_min_len(super::matmul_min_rows())
+                .enumerate()
+                .for_each(|(o, dst)| {
+                    let row = &raw[o * row_bytes..(o + 1) * row_bytes];
+                    for (dst, acts) in dst.chunks_mut(per_pass).zip(acts.chunks(per_pass)) {
+                        vecdot::dot_k_row_tokens(ggml_type, row, acts, dst);
+                    }
+                });
+            Self::finish_into(out, yt, n_tokens, out_dim);
+            return true;
+        }
+
         // K-quant prefill takes a dedicated GEMM: `q8_K`-style activations
         // (one scale per 256) accumulated in `i32` across the super-block,
         // laid out interleaved by token tile. Worth +45% to +84% per tensor
@@ -762,6 +796,35 @@ impl CpuBackend {
         const TOKENS: usize = 16;
         out.clear();
         out.reserve_exact(n_tokens * out_dim);
+        // A pass of few tokens (a speculative verify) is one or two token
+        // blocks: one thread would transpose nearly all of it while the
+        // pool waits. Blocks of output rows instead, each task writing a
+        // contiguous run of every token's row.
+        if n_tokens.div_ceil(TOKENS) < rayon::current_num_threads() {
+            const ROWS: usize = 256;
+            let sink = SharedOut(out.as_mut_ptr());
+            let yt = &yt;
+            (0..out_dim.div_ceil(ROWS))
+                .into_par_iter()
+                .for_each(move |block| {
+                    let sink = sink;
+                    let o0 = block * ROWS;
+                    let o1 = (o0 + ROWS).min(out_dim);
+                    for t in 0..n_tokens {
+                        for o in o0..o1 {
+                            // Safety: task `block` alone writes columns
+                            // `o0..o1` of every token row of a buffer reserved
+                            // for `n_tokens * out_dim` above; the pointer
+                            // outlives the parallel loop it is used in.
+                            unsafe { *sink.0.add(t * out_dim + o) = yt[o * n_tokens + t] };
+                        }
+                    }
+                });
+            // Safety: every slot was written above — the blocks cover every
+            // column of every token row.
+            unsafe { out.set_len(n_tokens * out_dim) };
+            return;
+        }
         let dst = &mut out.spare_capacity_mut()[..n_tokens * out_dim];
         dst.par_chunks_mut(TOKENS * out_dim)
             .enumerate()
@@ -1042,11 +1105,77 @@ impl Backend for CpuBackend {
     }
 }
 
+/// The most tokens a pass may have to take the row kernels in
+/// `CpuBackend::matmul_fused_into` rather than a GEMM;
+/// `ORANGU_CPU_NARROW_TOKENS` overrides it, `0` or `1` turns it off.
+fn narrow_row_tokens() -> usize {
+    static TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        super::env_tuning_value(
+            "ORANGU_CPU_NARROW_TOKENS",
+            NARROW_ROW_TOKENS_DEFAULT,
+            "a token count in 0..=64",
+            |n| n <= 64,
+        )
+    })
+}
+
+/// The default for [`narrow_row_tokens`]: three passes of the row kernels
+/// ([`vecdot::K_ROW_TOKENS_MAX`] tokens each). The GEMM unpacks and
+/// re-interleaves every row once a call, which a few passes over the raw
+/// row undercut until about 32 tokens. Only beside the AVX2 row kernels;
+/// other cores keep their GEMMs, whose tile kernels are another trade.
+const NARROW_ROW_TOKENS_DEFAULT: usize = if cfg!(target_arch = "x86_64") {
+    3 * vecdot::K_ROW_TOKENS_MAX
+} else {
+    0
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q8_0};
+
+    /// A pass of a few tokens gives each token exactly what a one-token pass
+    /// of it gives, for the two K-quant types a `Q4_K_M` file's layers are
+    /// made of.
+    #[test]
+    fn a_narrow_pass_matches_one_token_at_a_time_bit_for_bit() {
+        if narrow_row_tokens() < 2 {
+            eprintln!("the narrow path is off here — nothing to check");
+            return;
+        }
+        for ggml_type in [GGML_TYPE_Q4_K, crate::engine::quant::GGML_TYPE_Q6_K] {
+            let (in_dim, out_dim) = (512, 300);
+            let mut seed = 0x9E37_u64;
+            let mut bytes = Vec::new();
+            for _ in 0..out_dim * (in_dim / 256) {
+                bytes.extend(crate::engine::backend::probe_blocks::build_block(
+                    ggml_type, &mut seed,
+                ));
+            }
+            let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+            for n_tokens in 2..=narrow_row_tokens() {
+                let x: Vec<f32> = (0..n_tokens * in_dim)
+                    .map(|i| ((i * 7919) % 251) as f32 / 125.0 - 1.0)
+                    .collect();
+                let all = CpuBackend.matmul(&x, n_tokens, &w);
+                for t in 0..n_tokens {
+                    let one = CpuBackend.matmul(&x[t * in_dim..(t + 1) * in_dim], 1, &w);
+                    let row = &all[t * out_dim..(t + 1) * out_dim];
+                    let first = row
+                        .iter()
+                        .zip(&one)
+                        .position(|(a, b)| a.to_bits() != b.to_bits());
+                    assert!(
+                        first.is_none(),
+                        "type {ggml_type}, {n_tokens} tokens: token {t} differs at {first:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The prompt GEMM on a real model's projections — the attention,
     /// FFN and per-layer-embedding matrices of `ORANGU_TEST_MODEL`'s
@@ -1080,6 +1209,9 @@ mod tests {
             "blk.0.inp_gate.weight",
             "blk.0.proj.weight",
             "per_layer_model_proj.weight",
+            // The vocabulary head, own or tied to the embedding.
+            "output.weight",
+            "token_embd.weight",
         ] {
             let Ok(w) = loaded.matrix(name) else {
                 continue;
@@ -1556,18 +1688,23 @@ mod tests {
     /// short, into an output that held something before.
     #[test]
     fn finish_into_is_the_plain_transpose() {
-        let (n_tokens, out_dim) = (37usize, 5usize);
-        let yt: Vec<f32> = (0..n_tokens * out_dim).map(|i| i as f32 * 0.5).collect();
-        let mut out = vec![9.0f32; 3];
-        CpuBackend::finish_into(&mut out, yt.clone(), n_tokens, out_dim);
-        assert_eq!(out.len(), n_tokens * out_dim);
-        for t in 0..n_tokens {
-            for o in 0..out_dim {
-                assert_eq!(
-                    out[t * out_dim + o],
-                    yt[o * n_tokens + t],
-                    "token {t} row {o}"
-                );
+        // Row blocks (a few tokens, one block or several, a ragged last
+        // one) and token blocks (more tokens than the pool has threads for
+        // in blocks of 16).
+        let wide = 16 * rayon::current_num_threads() + 3;
+        for (n_tokens, out_dim) in [(37usize, 5usize), (17, 600), (2, 257), (wide, 7)] {
+            let yt: Vec<f32> = (0..n_tokens * out_dim).map(|i| i as f32 * 0.5).collect();
+            let mut out = vec![9.0f32; 3];
+            CpuBackend::finish_into(&mut out, yt.clone(), n_tokens, out_dim);
+            assert_eq!(out.len(), n_tokens * out_dim);
+            for t in 0..n_tokens {
+                for o in 0..out_dim {
+                    assert_eq!(
+                        out[t * out_dim + o],
+                        yt[o * n_tokens + t],
+                        "{n_tokens} tokens: token {t} row {o}"
+                    );
+                }
             }
         }
     }

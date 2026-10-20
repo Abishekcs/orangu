@@ -123,6 +123,65 @@ fn estimate_total_vram_bytes(
     (model_bytes + RUNTIME_OVERHEAD_BYTES as f64 + kv_cache_bytes + compute_buffer_bytes) as u64
 }
 
+/// What a catalogue model needs at `context`: its file, the runtime
+/// overhead, and the KV cache and compute buffer
+/// [`estimate_total_vram_bytes`] estimates from its parameter count.
+fn catalogue_needs_bytes(entry: &orangu::model_catalogue::CatalogueEntry, context: u64) -> u64 {
+    let weights_estimate = (entry.params_billion * 1e9 * DEFAULT_BITS_PER_WEIGHT / 8.0) as u64;
+    let estimate = estimate_total_vram_bytes(
+        entry.params_billion,
+        DEFAULT_BITS_PER_WEIGHT,
+        context,
+        KV_CACHE_BITS,
+    );
+    entry.file_bytes + estimate.saturating_sub(weights_estimate)
+}
+
+/// The catalogue's models that fit `budget`, largest file first, each with
+/// the largest context of [`CONTEXT_LADDER`] that fits, up to its own.
+fn catalogue_fits(budget: u64) -> Vec<(&'static orangu::model_catalogue::CatalogueEntry, u64)> {
+    let mut fit: Vec<_> = orangu::model_catalogue::CATALOGUE
+        .iter()
+        .filter_map(|e| {
+            CONTEXT_LADDER
+                .iter()
+                .rev()
+                .copied()
+                .filter(|&c| c <= e.context)
+                .find(|&c| catalogue_needs_bytes(e, c) <= budget)
+                .map(|c| (e, c))
+        })
+        .collect();
+    fit.sort_by_key(|(e, _)| std::cmp::Reverse(e.file_bytes));
+    fit
+}
+
+/// The catalogue's models that fit `budget` ([`catalogue_fits`]), as a
+/// table under the size suggestion of the same budget.
+fn push_catalogue_block(out: &mut String, budget: u64) {
+    let fit = catalogue_fits(budget);
+    out.push_str("\n  Catalogue models that fit, with the context that fits:\n");
+    if fit.is_empty() {
+        out.push_str("    none\n");
+        return;
+    }
+    let width = fit.iter().map(|(e, _)| e.spec().len()).max().unwrap_or(0);
+    for (e, context) in fit {
+        let drafter = match e.drafter {
+            Some(orangu::model_catalogue::Drafter::Model(d)) => format!("  draft_model {d}"),
+            Some(orangu::model_catalogue::Drafter::MtpHead(_)) => "  MTP head".to_string(),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "    {:<width$}  {:>7}  {:>4}  {}{drafter}\n",
+            e.spec(),
+            orangu::model_catalogue::format_size(e.file_bytes),
+            format_context_size(context),
+            e.roles.join(","),
+        ));
+    }
+}
+
 /// The largest entry in [`PARAM_LADDER_BILLIONS`] whose estimated VRAM
 /// requirement (at `bits_per_weight` quantization, at `context_size` tokens
 /// of KV cache) fits within `budget_bytes`, if any.
@@ -356,6 +415,7 @@ pub fn format_suggestion(
             dedicated_vram_budget_bytes(gpus),
             Some(&gpu.name),
         );
+        push_catalogue_block(&mut out, dedicated_vram_budget_bytes(gpus));
     }
     let total = total_budget_bytes(cpu, gpus);
     push_suggestion_block(
@@ -368,6 +428,7 @@ pub fn format_suggestion(
                 .unwrap_or_else(|| "system RAM".to_string()),
         ),
     );
+    push_catalogue_block(&mut out, total);
 
     out
 }
@@ -720,5 +781,29 @@ mod tests {
             report.contains("\n\nSuggested model size (Total)\n"),
             "report:\n{report}"
         );
+    }
+
+    /// A catalogue model is listed at the largest context that fits,
+    /// never past its own and never one that does not fit; one whose file
+    /// alone overflows the budget is not listed, and the list is largest
+    /// first.
+    #[test]
+    fn catalogue_models_are_listed_at_the_context_that_fits() {
+        let fit = catalogue_fits(4 * GIB);
+        assert!(!fit.is_empty());
+        for (e, context) in &fit {
+            assert!(*context <= e.context, "{}", e.repo);
+            assert!(catalogue_needs_bytes(e, *context) <= 4 * GIB, "{}", e.repo);
+            assert!(e.file_bytes < 4 * GIB, "{}", e.repo);
+        }
+        assert!(
+            fit.windows(2)
+                .all(|w| w[0].0.file_bytes >= w[1].0.file_bytes)
+        );
+        // A model the size of the budget's half fits at a shorter context
+        // than one a tenth of it.
+        let ctx = |repo: &str| fit.iter().find(|(e, _)| e.repo == repo).map(|f| f.1);
+        assert!(ctx("bartowski/Llama-3.2-3B-Instruct-GGUF") < ctx("unsloth/Qwen3.5-0.8B-GGUF"));
+        assert!(catalogue_fits(0).is_empty());
     }
 }

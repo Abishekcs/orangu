@@ -2260,7 +2260,7 @@ fn cross_check_decode(ggml_type: u32, in_dim: usize) {
             matches!(name, "kq-light" | "block-hoisted"),
             "type {ggml_type} at one token: {name}"
         );
-        if vulkan.decode_mmvq {
+        if vulkan.decode_mmvq() {
             let mut seed = 0x1D07_u64;
             let block = build_block(ggml_type, &mut seed);
             let w = test_quant_matrix(&block.repeat(in_dim / block_elems), ggml_type, in_dim, 1);
@@ -6957,7 +6957,7 @@ fn paged_prefill_agrees_at_len(page: usize, pages: usize, positions: usize) {
         n_positions + page_tokens,
         &strided_dims(&pool),
     )
-    .try_into_paged(pool.clone())
+    .try_into_paged(pool.clone(), 0)
     .unwrap_or_else(|_| panic!("test pool has room"));
     for i in 0..n_positions {
         paged.layers[0].push(&rows_k[i], &rows_v[i]);
@@ -8111,7 +8111,29 @@ fn record_ple_projection_matches_cpu_reference() {
         eprintln!("{NO_GPU_SKIP}");
         return;
     };
+    ple_projection_against_cpu(vulkan, 0xFEEDFACE_u64);
+}
 
+/// A kernel switch (`VulkanBackend::set_integer_dot_decode`, timed at
+/// start-up) drops the op entries, and the projection's comes back with a
+/// new output buffer. The projection's cached resources must follow it: a
+/// bind group kept over the old buffer reads the last projection computed
+/// before the switch, for every token after it.
+#[test]
+fn record_ple_projection_follows_a_rebuilt_projection() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    ple_projection_against_cpu(vulkan, 0xFEEDFACE_u64);
+    vulkan.drop_cached_op_resources();
+    ple_projection_against_cpu(vulkan, 0x5EED_0FA1_u64);
+}
+
+/// `record_ple_projection` on a fixed projection against the CPU, with
+/// the token's embedding and per-layer inputs drawn from `x_seed`.
+fn ple_projection_against_cpu(vulkan: &VulkanBackend, x_seed: u64) {
     let n_embd = 20;
     let n_layer = 5;
     let per_layer = 8;
@@ -8132,8 +8154,9 @@ fn record_ple_projection_matches_cpu_reference() {
             .map(|_| (next_byte(seed) as f32 - 128.0) / 64.0)
             .collect()
     };
-    let x = rand_vec(n_embd, &mut seed);
     let proj_norm = rand_vec(per_layer, &mut seed);
+    let mut seed = x_seed;
+    let x = rand_vec(n_embd, &mut seed);
     let gathered = rand_vec(total, &mut seed);
 
     // CPU reference, matching `GemmaModel::compute_per_layer_inputs`'s
@@ -9450,7 +9473,9 @@ fn cross_check_fused_ple_prefill(n_tokens: usize) {
         .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
         .collect();
 
-    let mut g = vulkan.matmul(&x, n_tokens, &gate);
+    // The float kernels the fused path runs: at these widths `matmul` takes
+    // the integer-dot GEMM, whose 8-bit activation is a different rounding.
+    let mut g = vulkan.without_prefill_mmq(|| vulkan.matmul(&x, n_tokens, &gate));
     crate::engine::tensor::gelu_inplace(&mut g);
     for t in 0..n_tokens {
         let slice = &per_layer[t * per_layer_dim..(t + 1) * per_layer_dim];
@@ -9459,7 +9484,7 @@ fn cross_check_fused_ple_prefill(n_tokens: usize) {
             slice,
         );
     }
-    let expected = vulkan.matmul(&g, n_tokens, &proj);
+    let expected = vulkan.without_prefill_mmq(|| vulkan.matmul(&g, n_tokens, &proj));
 
     let got = vulkan
         .fused_ple_prefill(&x, n_tokens, &gate, &proj, &per_layer)
@@ -9737,7 +9762,7 @@ fn cross_check_fused_attention_prefill_paged_float_mode(
         }
         held_pool = Some((pool.clone(), held));
         crate::engine::kv_cache::KvCache::new_with_strided_dims(capacity, &strided_dims(&pool))
-            .try_into_paged(pool)
+            .try_into_paged(pool, 0)
             .unwrap_or_else(|_| panic!("test pool has room"))
     } else {
         crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim])
@@ -9918,7 +9943,7 @@ fn ring_mirror_matches_the_plain_mirror_across_the_wrap() {
     let mut paged_ring = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
     paged_ring.set_mirror_ring(0, n_swa, chunk);
     let mut paged_ring = paged_ring
-        .try_into_paged(pool.clone())
+        .try_into_paged(pool.clone(), 0)
         .unwrap_or_else(|_| panic!("test pool has room"));
     assert_eq!(paged_ring.layers[0].ring_rows(), Some(16));
 
@@ -11289,6 +11314,28 @@ fn gpu_attention_prefill_tiled_long_sliding_window() {
 fn gpu_attention_prefill_tiled_deep_causal_narrow_head() {
     cross_check_gpu_attention_prefill_sized(0, true, 1000, 4, 1, 128, 100);
     cross_check_gpu_attention_prefill_sized(40, false, 0, 4, 2, 128, 77);
+}
+
+/// A narrow pass deep in its window splits the window over positions
+/// (`VulkanBackend::attn_prefill_split_form`): a few queries are a few
+/// tiles, and the runs' partials meet in the decode step's reduce. Both
+/// head dims, a sliding window that starts mid-run, a group of query
+/// heads, a run count that does not divide the blocks, and two queries.
+#[test]
+fn gpu_attention_prefill_split_window_matches_cpu_reference() {
+    if let Some(vulkan) = shared_vulkan().filter(|v| v.prefill_tiled_attn) {
+        for (head_dim, n_head, n_tokens, span) in [(256, 8, 5, 1005), (128, 24, 16, 716)] {
+            assert!(
+                vulkan.attn_prefill_splits(head_dim, n_head, n_tokens, span) > 1,
+                "a {n_tokens}-query pass at head_dim {head_dim} keeps its window whole"
+            );
+        }
+    }
+    cross_check_gpu_attention_prefill_sized(0, true, 1000, 8, 1, 256, 5);
+    cross_check_gpu_attention_prefill_sized(0, true, 1000, 8, 1, 512, 3);
+    cross_check_gpu_attention_prefill_sized(512, true, 1500, 8, 1, 256, 8);
+    cross_check_gpu_attention_prefill_sized(0, true, 700, 24, 8, 128, 16);
+    cross_check_gpu_attention_prefill_sized(0, true, 333, 4, 2, 128, 2);
 }
 
 /// `n_head_kv == n_head` leaves nothing to share, so this is the one shape
@@ -15354,7 +15401,7 @@ fn paged_fused_decode_matches_cpu_reference() {
 
     let mut kv_cache =
         crate::engine::kv_cache::KvCache::new_with_strided_dims(capacity, &strided_dims(&pool))
-            .try_into_paged(pool.clone())
+            .try_into_paged(pool.clone(), 0)
             .unwrap_or_else(|_| panic!("test pool has room"));
     let mut reference_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
     for _ in 0..3 {
@@ -15742,6 +15789,16 @@ fn mmq_q4k_gemm_matches_the_cpu_product() {
     let mut seed = 0x51EE_D4A7_u64;
     for (ggml_type, in_dim, out_dim, n_tokens) in [
         (GGML_TYPE_Q4_K, 1536usize, 512usize, 64usize),
+        // Short rows at a verify's widths (`MmqKernel::Q4kShort`): the
+        // FFN gate shape, a row count that is an odd number of 64-row
+        // tiles, one block a row, and a head of tens of thousands of rows.
+        (GGML_TYPE_Q4_K, 1536, 6144, 5),
+        (GGML_TYPE_Q4_K, 2048, 2112, 13),
+        (GGML_TYPE_Q4_K, 256, 1984, 2),
+        (GGML_TYPE_Q4_K, 512, 70_016, 3),
+        // And past the multi-position form's width, to the short-row
+        // form's own: a partial last token tile.
+        (GGML_TYPE_Q4_K, 1536, 6144, 45),
         (GGML_TYPE_Q4_K, 6144, 512, 128),
         (GGML_TYPE_Q4_K, 1536, 256, 90),
         // Wide enough for the 128 × 128 kernel (`mmq_kernel_for`): the
@@ -15821,6 +15878,14 @@ fn mmq_q4k_gemm_matches_the_cpu_product() {
         (crate::engine::quant::GGML_TYPE_Q5_1, 12288, 1536, 128),
         (crate::engine::quant::GGML_TYPE_Q8_0, 8192, 1536, 200),
         (GGML_TYPE_Q4_K, 8192, 1536, 200),
+        // `Q6_K`'s multi-position form under the GEMMs' tile: a verify's
+        // widths, a partial token tile, both block parities on a row of
+        // odd super-block count, and a padded row stride.
+        (crate::engine::quant::GGML_TYPE_Q6_K, 8192, 3072, 5),
+        (crate::engine::quant::GGML_TYPE_Q6_K, 3840, 512, 2),
+        (crate::engine::quant::GGML_TYPE_Q6_K, 1536, 256, 13),
+        (crate::engine::quant::GGML_TYPE_Q6_K, 2304, 1024, 31),
+        (crate::engine::quant::GGML_TYPE_Q6_K, 6144, 1536, 9),
     ] {
         let mut bytes = Vec::new();
         let (_, block_elems) =
@@ -15832,31 +15897,56 @@ fn mmq_q4k_gemm_matches_the_cpu_product() {
         let x: Vec<f32> = (0..n_tokens * in_dim)
             .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
             .collect();
-        let Some(got) = vulkan.mmq_matmul_for_test(&x, n_tokens, &w) else {
-            eprintln!("mmq kernel not built (ORANGU_PREFILL_MMQ=0?) — nothing to check");
-            return;
-        };
         let want = CpuBackend.matmul_dequant(&x, n_tokens, &w);
-        assert_eq!(got.len(), want.len());
-        let mut worst = 0.0f32;
-        for t in 0..n_tokens {
-            let row = &want[t * out_dim..(t + 1) * out_dim];
-            let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
-            for o in 0..out_dim {
-                let i = t * out_dim + o;
-                let err = (got[i] - want[i]).abs() / mag;
-                worst = worst.max(err);
-                assert!(
-                    err <= 2e-2,
-                    "[type {ggml_type}: {in_dim}x{out_dim}] token {t} row {o}: mmq {} vs cpu {} (row magnitude {mag})",
-                    got[i],
-                    want[i]
-                );
-            }
-        }
-        eprintln!(
-            "[type {ggml_type}: {in_dim}x{out_dim}] {n_tokens} tokens: worst relative error {worst:.2e}"
+        // The short-row form at every row count start-up may choose, where
+        // it takes the shape; once, as configured, everywhere else.
+        let in_force = vulkan.q4k_short_rows();
+        let short = matches!(
+            vulkan.mmq_kernel_for(&w, n_tokens),
+            Some(MmqKernel::Q4kShort { .. })
         );
+        let row_counts = if short {
+            vulkan.q4k_short_rows_choices()
+        } else {
+            Vec::new()
+        };
+        for rows in row_counts.iter().copied().map(Some).chain([None]) {
+            if let Some(rows) = rows {
+                vulkan.set_q4k_short_rows(rows);
+            }
+            let got = vulkan.mmq_matmul_for_test(&x, n_tokens, &w);
+            vulkan.set_q4k_short_rows(in_force);
+            let Some(got) = got else {
+                // Only a GEMM that is off may decline: a shape it does not
+                // take would check nothing here, and pass.
+                assert!(
+                    !vulkan.prefill_mmq(),
+                    "[type {ggml_type}: {in_dim}x{out_dim}] {n_tokens} tokens: the GEMM does not take this shape"
+                );
+                eprintln!("mmq kernel not built (ORANGU_PREFILL_MMQ=0?) — nothing to check");
+                return;
+            };
+            assert_eq!(got.len(), want.len());
+            let mut worst = 0.0f32;
+            for t in 0..n_tokens {
+                let row = &want[t * out_dim..(t + 1) * out_dim];
+                let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+                for o in 0..out_dim {
+                    let i = t * out_dim + o;
+                    let err = (got[i] - want[i]).abs() / mag;
+                    worst = worst.max(err);
+                    assert!(
+                        err <= 2e-2,
+                        "[type {ggml_type}: {in_dim}x{out_dim}, short rows {rows:?}] token {t} row {o}: mmq {} vs cpu {} (row magnitude {mag})",
+                        got[i],
+                        want[i]
+                    );
+                }
+            }
+            eprintln!(
+                "[type {ggml_type}: {in_dim}x{out_dim}, short rows {rows:?}] {n_tokens} tokens: worst relative error {worst:.2e}"
+            );
+        }
     }
 }
 
@@ -16622,6 +16712,122 @@ fn decode_matvec_q4k_integer_dot() {
     }
 }
 
+/// The multi-position integer-dot `Q4_K` kernel writes, for every token
+/// of a pass, exactly what the one-token kernel writes for that token
+/// alone — the property that makes a verified token the token a decode
+/// step would have chosen. Widths below, at and past one tile, a row
+/// count that is not a whole group, and a vocabulary head's row count —
+/// more row groups than one dispatch dimension holds. The GEMMs' staging
+/// is checked with the short-row form off wherever the GEMM takes the
+/// shape: that form's sum is in another order (checked against the CPU's
+/// product in `mmq_q4k_gemm_matches_the_cpu_product`).
+#[test]
+fn q4k_integer_dot_rows_match_one_token_at_a_time_bit_for_bit() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let mut rows_checked = 0;
+    for &(in_dim, out_dim) in &[
+        (1536usize, 6144usize),
+        (2048, 2055),
+        (256, 262_144),
+        (4096, 2055),
+        (4096, 2048),
+    ] {
+        let mut seed = 0x51DE_u64;
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / 256) {
+            bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+        }
+        let w = test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim);
+        for n_tokens in [2usize, 3, 8, 9, 13] {
+            if vulkan.mmvq_token_tile(&w, n_tokens) < 2 {
+                eprintln!("the multi-position Q4_K kernel is not built here — nothing to check");
+                return;
+            }
+            let x: Vec<f32> = (0..n_tokens * in_dim)
+                .map(|i| (next_byte(&mut seed) as f32 - 128.0) / 64.0 + (i % 97) as f32 * 1e-5)
+                .collect();
+            // The decode quantizer's layout, then the GEMMs' staging (the
+            // narrow integer-dot GEMM a short prompt chunk takes).
+            let decode_layout = vulkan.without_prefill_mmq(|| vulkan.matmul(&x, n_tokens, &w));
+            let in_force = vulkan.q4k_short_rows();
+            vulkan.set_q4k_short_rows(0);
+            let rows_layout = (vulkan.mmq_for(&w, n_tokens)
+                && vulkan.mmq_kernel_for(&w, n_tokens) == Some(MmqKernel::Q4kNarrow))
+            .then(|| vulkan.matmul(&x, n_tokens, &w));
+            vulkan.set_q4k_short_rows(in_force);
+            rows_checked += usize::from(rows_layout.is_some());
+            let layouts = std::iter::once(("decode", &decode_layout))
+                .chain(rows_layout.as_ref().map(|all| ("rows", all)));
+            for (layout, all) in layouts {
+                for t in 0..n_tokens {
+                    let one = vulkan.matmul(&x[t * in_dim..(t + 1) * in_dim], 1, &w);
+                    let row = &all[t * out_dim..(t + 1) * out_dim];
+                    let first = row
+                        .iter()
+                        .zip(&one)
+                        .position(|(a, b)| a.to_bits() != b.to_bits());
+                    assert!(
+                        first.is_none(),
+                        "{in_dim}x{out_dim}, {n_tokens} tokens, {layout} layout: token {t} differs at {first:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        rows_checked > 0 || !vulkan.prefill_mmq(),
+        "no shape here takes the GEMMs' multi-position form — the staging layout went unchecked"
+    );
+}
+
+/// The multi-position `Q6_K` light kernel writes, for every token of a
+/// pass, exactly what the one-token light kernel writes for that token
+/// alone. Widths below, at and past one tile, and a row length whose blocks
+/// sit at both misalignments.
+#[test]
+fn q6k_light_rows_match_one_token_at_a_time_bit_for_bit() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    for &(in_dim, out_dim) in &[(2048usize, 256usize), (3072, 1024), (2304, 515)] {
+        let mut seed = 0x6B6_u64;
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / 256) {
+            bytes.extend(build_block(GGML_TYPE_Q6_K, &mut seed));
+        }
+        let w = test_quant_matrix(&bytes, GGML_TYPE_Q6_K, in_dim, out_dim);
+        for n_tokens in [2usize, 3, 8, 9, 13, 16] {
+            if vulkan.selected_kernel_name(GGML_TYPE_Q6_K, in_dim, n_tokens) != "q6_k-light-tokens"
+            {
+                eprintln!("the multi-position Q6_K kernel is not selected here — nothing to check");
+                return;
+            }
+            let x: Vec<f32> = (0..n_tokens * in_dim)
+                .map(|i| (next_byte(&mut seed) as f32 - 128.0) / 64.0 + (i % 89) as f32 * 1e-5)
+                .collect();
+            let all = vulkan.without_prefill_mmq(|| vulkan.matmul(&x, n_tokens, &w));
+            for t in 0..n_tokens {
+                let one = vulkan.matmul(&x[t * in_dim..(t + 1) * in_dim], 1, &w);
+                let row = &all[t * out_dim..(t + 1) * out_dim];
+                let first = row
+                    .iter()
+                    .zip(&one)
+                    .position(|(a, b)| a.to_bits() != b.to_bits());
+                assert!(
+                    first.is_none(),
+                    "{in_dim}x{out_dim}, {n_tokens} tokens: token {t} differs at {first:?}"
+                );
+            }
+        }
+    }
+}
+
 /// A few tokens (under the coop threshold, under the thin-tile width) on
 /// the integer-dot path through the CPU-orchestrated batch — the shape a
 /// prompt's last short chunk takes.
@@ -16926,4 +17132,192 @@ fn every_integer_dot_pipeline_builds() {
         "the family is switched on and yet not one kernel built — every one \
          of them was refused by this platform's shader compiler"
     );
+}
+
+/// **The cooperative decode kernel reads a `q8_0` cache a word at a time,
+/// and gets what reading it an element at a time gets.** Run straight from
+/// its source over hand-built `q8_0` rows — the shared test backend's KV
+/// width is whatever it started with, so this is the one test that sees the
+/// word path — at `head_dim` 128, 256 and 512, one to four words a lane,
+/// against the CPU over the same dequantised values: per head, the running
+/// max, the softmax denominator and the unnormalised output a split hands
+/// its merge. Both layouts a decode reads: pool pages behind a shuffled
+/// block table, and a windowed layer's ring with the window wrapped.
+#[test]
+fn coop_decode_attention_reads_q8_0_by_the_word() {
+    for paging in [
+        vulkan_shaders::KvPaging::Paged,
+        vulkan_shaders::KvPaging::Ring,
+    ] {
+        coop_decode_attention_q8_0_at(128, 2, paging);
+        coop_decode_attention_q8_0_at(256, 2, paging);
+        coop_decode_attention_q8_0_at(512, 1, paging);
+        coop_decode_attention_q8_0_at(256, 1, paging);
+    }
+}
+
+fn coop_decode_attention_q8_0_at(
+    head_dim: usize,
+    n_head_kv: usize,
+    paging: vulkan_shaders::KvPaging,
+) {
+    use wgpu::util::DeviceExt;
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let lanes = vulkan.attn_coop_decode_lanes;
+    if lanes == 0 {
+        eprintln!("skipping: this device runs no cooperative decode kernel");
+        return;
+    }
+    let ring = matches!(paging, vulkan_shaders::KvPaging::Ring);
+    let (n_head, page_tokens, ring_rows) = (8usize, 4usize, 16usize);
+    // A ring holds 13 positions from 29: rows 13..15, then 0..9.
+    let (window_start, n_pos) = if ring { (29usize, 13usize) } else { (0, 37) };
+    let n_pages = n_pos.div_ceil(page_tokens);
+    // Logical page `i` in physical page `n_pages + 2 - i`, past two junk ones.
+    let table: Vec<u32> = (0..n_pages).map(|i| (n_pages + 2 - i) as u32).collect();
+    let rows = if ring {
+        ring_rows
+    } else {
+        (n_pages + 3) * page_tokens
+    };
+    let row_of = |p: usize| {
+        if ring {
+            (window_start + p) & (ring_rows - 1)
+        } else {
+            table[p / page_tokens] as usize * page_tokens + p % page_tokens
+        }
+    };
+    let kv_dim = n_head_kv * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut seed = 0x0C0B_8A1E_u64;
+    let mut rand = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 48.0)
+            .collect()
+    };
+    let k_rows = rand(rows * kv_dim);
+    let v_rows = rand(rows * kv_dim);
+    let q = rand(n_head * head_dim);
+    let k_bytes = crate::engine::kv_cache::f32_to_q8_0_bytes(&k_rows);
+    let v_bytes = crate::engine::kv_cache::f32_to_q8_0_bytes(&v_rows);
+    let k = crate::engine::kv_cache::device_rows_to_f32(&k_bytes, vulkan_shaders::KvStorage::Q8_0);
+    let v = crate::engine::kv_cache::device_rows_to_f32(&v_bytes, vulkan_shaders::KvStorage::Q8_0);
+
+    let (device, _) = vulkan.device_and_queue();
+    let src = vulkan_shaders::shader_source_attention_split_coop(
+        vulkan_shaders::KvStorage::Q8_0,
+        head_dim as u32,
+        lanes,
+        paging,
+    );
+    assert!(src.contains("kv_read_k4"), "the word path was not emitted");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("q8 coop test"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("q8 coop test"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let storage = |label: &str, bytes: &[u8]| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        })
+    };
+    let aq = storage("aq", bytemuck::cast_slice(&q));
+    let kb = storage("k", &k_bytes);
+    let vb = storage("v", &v_bytes);
+    let ml = storage("ml", &vec![0u8; n_head * 2 * 4]);
+    let acc = storage("acc", &vec![0u8; n_head * head_dim * 4]);
+    let tb = storage("table", bytemuck::cast_slice(&table));
+    let meta: [u32; 12] = [
+        n_head as u32,
+        n_head_kv as u32,
+        head_dim as u32,
+        window_start as u32,
+        n_pos as u32,
+        1,
+        scale.to_bits(),
+        0,
+        page_tokens as u32,
+        ring_rows as u32,
+        0,
+        0,
+    ];
+    let meta = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("meta"),
+        contents: bytemuck::cast_slice(&meta),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bound: &[&wgpu::Buffer] = if ring {
+        &[&aq, &kb, &vb, &ml, &acc, &meta]
+    } else {
+        &[&aq, &kb, &vb, &ml, &acc, &meta, &tb]
+    };
+    let entries: Vec<wgpu::BindGroupEntry<'_>> = bound
+        .iter()
+        .enumerate()
+        .map(|(i, b)| wgpu::BindGroupEntry {
+            binding: i as u32,
+            resource: b.as_entire_binding(),
+        })
+        .collect();
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q8 coop test"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &entries,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(n_head as u32, 1, 1);
+    }
+    let got_acc = vulkan.submit_and_readback_for_test(encoder, &acc, n_head * head_dim);
+    let got_ml = vulkan.readback_for_test(&ml, n_head * 2);
+
+    let group = n_head / n_head_kv;
+    for h in 0..n_head {
+        let kv_head = h / group;
+        let qh = &q[h * head_dim..(h + 1) * head_dim];
+        let scores: Vec<f32> = (0..n_pos)
+            .map(|p| {
+                let kh = &k[(row_of(p) * n_head_kv + kv_head) * head_dim..][..head_dim];
+                crate::engine::tensor::dot(qh, kh) * scale
+            })
+            .collect();
+        let m = scores.iter().copied().fold(f32::MIN, f32::max);
+        let l: f32 = scores.iter().map(|s| (s - m).exp()).sum();
+        assert!(
+            (got_ml[h * 2] - m).abs() <= 1e-3 * m.abs().max(1.0),
+            "head {h}: max"
+        );
+        assert!(
+            (got_ml[h * 2 + 1] - l).abs() <= 1e-3 * l.max(1.0),
+            "head {h}: sum"
+        );
+        for d in 0..head_dim {
+            let want: f32 = (0..n_pos)
+                .map(|p| {
+                    (scores[p] - m).exp() * v[(row_of(p) * n_head_kv + kv_head) * head_dim + d]
+                })
+                .sum();
+            let got = got_acc[h * head_dim + d];
+            assert!(
+                (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                "head_dim {head_dim}, head {h} dim {d}: cpu={want} gpu={got}"
+            );
+        }
+    }
 }

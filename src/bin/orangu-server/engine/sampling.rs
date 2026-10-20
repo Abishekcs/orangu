@@ -18,8 +18,6 @@
 //! closely enough for these parameters. `temperature <= 0.0` means greedy
 //! (always the highest-logit token) and is fully deterministic.
 
-use rand::{RngExt, SeedableRng, rngs::StdRng};
-
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
     pub temperature: f32,
@@ -167,7 +165,6 @@ impl Constraint {
 
 pub struct Sampler {
     params: SamplingParams,
-    rng: StdRng,
     /// `None` for an unconstrained request, which is every request that did
     /// not ask for a `response_format`.
     constraint: Option<Constraint>,
@@ -175,10 +172,8 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(params: SamplingParams) -> Self {
-        let rng = StdRng::seed_from_u64(params.seed);
         Self {
             params,
-            rng,
             constraint: None,
         }
     }
@@ -212,18 +207,25 @@ impl Sampler {
         self.params.repeat_last_n
     }
 
-    /// Picks the next token from `logits` (one score per vocab id),
-    /// penalizing any token id present in `recent_tokens`' last
+    /// Picks the token for absolute position `pos` from `logits` (one score
+    /// per vocab id), penalizing any token id present in `recent_tokens`' last
     /// `repeat_last_n` entries.
-    pub fn sample(&mut self, logits: &[f32], recent_tokens: &[u32]) -> u32 {
-        let id = self.pick(logits, recent_tokens);
+    ///
+    /// The random draw is a function of the seed and `pos` alone
+    /// ([`position_draw`]), not of how many draws came before. So the token
+    /// chosen for a position depends only on that position's logits, which
+    /// is what lets speculative decoding verify a draft under sampling
+    /// exactly: the target's choice at each drafted position is the one plain
+    /// decoding would have made there.
+    pub fn sample(&mut self, logits: &[f32], recent_tokens: &[u32], pos: usize) -> u32 {
+        let id = self.pick(logits, recent_tokens, pos);
         if let Some(constraint) = self.constraint.as_mut() {
             constraint.accept(id);
         }
         id
     }
 
-    fn pick(&mut self, logits: &[f32], recent_tokens: &[u32]) -> u32 {
+    fn pick(&mut self, logits: &[f32], recent_tokens: &[u32], pos: usize) -> u32 {
         let mut logits: Vec<f32> = logits.to_vec();
         apply_repeat_penalty(&mut logits, recent_tokens, &self.params);
 
@@ -293,14 +295,14 @@ impl Sampler {
         apply_top_p(&mut candidates, self.params.top_p);
         apply_min_p(&mut candidates, self.params.min_p);
 
-        self.draw(&candidates)
+        self.draw(&candidates, pos)
     }
 
     /// One weighted draw over `candidates`, whose second field is a
-    /// probability.
-    fn draw(&mut self, candidates: &[(u32, f32)]) -> u32 {
+    /// probability, for position `pos`.
+    fn draw(&self, candidates: &[(u32, f32)], pos: usize) -> u32 {
         let total: f32 = candidates.iter().map(|(_, p)| p).sum();
-        let mut draw = self.rng.random::<f32>() * total;
+        let mut draw = position_draw(self.params.seed, pos) * total;
         for &(id, p) in candidates {
             draw -= p;
             if draw <= 0.0 {
@@ -340,7 +342,7 @@ impl Sampler {
     /// temperature, the descending order, softmax, `top_p`, `min_p`, the
     /// draw — the same candidates in the same order, so the same
     /// distribution.
-    pub fn sample_from_candidates(&mut self, candidates: Vec<(u32, f32)>) -> u32 {
+    pub fn sample_from_candidates(&mut self, candidates: Vec<(u32, f32)>, pos: usize) -> u32 {
         let mut candidates = candidates;
         for (_, v) in candidates.iter_mut() {
             *v /= self.params.temperature;
@@ -349,12 +351,28 @@ impl Sampler {
         softmax_pairs(&mut candidates);
         apply_top_p(&mut candidates, self.params.top_p);
         apply_min_p(&mut candidates, self.params.min_p);
-        let id = self.draw(&candidates);
+        let id = self.draw(&candidates, pos);
         if let Some(constraint) = self.constraint.as_mut() {
             constraint.accept(id);
         }
         id
     }
+}
+
+/// A uniform number in `[0, 1)` for the draw at absolute position `pos`
+/// under `seed`: SplitMix64 over the two, so every position has its own
+/// independent draw and nothing depends on the order draws are made in.
+pub fn position_draw(seed: u64, pos: usize) -> f32 {
+    let mut z = seed
+        ^ (pos as u64)
+            .wrapping_add(1)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // The top 24 bits: exactly representable in an `f32`, so the value is
+    // strictly below 1.
+    (z >> 40) as f32 / (1u64 << 24) as f32
 }
 
 /// The highest-scoring token the constraint still allows.
@@ -548,7 +566,7 @@ mod tests {
         };
         let mut sampler = Sampler::new(params);
         for _ in 0..5 {
-            assert_eq!(sampler.sample(&logits, &[]), 1);
+            assert_eq!(sampler.sample(&logits, &[], 0), 1);
         }
     }
 
@@ -563,7 +581,7 @@ mod tests {
         let mut sampler = Sampler::new(params);
         // Token 0 was just used; greedy sampling with equal raw logits
         // should now prefer a different (unpenalized) token.
-        let chosen = sampler.sample(&logits, &[0]);
+        let chosen = sampler.sample(&logits, &[0], 1);
         assert_ne!(chosen, 0);
     }
 
@@ -577,9 +595,32 @@ mod tests {
         };
         let mut a = Sampler::new(params.clone());
         let mut b = Sampler::new(params);
-        let seq_a: Vec<u32> = (0..10).map(|_| a.sample(&logits, &[])).collect();
-        let seq_b: Vec<u32> = (0..10).map(|_| b.sample(&logits, &[])).collect();
+        let seq_a: Vec<u32> = (0..10).map(|p| a.sample(&logits, &[], p)).collect();
+        let seq_b: Vec<u32> = (0..10).map(|p| b.sample(&logits, &[], p)).collect();
         assert_eq!(seq_a, seq_b);
+    }
+
+    /// A position's draw does not depend on which positions were drawn
+    /// before it — the property exact speculative verification rests on.
+    #[test]
+    fn a_positions_draw_is_independent_of_the_draws_before_it() {
+        let logits = [1.0, 2.0, 3.0, 0.5, 0.1];
+        let params = SamplingParams {
+            temperature: 1.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let mut in_order = Sampler::new(params.clone());
+        let all: Vec<u32> = (0..32).map(|p| in_order.sample(&logits, &[], p)).collect();
+        let mut alone = Sampler::new(params);
+        for p in [31usize, 3, 17, 0] {
+            assert_eq!(alone.sample(&logits, &[], p), all[p], "position {p}");
+        }
+        // And the draws are spread over [0, 1).
+        let draws: Vec<f32> = (0..10_000).map(|p| position_draw(7, p)).collect();
+        let mean = draws.iter().sum::<f32>() / draws.len() as f32;
+        assert!((mean - 0.5).abs() < 0.02, "mean draw {mean}");
+        assert!(draws.iter().all(|&d| (0.0..1.0).contains(&d)));
     }
 
     #[test]
@@ -688,9 +729,9 @@ mod constraint_tests {
         let mut sampler = Sampler::new(params.clone()).with_constraint(json_constraint());
         // `hello` (5) is the model's favourite; `{` (0) is its second.
         let logits = vec![9.0, 1.0, 1.0, 1.0, 1.0, 10.0, 0.5, 0.0];
-        assert_eq!(sampler.sample(&logits, &[]), 0, "must not pick `hello`");
+        assert_eq!(sampler.sample(&logits, &[], 0), 0, "must not pick `hello`");
         // Unconstrained, the same logits give the prose token.
         let mut plain = Sampler::new(params);
-        assert_eq!(plain.sample(&logits, &[]), 5);
+        assert_eq!(plain.sample(&logits, &[], 0), 5);
     }
 }

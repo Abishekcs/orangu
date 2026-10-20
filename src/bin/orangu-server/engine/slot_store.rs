@@ -183,6 +183,35 @@ impl SlotStore {
         }
     }
 
+    /// [`Self::retain`] for background work (`GenerateRequest::background`):
+    /// fills a slot that retains nothing and never replaces a retained entry.
+    pub fn fill_if_empty(&self, slot_id: usize, tokens: Vec<u32>, cache: KvCache) {
+        if let Some(cell) = self.retained.get(slot_id) {
+            let mut held = retained(cell);
+            if held.is_none() {
+                *held = Some(CachedPrefill { tokens, cache });
+            }
+        }
+    }
+
+    /// Drops every retained snapshot that holds pages of the shared pool and
+    /// is not in use; whether any did. Its pages were published when its
+    /// request ended, so they stay findable as cached pages and serve the
+    /// slot's next turn unless the pool reclaims them first — what a
+    /// sequence short of pages asks for before giving its own back.
+    pub fn release_paged(&self) -> bool {
+        let mut released = false;
+        for cell in &self.retained {
+            if let Some(mut held) = try_retained(cell)
+                && held.as_ref().is_some_and(|entry| entry.cache.is_paged())
+            {
+                *held = None;
+                released = true;
+            }
+        }
+        released
+    }
+
     /// Drops every slot's retained snapshot: a `[workers]` node switching
     /// between its tree and its model alone, whose caches do not
     /// serve each other — one holds its rows on the workers.
@@ -278,6 +307,28 @@ impl SlotStore {
         len
     }
 
+    /// [`Self::reuse_into`] for a paged `dst`, which is filled by pushing
+    /// rows (`KvCache::push_prefix_from`): this slot's own retained or
+    /// restored conversation, as far as it matches `prompt`. `0` when nothing
+    /// matches or `dst` cannot be filled that way.
+    pub fn reuse_into_paged(&self, slot_id: usize, prompt: &[u32], dst: &mut KvCache) -> usize {
+        if dst.remote.is_some() {
+            return 0;
+        }
+        let Some(cell) = self.retained.get(slot_id) else {
+            return 0;
+        };
+        let guard = retained(cell);
+        let Some(entry) = guard.as_ref() else {
+            return 0;
+        };
+        let len = usable_len(entry, prompt).min(entry.cache.host_committed_len());
+        if len == 0 || !dst.push_prefix_from(&entry.cache, len) {
+            return 0;
+        }
+        len
+    }
+
     /// Copies slot `other`'s matching prefix into `dst`, keeping `other`'s
     /// snapshot: see [`Self::reuse_into`]. `0` when that slot is busy, no
     /// longer matches, or its workers cannot copy.
@@ -364,6 +415,22 @@ impl SlotStore {
         // `get` re-checked above, so this index is in range.
         *retained(&self.retained[slot_id]) = Some(CachedPrefill { tokens, cache });
         Ok(restored)
+    }
+
+    /// [`Self::restore`] for every slot from `<prefix>-<slot>.bin`, as the
+    /// coordinator names the slots it saves before a swap: how many token
+    /// positions each slot got back. A slot with no file, or an unusable one,
+    /// gets nothing and the next request prefills as it would have.
+    pub fn restore_all(&self, prefix: &str) -> Vec<usize> {
+        (0..self.retained.len())
+            .map(|slot| {
+                self.restore(slot, &format!("{prefix}-{slot}.bin"))
+                    .unwrap_or_else(|err| {
+                        log::warn!("orangu-server: slot {slot} not restored: {err}");
+                        0
+                    })
+            })
+            .collect()
     }
 
     /// Resolves `filename` to a path inside `dir`, rejecting anything that is
@@ -596,6 +663,30 @@ mod tests {
 
     fn store(dir: &std::path::Path, n_slots: usize) -> SlotStore {
         SlotStore::at(dir.to_path_buf(), "fptest".to_string(), n_slots)
+    }
+
+    /// Background work fills an empty slot and never displaces a client's
+    /// conversation.
+    #[test]
+    fn background_work_never_replaces_what_a_slot_retains() {
+        let dir = std::env::temp_dir().join(format!("orangu-slots-bg-{}", std::process::id()));
+        let store = store(&dir, 1);
+        store.fill_if_empty(0, vec![9, 9, 9, 9], filled_cache(1, 4, 4));
+        let mut dst = KvCache::new(1, 8, 4);
+        assert_eq!(
+            store.reuse_into(0, &[9, 9, 9, 9, 1], &mut dst),
+            4,
+            "an empty slot takes it"
+        );
+        store.retain(0, vec![1, 2, 3, 4], filled_cache(1, 4, 4));
+        store.fill_if_empty(0, vec![9, 9, 9, 9], filled_cache(1, 4, 4));
+        let mut dst = KvCache::new(1, 8, 4);
+        assert_eq!(
+            store.reuse_into(0, &[1, 2, 3, 4, 5], &mut dst),
+            4,
+            "the client's conversation was displaced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

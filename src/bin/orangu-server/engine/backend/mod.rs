@@ -52,6 +52,7 @@ pub mod probe_blocks;
 pub mod rknpu;
 #[cfg(feature = "rocm")]
 pub mod rocm;
+pub mod tuning_profile;
 pub mod vendor_shaders;
 pub mod vulkan;
 pub mod vulkan_clock;
@@ -100,7 +101,9 @@ pub(crate) fn env_tuning_value<T>(
 where
     T: std::str::FromStr + std::fmt::Display + Copy,
 {
-    let Ok(raw) = std::env::var(var) else {
+    // The environment, then this device's tuning profile — see
+    // `tuning_profile`.
+    let Some(raw) = tuning_profile::var(var) else {
         return default;
     };
     match raw.trim().parse::<T>() {
@@ -358,6 +361,17 @@ pub(crate) fn note_tail_step(elapsed: std::time::Duration) {
         .lock()
         .expect("tail probe poisoned")
         .note(elapsed);
+    if let crate::engine::step_probe::Noted::Decided(round, verdict) = &noted
+        && let Some(key) = TAIL_KEY.get()
+    {
+        crate::engine::probe_cache::keep_choice(
+            TAIL_CHOICE,
+            key,
+            verdict.arm == TAIL_HOST,
+            round.medians[TAIL_HOST] as f64 / 1e9,
+            round.medians[0] as f64 / 1e9,
+        );
+    }
     if crate::engine::env::flag_on("ORANGU_TAIL_TRACE") {
         let arm = |a: usize| if a == TAIL_HOST { "host" } else { "device" };
         let print_round = |r: &crate::engine::step_probe::Round| {
@@ -384,6 +398,34 @@ pub(crate) fn note_tail_step(elapsed: std::time::Duration) {
         }
     }
 }
+
+/// Keeps the tail probe's answers under `key` (`engine::probe_cache::key`)
+/// and starts from one an earlier start kept: the probe's rounds put about
+/// a third of a fresh process's first seventy decode steps on the losing
+/// arm, which on a small model is most of the first request's rate.
+pub(crate) fn keep_tail_choice_under(key: String) {
+    if tail_forced().is_some() {
+        return;
+    }
+    if let Some(host) = crate::engine::probe_cache::choice(TAIL_CHOICE, &key) {
+        TAIL_PROBE
+            .lock()
+            .expect("tail probe poisoned")
+            .adopt(if host { TAIL_HOST } else { 0 });
+        crate::engine::adapt::note(
+            "vocabulary projection",
+            if host { "host" } else { "device" }.to_string(),
+            "measured at an earlier start, kept in the probe cache".to_string(),
+        );
+    }
+    let _ = TAIL_KEY.set(key);
+}
+
+/// The probe-cache name of the tail probe's answer.
+const TAIL_CHOICE: &str = "tail";
+
+/// Where [`note_tail_step`] keeps a settled answer, once a start names it.
+static TAIL_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Whether the tail is being timed right now — its arms shape the step,
 /// and another experiment over the same steps must stand aside while

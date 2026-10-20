@@ -20,12 +20,12 @@
 use crate::config::{CoordinatorConfiguration, CoordinatorLlmEntry, role_server_flag};
 use anyhow::{Context, Result, anyhow};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     sync::Mutex as StdMutex,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
     time::Duration,
 };
 use tokio::{
@@ -186,8 +186,10 @@ pub struct Coordinator {
     /// RwLock to allow hot-reloading config.
     config: std::sync::RwLock<CoordinatorConfiguration>,
     http_client: reqwest::Client,
-    active: Mutex<Option<ActiveProcess>>,
-    /// PID of whatever `orangu-server` process is currently starting or
+    /// The running `orangu-server`s, most recently used first — one unless
+    /// `resident` allows more (see [`CoordinatorConfiguration::resident`]).
+    active: Mutex<Vec<ActiveProcess>>,
+    /// PID of the `orangu-server` process most recently starting or made
     /// active, if any. Set the instant a process is spawned — before its
     /// (possibly slow) health check even begins — and cleared once it's
     /// known to have stopped. `active` is held locked for an entire start
@@ -207,7 +209,78 @@ pub struct Coordinator {
     /// (the common case) falls back to [`Coordinator::resolve_server_binary`]'s
     /// sibling-binary/`PATH` search.
     server_binary_override: Option<PathBuf>,
+    /// Proxied requests whose response is still being streamed back, per
+    /// origin — see [`InFlight`]. Stopping a server waits for its count to
+    /// reach zero first.
+    in_flight: StdMutex<HashMap<String, Arc<AtomicUsize>>>,
 }
+
+/// One proxied request, counted in [`Coordinator::in_flight`] until it is
+/// dropped — which the proxy arranges to happen when the response body has
+/// been streamed to the client, or the client has gone.
+pub struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How long [`Coordinator::fit_verdict`] waits for `orangu-server plan`. It
+/// reads tensor tables only, which is seconds even for a model of many
+/// shards.
+const FIT_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The verdict in `orangu-server plan --json`'s output: `Err` with its
+/// problems only when it says the model does not run.
+fn fit_from_plan(stdout: &[u8]) -> std::result::Result<(), String> {
+    let Some(v) = std::str::from_utf8(stdout)
+        .ok()
+        .and_then(|s| s.lines().rev().find(|l| l.trim_start().starts_with('{')))
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    else {
+        return Ok(());
+    };
+    if v["runs"].as_bool() != Some(false) {
+        return Ok(());
+    }
+    let problems: Vec<&str> = v["problems"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| p.as_str()).collect())
+        .unwrap_or_default();
+    Err(if problems.is_empty() {
+        "it does not fit this machine".to_string()
+    } else {
+        problems.join("; ")
+    })
+}
+
+/// How long one slot's save or restore may take: a slot holding a long
+/// conversation writes or reads a file of a gigabyte or more.
+const SLOT_FILE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The start of the files a profile's slots are kept in across swaps,
+/// `<prefix>-<slot>.bin` under the server's own slot directory: one path
+/// component of the characters the server accepts. The server it starts is
+/// told it (`ORANGU_SLOT_RESTORE`) and restores them before anything else
+/// runs, its prefix warm-up included.
+fn swap_slot_prefix(profile: &str) -> String {
+    let name: String = profile
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("coordinator-{name}")
+}
+
+/// How long a swap waits for the outgoing server's in-flight responses.
+/// Bounded, so one stuck stream cannot keep every other profile out.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Per-attempt timeout for the `/v1/models` health-check probe only — kept
 /// short so a genuinely stuck/unreachable process is detected quickly and
@@ -236,11 +309,118 @@ impl Coordinator {
         Ok(Self {
             config: std::sync::RwLock::new(config),
             http_client,
-            active: Mutex::new(None),
+            active: Mutex::new(Vec::new()),
             current_pid: AtomicU32::new(0),
             last_accessed: StdMutex::new(Instant::now()),
             server_binary_override,
+            in_flight: StdMutex::new(HashMap::new()),
         })
+    }
+
+    /// The in-flight count of the server at `origin`.
+    fn in_flight_at(&self, origin: &str) -> Arc<AtomicUsize> {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .entry(origin.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Counts one request proxied to `origin` as in flight until the
+    /// returned guard drops.
+    pub fn begin_request(&self, origin: &str) -> InFlight {
+        let count = self.in_flight_at(origin);
+        count.fetch_add(1, Ordering::Relaxed);
+        InFlight(count)
+    }
+
+    /// Waits until no response from the server at `origin` is still
+    /// streaming, or [`DRAIN_TIMEOUT`] passes. Called before that server is
+    /// stopped, so a stream another client is reading is finished rather
+    /// than cut off mid-answer.
+    async fn drain(&self, origin: &str, running: &str) {
+        let count = self.in_flight_at(origin);
+        let started = Instant::now();
+        let mut logged = false;
+        while count.load(Ordering::Relaxed) > 0 {
+            if started.elapsed() >= DRAIN_TIMEOUT {
+                log::warn!(
+                    "'{running}' still has {} response(s) in flight after {}s; stopping it anyway",
+                    count.load(Ordering::Relaxed),
+                    DRAIN_TIMEOUT.as_secs()
+                );
+                return;
+            }
+            if !logged {
+                log::info!(
+                    "waiting for {} in-flight response(s) from '{running}' before stopping it",
+                    count.load(Ordering::Relaxed)
+                );
+                logged = true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Stops a live resident the way a swap does: its responses finished,
+    /// its slots saved for its next start, then the process.
+    async fn retire(&self, active: ActiveProcess) {
+        let origin = active.entry_at_start.origin();
+        let mut active = active;
+        if matches!(active.child.try_wait(), Ok(None)) {
+            self.drain(&origin, &active.entry_name).await;
+            self.save_slots(&origin, &active.entry_name).await;
+        }
+        Self::stop(active).await;
+    }
+
+    /// Saves every slot of the server at `origin` to `profile`'s swap files
+    /// ([`swap_slot_prefix`]) before a swap stops it, so its conversations
+    /// survive to the profile's next server, which restores them at start.
+    /// Best effort: a slot that holds nothing or a server that refuses only
+    /// costs the next request its prefill.
+    async fn save_slots(&self, origin: &str, profile: &str) {
+        let slots = match self
+            .http_client()
+            .get(format!("{origin}/slots"))
+            .timeout(HEALTH_CHECK_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(r) => r
+                .json::<Vec<serde_json::Value>>()
+                .await
+                .map_or(0, |v| v.len()),
+            Err(_) => 0,
+        };
+        let prefix = swap_slot_prefix(profile);
+        for slot in 0..slots {
+            let started = Instant::now();
+            let Ok(reply) = self
+                .http_client()
+                .post(format!("{origin}/slots/{slot}?action=save"))
+                .json(&serde_json::json!({ "filename": format!("{prefix}-{slot}.bin") }))
+                .timeout(SLOT_FILE_TIMEOUT)
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(body) = reply.json::<serde_json::Value>().await else {
+                continue;
+            };
+            let tokens = body
+                .get("n_saved")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if tokens > 0 {
+                log::info!(
+                    "saved slot {slot} of '{profile}' ({tokens} tokens) in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
     }
 
     /// The shared HTTP client used both for readiness probes and, by the
@@ -303,46 +483,33 @@ impl Coordinator {
         *self.config.write().unwrap() = new_config;
     }
 
-    /// After a config reload, stop the active process if its profile was
-    /// removed or any of its settings changed — otherwise it would keep
+    /// After a config reload, stop every running process whose profile was
+    /// removed or had any of its settings changed — otherwise it would keep
     /// running with stale settings indefinitely.
     pub async fn stop_if_stale(&self) {
-        // Snapshot the active identity without holding the async mutex while
-        // reading the (blocking) config lock.
-        let (entry_name, entry_at_start) = {
-            let guard = self.active.lock().await;
-            let Some(active) = guard.as_ref() else {
-                return;
-            };
-            (active.entry_name.clone(), active.entry_at_start.clone())
-        };
-
-        let should_stop = {
-            let config = self.config.read().unwrap();
-            match config.llms.get(&entry_name) {
-                None => true, // profile was removed
-                Some(entry) => *entry != entry_at_start,
-            }
-        };
-
-        if !should_stop {
-            return;
-        }
-
-        // Re-lock and verify the active process is still the same one we
-        // snapshotted — a concurrent request could have swapped it.
         let mut guard = self.active.lock().await;
-        if let Some(active) = guard.as_ref()
-            && active.entry_name == entry_name
-            && active.entry_at_start == entry_at_start
-        {
-            let active = guard.take().expect("checked above");
+        let stale: Vec<usize> = {
+            let config = self.config.read().unwrap();
+            guard
+                .iter()
+                .enumerate()
+                .filter(|(_, active)| match config.llms.get(&active.entry_name) {
+                    None => true, // profile was removed
+                    Some(entry) => *entry != active.entry_at_start,
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        for i in stale.into_iter().rev() {
+            let active = guard.remove(i);
             log::info!(
                 "stopping '{}' — profile was removed or changed in reloaded config",
                 active.entry_name
             );
-            self.current_pid.store(0, Ordering::Relaxed);
             Self::stop(active).await;
+        }
+        if guard.is_empty() {
+            self.current_pid.store(0, Ordering::Relaxed);
         }
     }
 
@@ -380,7 +547,7 @@ impl Coordinator {
             .active
             .lock()
             .await
-            .as_ref()
+            .first()
             .map(|active| active.entry_name.clone());
         let config = self.config.read().unwrap();
         select_entry(
@@ -393,67 +560,107 @@ impl Coordinator {
         .clone()
     }
 
-    /// Ensures `entry`'s `orangu-server` is the active process, starting it
-    /// (and stopping whatever else was active) if it isn't already, then
-    /// returns the origin requests should be proxied to.
+    /// Ensures `entry`'s `orangu-server` is running and the most recently
+    /// used, starting it if it isn't, then returns the origin requests
+    /// should be proxied to.
     ///
-    /// Swapping to a *different* profile always fully stops (`Self::stop`,
-    /// which awaits the child's actual exit, not just signals it) whatever
-    /// was running **before** starting the new one — never the other way
-    /// around, and never concurrently. This is what makes it safe for
-    /// multiple profiles to share the same `host`/`port` (the default for
-    /// every role, since `CoordinatorLlmEntry::host`/`port` both fall back
-    /// to `all`/`8100` when a profile's own config omits them): by
-    /// the time the new `orangu-server` tries to bind that address, the old
-    /// one's listening socket has already been released, not merely asked
-    /// to release it.
+    /// Whatever `entry` cannot run beside
+    /// ([`CoordinatorLlmEntry::can_reside_with`]) is stopped first — and
+    /// with `resident` at its default of one, that is whatever else is
+    /// running — and so is the least recently used when the set is full.
+    /// A stopped server first finishes what it is streaming and saves its
+    /// slots. Stopping always awaits the child's actual exit, not just
+    /// signals it, **before** the new one starts — never concurrently. This
+    /// is what makes it safe for profiles that are never resident together
+    /// to share one `host`/`port` (the default for every role, since
+    /// `CoordinatorLlmEntry::host`/`port` both fall back to `all`/`8100`):
+    /// by the time the new `orangu-server` binds that address, the old one's
+    /// listening socket has been released, not merely asked to release it.
     pub async fn ensure_active(&self, entry: &CoordinatorLlmEntry) -> Result<String> {
         let mut guard = self.active.lock().await;
 
-        if let Some(active) = guard.as_mut() {
-            // The same profile, or a different one this process already
-            // serves: `serves_same_process_as` is true exactly when the only
-            // difference is the role, which travels per request instead
-            // (`proxy::ROLE_HEADER`). Restarting for that would reload the
-            // identical model file and throw away every cached prefix with
-            // the old process.
-            let running = active.entry_name.clone();
-            if active.entry_name == entry.name
-                || active.entry_at_start.serves_same_process_as(entry)
-            {
-                // Already the active model — but confirm the process is
-                // still alive; a crashed backend must be restarted rather
-                // than silently proxied into.
-                match active.child.try_wait() {
-                    Ok(None) => return Ok(entry.origin()),
-                    Ok(Some(status)) => {
-                        // A device-loss exit is expected, self-inflicted,
-                        // and fixed by the restart this function is about
-                        // to do — so it's reported as what it is rather
-                        // than as an unexplained crash, and without the
-                        // output tail, whose last lines are the same
-                        // message `orangu-server` already printed.
-                        if is_device_lost_exit(&status) {
-                            log::warn!(
-                                "'{running}' exited after losing its GPU device (a driver \
-                                 reset); restarting it on a fresh device"
-                            );
-                        } else {
-                            log::warn!(
-                                "warning: '{running}' exited unexpectedly while active \
-                                 (status: {status}){}",
-                                format_output_tail(&active.tail).await
-                            );
-                        }
-                    }
-                    _ => {}
+        // The same profile, or a different one a running process already
+        // serves: `serves_same_process_as` is true exactly when the only
+        // difference is the role, which travels per request instead
+        // (`proxy::ROLE_HEADER`). Restarting for that would reload the
+        // identical model file and throw away every cached prefix with the
+        // old process.
+        if let Some(i) = guard.iter().position(|active| {
+            active.entry_name == entry.name || active.entry_at_start.serves_same_process_as(entry)
+        }) {
+            // Confirm the process is still alive; a crashed backend must be
+            // restarted rather than silently proxied into.
+            let running = guard[i].entry_name.clone();
+            match guard[i].child.try_wait() {
+                Ok(None) => {
+                    let active = guard.remove(i);
+                    guard.insert(0, active);
+                    return Ok(entry.origin());
                 }
+                Ok(Some(status)) => {
+                    // A device-loss exit is expected, self-inflicted, and
+                    // fixed by the restart this function is about to do —
+                    // so it's reported as what it is rather than as an
+                    // unexplained crash, and without the output tail, whose
+                    // last lines are the same message `orangu-server`
+                    // already printed.
+                    if is_device_lost_exit(&status) {
+                        log::warn!(
+                            "'{running}' exited after losing its GPU device (a driver \
+                             reset); restarting it on a fresh device"
+                        );
+                    } else {
+                        log::warn!(
+                            "warning: '{running}' exited unexpectedly while active \
+                             (status: {status}){}",
+                            format_output_tail(&guard[i].tail).await
+                        );
+                    }
+                }
+                _ => {}
             }
-            // Clear `current_pid` before reaping: once `stop` returns, that
-            // pid is gone and the OS is free to recycle it, so it must not
-            // linger as a stale value a concurrent `shutdown` could kill.
+            Self::stop(guard.remove(i)).await;
+        }
+
+        // What has to go for `entry` to start: what it cannot run beside,
+        // then the least recently used while the set is full. A model that
+        // cannot run here at all is refused before any of them is touched.
+        let resident = self.config.read().unwrap().resident;
+        let mut leaving: Vec<usize> = (0..guard.len())
+            .filter(|&i| !entry.can_reside_with(&guard[i].entry_at_start))
+            .collect();
+        let mut staying = guard.len() - leaving.len();
+        for i in (0..guard.len()).rev() {
+            if staying < resident {
+                break;
+            }
+            if !leaving.contains(&i) {
+                leaving.push(i);
+                staying -= 1;
+            }
+        }
+        if leaving
+            .iter()
+            .any(|&i| matches!(guard[i].child.try_wait(), Ok(None)))
+            && let Err(why) = self.fit_verdict(entry).await
+        {
+            let running = guard[leaving[0]].entry_name.clone();
+            return Err(anyhow!(
+                "'{}' cannot run on this machine: {why} — '{running}' keeps serving",
+                entry.name
+            ));
+        }
+        leaving.sort_unstable();
+        for i in leaving.into_iter().rev() {
+            let active = guard.remove(i);
+            self.retire(active).await;
+        }
+        if guard.is_empty() {
+            // Cleared before the next start records its own: once `stop`
+            // returns, that pid is gone and the OS is free to recycle it,
+            // so it must not linger as a value a concurrent `shutdown` could
+            // kill.
             self.current_pid.store(0, Ordering::Relaxed);
-            Self::stop(guard.take().expect("checked above")).await;
         }
 
         // Before starting one, see what is already on the address — starting
@@ -474,14 +681,17 @@ impl Coordinator {
                     occupant.pid
                 );
                 self.current_pid.store(occupant.pid, Ordering::Relaxed);
-                *guard = Some(ActiveProcess {
-                    entry_name: entry.name.clone(),
-                    entry_at_start: entry.clone(),
-                    child: ServerHandle::Adopted { pid: occupant.pid },
-                    // Nothing was captured from a process this one did not
-                    // start; its output belongs to whoever did.
-                    tail: Arc::new(Mutex::new(VecDeque::new())),
-                });
+                guard.insert(
+                    0,
+                    ActiveProcess {
+                        entry_name: entry.name.clone(),
+                        entry_at_start: entry.clone(),
+                        child: ServerHandle::Adopted { pid: occupant.pid },
+                        // Nothing was captured from a process this one did not
+                        // start; its output belongs to whoever did.
+                        tail: Arc::new(Mutex::new(VecDeque::new())),
+                    },
+                );
                 return Ok(entry.origin());
             }
             // Serving something else. This is a *swap*, and the fact that
@@ -515,12 +725,15 @@ impl Coordinator {
         }
 
         let (child, tail) = self.start(entry).await?;
-        *guard = Some(ActiveProcess {
-            entry_name: entry.name.clone(),
-            entry_at_start: entry.clone(),
-            child: ServerHandle::Spawned(Box::new(child)),
-            tail,
-        });
+        guard.insert(
+            0,
+            ActiveProcess {
+                entry_name: entry.name.clone(),
+                entry_at_start: entry.clone(),
+                child: ServerHandle::Spawned(Box::new(child)),
+                tail,
+            },
+        );
         Ok(entry.origin())
     }
 
@@ -605,10 +818,14 @@ impl Coordinator {
         }
 
         let mut guard = self.active.lock().await;
-        if let Some(active) = guard.take() {
+        if let Some(i) = guard
+            .iter()
+            .position(|active| active.entry_at_start.origin() == entry.origin())
+        {
+            let active = guard.remove(i);
             log::warn!(
                 "'{}' stopped answering on {}; restarting it",
-                entry.name,
+                active.entry_name,
                 entry.origin()
             );
             // Same ordering rule as `ensure_active`: clear the pid before
@@ -618,12 +835,15 @@ impl Coordinator {
             Self::stop(active).await;
         }
         let (child, tail) = self.start(entry).await?;
-        *guard = Some(ActiveProcess {
-            entry_name: entry.name.clone(),
-            entry_at_start: entry.clone(),
-            child: ServerHandle::Spawned(Box::new(child)),
-            tail,
-        });
+        guard.insert(
+            0,
+            ActiveProcess {
+                entry_name: entry.name.clone(),
+                entry_at_start: entry.clone(),
+                child: ServerHandle::Spawned(Box::new(child)),
+                tail,
+            },
+        );
         Ok(entry.origin())
     }
 
@@ -636,7 +856,7 @@ impl Coordinator {
     pub async fn shutdown(&self) {
         self.current_pid.store(0, Ordering::Relaxed);
         let mut guard = self.active.lock().await;
-        if let Some(active) = guard.take() {
+        for active in guard.drain(..) {
             Self::stop(active).await;
         }
         // If no active process exists but a stale PID was recorded (still
@@ -656,15 +876,15 @@ impl Coordinator {
         if last_accessed.elapsed().as_secs() >= timeout_secs {
             let mut guard = self.active.lock().await;
             let last_accessed = *self.last_accessed.lock().unwrap();
-            if last_accessed.elapsed().as_secs() >= timeout_secs
-                && let Some(active) = guard.take()
-            {
-                log::info!(
-                    "unloading active profile '{}' due to idle timeout",
-                    active.entry_name
-                );
+            if last_accessed.elapsed().as_secs() >= timeout_secs && !guard.is_empty() {
                 self.current_pid.store(0, Ordering::Relaxed);
-                Self::stop(active).await;
+                for active in guard.drain(..) {
+                    log::info!(
+                        "unloading active profile '{}' due to idle timeout",
+                        active.entry_name
+                    );
+                    Self::stop(active).await;
+                }
             }
         }
     }
@@ -745,6 +965,44 @@ impl Coordinator {
         PathBuf::from(binary_name)
     }
 
+    /// Whether `entry`'s model can run on this machine at all, asked of
+    /// `orangu-server plan --deep --json` before a swap stops the model that
+    /// is serving — so a load that was always going to fail (an architecture
+    /// this build lacks, a missing shard, weights larger than the machine's
+    /// memory) is refused while the resident model keeps serving, instead
+    /// of evicting it first and finding out after the load.
+    ///
+    /// Only a definite "does not run" refuses. A server too old to answer,
+    /// one that takes longer than [`FIT_CHECK_TIMEOUT`], or an answer that
+    /// does not parse lets the swap go ahead as it always has.
+    async fn fit_verdict(&self, entry: &CoordinatorLlmEntry) -> std::result::Result<(), String> {
+        if cfg!(test) {
+            return Ok(());
+        }
+        let (models_dir, log) = {
+            let config = self.config.read().unwrap();
+            (config.models.clone(), config.log.clone())
+        };
+        let Ok(server_config_path) = write_server_config(entry, &models_dir, &log) else {
+            return Ok(());
+        };
+        let mut command = Command::new(self.resolve_server_binary());
+        command
+            .arg("--config")
+            .arg(&server_config_path)
+            .arg("plan")
+            .arg("--deep")
+            .arg("--json")
+            .arg(&entry.model)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let Ok(Ok(output)) = tokio::time::timeout(FIT_CHECK_TIMEOUT, command.output()).await else {
+            return Ok(());
+        };
+        fit_from_plan(&output.stdout)
+    }
+
     async fn start(
         &self,
         entry: &CoordinatorLlmEntry,
@@ -774,6 +1032,7 @@ impl Coordinator {
             .arg(&server_config_path)
             .arg(role_flag)
             .arg(&entry.model)
+            .env("ORANGU_SLOT_RESTORE", swap_slot_prefix(&entry.name))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -826,6 +1085,10 @@ impl Coordinator {
     ) -> Result<()> {
         let startup_timeout = self.config.read().unwrap().startup_timeout_seconds;
         let deadline = Instant::now() + Duration::from_secs(startup_timeout);
+        // From 50 ms, doubling to 500: a small model is up within a few
+        // hundred milliseconds of being spawned, and a fixed half-second poll
+        // added up to that much to every swap.
+        let mut poll = Duration::from_millis(50);
         // `/health`, not `/v1/models`: it is open on an authenticated server
         // (so a `200` needs no key) and it names the process answering, which
         // is the question this loop is actually asking. See `answering_pid`.
@@ -895,7 +1158,8 @@ impl Coordinator {
                     format_output_tail(tail).await
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(poll).await;
+            poll = (poll * 2).min(Duration::from_millis(500));
         }
     }
 }
@@ -1040,6 +1304,9 @@ fn write_server_config(
     );
     if let Some(backend) = &entry.backend {
         contents.push_str(&format!("backend = {backend}\n"));
+    }
+    if let Some(device) = &entry.device {
+        contents.push_str(&format!("device = {device}\n"));
     }
     if let Some(slots) = entry.slots {
         contents.push_str(&format!("slots = {slots}\n"));
@@ -1265,6 +1532,104 @@ mod tests {
         );
     }
 
+    /// Only `plan`'s definite "does not run" refuses a swap.
+    #[test]
+    fn a_swap_is_refused_only_on_a_plan_that_says_the_model_cannot_run() {
+        let no = br#"{"runs":false,"problems":["architecture: unknown 'xyz'"]}"#;
+        assert_eq!(
+            fit_from_plan(no),
+            Err("architecture: unknown 'xyz'".to_string())
+        );
+        assert_eq!(fit_from_plan(br#"{"runs":true,"problems":[]}"#), Ok(()));
+        assert_eq!(
+            fit_from_plan(b"error: unexpected argument '--json'"),
+            Ok(())
+        );
+        assert_eq!(fit_from_plan(b""), Ok(()));
+    }
+
+    /// A swap saves every slot of the outgoing server under its profile's
+    /// own file names (one path component, whatever the profile is called),
+    /// the names the server it next starts restores.
+    #[tokio::test]
+    async fn a_swap_saves_each_slot_under_the_profiles_name() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let line = request.lines().next().unwrap_or("").to_string();
+                    let body = if line.starts_with("GET /slots ") {
+                        "[{},{}]".to_string()
+                    } else {
+                        let filename = request
+                            .split("\"filename\":\"")
+                            .nth(1)
+                            .and_then(|r| r.split('"').next())
+                            .unwrap_or("")
+                            .to_string();
+                        seen.lock().unwrap().push(format!("{line} {filename}"));
+                        r#"{"n_saved":7}"#.to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+        let config = minimal_config("", "[main]\nrole = all\nmodel = org/gemma\nport = 8100\n");
+        let coordinator = Coordinator::new(config, None).unwrap();
+        let origin = format!("http://{addr}");
+        coordinator.save_slots(&origin, "code/big model").await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "POST /slots/0?action=save HTTP/1.1 coordinator-code_big_model-0.bin",
+                "POST /slots/1?action=save HTTP/1.1 coordinator-code_big_model-1.bin",
+            ]
+        );
+        assert_eq!(
+            swap_slot_prefix("code/big model"),
+            "coordinator-code_big_model"
+        );
+    }
+
+    /// A swap waits for the response still streaming from the outgoing
+    /// server, and goes ahead the moment it has finished.
+    #[tokio::test]
+    async fn a_swap_drains_the_responses_in_flight_first() {
+        let config = minimal_config("", "[main]\nrole = all\nmodel = org/gemma\nport = 8100\n");
+        let coordinator = Arc::new(Coordinator::new(config, None).unwrap());
+        const ORIGIN: &str = "http://127.0.0.1:8100";
+        let streaming = coordinator.begin_request(ORIGIN);
+        // Another server's response does not hold this one's stop up.
+        let _elsewhere = coordinator.begin_request("http://127.0.0.1:8101");
+        let started = Instant::now();
+        let drained = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.drain(ORIGIN, "main").await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!drained.is_finished(), "the swap went ahead mid-stream");
+        drop(streaming);
+        drained.await.unwrap();
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(200) && waited < Duration::from_secs(2));
+        // Nothing in flight: no wait at all.
+        let started = Instant::now();
+        coordinator.drain(ORIGIN, "main").await;
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
     #[tokio::test]
     async fn resolve_entry_falls_back_to_default_when_model_hint_is_absent_or_unknown() {
         let config = minimal_config("", "[main]\nrole = all\nmodel = org/gemma\nport = 8100\n");
@@ -1314,6 +1679,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 8100,
                 backend: None,
+                device: None,
                 slots: None,
                 web: None,
             },
@@ -1327,6 +1693,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 8200,
                 backend: None,
+                device: None,
                 slots: None,
                 web: None,
             },
@@ -1405,6 +1772,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 8300,
                 backend: None,
+                device: None,
                 slots: None,
                 web: None,
             },
@@ -1429,6 +1797,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 8400,
                 backend: None,
+                device: None,
                 slots: None,
                 web: None,
             },
@@ -1493,6 +1862,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 8100,
             backend: Some("vulkan".to_string()),
+            device: None,
             slots: Some(4),
             web: Some(8181),
         };
@@ -1517,6 +1887,7 @@ mod tests {
 
         let minimal_entry = CoordinatorLlmEntry {
             backend: None,
+            device: None,
             slots: None,
             web: None,
             ..entry
@@ -1547,6 +1918,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 8100,
             backend: None,
+            device: None,
             slots: None,
             web: None,
         };
@@ -1913,5 +2285,147 @@ mod tests {
                 .unwrap();
             assert!(!is_device_lost_exit(&status), "{other} must not match");
         }
+    }
+
+    /// A stand-in `orangu-server` that answers on the port its generated
+    /// config names, for as long as it is left running — `None` where there
+    /// is no `python3` to serve it.
+    #[cfg(unix)]
+    fn listening_fake_server() -> Option<PathBuf> {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .ok()?;
+        Some(fake_server_script(
+            "PORT=$(sed -n 's/^port = //p' \"$2\" | head -1)\n\
+             cd \"$(mktemp -d)\" && exec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
+        ))
+    }
+
+    /// Ports nothing listens on, for profiles of their own.
+    fn free_ports<const N: usize>() -> [u16; N] {
+        let listeners: Vec<std::net::TcpListener> = (0..N)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        std::array::from_fn(|i| listeners[i].local_addr().unwrap().port())
+    }
+
+    /// The running profiles, most recently used first, with their pids.
+    async fn residents(coordinator: &Coordinator) -> Vec<(String, u32)> {
+        coordinator
+            .active
+            .lock()
+            .await
+            .iter()
+            .map(|a| {
+                let pid = match &a.child {
+                    ServerHandle::Spawned(child) => child.id().unwrap_or(0),
+                    ServerHandle::Adopted { pid } => *pid,
+                };
+                (a.entry_name.clone(), pid)
+            })
+            .collect()
+    }
+
+    /// With `resident = 2`, a profile with a port and a device of its own
+    /// starts beside the running one instead of replacing it, going back to
+    /// either restarts nothing, and a third that fits beside both stops
+    /// the least recently used; a profile on the same card as one running
+    /// still replaces it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn resident_profiles_run_side_by_side_and_the_least_recent_goes() {
+        let Some(fake_bin) = listening_fake_server() else {
+            println!("no python3 to stand in for orangu-server; nothing to check");
+            return;
+        };
+        let [pa, pb, pc, pd] = free_ports::<4>();
+        let config = minimal_config(
+            "startup_timeout = 10\nresident = 2",
+            &format!(
+                "[a]\nrole = all\nmodel = org/a\nport = {pa}\n\
+                 [b]\nrole = explorer\nmodel = org/b\nport = {pb}\nbackend = cpu\n\
+                 [c]\nrole = review\nmodel = org/c\nport = {pc}\ndevice = igpu\n\
+                 [d]\nrole = code\nmodel = org/d\nport = {pd}\n"
+            ),
+        );
+        let coordinator = Coordinator::new(config, Some(fake_bin.clone())).unwrap();
+        let entry = |name: &str| coordinator.config.read().unwrap().llms[name].clone();
+
+        coordinator.ensure_active(&entry("a")).await.unwrap();
+        coordinator.ensure_active(&entry("b")).await.unwrap();
+        let both = residents(&coordinator).await;
+        assert_eq!(
+            both.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["b", "a"],
+            "b started beside a"
+        );
+        let a_pid = both[1].1;
+        assert!(process_is_alive(a_pid), "a kept running");
+
+        // Back to a: the same process, now the most recent.
+        coordinator.ensure_active(&entry("a")).await.unwrap();
+        let now = residents(&coordinator).await;
+        assert_eq!(now[0], ("a".to_string(), a_pid), "a was not restarted");
+
+        // c fits beside both, the set is full: b, the least recent, goes.
+        let b_pid = now[1].1;
+        coordinator.ensure_active(&entry("c")).await.unwrap();
+        let now = residents(&coordinator).await;
+        assert_eq!(
+            now.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["c", "a"]
+        );
+        assert!(!process_is_alive(b_pid), "b was stopped");
+
+        // d is on a's card (neither names a device): a goes even as the
+        // most recently used, and c stays.
+        coordinator.ensure_active(&entry("a")).await.unwrap();
+        coordinator.ensure_active(&entry("d")).await.unwrap();
+        let now = residents(&coordinator).await;
+        assert_eq!(
+            now.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["d", "c"]
+        );
+        assert!(
+            !process_is_alive(a_pid),
+            "a was stopped for a profile on its card"
+        );
+
+        coordinator.shutdown().await;
+        assert!(residents(&coordinator).await.is_empty());
+        std::fs::remove_file(&fake_bin).ok();
+    }
+
+    /// The default, `resident = 1`: a profile that could run beside the
+    /// running one still replaces it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn one_resident_swaps_even_between_profiles_that_could_share() {
+        let Some(fake_bin) = listening_fake_server() else {
+            println!("no python3 to stand in for orangu-server; nothing to check");
+            return;
+        };
+        let [pa, pb] = free_ports::<2>();
+        let config = minimal_config(
+            "startup_timeout = 10",
+            &format!(
+                "[one-a]\nrole = all\nmodel = org/a\nport = {pa}\n\
+                 [one-b]\nrole = explorer\nmodel = org/b\nport = {pb}\nbackend = cpu\n"
+            ),
+        );
+        let coordinator = Coordinator::new(config, Some(fake_bin.clone())).unwrap();
+        let entry = |name: &str| coordinator.config.read().unwrap().llms[name].clone();
+        coordinator.ensure_active(&entry("one-a")).await.unwrap();
+        let a_pid = residents(&coordinator).await[0].1;
+        coordinator.ensure_active(&entry("one-b")).await.unwrap();
+        let now = residents(&coordinator).await;
+        assert_eq!(
+            now.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["one-b"]
+        );
+        assert!(!process_is_alive(a_pid), "a was stopped");
+        coordinator.shutdown().await;
+        std::fs::remove_file(&fake_bin).ok();
     }
 }

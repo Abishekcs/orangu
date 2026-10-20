@@ -1418,14 +1418,21 @@ impl LlamaModel {
         }
         let scale = self.mul.embedding;
         let mut x = vec![0f32; tokens.len() * n_embd];
-        x.par_chunks_mut(n_embd)
-            .zip(tokens.par_iter())
-            .for_each(|(dst, &tok)| {
-                let row = self.tok_embeddings.row(tok as usize);
-                for (d, r) in dst.iter_mut().zip(row.iter()) {
-                    *d = r * scale;
-                }
-            });
+        let embed = |(dst, &tok): (&mut [f32], &u32)| {
+            let row = self.tok_embeddings.row(tok as usize);
+            for (d, r) in dst.iter_mut().zip(row.iter()) {
+                *d = r * scale;
+            }
+        };
+        // A decode batch is a few rows: waking the pool for them costs more
+        // than the rows, and leaves its workers spinning after.
+        if tokens.len() <= 8 {
+            x.chunks_mut(n_embd).zip(tokens.iter()).for_each(embed);
+        } else {
+            x.par_chunks_mut(n_embd)
+                .zip(tokens.par_iter())
+                .for_each(embed);
+        }
         Ok(x)
     }
 
@@ -1460,10 +1467,7 @@ impl LlamaModel {
                 .backend
                 .as_wgpu()
                 .is_some_and(|v| v.prefill_fused_attention_enabled())
-            && self
-                .layers
-                .iter()
-                .all(|l| l.q_norm.is_none() && l.k_norm.is_none() && l.wo.device() == 0)
+            && self.layers.iter().all(|l| l.wo.device() == 0)
     }
 
     /// The device-resident prefill stream for this family — see
@@ -1484,7 +1488,6 @@ impl LlamaModel {
             return Ok(None);
         };
         let x = self.scaled_token_embeddings(tokens)?;
-        let yarn = crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope);
         super::run_layers_resident(
             vulkan,
             cache,
@@ -1497,37 +1500,42 @@ impl LlamaModel {
             self.head_dim(),
             cfg.rms_eps,
             0..self.layers.len(),
-            |il| {
-                let layer = &self.layers[il];
-                let dense = layer
-                    .dense()
-                    .expect("resident_prefill_serves admits dense models only");
-                super::ResidentLayer {
-                    attn_norm: &layer.attn_norm,
-                    wq: &layer.wq,
-                    wk: &layer.wk,
-                    wv: &layer.wv,
-                    q_bias: layer.q_bias.as_deref(),
-                    k_bias: layer.k_bias.as_deref(),
-                    v_bias: layer.v_bias.as_deref(),
-                    pairing: self.rope.layout,
-                    yarn,
-                    rope_dim: cfg.rope_dim,
-                    rope_freq_base: cfg.rope_freq_base,
-                    freq_factors: self.rope_freq_factors.as_deref(),
-                    n_swa: 0,
-                    scale: self.attn_scale(),
-                    wo: &layer.wo,
-                    ffn_norm: &layer.ffn_norm,
-                    // `resident_prefill_serves` admitted this model, so
-                    // every layer of it is dense.
-                    ffn_gate: dense.0,
-                    ffn_up: dense.1,
-                    ffn_down: dense.2,
-                    activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
-                }
-            },
+            |il| self.resident_layer(il),
         )
+    }
+
+    /// Layer `il` as the device-resident stream records it. Only for a model
+    /// [`Self::resident_prefill_serves`] admitted, whose layers are all dense.
+    fn resident_layer(&self, il: usize) -> super::ResidentLayer<'_> {
+        let cfg = &self.config;
+        let layer = &self.layers[il];
+        let dense = layer
+            .dense()
+            .expect("resident_prefill_serves admits dense models only");
+        super::ResidentLayer {
+            attn_norm: &layer.attn_norm,
+            wq: &layer.wq,
+            wk: &layer.wk,
+            wv: &layer.wv,
+            q_bias: layer.q_bias.as_deref(),
+            k_bias: layer.k_bias.as_deref(),
+            v_bias: layer.v_bias.as_deref(),
+            q_norm: layer.q_norm.as_deref(),
+            k_norm: layer.k_norm.as_deref(),
+            pairing: self.rope.layout,
+            yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
+            rope_dim: cfg.rope_dim,
+            rope_freq_base: cfg.rope_freq_base,
+            freq_factors: self.rope_freq_factors.as_deref(),
+            n_swa: 0,
+            scale: self.attn_scale(),
+            wo: &layer.wo,
+            ffn_norm: &layer.ffn_norm,
+            ffn_gate: dense.0,
+            ffn_up: dense.1,
+            ffn_down: dense.2,
+            activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
+        }
     }
 
     /// [`Self::run_layers_resident`] over `layers` only, from `x`, the
@@ -1546,7 +1554,6 @@ impl LlamaModel {
         let Some(vulkan) = self.backend.as_wgpu() else {
             return Ok(None);
         };
-        let yarn = crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope);
         super::run_layers_resident(
             vulkan,
             cache,
@@ -1559,36 +1566,7 @@ impl LlamaModel {
             self.head_dim(),
             cfg.rms_eps,
             layers,
-            |il| {
-                let layer = &self.layers[il];
-                let dense = layer
-                    .dense()
-                    .expect("resident_prefill_serves admits dense models only");
-                super::ResidentLayer {
-                    attn_norm: &layer.attn_norm,
-                    wq: &layer.wq,
-                    wk: &layer.wk,
-                    wv: &layer.wv,
-                    q_bias: layer.q_bias.as_deref(),
-                    k_bias: layer.k_bias.as_deref(),
-                    v_bias: layer.v_bias.as_deref(),
-                    pairing: self.rope.layout,
-                    yarn,
-                    rope_dim: cfg.rope_dim,
-                    rope_freq_base: cfg.rope_freq_base,
-                    freq_factors: self.rope_freq_factors.as_deref(),
-                    n_swa: 0,
-                    scale: self.attn_scale(),
-                    wo: &layer.wo,
-                    ffn_norm: &layer.ffn_norm,
-                    // `resident_prefill_serves` admitted this model, so
-                    // every layer of it is dense.
-                    ffn_gate: dense.0,
-                    ffn_up: dense.1,
-                    ffn_down: dense.2,
-                    activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
-                }
-            },
+            |il| self.resident_layer(il),
         )
     }
 
@@ -1597,6 +1575,150 @@ impl LlamaModel {
     /// logits. One row whether this was a decode step or a thousand-token
     /// prefill, so the same host-or-device rule applies here as to the
     /// fused path's tail.
+    /// `ModelForward::head` as one projection of every row, so the output
+    /// matrix is read once for the pass rather than once a row; a device
+    /// model whose tail runs on the host keeps the row-by-row form.
+    /// [`ModelForward::forward_decode_batch_sampling`]'s body, and with no
+    /// `samples` [`ModelForward::forward_decode_batch`]'s. The batch runs on
+    /// the device-resident stream, and with `samples` the head and each
+    /// row's sampler run after it on the device
+    /// (`VulkanBackend::decode_batch_tail`); otherwise the residual comes
+    /// home for the head.
+    ///
+    /// `widths` as `run_layers_resident_batch` takes them (empty: one token
+    /// a row), `tokens` every row's tokens in order, and `samples` one per
+    /// token; the outcomes are one per token too.
+    fn decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        widths: &[usize],
+        tokens: &[u32],
+        samples: Option<&[Option<super::GreedySampleParams<'_>>]>,
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        // The batch runs on the device-resident stream, so it needs what that
+        // stream needs, and a device head: the host tail is one row's.
+        if rows.len() < 2 || !self.resident_prefill_serves(tokens.len()) || self.tail_on_host() {
+            return Ok(None);
+        }
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        let n_rows = tokens.len();
+        anyhow::ensure!(
+            n_rows
+                == if widths.is_empty() {
+                    rows.len()
+                } else {
+                    widths.iter().sum()
+                },
+            "one token per row of the pass"
+        );
+        let cfg = &self.config;
+        let (n_embd, n_vocab) = (cfg.n_embd, cfg.n_vocab);
+        let x = self.scaled_token_embeddings(tokens)?;
+        // Each row of the pass is its request's: a verifying request's
+        // tokens all take its slot.
+        let slots: Vec<usize> = if widths.is_empty() {
+            rows.iter().map(|r| r.slot).collect()
+        } else {
+            rows.iter()
+                .zip(widths)
+                .flat_map(|(r, &w)| std::iter::repeat_n(r.slot, w))
+                .collect()
+        };
+        // `batch_slot` is the request's slot, as `record_decode_chain` uses.
+        let Some(h_dev) = super::run_layers_resident_batch(
+            vulkan,
+            rows,
+            widths,
+            &x,
+            cfg.n_head,
+            cfg.n_head_kv,
+            self.head_dim(),
+            cfg.rms_eps,
+            0,
+            0..self.layers.len(),
+            |il| self.resident_layer(il),
+        )?
+        else {
+            return Ok(None);
+        };
+        let pos = rows.first().map_or(0, |r| r.pos);
+        // Granite divides its logits, which the device samplers do not.
+        if let Some(samples) = samples.filter(|_| vulkan.gpu_sample() && self.mul.logit == 1.0)
+            && let Some(outcomes) = vulkan.decode_batch_tail(
+                crate::engine::backend::vulkan::AttnOutSrc::Gpu(&h_dev, 0, n_rows),
+                n_rows,
+                &self.output_norm,
+                cfg.rms_eps,
+                &self.output_weight,
+                None,
+                samples,
+                &slots,
+            )
+        {
+            vulkan.finish_op_span(pos);
+            return Ok(Some(outcomes));
+        }
+        let mut h = vulkan.readback_rows(&h_dev, n_rows * n_embd);
+        vulkan.finish_op_span(pos);
+        tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_rows, n_embd, cfg.rms_eps);
+        let flat = self.backend.matmul(&h, n_rows, &self.output_weight);
+        anyhow::ensure!(
+            flat.len() == n_rows * n_vocab,
+            "output projection produced {} logits, expected {}",
+            flat.len(),
+            n_rows * n_vocab
+        );
+        Ok(Some(
+            flat.chunks_exact(n_vocab)
+                .map(|row| {
+                    // Granite divides; everything else has `logit == 1.0`.
+                    super::ForwardOutcome::Logits(if self.mul.logit == 1.0 {
+                        row.to_vec()
+                    } else {
+                        row.iter().map(|v| v / self.mul.logit).collect()
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    fn head_rows(&self, mut hidden: Vec<f32>, n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        let cfg = &self.config;
+        if n_rows == 1 || (self.backend.as_wgpu().is_some() && self.tail_on_host()) {
+            return self.head(&hidden, n_rows);
+        }
+        anyhow::ensure!(
+            hidden.len() == n_rows * cfg.n_embd,
+            "hidden state holds {} values, expected {n_rows} rows of {}",
+            hidden.len(),
+            cfg.n_embd
+        );
+        tensor::rmsnorm_inplace(
+            &mut hidden,
+            &self.output_norm,
+            n_rows,
+            cfg.n_embd,
+            cfg.rms_eps,
+        );
+        let flat = self.backend.matmul(&hidden, n_rows, &self.output_weight);
+        let n_vocab = flat.len() / n_rows;
+        Ok(flat
+            .chunks_exact(n_vocab)
+            .map(|row| {
+                let mut row = row.to_vec();
+                // Granite divides; everything else has `logit == 1.0`.
+                if self.mul.logit != 1.0 {
+                    for v in row.iter_mut() {
+                        *v /= self.mul.logit;
+                    }
+                }
+                row
+            })
+            .collect())
+    }
+
     fn row_logits(&self, row: &mut [f32]) -> Vec<f32> {
         let cfg = &self.config;
         tensor::rmsnorm_inplace(row, &self.output_norm, 1, cfg.n_embd, cfg.rms_eps);
@@ -2268,6 +2390,67 @@ impl ModelForward for LlamaModel {
         KvCache::new(self.config.n_layer, capacity, kv_dim)
     }
 
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        Ok(self.decode_batch(rows, &[], tokens, None)?.map(|outcomes| {
+            outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    super::ForwardOutcome::Logits(logits) => logits,
+                    _ => unreachable!("a batch asked for no sampling returns logits"),
+                })
+                .collect()
+        }))
+    }
+
+    fn forward_decode_batch_sampling(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+        samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        self.decode_batch(rows, &[], tokens, Some(samples))
+    }
+
+    fn batches_verify(&self) -> bool {
+        super::batch_verify() && self.backend.as_wgpu().is_some() && !self.tail_on_host()
+    }
+
+    fn forward_decode_batch_verify(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[&[u32]],
+        samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<Vec<super::ForwardOutcome>>>> {
+        if !self.batches_verify() || tokens.len() != rows.len() || samples.len() != rows.len() {
+            return Ok(None);
+        }
+        let widths: Vec<usize> = tokens.iter().map(|t| t.len()).collect();
+        let flat: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
+        // A verifying row's tokens all come back as logits.
+        let row_samples: Vec<Option<super::GreedySampleParams<'_>>> = samples
+            .iter()
+            .zip(&widths)
+            .flat_map(|(sample, &w)| {
+                let one = if w == 1 { *sample } else { None };
+                std::iter::once(one).chain(std::iter::repeat_n(None, w - 1))
+            })
+            .collect();
+        let Some(outcomes) = self.decode_batch(rows, &widths, &flat, Some(&row_samples))? else {
+            return Ok(None);
+        };
+        let mut outcomes = outcomes.into_iter();
+        Ok(Some(
+            widths
+                .iter()
+                .map(|&w| outcomes.by_ref().take(w).collect())
+                .collect(),
+        ))
+    }
+
     fn forward(
         &self,
         cache: &mut KvCache,
@@ -2290,7 +2473,7 @@ impl ModelForward for LlamaModel {
                 // The same chunk again on the step path, into a copy of the
                 // cache, and the two residuals compared.
                 let mut again = cache.duplicate();
-                again.truncate(start_pos);
+                again.truncate(start_pos)?;
                 let step = self.run_layers(&mut again, tokens, start_pos)?;
                 super::report_resident_check(&x, &step, n_embd, start_pos);
                 x
@@ -2341,6 +2524,27 @@ impl ModelForward for LlamaModel {
     ) -> Result<Vec<Vec<f32>>> {
         let x = self.run_layers(cache, tokens, start_pos)?;
         self.head(&x, tokens.len())
+    }
+
+    /// On the device-resident prefill stream with every row's residual
+    /// kept, then the head over all of them in one projection: a draft of
+    /// `n` tokens costs one pass that reads the weights once, where the step
+    /// path above reads them per projection call. One token is a decode
+    /// step. Anything the stream does not serve takes the step path.
+    fn forward_verify(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if tokens.len() == 1 {
+            return Ok(vec![self.forward(cache, tokens, start_pos, slot_id)?]);
+        }
+        match self.run_layers_resident(cache, tokens, start_pos, true)? {
+            Some(x) => self.head_rows(x, tokens.len()),
+            None => self.forward_all_logits(cache, tokens, start_pos, slot_id),
+        }
     }
 
     fn supports_layer_split(&self) -> bool {
@@ -2519,6 +2723,470 @@ mod fusion_width_tests {
 mod real_model_tests {
     use super::*;
     use crate::engine::loader::PoolingType;
+
+    /// The device-resident prefill stream against the step path on a model
+    /// with per-head Q/K norms: the repository's qwen3 smoke model, one
+    /// chunk, the two residuals compared. They round their activations at
+    /// different places, so the bound is a tolerance; a norm left out puts
+    /// whole rows off.
+    /// `cargo test --release --bin orangu-server resident_stream_applies -- --ignored`.
+    #[test]
+    #[ignore]
+    fn the_resident_stream_applies_the_per_head_qk_norms() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib/orangu-model/smoke/orangu-code-smoke-Q4_K_M.gguf");
+        let loaded = LoadedModel::open(&path).expect("load model");
+        let model = LlamaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        assert!(
+            model
+                .layers
+                .iter()
+                .all(|l| l.q_norm.is_some() && l.k_norm.is_some())
+        );
+        let tokens: Vec<u32> = (0..96u32).map(|i| 100 + (i * 37) % 2000).collect();
+        let n_embd = model.config.n_embd;
+        let mut cache = model.new_kv_cache(tokens.len() + 1);
+        let resident = model
+            .run_layers_resident(&mut cache, &tokens, 0, true)
+            .expect("resident pass")
+            .expect("the stream serves this model");
+        let mut cache = model.new_kv_cache(tokens.len() + 1);
+        let step = model.run_layers(&mut cache, &tokens, 0).expect("step pass");
+        let (mut diff2, mut val2) = (0f64, 0f64);
+        for (x, y) in resident.iter().zip(&step) {
+            diff2 += f64::from((x - y) * (x - y));
+            val2 += f64::from(y * y);
+        }
+        let rms = (diff2 / val2).sqrt();
+        let worst = resident
+            .chunks_exact(n_embd)
+            .zip(step.chunks_exact(n_embd))
+            .map(|(a, b)| {
+                let mag = b.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+                a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / mag
+            })
+            .fold(0f32, f32::max);
+        println!("resident against step: rms {rms:.2e}, worst row {worst:.2e}");
+        assert!(rms < 2e-2, "rms {rms}");
+        assert!(worst < 0.1, "worst row {worst}");
+    }
+
+    /// Two sequences' decode steps taken together (`forward_decode_batch`)
+    /// give each the logits of its own solo steps, to the rounding of the
+    /// narrow-pass kernels the batch runs on, and the same next tokens —
+    /// over a batched step, a batched step with the rows in the other order,
+    /// and a solo step after them, which is how a cache meets a different
+    /// row of a batch and goes back to stepping alone. On the GPU, so
+    /// ignored by default:
+    /// `cargo test --release --bin orangu-server decode_batch_matches -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_decode_batch_matches_each_rows_solo_step() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib/orangu-model/smoke/orangu-code-smoke-Q4_K_M.gguf");
+        let loaded = LoadedModel::open(&path).expect("load model");
+        let model = LlamaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        let prompts: [Vec<u32>; 2] = [
+            (0..40u32).map(|i| 100 + (i * 37) % 2000).collect(),
+            (0..23u32).map(|i| 300 + (i * 53) % 1700).collect(),
+        ];
+        // Each sequence's next three tokens, fed the same way to both.
+        let next: [[u32; 3]; 2] = [[911, 57, 1302], [1207, 640, 88]];
+        let prefilled = || -> Vec<KvCache> {
+            prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let mut cache = model.new_kv_cache(64);
+                    model.forward(&mut cache, p, 0, i).expect("prefill");
+                    cache
+                })
+                .collect()
+        };
+        let mut solo_caches = prefilled();
+        let solo: Vec<Vec<Vec<f32>>> = solo_caches
+            .iter_mut()
+            .enumerate()
+            .map(|(i, cache)| {
+                (0..3)
+                    .map(|step| {
+                        model
+                            .forward(cache, &next[i][step..=step], prompts[i].len() + step, i)
+                            .expect("solo step")
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut caches = prefilled();
+        let mut got: Vec<Vec<Vec<f32>>> = vec![Vec::new(), Vec::new()];
+        for (step, order) in [[0usize, 1], [1, 0]].iter().enumerate() {
+            let (first, second) = caches.split_at_mut(1);
+            let mut by_seq = [Some(&mut first[0]), Some(&mut second[0])];
+            let mut rows: Vec<super::super::DecodeRow<'_>> = order
+                .iter()
+                .map(|&i| super::super::DecodeRow {
+                    cache: by_seq[i].take().expect("each sequence once"),
+                    pos: prompts[i].len() + step,
+                    slot: i,
+                })
+                .collect();
+            let tokens: Vec<u32> = order.iter().map(|&i| next[i][step]).collect();
+            let batched = model
+                .forward_decode_batch(&mut rows, &tokens)
+                .expect("batched step")
+                .expect("the batch serves this model");
+            for (&i, logits) in order.iter().zip(batched) {
+                got[i].push(logits);
+            }
+        }
+        for (i, cache) in caches.iter_mut().enumerate() {
+            got[i].push(
+                model
+                    .forward(cache, &next[i][2..=2], prompts[i].len() + 2, i)
+                    .expect("solo step after the batch"),
+            );
+        }
+        let argmax = |v: &[f32]| crate::engine::sampling::argmax(v);
+        for i in 0..2 {
+            for step in 0..3 {
+                let (b, s) = (&got[i][step], &solo[i][step]);
+                let (mut diff2, mut val2) = (0f64, 0f64);
+                for (x, y) in b.iter().zip(s) {
+                    diff2 += f64::from((x - y) * (x - y));
+                    val2 += f64::from(y * y);
+                }
+                let rms = (diff2 / val2).sqrt();
+                println!(
+                    "sequence {i} step {step}: rms {rms:.2e}, argmax {} / {}",
+                    argmax(b),
+                    argmax(s)
+                );
+                // ~1–2e-3 measured; a K norm left out of the batch is 5–7e-3.
+                assert!(rms < 3.5e-3, "sequence {i} step {step} rms {rms}");
+                assert_eq!(
+                    argmax(b),
+                    argmax(s),
+                    "sequence {i} step {step} picks another token"
+                );
+            }
+        }
+        for (b, s) in caches.iter().zip(&solo_caches) {
+            assert_eq!(b.committed_len(), s.committed_len());
+        }
+    }
+
+    /// A verify taken into a batched step (`forward_decode_batch_verify`)
+    /// gives the verifying sequence the logits of its own `forward_verify`
+    /// at every position and the decoding one the logits of its own step,
+    /// to the narrow-pass kernels' rounding — then, after the verify's
+    /// rejected tail is rolled back, the same with the roles swapped, and a
+    /// solo step on each after that. On the GPU, so ignored by default:
+    /// `cargo test --release --bin orangu-server decode_batch_verifies -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_decode_batch_verifies_a_draft_as_its_own_pass_would() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib/orangu-model/smoke/orangu-code-smoke-Q4_K_M.gguf");
+        let loaded = LoadedModel::open(&path).expect("load model");
+        let model = LlamaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        let prompts: [Vec<u32>; 2] = [
+            (0..40u32).map(|i| 100 + (i * 37) % 2000).collect(),
+            (0..23u32).map(|i| 300 + (i * 53) % 1700).collect(),
+        ];
+        let prefilled = || -> Vec<KvCache> {
+            prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let mut cache = model.new_kv_cache(64);
+                    model.forward(&mut cache, p, 0, i).expect("prefill");
+                    cache
+                })
+                .collect()
+        };
+        let compare = |what: &str, b: &[f32], s: &[f32]| {
+            let (mut diff2, mut val2) = (0f64, 0f64);
+            for (x, y) in b.iter().zip(s) {
+                diff2 += f64::from((x - y) * (x - y));
+                val2 += f64::from(y * y);
+            }
+            let rms = (diff2 / val2).sqrt();
+            let (ab, as_) = (
+                crate::engine::sampling::argmax(b),
+                crate::engine::sampling::argmax(s),
+            );
+            println!("{what}: rms {rms:.2e}, argmax {ab} / {as_}");
+            assert!(rms < 3.5e-3, "{what} rms {rms}");
+            assert_eq!(ab, as_, "{what} picks another token");
+        };
+        let logits_of = |o: &super::super::ForwardOutcome| match o {
+            super::super::ForwardOutcome::Logits(l) => l.clone(),
+            _ => panic!("no sampling was asked for"),
+        };
+        // Round one: sequence 0 decodes, sequence 1 verifies five tokens;
+        // round two, after sequence 1 keeps two of them: the other way round.
+        // The rounds after those reuse what each layer cached on the first.
+        let rounds: [(usize, Vec<u32>, usize, Vec<u32>); 6] = [
+            (0, vec![911], 1, vec![1207, 640, 88, 1500, 7]),
+            (1, vec![33], 0, vec![57, 1302, 400, 12]),
+            (0, vec![12], 1, vec![5, 1606, 7]),
+            (1, vec![13], 0, vec![808, 9, 1010]),
+            (0, vec![14], 1, vec![11, 1212, 13]),
+            (1, vec![15], 0, vec![16, 1717, 18]),
+        ];
+        let mut solo = prefilled();
+        let mut batched = prefilled();
+        let mut pos = [prompts[0].len(), prompts[1].len()];
+        for (round, (dec, dec_tokens, ver, ver_tokens)) in rounds.iter().enumerate() {
+            let solo_dec = model
+                .forward(&mut solo[*dec], dec_tokens, pos[*dec], *dec)
+                .expect("solo step");
+            let solo_ver = model
+                .forward_verify(&mut solo[*ver], ver_tokens, pos[*ver], *ver)
+                .expect("solo verify");
+            let (lo, hi) = batched.split_at_mut(1);
+            let (dec_cache, ver_cache) = if *dec == 0 {
+                (&mut lo[0], &mut hi[0])
+            } else {
+                (&mut hi[0], &mut lo[0])
+            };
+            let mut rows = vec![
+                super::super::DecodeRow {
+                    cache: dec_cache,
+                    pos: pos[*dec],
+                    slot: *dec,
+                },
+                super::super::DecodeRow {
+                    cache: ver_cache,
+                    pos: pos[*ver],
+                    slot: *ver,
+                },
+            ];
+            let tokens: [&[u32]; 2] = [dec_tokens, ver_tokens];
+            let out = model
+                .forward_decode_batch_verify(&mut rows, &tokens, &[None, None])
+                .expect("batched verify")
+                .expect("the batch serves this model");
+            assert_eq!(out[0].len(), 1);
+            assert_eq!(out[1].len(), ver_tokens.len());
+            compare(
+                &format!("round {round}: the decoding row"),
+                &logits_of(&out[0][0]),
+                &solo_dec,
+            );
+            for (k, (o, s)) in out[1].iter().zip(&solo_ver).enumerate() {
+                compare(
+                    &format!("round {round}: verify position {k}"),
+                    &logits_of(o),
+                    s,
+                );
+            }
+            pos[*dec] += 1;
+            // Two of the draft kept: the token and one more.
+            let kept = pos[*ver] + 2;
+            for caches in [&mut solo, &mut batched] {
+                caches[*ver].truncate(kept).expect("roll back");
+            }
+            pos[*ver] = kept;
+        }
+        // Both verifying, no one-token row in the step: as wide as each
+        // other, then not.
+        let both: [[Vec<u32>; 2]; 2] = [
+            [vec![71, 802, 13, 1999], vec![640, 5, 1201, 77]],
+            [vec![18, 990, 4], vec![1450, 3, 760, 41, 1102, 9]],
+        ];
+        for (round, drafts) in both.iter().enumerate() {
+            let solo_out: Vec<Vec<Vec<f32>>> = (0..2)
+                .map(|i| {
+                    model
+                        .forward_verify(&mut solo[i], &drafts[i], pos[i], i)
+                        .expect("solo verify")
+                })
+                .collect();
+            let (lo, hi) = batched.split_at_mut(1);
+            let mut rows = vec![
+                super::super::DecodeRow {
+                    cache: &mut lo[0],
+                    pos: pos[0],
+                    slot: 0,
+                },
+                super::super::DecodeRow {
+                    cache: &mut hi[0],
+                    pos: pos[1],
+                    slot: 1,
+                },
+            ];
+            let tokens: [&[u32]; 2] = [&drafts[0], &drafts[1]];
+            let out = model
+                .forward_decode_batch_verify(&mut rows, &tokens, &[None, None])
+                .expect("batched verify")
+                .expect("the batch serves this model");
+            for i in 0..2 {
+                assert_eq!(out[i].len(), drafts[i].len());
+                for (k, (o, s)) in out[i].iter().zip(&solo_out[i]).enumerate() {
+                    compare(
+                        &format!("both verify {round}: sequence {i} position {k}"),
+                        &logits_of(o),
+                        s,
+                    );
+                }
+                let kept = pos[i] + 1;
+                for caches in [&mut solo, &mut batched] {
+                    caches[i].truncate(kept).expect("roll back");
+                }
+                pos[i] = kept;
+            }
+        }
+        for i in 0..2 {
+            let s = model
+                .forward(&mut solo[i], &[5], pos[i], i)
+                .expect("solo step");
+            let b = model
+                .forward(&mut batched[i], &[5], pos[i], i)
+                .expect("solo step after the batch");
+            compare(&format!("sequence {i} after the batch"), &b, &s);
+            assert_eq!(batched[i].committed_len(), solo[i].committed_len());
+        }
+    }
+
+    /// A batched step that samples on the device
+    /// (`forward_decode_batch_sampling`) picks what the host would pick from
+    /// the batch's logits: the greedy token after the repeat penalty, the
+    /// top `k` candidates, and a row that asks for nothing gets its logits.
+    /// On the GPU, so ignored by default:
+    /// `cargo test --release --bin orangu-server decode_batch_samples -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_decode_batch_samples_each_row_as_the_host_would() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contrib/orangu-model/smoke/orangu-code-smoke-Q4_K_M.gguf");
+        let loaded = LoadedModel::open(&path).expect("load model");
+        let model = LlamaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        let prompts: [Vec<u32>; 3] = [
+            (0..40u32).map(|i| 100 + (i * 37) % 2000).collect(),
+            (0..23u32).map(|i| 300 + (i * 53) % 1700).collect(),
+            (0..31u32).map(|i| 700 + (i * 29) % 1500).collect(),
+        ];
+        let tokens = [911u32, 1207, 64];
+        let step = |samples: Option<&[Option<super::super::GreedySampleParams<'_>>]>| {
+            let mut caches: Vec<KvCache> = prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let mut cache = model.new_kv_cache(64);
+                    model.forward(&mut cache, p, 0, i).expect("prefill");
+                    cache
+                })
+                .collect();
+            let mut rows: Vec<super::super::DecodeRow<'_>> = caches
+                .iter_mut()
+                .enumerate()
+                .map(|(i, cache)| super::super::DecodeRow {
+                    cache,
+                    pos: prompts[i].len(),
+                    slot: i,
+                })
+                .collect();
+            match samples {
+                Some(samples) => model
+                    .forward_decode_batch_sampling(&mut rows, &tokens, samples)
+                    .expect("sampled batch")
+                    .expect("the batch serves this model"),
+                None => model
+                    .forward_decode_batch(&mut rows, &tokens)
+                    .expect("batched step")
+                    .expect("the batch serves this model")
+                    .into_iter()
+                    .map(super::super::ForwardOutcome::Logits)
+                    .collect(),
+            }
+        };
+        let logits: Vec<Vec<f32>> = step(None)
+            .into_iter()
+            .map(|o| match o {
+                super::super::ForwardOutcome::Logits(l) => l,
+                _ => unreachable!("no sampling asked for"),
+            })
+            .collect();
+        let argmax = |v: &[f32]| crate::engine::sampling::argmax(v);
+        // Row 0's penalty covers its own favourite, so the penalty decides.
+        let recent = [argmax(&logits[0]), 5, 17];
+        let penalty = 1.3f32;
+        let mut penalized = logits[0].clone();
+        for &t in &recent {
+            let v = &mut penalized[t as usize];
+            *v = if *v > 0.0 { *v / penalty } else { *v * penalty };
+        }
+        let k = 8u32;
+        let samples = [
+            Some(super::super::GreedySampleParams {
+                recent_tokens: &recent,
+                repeat_penalty: penalty,
+                top_k: 0,
+            }),
+            Some(super::super::GreedySampleParams {
+                recent_tokens: &[],
+                repeat_penalty: 1.0,
+                top_k: k,
+            }),
+            None,
+        ];
+        let sampled = step(Some(&samples));
+        match &sampled[0] {
+            super::super::ForwardOutcome::Token(t) => {
+                println!("greedy with a penalty: {t} / {}", argmax(&penalized));
+                assert_eq!(*t, argmax(&penalized));
+            }
+            _ => panic!("row 0 asked for the greedy token"),
+        }
+        match &sampled[1] {
+            super::super::ForwardOutcome::Candidates(c) => {
+                let mut want: Vec<u32> = (0..logits[1].len() as u32).collect();
+                want.sort_by(|a, b| logits[1][*b as usize].total_cmp(&logits[1][*a as usize]));
+                want.truncate(k as usize);
+                let got: Vec<u32> = c.iter().map(|(t, _)| *t).collect();
+                println!("top {k}: {got:?} / {want:?}");
+                assert_eq!(got, want);
+                for (t, v) in c {
+                    let host = logits[1][*t as usize];
+                    assert!(
+                        (v - host).abs() <= 1e-2 * host.abs().max(1.0),
+                        "{t}: {v} / {host}"
+                    );
+                }
+            }
+            _ => panic!("row 1 asked for candidates"),
+        }
+        match &sampled[2] {
+            super::super::ForwardOutcome::Logits(l) => {
+                let (mut diff2, mut val2) = (0f64, 0f64);
+                for (x, y) in l.iter().zip(&logits[2]) {
+                    diff2 += f64::from((x - y) * (x - y));
+                    val2 += f64::from(y * y);
+                }
+                let rms = (diff2 / val2).sqrt();
+                println!("logits row: rms {rms:.2e}");
+                assert!(rms < 3.5e-3, "rms {rms}");
+            }
+            _ => panic!("row 2 asked for nothing"),
+        }
+    }
 
     /// End-to-end greedy decode against a real Llama-3-family `.gguf`
     /// (`bartowski/Llama-3.2-1B-Instruct-GGUF` and its 3B sibling are what

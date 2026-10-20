@@ -51,9 +51,12 @@ use clap::Parser;
 
 mod bundle;
 mod chart;
+mod chat;
 mod download;
 mod history;
 mod image;
+mod interference;
+mod kl;
 mod moe;
 mod points;
 use orangu::profiling::profile;
@@ -62,6 +65,7 @@ mod shell;
 mod storage;
 mod sweep;
 mod table;
+mod verdict;
 mod web;
 mod workers;
 use orangu::shell_completions;
@@ -128,6 +132,18 @@ struct Args {
     #[arg(skip)]
     streams: Vec<u32>,
 
+    /// Concurrency mode: each stream copies a passage out of its prompt, which speculation drafts.
+    #[arg(long, default_value_t = false)]
+    streams_echo: bool,
+
+    /// Concurrency mode: prefill the prompts before each run, so all streams decode at once.
+    #[arg(long, default_value_t = false)]
+    streams_warm: bool,
+
+    /// Concurrency mode: tokens of context in front of each stream's instruction; 0 is none.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    streams_depth: u32,
+
     /// Shared-prefix mode: stream counts that all send the SAME long prefix.
     #[arg(long = "shared-prefix", value_delimiter = ',', value_name = "LIST")]
     shared_prefix_spec: Vec<String>,
@@ -139,6 +155,10 @@ struct Args {
     /// Length in tokens of the prefix `--shared-prefix` streams have in common.
     #[arg(long, default_value_t = 2048, value_name = "N")]
     shared_prefix_tokens: u32,
+
+    /// Shared-prefix mode: every round sends a prefix the server has not seen, so all streams arrive cold.
+    #[arg(long, default_value_t = false)]
+    shared_prefix_cold: bool,
 
     /// Scan-resistance mode: unique prompts to push through between two uses
     /// of one hot prefix.
@@ -192,6 +212,42 @@ struct Args {
     /// Number of tokens to generate per timed run.
     #[arg(long = "gen", default_value_t = 128, value_name = "N")]
     n_gen: u32,
+
+    /// Interference mode: prompt lengths a second request prefills while one stream decodes; reports the decoder's stalls.
+    #[arg(long = "interference", value_delimiter = ',', value_name = "LIST")]
+    interference_spec: Vec<String>,
+
+    /// [`Args::interference_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
+    interference: Vec<u32>,
+
+    /// Chat mode: replay this many turns of a coding session through /v1/chat/completions; 0 disables.
+    #[arg(long, default_value_t = 0, value_name = "TURNS")]
+    chat: u32,
+
+    /// The conversation `--chat` replays (JSON: system, tools, turns). Default: the built-in coding session.
+    #[arg(long, value_name = "PATH")]
+    chat_fixture: Option<PathBuf>,
+
+    /// KL mode: compare the server's teacher-forced distributions with this reference, saving it first if absent.
+    #[arg(long, value_name = "PATH")]
+    kl: Option<PathBuf>,
+
+    /// Positions per `--kl` pass: 1 runs decode steps, more runs verify passes.
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    kl_rows: usize,
+
+    /// Candidates `--kl` keeps per position.
+    #[arg(long, default_value_t = 32, value_name = "N")]
+    kl_top: usize,
+
+    /// Tokens `--kl` runs.
+    #[arg(long, default_value_t = 1024, value_name = "N")]
+    kl_tokens: u32,
+
+    /// The text `--kl` runs. Default: the chat fixture's system prompt and turns.
+    #[arg(long, value_name = "PATH")]
+    kl_text: Option<PathBuf>,
 
     /// Curve mode: one generation of this many tokens, bucketed by context; 0 disables.
     #[arg(long, default_value_t = 0, value_name = "N")]
@@ -365,6 +421,10 @@ struct Args {
     #[arg(long, value_name = "CMD")]
     sweep_cmd: Option<String>,
 
+    /// After a two-value `--sweep`, exit 2 if the second value is worse than the first beyond the sweep's measured noise.
+    #[arg(long)]
+    fail_on_regression: bool,
+
     /// Environment held constant across every `--sweep` point (repeatable).
     #[arg(long = "sweep-env", value_name = "K=V")]
     sweep_env: Vec<String>,
@@ -449,6 +509,11 @@ impl Args {
             ("--embed", &self.embed_spec, &mut self.embed),
             ("--image", &self.image_spec, &mut self.image),
             ("--streams", &self.streams_spec, &mut self.streams),
+            (
+                "--interference",
+                &self.interference_spec,
+                &mut self.interference,
+            ),
             (
                 "--shared-prefix",
                 &self.shared_prefix_spec,
@@ -740,11 +805,11 @@ fn build_prompt(depth: u32) -> String {
     // whole regime is forwards of 2..24 positions, read as having no effect
     // anywhere below its default.
     //
-    // So short prompts get their own construction. Every length the old one
-    // could actually produce (`depth >= words_per`, i.e. one sentence or
-    // more) still takes the identical path below and builds a byte-identical
-    // prompt, so no previously-recorded `pp` point moves.
-    if depth < words_per {
+    // So short prompts get their own construction — every length under two
+    // sentences, since one sentence with its preamble and tail is already
+    // ~52 tokens and `--pp 24` and `--pp 28` came out as that same prompt.
+    // From two sentences up the path below builds the prompt it always has.
+    if depth < 2 * words_per {
         return short_prompt(sentence, depth);
     }
     let repeats = (depth / words_per).max(1);
@@ -757,7 +822,7 @@ fn build_prompt(depth: u32) -> String {
     s
 }
 
-/// A prompt of roughly `depth` tokens, for `depth` below one sentence.
+/// A prompt of roughly `depth` tokens, for `depth` below two sentences.
 ///
 /// Just `depth` words of the same sentence, cycled — no preamble and **no
 /// "continue, do not stop" tail**. The tail is ~20 tokens on its own, which is
@@ -1062,6 +1127,20 @@ fn run_once(
     model: &Option<String>,
     temperature: f32,
 ) -> anyhow::Result<Sample> {
+    run_once_with(client, url, prompt, n_gen, model, temperature, false)
+}
+
+/// [`run_once`], with the prefix cache on where `cache_prompt` asks for it:
+/// `--streams-warm` primes each stream's prompt and then sends it again.
+fn run_once_with(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    prompt: &str,
+    n_gen: u32,
+    model: &Option<String>,
+    temperature: f32,
+    cache_prompt: bool,
+) -> anyhow::Result<Sample> {
     let mut body = serde_json::json!({
         "prompt": prompt,
         "max_tokens": n_gen,
@@ -1073,7 +1152,7 @@ fn run_once(
         // and that path is what a client that sends no temperature gets.
         "temperature": temperature,
         "stream": true,
-        "cache_prompt": false,
+        "cache_prompt": cache_prompt,
         // Generate exactly `n_gen` tokens regardless of content — without this a
         // greedy model handed a depth-padded (repetitive) prompt emits EOS on
         // the first token, so the non-zero-depth rows timed **0** tokens. This
@@ -1135,6 +1214,11 @@ fn stream_and_time(
             Ok(v) => v,
             Err(_) => continue,
         };
+        // A request the server gave up on mid-stream is a failure, not a
+        // run with no tokens and a zero time to first token.
+        if let Some(err) = v.get("error") {
+            anyhow::bail!("the server ended the stream with an error: {err}");
+        }
         // OpenAI `choices[0].text`, or the native `content`.
         let text = v
             .get("choices")
@@ -1888,6 +1972,11 @@ fn measurement_name(mode: &str) -> &str {
         "cpu" => "decode CPU",
         "embed" => "embedding",
         "image" => "image generation",
+        "chat" => "chat turn (prompt / time to first token)",
+        "chat-tg" => "chat turn decode",
+        "kl" => "KL divergence from the reference",
+        "top1" => "top-1 agreement with the reference (%)",
+        "itl" => "worst decode gap under a concurrent prefill (ms)",
         other => other,
     }
 }
@@ -1901,7 +1990,24 @@ fn workload_detail(args: &Args) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let points = if !args.pg.is_empty() {
+    let points = if let Some(path) = &args.kl {
+        format!(
+            "{} teacher-forced tokens, {} a pass, against {}",
+            args.kl_tokens,
+            args.kl_rows,
+            path.display()
+        )
+    } else if args.chat > 0 {
+        format!(
+            "{} chat turns of {}",
+            args.chat,
+            args.chat_fixture
+                .as_ref()
+                .map_or("the built-in coding session".to_string(), |p| p
+                    .display()
+                    .to_string())
+        )
+    } else if !args.pg.is_empty() {
         format!("prompt lengths {}", list(&args.pg))
     } else if !args.pp.is_empty() {
         format!("prompt lengths {}", list(&args.pp))
@@ -1929,6 +2035,11 @@ fn workload_detail(args: &Args) -> String {
         )
     } else if !args.streams.is_empty() {
         format!("streams {}", list(&args.streams))
+    } else if !args.interference.is_empty() {
+        format!(
+            "one decoding stream against concurrent prompts of {}",
+            list(&args.interference)
+        )
     } else if !args.shared_prefix.is_empty() {
         format!(
             "streams {} sharing a {}-token prefix",
@@ -2125,12 +2236,85 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         sweep_point_label(args, &spec, &spec.values[0])
     );
     print_sweep_table(args, &spec, &all);
+    let regressed = print_sweep_verdict(args, &spec, &all);
     print_sweep_devices(args, &spec, &all);
     if !bundles.is_empty() {
         println!("\nbundles: {}", bundles.join(" "));
     }
     write_chart(args, &all)?;
-    write_table(args)
+    write_table(args)?;
+    if regressed && args.fail_on_regression {
+        eprintln!("orangu-bench: the candidate is worse than the control beyond the noise");
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+/// For a sweep of exactly two values, the second (the candidate) judged
+/// against the first (the control) at every point — see `verdict`. Returns
+/// whether any point came out worse.
+fn print_sweep_verdict(args: &Args, spec: &sweep::Spec, records: &[history::Record]) -> bool {
+    let mut distinct: Vec<&String> = Vec::new();
+    for v in &spec.values {
+        if !distinct.contains(&v) {
+            distinct.push(v);
+        }
+    }
+    let [control, candidate] = distinct[..] else {
+        return false;
+    };
+    let runs = |value: &str, mode: &str, n: u32| -> Vec<verdict::Run> {
+        let label = sweep_point_label(args, spec, value);
+        records
+            .iter()
+            .filter(|r| r.label == label && r.mode == mode && r.n == n)
+            .map(|r| verdict::Run {
+                mean: r.mean,
+                sd: r.sd_sample,
+                reps: args.reps.max(1),
+            })
+            .collect()
+    };
+    let mut points: Vec<(String, u32)> = records.iter().map(|r| (r.mode.clone(), r.n)).collect();
+    points.sort_unstable();
+    points.dedup();
+    println!(
+        "
+verdict — {} against {}, noise = max(2 × standard error, one arm's run-to-run spread)",
+        if candidate.is_empty() {
+            "<unset>"
+        } else {
+            candidate
+        },
+        if control.is_empty() {
+            "<unset>"
+        } else {
+            control
+        },
+    );
+    let mut regressed = false;
+    for (mode, n) in &points {
+        let Some(v) = verdict::judge(
+            &runs(control, mode, *n),
+            &runs(candidate, mode, *n),
+            verdict::lower_is_better(mode),
+        ) else {
+            continue;
+        };
+        regressed |= v.outcome == verdict::Outcome::Worse;
+        println!(
+            "  {:<12}  {:>+7.1}%  noise ±{:>5.1}%  {}",
+            format!("{mode} {n}"),
+            v.change * 100.0,
+            v.noise * 100.0,
+            match v.outcome {
+                verdict::Outcome::Better => "better",
+                verdict::Outcome::Worse => "WORSE",
+                verdict::Outcome::WithinNoise => "within noise",
+            }
+        );
+    }
+    regressed
 }
 
 /// Warm a freshly-started server on **the workload it is about to be measured
@@ -2822,6 +3006,18 @@ fn measure(
     // measure its text encoder, which is not the model anyone asked about.
     if !args.image.is_empty() {
         return image::run_image(client, args, label);
+    }
+
+    if let Some(path) = &args.kl {
+        return kl::run_kl(client, args, path, label);
+    }
+
+    if args.chat > 0 {
+        return chat::run_chat(client, args, label);
+    }
+
+    if !args.interference.is_empty() {
+        return interference::run_interference(client, args, label);
     }
 
     if !args.pg.is_empty() {
@@ -3986,6 +4182,16 @@ fn workload_name(args: &Args) -> String {
         )
     } else if !args.embed.is_empty() {
         format!("embeddings {}", list(&args.embed))
+    } else if args.kl.is_some() {
+        format!("kl {} tokens rows {}", args.kl_tokens, args.kl_rows)
+    } else if args.chat > 0 {
+        format!("chat {} turns gen {}", args.chat, args.n_gen)
+    } else if !args.interference.is_empty() {
+        format!(
+            "interference {} gen {}",
+            list(&args.interference),
+            args.n_gen
+        )
     } else if !args.pg.is_empty() {
         format!("prefill+decode pg {} gen {}", list(&args.pg), args.n_gen)
     } else if !args.pp.is_empty() {
@@ -4246,6 +4452,47 @@ fn run_pp(
 /// is flat in aggregate and falling as 1/n means the streams are taking turns.
 /// Pair it with the `gpu busy` line: aggregate that stops rising while the
 /// engine is *not* at 100% is the interesting case.
+/// What `--streams-echo` asks every stream to copy: text a reply reproduces
+/// token for token, so prompt lookup drafts most of it.
+const ECHO_PASSAGE: &str = "fn merge_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
+fn dedup_sorted(v: &mut Vec<i64>) {
+    let mut write = 0;
+    for read in 0..v.len() {
+        if read == 0 || v[read] != v[write - 1] {
+            v[write] = v[read];
+            write += 1;
+        }
+    }
+    v.truncate(write);
+}
+
+fn main() {
+    let a = vec![1, 3, 5, 7, 9, 11, 13];
+    let b = vec![2, 3, 4, 7, 8, 11, 12];
+    let mut merged = merge_sorted(&a, &b);
+    dedup_sorted(&mut merged);
+    for value in &merged {
+        println!(\"{value}\");
+    }
+}
+";
+
 fn run_streams(
     client: &reqwest::blocking::Client,
     args: &Args,
@@ -4269,25 +4516,54 @@ fn run_streams(
         let n = n.max(1);
         let mut aggregate = Vec::new();
         let mut total_tokens = 0u32;
+        // Distinct prompts, so no two streams share a prefix cache entry and
+        // get a free ride.
+        let prompt_of = |i: u32| {
+            if args.streams_echo {
+                format!(
+                    "Stream {i}: copy the following code exactly, line for \
+                     line, then stop.\n\n{ECHO_PASSAGE}\nThe copy:\n"
+                )
+            } else if args.streams_depth > 0 {
+                format!("Stream {i}: {}", build_prompt(args.streams_depth))
+            } else {
+                format!("Stream {i}: tell a long, continuous story, do not stop:")
+            }
+        };
         for _ in 0..args.reps.max(1) {
+            // Each stream's prompt prefilled one after another, unmeasured,
+            // so the measured requests find them cached and every stream
+            // decodes from the start rather than as the prompts before it
+            // finish.
+            if args.streams_warm {
+                for i in 0..n {
+                    run_once_with(
+                        client,
+                        &args.url,
+                        &prompt_of(i),
+                        1,
+                        &args.model,
+                        args.temperature,
+                        true,
+                    )?;
+                }
+            }
             let start = Instant::now();
             // One thread per stream, each its own request. Scoped threads so no
             // clones of the client are needed and no task can outlive the run.
             let results: Vec<Sample> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..n)
                     .map(|i| {
+                        let prompt = prompt_of(i);
                         scope.spawn(move || {
-                            // Distinct prompts, so no two streams share a prefix
-                            // cache entry and get a free ride.
-                            let prompt =
-                                format!("Stream {i}: tell a long, continuous story, do not stop:");
-                            run_once(
+                            run_once_with(
                                 client,
                                 &args.url,
                                 &prompt,
                                 args.n_gen,
                                 &args.model,
                                 args.temperature,
+                                args.streams_warm,
                             )
                         })
                     })
@@ -4334,7 +4610,21 @@ fn run_streams(
         records.push(history::Record {
             date: history::today(),
             label: label.to_string(),
-            mode: "tg".to_string(),
+            mode: {
+                let mode = match (args.streams_echo, args.streams_warm) {
+                    (false, false) => "tg",
+                    (true, false) => "tg-echo",
+                    (false, true) => "tg-warm",
+                    (true, true) => "tg-echo-warm",
+                };
+                // A deep run is its own series: its rate is not comparable
+                // with the same stream count at the instruction alone.
+                if args.streams_depth > 0 && !args.streams_echo {
+                    format!("{mode}-d{}", args.streams_depth)
+                } else {
+                    mode.to_string()
+                }
+            },
             n,
             best: stats.best,
             mean: stats.mean,
@@ -4395,7 +4685,12 @@ fn run_shared_prefix(
 
     // Prime the pool: one request establishes the prefix so the measured
     // rounds are contending for a warm entry rather than all arriving cold.
-    let _ = run_once_cached(client, &args.url, &prefix, 1, &args.model);
+    // `--shared-prefix-cold` measures exactly that instead: each round opens
+    // with its own number, so no round finds the last one's pages.
+    if !args.shared_prefix_cold {
+        let _ = run_once_cached(client, &args.url, &prefix, 1, &args.model);
+    }
+    let mut round = 0u32;
 
     for (point, &n) in args.shared_prefix.iter().enumerate() {
         if point > 0 {
@@ -4405,11 +4700,20 @@ fn run_shared_prefix(
         let mut fastest = f64::MAX;
         let mut slowest: f64 = 0.0;
         let mut total_tokens = 0u32;
+        let mut failed = 0u32;
+        let mut first_failure: Option<String> = None;
+        let mut round_slowest = Vec::new();
         for _ in 0..args.reps.max(1) {
-            let results: Vec<Sample> = std::thread::scope(|scope| {
+            round += 1;
+            let round_prefix = if args.shared_prefix_cold {
+                format!("Round {round}.\n{prefix}")
+            } else {
+                prefix.clone()
+            };
+            let results: Vec<anyhow::Result<Sample>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..n)
                     .map(|i| {
-                        let prefix = prefix.as_str();
+                        let prefix = round_prefix.as_str();
                         scope.spawn(move || {
                             // Identical prefix, distinct suffix: every stream
                             // can reuse everything but its own last few tokens,
@@ -4421,17 +4725,52 @@ fn run_shared_prefix(
                     .collect();
                 handles
                     .into_iter()
-                    .filter_map(|h| h.join().ok().and_then(Result::ok))
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("the stream's thread panicked"))
+                        })
+                    })
                     .collect()
             });
+            // A stream that produced nothing has no time to first token, so
+            // it is counted as failed rather than as the fastest.
+            let results: Vec<Sample> = results
+                .into_iter()
+                .filter_map(|r| match r {
+                    Ok(s) if s.generated() > 0 => Some(s),
+                    Ok(_) => {
+                        failed += 1;
+                        first_failure.get_or_insert_with(|| "no tokens streamed".to_string());
+                        None
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        first_failure.get_or_insert_with(|| format!("{e:#}"));
+                        None
+                    }
+                })
+                .collect();
             if results.is_empty() {
-                anyhow::bail!("no streams completed at {n} sharing a prefix");
+                anyhow::bail!(
+                    "no streams completed at {n} sharing a prefix: {}",
+                    first_failure.as_deref().unwrap_or("no streams ran")
+                );
             }
+            let mut this_round: f64 = 0.0;
             for s in &results {
                 fastest = fastest.min(s.ttft_ms);
-                slowest = slowest.max(s.ttft_ms);
+                this_round = this_round.max(s.ttft_ms);
                 total_tokens += s.generated();
             }
+            slowest = slowest.max(this_round);
+            round_slowest.push(this_round);
+        }
+        if failed > 0 {
+            eprintln!(
+                "orangu-bench: {failed} of {} streams at {n} sharing a prefix failed: {}",
+                n * args.reps.max(1),
+                first_failure.as_deref().unwrap_or("")
+            );
         }
         let ratio = if fastest > 0.0 {
             slowest / fastest
@@ -4458,17 +4797,40 @@ fn run_shared_prefix(
             );
         }
 
+        let cold = Stats::of(&round_slowest, true);
         records.push(history::Record {
             date: history::today(),
             label: label.to_string(),
             // The recorded value is the *slowest* stream's TTFT: it is the one
             // a user actually waits for, and the one sharing would remove.
-            mode: "ttft".to_string(),
+            // Cold rounds are each their own sample, so they carry a spread.
+            mode: if args.shared_prefix_cold {
+                "ttft-cold"
+            } else {
+                "ttft"
+            }
+            .to_string(),
             n,
-            best: slowest,
-            mean: slowest,
-            sd: 0.0,
-            sd_sample: None,
+            best: if args.shared_prefix_cold {
+                cold.best
+            } else {
+                slowest
+            },
+            mean: if args.shared_prefix_cold {
+                cold.mean
+            } else {
+                slowest
+            },
+            sd: if args.shared_prefix_cold {
+                cold.sd
+            } else {
+                0.0
+            },
+            sd_sample: if args.shared_prefix_cold {
+                cold.sd_sample
+            } else {
+                None
+            },
             device: None,
         });
     }
@@ -6656,7 +7018,7 @@ mod tests {
     fn short_prompts_are_short_and_distinct() {
         let words = |s: &str| s.split_whitespace().count();
         // Monotone, and near the requested count rather than 40 tokens above.
-        for depth in [1u32, 4, 8, 16, 23] {
+        for depth in [1u32, 4, 8, 16, 23, 24, 28, 47] {
             let got = words(&build_prompt(depth));
             assert_eq!(got, depth as usize, "--pp {depth} should be ~{depth} words");
         }
@@ -6667,11 +7029,11 @@ mod tests {
         assert!(!build_prompt(8).contains("do not stop"));
     }
 
-    /// ...and every length the old builder could really produce is untouched,
-    /// so no `pp` point already in a history file moves under it.
+    /// ...and from two sentences up the padded construction is untouched,
+    /// so no `pp` point there already in a history file moves under it.
     #[test]
-    fn prompts_of_a_sentence_or_more_keep_the_original_construction() {
-        for depth in [24u32, 48, 256, 1024, 2048] {
+    fn prompts_of_two_sentences_or_more_keep_the_original_construction() {
+        for depth in [48u32, 256, 1024, 2048] {
             let p = build_prompt(depth);
             assert!(
                 p.starts_with("Here is the story so far:"),

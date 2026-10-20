@@ -41,6 +41,9 @@ The report covers:
 - total tool execution time,
 - total tokens generated (counted with the bundled tokenizer),
 - average tokens per second,
+- prompt cache statistics: the prompt tokens sent to the server this session,
+  how many it answered from its prefix cache, and the rate — a rate that drops
+  during one conversation means its prompt stopped extending the previous one,
 - context cache statistics (reads, hits, misses, rate, bytes saved),
 - context compression statistics (lines saved, patterns applied),
 - tool invocation statistics (counts, percentages), and

@@ -245,6 +245,30 @@ pub fn too_long_response(message: String) -> axum::response::Response {
 /// answer is still free. Past this point the prompt is on its way to a device
 /// that answers an oversized request by stalling until its driver resets it,
 /// taking every other request on the process with it.
+/// Prompts at least this long are tokenised on a blocking thread.
+const ENCODE_INLINE_BYTES: usize = 16 * 1024;
+
+/// Tokenises `text`, off the async runtime when it is long.
+///
+/// A long prompt takes milliseconds to encode, and on a runtime worker that
+/// is time no other connection — another agent's stream, a health check —
+/// is served. A short one is cheaper encoded where it is than handed to
+/// another thread.
+pub async fn encode_off_runtime(
+    tokenizer: &Arc<crate::engine::tokenizer::Tokenizer>,
+    text: String,
+    add_bos: bool,
+) -> Vec<u32> {
+    if text.len() < ENCODE_INLINE_BYTES {
+        return tokenizer.encode(&text, add_bos);
+    }
+    let tokenizer = tokenizer.clone();
+    match tokio::task::spawn_blocking(move || tokenizer.encode(&text, add_bos)).await {
+        Ok(tokens) => tokens,
+        Err(err) => std::panic::resume_unwind(err.into_panic()),
+    }
+}
+
 pub fn reject_oversized_context(prompt_tokens: usize) -> Option<Response> {
     let ceiling = crate::engine::generate::kv_device_token_ceiling()?;
     if crate::engine::generate::prompt_fits_device(prompt_tokens, ceiling) {
@@ -286,6 +310,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/metrics", get(native::metrics))
         .route("/tokenize", post(native::tokenize))
         .route("/detokenize", post(native::detokenize))
+        .route("/logits", post(native::logits))
         .route("/completion", post(native::completion))
         .route("/embedding", post(native::embedding))
         .route("/apply-template", post(native::apply_template))

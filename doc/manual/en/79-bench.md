@@ -417,6 +417,98 @@ Because the token counts are approximate (the tool has no tokenizer), `added`
 is a target and `processed` is the truth — history rows are recorded against
 `processed`.
 
+### Chat mode (`--chat`) — a coding session, turn by turn
+
+Every other text mode sends a repeated sentence to `/v1/completions`, which
+skips the chat template, the tool declarations and the prefix cache a
+conversation depends on. `--chat TURNS` sends what a coding agent sends: a
+system prompt, a tool array and a conversation that grows by one user message
+and the model's own reply per turn, to `/v1/chat/completions`. A reply that
+calls a tool is answered with a placeholder tool result, so the transcript
+stays one a template accepts.
+
+The conversation is built in — a coding agent's system prompt, four tools and
+eight turns that carry source code — unless `--chat-fixture` names a JSON file
+of the same shape (`{"system": "...", "tools": [...], "turns": ["...", ...]}`).
+Each repetition opens with a system line of its own, so one repetition's cache
+never serves the next one's first turn.
+
+```sh
+orangu-bench --url http://127.0.0.1:8100 --chat 8 --gen 64 --reps 3
+```
+
+```
+turn | prompt | cached |  hit |  ttft_ms |    pp_ms | other_ms |  tg t/s | pp/ttft mean ± sd
+--------------------------------------------------------------------------------------------------
+   1 |    975 |      0 |   0% |    211.7 |    209.9 |      1.7 |  553.39 |   4386.1 ± 307.4
+   2 |   1408 |    960 |  68% |    135.8 |    134.3 |      1.5 |  434.45 |  10095.8 ± 284.6
+ ...
+cache: 39552 of 48387 prompt tokens (81.7%) · 0 tool call(s)
+```
+
+Per turn: the prompt as the server counted it, how much of it the cache
+supplied, time to first token, the server's prefill time, and `other_ms` —
+everything else before the first token (template, tokenizer, queueing, the
+network). The recorded rate (mode `chat`, `n` = turn) is the prompt over the
+time to first token, so a turn answered from cache and a turn rendered faster
+both read higher. The reply's decode rate is recorded beside it as mode
+`chat-tg`: what a decode-side change such as speculation moves, and a
+prompt-side one should leave alone.
+
+### Interference mode (`--interference`) — one request's prefill against another's decode
+
+Two agents on one server share one device, and a decode step queued behind a
+prefill submission waits for it. `--interference LIST` starts one stream
+decoding `--gen` tokens and, eight tokens in, sends a second request whose
+prompt is each listed length. It reports the decoding stream's inter-token
+gaps — median, 99th percentile and worst — and how long the second request
+took. The recorded value (mode `itl`) is the worst gap in milliseconds, lower
+is better.
+
+```sh
+orangu-bench --url http://127.0.0.1:8100 --interference 1024,4096 --gen 400
+```
+
+It needs a server with at least two slots (`slots = 2` in its configuration);
+on one slot the second request queues and the gaps show nothing.
+
+### KL mode (`--kl`) — has a change moved the model's answers?
+
+A change to how the arithmetic is done — a KV storage format, a kernel's
+summation order, a weight layout, the multi-position verify path — can be
+fast because it is wrong, and a few generated replies that read well do not
+show it. `--kl PATH` asks the server's `/logits` for its teacher-forced
+next-token distributions over `--kl-tokens` tokens (default 1024) of
+`--kl-text`, or of the chat fixture's system prompt and turns when that is
+not given.
+
+The first run against a `PATH` that does not exist saves the answer there as
+the reference. Every later run sends the reference's exact tokens and
+reports, position by position, the KL divergence from the reference (mean,
+99th percentile and worst), how often the most likely token is the same, and
+milliseconds a position on both sides.
+
+```sh
+# the reference: this build, its default configuration
+orangu-bench --kl ref.json
+# the same server, verifying 8 positions a pass instead of decoding one
+orangu-bench --kl ref.json --kl-rows 8
+# a second build or configuration, started on the same port
+orangu-bench --kl ref.json
+```
+
+Each side keeps `--kl-top` candidates a position (default 32), so the
+divergence is taken over the reference's candidates and one bucket for the
+rest. A candidate the other side did not keep is given that side's smallest
+kept probability, which is an upper bound on what it held. The recorded
+values are mode `kl` (the mean, lower is better) and mode `top1` (agreement
+in percent), with `n` the rows a pass.
+
+Read a mean KL near zero and agreement near 100% as the same model. Two
+runs of one build on one device are the floor to compare against: a device
+whose sums run in a different order from run to run does not reach zero
+against itself.
+
 ### Decode CPU per token (`--decode-cpu`)
 
 Reports the **server's own CPU time per generated token**, read from
@@ -1133,6 +1225,17 @@ Options:
       --pg <LIST>                      Combined mode: prompt lengths prefilled and generated in one request
       --decode-cpu                     Report the server's CPU time per generated token, with prefill excluded
       --streams <LIST>                 Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s
+      --streams-echo                   Concurrency mode: each stream copies a passage out of its prompt, which speculation drafts
+      --streams-warm                   Concurrency mode: prefill the prompts before each run, so all streams decode at once
+      --streams-depth <N>              Concurrency mode: tokens of context in front of each stream's instruction; 0 is none [default: 0]
+      --interference <LIST>            Interference mode: prompt lengths a second request prefills while one stream decodes; reports the decoder's stalls
+      --chat <TURNS>                   Chat mode: replay this many turns of a coding session through /v1/chat/completions; 0 disables [default: 0]
+      --chat-fixture <PATH>            The conversation `--chat` replays (JSON: system, tools, turns). Default: the built-in coding session
+      --kl <PATH>                      KL mode: compare the server's teacher-forced distributions with this reference, saving it first if absent
+      --kl-rows <N>                    Positions per `--kl` pass: 1 runs decode steps, more runs verify passes [default: 1]
+      --kl-top <N>                     Candidates `--kl` keeps per position [default: 32]
+      --kl-tokens <N>                  Tokens `--kl` runs [default: 1024]
+      --kl-text <PATH>                 The text `--kl` runs. Default: the chat fixture's system prompt and turns
       --pp-continue-base <N>           Prompt length (tokens) to prime the prefix cache with for `--pp-continue` [default: 512]
       --embed <LIST>                   Embedding mode: prompt lengths to sweep against /v1/embeddings
       --image <LIST>                   Image mode: square picture sizes (pixels, multiples of 16) to sweep against /v1/images/generations
@@ -1730,6 +1833,29 @@ passes 66% with eight. Same device.
 
 Each stream gets a distinct prompt so no two share a prefix-cache entry and get a
 free ride.
+
+The prompts ask for a story, which prompt-lookup speculation rarely drafts.
+`--streams-echo` asks every stream to copy a passage of code out of its
+prompt instead, so most of each reply is drafted and verified. That is the
+workload where speculation and batching compete for the same steps; its
+history rows are recorded as mode `tg-echo`.
+
+All streams are sent at once, but the server prefills their prompts one
+after another, so the first stream decodes alone while the others' prompts
+run, and the measured window includes that ramp. `--streams-warm` sends each
+stream's prompt first, unmeasured and one at a time, with one token to
+generate and the prefix cache on; the measured requests then find their
+prompts cached, and every stream decodes from the first step. Its history
+rows are recorded as mode `tg-warm` (`tg-echo-warm` with `--streams-echo`).
+
+`--streams-depth N` puts about N tokens of prose in front of each story
+stream's instruction, each prompt starting with its stream's number so no
+two share a cached prefix. Every step then reads N rows of KV per stream as
+well as the weights, which is how batched decode is measured at the depth of
+a long conversation. Pair it with `--streams-warm`, or the measured window
+holds every prompt's prefill. Its history rows carry the depth in their mode
+(`tg-warm-d3500`), a series of their own. `--streams-echo` keeps its own
+prompt and ignores the depth.
 
 ### Was it memory-bound? (`engine` and `memory` busy)
 

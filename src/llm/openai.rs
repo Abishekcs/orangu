@@ -305,6 +305,13 @@ where
         return Err(anyhow!("{}", stream_error_message(error)));
     }
     let metrics = stream_metrics_from_response(&response);
+    // The final chunk's progress is the whole prompt's: counted once a
+    // response, on the chunk that finishes it.
+    if response.choices.iter().any(|c| c.finish_reason.is_some())
+        && let Some(progress) = &metrics.prompt_progress
+    {
+        super::note_prompt_cache(progress);
+    }
     if !metrics.is_empty() {
         on_stream_metrics(metrics);
     }

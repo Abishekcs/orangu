@@ -1370,6 +1370,27 @@ impl ModelForward for DelegatingModel {
         self.model.config()
     }
 
+    /// Handed over, the model's own batch samples as it would; on the tree
+    /// every row comes back as logits.
+    fn forward_decode_batch_sampling(
+        &self,
+        rows: &mut [DecodeRow<'_>],
+        tokens: &[u32],
+        samples: &[Option<crate::engine::arch::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<crate::engine::arch::ForwardOutcome>>> {
+        if rows.iter().all(|row| row.cache.whole) {
+            return self
+                .model
+                .forward_decode_batch_sampling(rows, tokens, samples);
+        }
+        Ok(self.forward_decode_batch(rows, tokens)?.map(|logits| {
+            logits
+                .into_iter()
+                .map(crate::engine::arch::ForwardOutcome::Logits)
+                .collect()
+        }))
+    }
+
     /// One decode step of every slot, as one message per worker at every
     /// level of the tree. Declines (`None`, and the batcher steps each slot
     /// on its own) when a sequence has to be rebuilt first; and when any
@@ -1429,7 +1450,7 @@ impl ModelForward for DelegatingModel {
                 "orangu-server: a batched decode step failed ({error}); stepping one by one"
             );
             for row in rows.iter_mut() {
-                row.cache.truncate(row.pos);
+                row.cache.truncate(row.pos)?;
             }
             return Ok(None);
         }
@@ -2041,7 +2062,7 @@ mod tests {
         let mut cache = split.new_kv_cache(N_CTX);
         split.forward(&mut cache, &tokens[..6], 0, 0).unwrap();
         assert_eq!(cache.committed_len(), 6);
-        cache.truncate(3);
+        cache.truncate(3).unwrap();
         assert_eq!(cache.committed_len(), 3);
         let after = split.forward(&mut cache, &tokens[3..5], 3, 0).unwrap();
 
@@ -2481,7 +2502,7 @@ mod tests {
 
         let mut alone = model.new_kv_cache(N_CTX);
         model.forward(&mut alone, &history, 0, 0).unwrap();
-        alone.truncate(75);
+        alone.truncate(75).unwrap();
         let want = model.forward(&mut alone, &prompt[75..], 75, 0).unwrap();
         assert_eq!(got, want);
 

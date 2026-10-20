@@ -6841,6 +6841,11 @@ pub struct ActQ8KRow {
     /// the offset weights and needs no sum.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     prism_sums: Vec<i32>,
+    /// Per-32 `sum(q)` as `i16` (`|sum| <= 32 · 127`), eight a super-block:
+    /// one load against a row's eight `Q4_K` mins. Read only by the `AVX2`
+    /// narrow pass ([`dot_k_row_tokens`]).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    block_sums: Vec<i16>,
 }
 
 /// Quantizes one token's activations for [`dot_k_row`]. `x.len()` must be a
@@ -6885,11 +6890,18 @@ pub fn quantize_act_k_row(x: &[f32]) -> ActQ8KRow {
         .iter()
         .map(|g| g.iter().sum())
         .collect();
+    let block_sums = sums
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[a, b]| (a + b) as i16)
+        .collect();
     ActQ8KRow {
         q,
         d,
         sums,
         prism_sums,
+        block_sums,
     }
 }
 
@@ -7202,6 +7214,178 @@ unsafe fn dot_k_row_q6_k_avx2(row: &[u8], act: &ActQ8KRow) -> f32 {
             accf = _mm256_fmadd_ps(_mm256_set1_ps(act.d[s] * d), _mm256_cvtepi32_ps(acc), accf);
         }
         hsum_ps_avx2(accf)
+    }
+}
+
+/// The most tokens [`dot_k_row_tokens`] takes in one pass over a row.
+pub const K_ROW_TOKENS_MAX: usize = 8;
+
+/// One row against several tokens: `out[t] = dot_k_row(ggml_type, row,
+/// &acts[t])`, bit for bit. Where a kernel for the type exists the row is
+/// read and unpacked once — its scales, mins and nibbles — and each token
+/// takes the same integer sums, lane for lane, that [`dot_k_row`] takes.
+pub fn dot_k_row_tokens(ggml_type: u32, row: &[u8], acts: &[ActQ8KRow], out: &mut [f32]) {
+    debug_assert_eq!(acts.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        macro_rules! by_count {
+            ($kernel:ident) => {
+                // Safety: guarded by the runtime feature check above.
+                match acts.len() {
+                    2 => return unsafe { $kernel::<2>(row, acts, out) },
+                    3 => return unsafe { $kernel::<3>(row, acts, out) },
+                    4 => return unsafe { $kernel::<4>(row, acts, out) },
+                    5 => return unsafe { $kernel::<5>(row, acts, out) },
+                    6 => return unsafe { $kernel::<6>(row, acts, out) },
+                    7 => return unsafe { $kernel::<7>(row, acts, out) },
+                    8 => return unsafe { $kernel::<8>(row, acts, out) },
+                    _ => {}
+                }
+            };
+        }
+        match ggml_type {
+            GGML_TYPE_Q4_K => by_count!(dot_k_row_tokens_q4_k_avx2),
+            GGML_TYPE_Q6_K => by_count!(dot_k_row_tokens_q6_k_avx2),
+            _ => {}
+        }
+    }
+    for (y, act) in out.iter_mut().zip(acts) {
+        *y = dot_k_row(ggml_type, row, act);
+    }
+}
+
+/// [`dot_k_row_q4_k_avx2`] over `N` tokens.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_tokens_q4_k_avx2<const N: usize>(
+    row: &[u8],
+    acts: &[ActQ8KRow],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
+    let acts: &[ActQ8KRow; N] = acts.try_into().expect("N activations");
+    unsafe {
+        let m4 = _mm256_set1_epi8(0x0F);
+        let mut accf = [_mm256_setzero_ps(); N];
+        let mut total_min = [0f32; N];
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let dmin = read_f16(block, 2);
+            let scales = &block[4..16];
+            let qs = block.as_ptr().add(16);
+            let mut sc = [0i16; 8];
+            let mut mins = [0i16; 8];
+            for (j, (sc_j, m_j)) in sc.iter_mut().zip(&mut mins).enumerate() {
+                let (a, m) = get_scale_min_k4(j, scales);
+                *sc_j = a as i16;
+                *m_j = m as i16;
+            }
+            let minv = _mm_loadu_si128(mins.as_ptr() as *const __m128i);
+            let mut acc = [_mm256_setzero_si256(); N];
+            for g in 0..4 {
+                let q = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                let lo = _mm256_and_si256(q, m4);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+                let sc0 = _mm256_set1_epi16(sc[2 * g]);
+                let sc1 = _mm256_set1_epi16(sc[2 * g + 1]);
+                for (acc, act) in acc.iter_mut().zip(acts) {
+                    let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+                    let x0 = _mm256_loadu_si256(x.add(g * 64) as *const __m256i);
+                    let x1 = _mm256_loadu_si256(x.add(g * 64 + 32) as *const __m256i);
+                    let p0 = _mm256_maddubs_epi16(lo, x0);
+                    let p1 = _mm256_maddubs_epi16(hi, x1);
+                    *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(p0, sc0));
+                    *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(p1, sc1));
+                }
+            }
+            for t in 0..N {
+                let act = &acts[t];
+                // `Σ_j mins[j] · sum_j(x)` in `i32`, exact: the integer
+                // `dot_k_row` sums a term at a time, here one `vpmaddwd`.
+                // A scalar loop of it per token was as much work as the
+                // token's whole dot.
+                let bs = _mm_loadu_si128(act.block_sums.as_ptr().add(s * SUBS) as *const __m128i);
+                let p = _mm_madd_epi16(minv, bs);
+                let p = _mm_add_epi32(p, _mm_shuffle_epi32(p, 0b01_00_11_10));
+                let p = _mm_add_epi32(p, _mm_shuffle_epi32(p, 0b10_11_00_01));
+                let imin = _mm_cvtsi128_si32(p);
+                accf[t] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(act.d[s] * d),
+                    _mm256_cvtepi32_ps(acc[t]),
+                    accf[t],
+                );
+                total_min[t] += act.d[s] * dmin * imin as f32;
+            }
+        }
+        for t in 0..N {
+            out[t] = hsum_ps_avx2(accf[t]) - total_min[t];
+        }
+    }
+}
+
+/// [`dot_k_row_q6_k_avx2`] over `N` tokens.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_tokens_q6_k_avx2<const N: usize>(
+    row: &[u8],
+    acts: &[ActQ8KRow],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
+    let acts: &[ActQ8KRow; N] = acts.try_into().expect("N activations");
+    unsafe {
+        let m4 = _mm256_set1_epi8(0x0F);
+        let m3 = _mm256_set1_epi8(3);
+        let bias = _mm256_set1_epi8(32);
+        let mut accf = [_mm256_setzero_ps(); N];
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let ql = block.as_ptr();
+            let qh = block.as_ptr().add(128);
+            let sc = &block[192..208];
+            let d = read_f16(block, 208);
+            let mut acc = [_mm256_setzero_si256(); N];
+            let mut r = 0usize;
+            for h in 0..2 {
+                let qhv = _mm256_loadu_si256(qh.add(h * 32) as *const __m256i);
+                for &(ql_add, hshift, high) in Q6K_RUNS.iter() {
+                    let qlv = _mm256_loadu_si256(ql.add(h * 64 + ql_add) as *const __m256i);
+                    let nib = if high {
+                        _mm256_and_si256(_mm256_srli_epi16(qlv, 4), m4)
+                    } else {
+                        _mm256_and_si256(qlv, m4)
+                    };
+                    let hb = _mm256_slli_epi16(
+                        _mm256_and_si256(_mm256_srl_epi16(qhv, _mm_cvtsi32_si128(hshift)), m3),
+                        4,
+                    );
+                    let w = _mm256_sub_epi8(_mm256_or_si256(nib, hb), bias);
+                    let s0 = sc[2 * r] as i8 as i16;
+                    let s1 = sc[2 * r + 1] as i8 as i16;
+                    let scv = _mm256_setr_epi16(
+                        s0, s0, s0, s0, s0, s0, s0, s0, s1, s1, s1, s1, s1, s1, s1, s1,
+                    );
+                    for (acc, act) in acc.iter_mut().zip(acts) {
+                        let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+                        let xv = _mm256_loadu_si256(x.add(r * 32) as *const __m256i);
+                        let p = _mm256_maddubs_epi16(_mm256_abs_epi8(xv), _mm256_sign_epi8(w, xv));
+                        *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(p, scv));
+                    }
+                    r += 1;
+                }
+            }
+            for t in 0..N {
+                accf[t] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(acts[t].d[s] * d),
+                    _mm256_cvtepi32_ps(acc[t]),
+                    accf[t],
+                );
+            }
+        }
+        for t in 0..N {
+            out[t] = hsum_ps_avx2(accf[t]);
+        }
     }
 }
 
@@ -8995,6 +9179,43 @@ mod tests {
     /// never wrong. A type here but missing from `dot_k_row`'s match is a panic
     /// on the first token. And `Q2_K` is in decode but not prefill on purpose:
     /// its min is per 16 and the prefill GEMM's `bsum` is per 32.
+    /// `dot_k_row_tokens` is `dot_k_row` once a token, bit for bit, at every
+    /// count it has a kernel for and past it, on the types with a kernel and
+    /// one without.
+    #[test]
+    fn a_row_against_several_tokens_is_each_token_alone_bit_for_bit() {
+        for ggml_type in [quant::GGML_TYPE_Q4_K, quant::GGML_TYPE_Q6_K, GGML_TYPE_Q5_K] {
+            let in_dim = 3 * SUPER_BLOCK;
+            let mut seed = 0x51ED_u64;
+            let mut row = Vec::new();
+            for _ in 0..in_dim / SUPER_BLOCK {
+                row.extend(crate::engine::backend::probe_blocks::build_block(
+                    ggml_type, &mut seed,
+                ));
+            }
+            for n in 1..=K_ROW_TOKENS_MAX + 1 {
+                let acts: Vec<ActQ8KRow> = (0..n)
+                    .map(|t| {
+                        let x: Vec<f32> = (0..in_dim)
+                            .map(|i| (((i + 31 * t) * 7919) % 251) as f32 / 125.0 - 1.0)
+                            .collect();
+                        quantize_act_k_row(&x)
+                    })
+                    .collect();
+                let mut got = vec![0f32; n];
+                dot_k_row_tokens(ggml_type, &row, &acts, &mut got);
+                for (t, (g, act)) in got.iter().zip(&acts).enumerate() {
+                    let want = dot_k_row(ggml_type, &row, act);
+                    assert_eq!(
+                        g.to_bits(),
+                        want.to_bits(),
+                        "type {ggml_type}, {n} tokens: token {t} is {g}, alone {want}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn supports_k_row_is_a_superset_of_supports_k() {
         for t in [

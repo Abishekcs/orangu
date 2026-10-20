@@ -33,18 +33,24 @@
 //! there is no timeout: the join is deterministic.
 //!
 //! With one slot registered its step runs at once on the solo path,
-//! unchanged — device sampling and all. A batched step comes back as logits
-//! and is sampled on the host, which is the same result the device sampler
-//! computes.
+//! unchanged. A batched step samples as the solo step does: each row's
+//! sampling rides along, and an architecture that batches on the device
+//! picks each row's token (or its top-k candidates) in the batch's own
+//! submission (`ModelForward::forward_decode_batch_sampling`), so a row
+//! reads back a token rather than its logits.
 //!
-//! **Opt-in for now** (`ORANGU_DECODE_BATCH=1`). The batched step is correct
-//! — three different prompts decoded together give exactly their solo
-//! answers — but it runs on the prefill chains, which build every bind
-//! group, meta, scratch buffer and norm-weight upload afresh per call, and
-//! at two to four rows that host work outweighs the weights saved: two
-//! streams measured 48 tok/s aggregate against 54 for one, four streams 66.
-//! Caching those resources per layer is what makes it pay, and is the next
-//! step.
+//! A slot verifying a speculative draft offers that to the same rendezvous
+//! (`DecodeBatcher::verify`): its token and draft become rows of the step,
+//! one offer like any other, so the others step with it instead of waiting
+//! for its own pass. A model that does not batch a verify
+//! (`ModelForward::batches_verify`) is never offered one.
+//!
+//! **On unless disabled** (`ORANGU_DECODE_BATCH=0` turns it off). The batched
+//! step runs every row's projections and feed-forward on the narrow-pass
+//! kernels a speculative verify uses, and each row's attention as its solo
+//! step would. So a batched answer is the solo answer to the rounding of
+//! those kernels, the same floor a verify pass has: greedy output can differ
+//! with which requests happen to share its steps.
 
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
@@ -65,20 +71,56 @@ struct Inner {
     /// Slots currently decoding — how many steps a batch waits for.
     registered: usize,
     pending: Vec<Pending>,
-    results: HashMap<u64, Result<Vec<f32>>>,
+    results: HashMap<u64, Result<Answer>>,
     running: bool,
     next_ticket: u64,
+}
+
+/// What a ticket gets back: a step's outcome, or a verify's logits at
+/// every position.
+enum Answer {
+    Step(ForwardOutcome),
+    Verify(Vec<Vec<f32>>),
 }
 
 struct Pending {
     ticket: u64,
     slot: usize,
-    token: u32,
+    /// One token for a step; the token and its draft for a verify.
+    tokens: Vec<u32>,
+    verify: bool,
     pos: usize,
     /// The waiter's cache. The waiter is parked on `joined` for as long as
     /// this entry exists, so the leader is the only thread touching it —
     /// that is what makes the pointer usable from another thread.
     cache: *mut KvCache,
+    /// The step's sampling, copied: the waiter's history is borrowed from a
+    /// thread that is parked, and a window of recent tokens is short.
+    sample: Option<OwnedSample>,
+}
+
+struct OwnedSample {
+    recent_tokens: Vec<u32>,
+    repeat_penalty: f32,
+    top_k: u32,
+}
+
+impl OwnedSample {
+    fn of(params: &GreedySampleParams<'_>) -> Self {
+        Self {
+            recent_tokens: params.recent_tokens.to_vec(),
+            repeat_penalty: params.repeat_penalty,
+            top_k: params.top_k,
+        }
+    }
+
+    fn params(&self) -> GreedySampleParams<'_> {
+        GreedySampleParams {
+            recent_tokens: &self.recent_tokens,
+            repeat_penalty: self.repeat_penalty,
+            top_k: self.top_k,
+        }
+    }
 }
 
 // `Pending::cache` is only dereferenced while its owner is parked (see the
@@ -106,17 +148,27 @@ impl Default for DecodeBatcher {
 }
 
 impl DecodeBatcher {
-    /// Off unless `ORANGU_DECODE_BATCH=1` — see the module doc.
+    /// On unless `ORANGU_DECODE_BATCH=0` — see the module doc.
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             joined: Condvar::new(),
-            enabled: super::env::flag_on("ORANGU_DECODE_BATCH"),
+            enabled: super::env::flag_on_unless_disabled("ORANGU_DECODE_BATCH"),
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// How many slots a decode step is shared by: those registered, or one
+    /// when batching is off.
+    pub fn rows(&self) -> usize {
+        if self.enabled {
+            self.lock().registered.max(1)
+        } else {
+            1
+        }
     }
 
     /// Joins the batch for the decode loop about to run. `None` when
@@ -131,8 +183,9 @@ impl DecodeBatcher {
 
     /// One decode step — this slot's `token` at `pos` into `cache` — as part
     /// of whatever batch forms, or alone when this slot is the only one
-    /// decoding. `greedy` is honoured on the solo path (the device samples);
-    /// a batched step returns logits for the host sampler.
+    /// decoding. `greedy` asks for the device's sampling, on the solo path
+    /// and in a batch alike; where the model cannot, the step returns
+    /// logits for the host sampler.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &self,
@@ -144,7 +197,7 @@ impl DecodeBatcher {
         greedy: Option<GreedySampleParams<'_>>,
         slot: usize,
     ) -> Result<ForwardOutcome> {
-        let solo = |cache: &mut KvCache| {
+        let solo = |cache: &mut KvCache, greedy: Option<GreedySampleParams<'_>>| {
             // Timed, for the chunk-plan experiment: the whole step, which is
             // the only comparison that charges each plan for exactly what
             // it costs.
@@ -156,30 +209,84 @@ impl DecodeBatcher {
             outcome
         };
         if registration.is_none() {
-            return solo(cache);
+            return solo(cache, greedy);
         }
+        let entry = |ticket| Pending {
+            ticket,
+            slot,
+            tokens: vec![token],
+            verify: false,
+            pos,
+            cache: cache as *mut KvCache,
+            sample: greedy.as_ref().map(OwnedSample::of),
+        };
+        match self.offer(model, entry) {
+            Some(answer) => answer.map(|answer| match answer {
+                Answer::Step(outcome) => outcome,
+                Answer::Verify(_) => unreachable!("a step is answered as a step"),
+            }),
+            None => solo(cache, greedy),
+        }
+    }
+
+    /// A speculative verify — `tokens` (the slot's token and its draft) from
+    /// `pos` into `cache` — as rows of whatever batch forms, or as its own
+    /// pass (`ModelForward::forward_verify`) when this slot is decoding
+    /// alone. Returns every position's logits, with all of `tokens` in the
+    /// cache for the caller to roll back past what it accepts.
+    pub fn verify(
+        &self,
+        registration: Option<&Registration<'_>>,
+        model: &dyn ModelForward,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        pos: usize,
+        slot: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if registration.is_none() || tokens.len() < 2 || !crate::engine::arch::batch_verify() {
+            return model.forward_verify(cache, tokens, pos, slot);
+        }
+        let entry = |ticket| Pending {
+            ticket,
+            slot,
+            tokens: tokens.to_vec(),
+            verify: true,
+            pos,
+            cache: cache as *mut KvCache,
+            sample: None,
+        };
+        match self.offer(model, entry) {
+            Some(answer) => answer.map(|answer| match answer {
+                Answer::Verify(logits) => logits,
+                Answer::Step(_) => unreachable!("a verify is answered as a verify"),
+            }),
+            None => model.forward_verify(cache, tokens, pos, slot),
+        }
+    }
+
+    /// Offers `entry` (built with its ticket) to the batch and waits for its
+    /// answer, running the batch when this offer completes it. `None` when
+    /// this slot is the only one decoding, and the caller runs alone.
+    fn offer(
+        &self,
+        model: &dyn ModelForward,
+        entry: impl FnOnce(u64) -> Pending,
+    ) -> Option<Result<Answer>> {
         let ticket = {
             let mut inner = self.lock();
             // Alone: nothing to wait for, and nothing to gain.
             if inner.registered <= 1 && inner.pending.is_empty() && !inner.running {
-                drop(inner);
-                return solo(cache);
+                return None;
             }
             let ticket = inner.next_ticket;
             inner.next_ticket += 1;
-            inner.pending.push(Pending {
-                ticket,
-                slot,
-                token,
-                pos,
-                cache: cache as *mut KvCache,
-            });
+            inner.pending.push(entry(ticket));
             ticket
         };
         let mut inner = self.lock();
         loop {
             if let Some(result) = inner.results.remove(&ticket) {
-                return result.map(ForwardOutcome::Logits);
+                return Some(result);
             }
             let complete = !inner.running
                 && !inner.pending.is_empty()
@@ -199,10 +306,12 @@ impl DecodeBatcher {
         }
     }
 
-    /// Runs one batch — as one forward where the model batches, one step
-    /// per sequence otherwise — and returns each ticket's logits.
-    fn run_batch(model: &dyn ModelForward, batch: Vec<Pending>) -> Vec<(u64, Result<Vec<f32>>)> {
-        let tokens: Vec<u32> = batch.iter().map(|p| p.token).collect();
+    /// Runs one batch — as one forward where the model batches, one pass
+    /// per sequence otherwise — and returns each ticket's answer.
+    fn run_batch(model: &dyn ModelForward, mut batch: Vec<Pending>) -> Vec<(u64, Result<Answer>)> {
+        // The one-token rows first, as a batch with verifies takes them.
+        batch.sort_by_key(|p| p.verify);
+        let verifies = batch.iter().any(|p| p.verify);
         // Safety: every owner of a cache here is parked on `joined` until
         // its ticket is answered, so these are the only live references.
         let mut rows: Vec<DecodeRow<'_>> = batch
@@ -213,18 +322,66 @@ impl DecodeBatcher {
                 slot: p.slot,
             })
             .collect();
-        match model.forward_decode_batch(&mut rows, &tokens) {
-            Ok(Some(logits)) => batch
+        let samples: Vec<Option<GreedySampleParams<'_>>> = batch
+            .iter()
+            .map(|p| p.sample.as_ref().map(OwnedSample::params))
+            .collect();
+        let batched: Result<Option<Vec<Answer>>> = if verifies {
+            let tokens: Vec<&[u32]> = batch.iter().map(|p| p.tokens.as_slice()).collect();
+            model
+                .forward_decode_batch_verify(&mut rows, &tokens, &samples)
+                .map(|answers| {
+                    answers.map(|answers| {
+                        batch
+                            .iter()
+                            .zip(answers)
+                            .map(|(p, mut outcomes)| {
+                                if p.verify {
+                                    Answer::Verify(
+                                        outcomes
+                                            .into_iter()
+                                            .map(|o| match o {
+                                                ForwardOutcome::Logits(l) => l,
+                                                _ => unreachable!("a verify's rows are logits"),
+                                            })
+                                            .collect(),
+                                    )
+                                } else {
+                                    Answer::Step(outcomes.remove(0))
+                                }
+                            })
+                            .collect()
+                    })
+                })
+        } else {
+            let tokens: Vec<u32> = batch.iter().map(|p| p.tokens[0]).collect();
+            model
+                .forward_decode_batch_sampling(&mut rows, &tokens, &samples)
+                .map(|outcomes| outcomes.map(|o| o.into_iter().map(Answer::Step).collect()))
+        };
+        drop(rows);
+        match batched {
+            Ok(Some(answers)) => batch
                 .iter()
-                .zip(logits)
-                .map(|(p, l)| (p.ticket, Ok(l)))
+                .zip(answers)
+                .map(|(p, a)| (p.ticket, Ok(a)))
                 .collect(),
             Ok(None) => batch
                 .iter()
                 .map(|p| {
                     // Safety: as above.
                     let cache = unsafe { &mut *p.cache };
-                    (p.ticket, model.forward(cache, &[p.token], p.pos, p.slot))
+                    let answer = if p.verify {
+                        model
+                            .forward_verify(cache, &p.tokens, p.pos, p.slot)
+                            .map(Answer::Verify)
+                    } else {
+                        let sample = p.sample.as_ref().map(OwnedSample::params);
+                        model
+                            .forward_maybe_sampling(cache, &p.tokens, p.pos, sample, p.slot)
+                            .map(Answer::Step)
+                    };
+                    (p.ticket, answer)
                 })
                 .collect(),
             Err(err) => {

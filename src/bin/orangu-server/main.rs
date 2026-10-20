@@ -352,6 +352,9 @@ enum Command {
         /// architecture is one this build implements.
         #[arg(long)]
         deep: bool,
+        /// Print the verdict as JSON (for orangu-coordinator).
+        #[arg(long)]
+        json: bool,
     },
     /// Print a GGUF file's full metadata.
     Show {
@@ -482,12 +485,14 @@ enum Command {
     /// directory, planning it against this machine first.
     Download {
         /// A Hugging Face repo, `<user>/<model>[:quant]`. Without `:quant`,
-        /// prefers Q4_K_M then Q8_0, falling back to the first GGUF file
-        /// found.
+        /// a catalogue model's own quantization, otherwise Q4_K_M then Q8_0.
         repo: String,
         /// Download without confirming a model this machine cannot run.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Also download the drafter the catalogue pairs with this model.
+        #[arg(long)]
+        with_drafter: bool,
     },
     /// Delete a GGUF model (every shard) from the configured models
     /// directory, reclaiming its Hugging Face hub-cache blob(s) too when
@@ -1247,7 +1252,12 @@ fn prepare(args: Args) -> Result<Prepared> {
     // oversized model between device and host, and the prefix warm-up are
     // all skipped. Weights are read, and uploaded
     // to a device, on first use; what a node never runs it never holds.
+    // The kernel choices are the exception: one kept in the probe cache is
+    // taken as it is, and one that is not is timed, which reads the model
+    // once — a node that plans layers away lets go of them after. Not for
+    // a model fetched in ranges, where reading it is a download.
     let partial = conf.workers.is_some();
+    let ranged = conf.workers.as_ref().is_some_and(|w| w.download_range);
     let npu_precompile = conf.npu_precompile && !partial;
     let npu_line = npu_inventory(if npu_precompile {
         "— preparing feed-forward blocks"
@@ -1678,20 +1688,61 @@ fn prepare(args: Args) -> Result<Prepared> {
         wgpu.plan_weight_bytes(weights_device_bytes, largest);
     }
     let model = build_model(&loaded, &backend)?;
+    if !ranged && image_variant.is_none() && role.allows_generation() {
+        choose_integer_dot(&model, &path);
+        choose_q4k_short_rows(&model, &path);
+        choose_mmq_toks_cap(&model, &path);
+    }
+    // The vocabulary projection's probe runs on its own decode steps, on a
+    // node that holds part of a model as on one that holds all of it.
+    if image_variant.is_none()
+        && role.allows_generation()
+        && let Some(key) = engine::backend::tuning_profile::device_key()
+            .and_then(|device| engine::probe_cache::key(device, &path))
+    {
+        engine::backend::keep_tail_choice_under(key);
+    }
     // Where a token is decoded, measured (`engine::decode_backend`): under
     // `backend = auto` on one GPU, the same model on the CPU backend — a
     // view of the mapped weights — and a few one-token decode steps timed
     // on each; the cores take decode only when clearly faster. Not where a
     // CPU build would copy the weights (the ternary repack), for a picture
     // model, or for a role that generates nothing.
-    let (backend, backend_label, model, decode_on_cpu, cpu_step) = if !partial
+    let probe_wanted = !partial
         && matches!(conf.backend, config::BackendPreference::Auto)
         && backend.as_wgpu().is_some()
         && image_variant.is_none()
         && role.allows_generation()
         && !engine::loader::ternary_repack::on()
-        && engine::decode_backend::enabled()
-    {
+        && engine::decode_backend::enabled();
+    // A device win measured at an earlier start of this build, on this
+    // device, for this file, is taken as it stands — `engine::probe_cache`.
+    // A cores win is measured again: it releases the device, and is decided
+    // by a prompt pass as well.
+    let probe_key = engine::backend::tuning_profile::device_key()
+        .and_then(|device| engine::probe_cache::key(device, &path));
+    let kept_probe = probe_key
+        .as_deref()
+        .filter(|_| probe_wanted)
+        .and_then(engine::probe_cache::decode_probe)
+        .filter(|p| !engine::decode_backend::cpu_wins(p.device_s, p.cpu_s));
+    let (backend, backend_label, model, decode_on_cpu, cpu_step) = if let Some(kept) = kept_probe {
+        engine::adapt::note(
+            "decode",
+            format!("on the device ({backend_label})"),
+            format!(
+                "a one-token decode step took {:.1} ms on the device, {:.1} ms on the cpu \
+                 (measured at an earlier start, kept in {}); the cores must be {}× faster",
+                kept.device_s * 1e3,
+                kept.cpu_s * 1e3,
+                engine::backend::tuning_profile::dir()
+                    .map(|d| d.join("probes.json").display().to_string())
+                    .unwrap_or_default(),
+                engine::decode_backend::min_gain()
+            ),
+        );
+        (backend, backend_label, model, false, None)
+    } else if probe_wanted {
         let cpu: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
         let probe_started = std::time::Instant::now();
         let cpu_model = build_model(&loaded, &cpu).ok();
@@ -1805,6 +1856,12 @@ fn prepare(args: Args) -> Result<Prepared> {
                             engine::decode_backend::min_gain()
                         ),
                     );
+                    if let Some(key) = &probe_key {
+                        engine::probe_cache::keep_decode_probe(
+                            key,
+                            engine::probe_cache::DecodeProbe { device_s, cpu_s },
+                        );
+                    }
                     (backend, backend_label, model, false, None)
                 }
             }
@@ -2193,6 +2250,45 @@ fn prepare(args: Args) -> Result<Prepared> {
             engine::backend::device_resident_split(loaded.resident_tensor_sizes());
         gpu_tuning = Some(split.to_json(&footprints, weights_host_bytes));
     }
+    // A `dflash` draft is no model of its own: it drafts from the served
+    // model's layer inputs, so it attaches the way a multi-token-prediction
+    // head does, below.
+    let dflash_head = match &conf.draft_model {
+        Some(spec) => {
+            let (path, _) = orangu::model_spec::resolve_load_target(&conf.models, spec)
+                .with_context(|| format!("resolving draft model '{spec}'"))?;
+            let gguf = GgufFile::open(&path)?;
+            (metadata_string(&gguf, "general.architecture").as_deref() == Some("dflash"))
+                .then_some(path)
+        }
+        None => None,
+    };
+    let (draft, draft_footprint) = match conf.draft_model.as_ref().filter(|_| dflash_head.is_none())
+    {
+        Some(spec) => {
+            let (draft, footprint) = load_draft_model(
+                &conf.models,
+                spec,
+                draft_tokens(conf.draft_tokens),
+                &tokenizer,
+                &backend,
+                &backend_label,
+            )
+            .with_context(|| format!("loading draft model '{spec}'"))?;
+            // Loaded before the KV pool is sized, which charges the draft's
+            // weights and its share of every context against the same card.
+            // Both halves are probed before anything is served, because
+            // `forward_all_logits` is optional on `ModelForward` and the
+            // architectures that implement it are a minority. Discovering
+            // that on the first request would mean a server that starts,
+            // reports a draft on its banner, and then fails every generation.
+            supports_multi_position(model.as_ref(), &architecture)?;
+            supports_multi_position(draft.model.as_ref(), &draft.label)?;
+            (Some(Arc::new(draft)), footprint)
+        }
+        None => (None, None),
+    };
+
     let footprint = backend.as_wgpu().map(|wgpu| {
         let mut footprint = engine::footprint::DeviceFootprint::measure(
             &loaded,
@@ -2276,6 +2372,17 @@ fn prepare(args: Args) -> Result<Prepared> {
         .then(|| {
             let page_tokens = engine::kv_pool::page_tokens();
             let probe = model.new_kv_cache(1);
+            // A page holds positional rows and nothing of a recurrent layer's
+            // state, so a hybrid model could share no prefix through the pool.
+            // Such a model keeps the contiguous cache, whose slot store reuses
+            // a prefix only where the retained state ends exactly.
+            if probe.has_recurrent() {
+                log::info!(
+                    "orangu-server: [kv] no paged cache — the model has recurrent layers, \
+                     whose state a page cannot hold"
+                );
+                return None;
+            }
             let layers = engine::kv_pool::LayerGeometry::of(&probe);
             // **Host** bytes, and only host bytes. This used to read the
             // device headroom, on the reasoning that VRAM is what a KV cache
@@ -2329,9 +2436,14 @@ fn prepare(args: Args) -> Result<Prepared> {
             // bus, and every kernel slows with it.
             let device_budget = backend.as_wgpu().and_then(|wgpu| {
                 let footprint = footprint.as_ref()?;
+                // A draft model's weights sit on the same card, with the
+                // arena's padding, for the server's life.
+                let draft_weights = draft_footprint
+                    .as_ref()
+                    .map_or(0, |d| d.weights_device_bytes * 105 / 100);
                 let quarter = footprint
                     .headroom_on(wgpu.device_in_use())
-                    .map(|h| h * kv_device_share_percent() / 100)?;
+                    .map(|h| h.saturating_sub(draft_weights) * kv_device_share_percent() / 100)?;
                 // `ORANGU_KV_DEVICE_BUDGET=0` keeps the quarter alone, the
                 // control arm of a sweep.
                 let budget_rule = engine::env::flag_on_unless_disabled("ORANGU_KV_DEVICE_BUDGET");
@@ -2341,24 +2453,41 @@ fn prepare(args: Args) -> Result<Prepared> {
                 };
                 // The weights are placed on first use, so what is held now
                 // is not yet them; the plan, with the arena's padding, is.
-                let planned = footprint.weights_device_bytes * 105 / 100;
-                let from_budget = budget
-                    .saturating_sub(usage.max(planned))
-                    .saturating_sub(footprint.reserved_device_bytes)
-                    .saturating_sub(kv_pool_scratch_reserve_bytes());
+                let planned = footprint.weights_device_bytes * 105 / 100 + draft_weights;
+                let from_budget = kv_pages_from_budget(
+                    budget,
+                    usage,
+                    planned,
+                    footprint.reserved_device_bytes,
+                    kv_pool_scratch_reserve_bytes(),
+                );
                 if from_budget > quarter {
                     log::info!(
                         "orangu-server: [kv] device pages sized from the driver's budget: {} of {} \
-                         after {} of weights and {} of reserve",
+                         after {} of weights ({} held now) and {} of reserve",
                         orangu::format::format_bytes(from_budget),
                         orangu::format::format_bytes(budget),
                         orangu::format::format_bytes(planned),
+                        orangu::format::format_bytes(usage),
                         orangu::format::format_bytes(
                             footprint.reserved_device_bytes + kv_pool_scratch_reserve_bytes()
                         ),
                     );
                 }
                 Some(from_budget.max(quarter))
+            });
+            // A draft model's cache follows every context the pages hold,
+            // row for row, in a mirror of its own: the pages take the
+            // served model's share of each token's bytes.
+            let device_budget = device_budget.map(|budget| {
+                let (Some(target), Some(draft)) = (&footprint, &draft_footprint) else {
+                    return budget;
+                };
+                let pair = target.kv_bytes_per_step + draft.kv_bytes_per_step;
+                if pair == 0 {
+                    return budget;
+                }
+                (budget as u128 * target.kv_bytes_per_step as u128 / pair as u128) as u64
             });
             // The ring layers' mirrors are per request, not per page: every
             // slot holds its own whatever the pool's size, so they come out
@@ -2405,13 +2534,16 @@ fn prepare(args: Args) -> Result<Prepared> {
             // mirrors it replaces were the reason a four-slot server advertised
             // a quarter of the context.
             //
-            // The block table is sized for every slot holding a full pool's
-            // worth of pages at once, which cannot happen (they draw on one
-            // pool) but is the bound that cannot be exceeded, and it is four
-            // bytes an entry.
+            // The block table is sized for every sequence holding a full
+            // pool's worth of pages at once, which cannot happen (they draw on
+            // one pool) but is the bound that cannot be exceeded, and it is
+            // four bytes an entry. A slot holds two sequences: the request it
+            // runs and the conversation it retained from its last one, which
+            // stays until the request ends. A sequence the table has no room
+            // for is declined from the pool and runs on a cache of its own.
             if let Some(wgpu) = backend.as_wgpu() {
                 let (device, _) = wgpu.device_and_queue();
-                let entries = pool.num_pages() * conf.slots;
+                let entries = pool.num_pages() * conf.slots * 2;
                 if pool.attach_device(device, wgpu.kv_storage(), entries) {
                     log::info!(
                         "orangu-server: [kv] device pages — {:.2} GiB across {} layers",
@@ -2571,7 +2703,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // the only reason it is not simply always on is that most models have
     // none. `ORANGU_NO_MTP` turns it off — the control arm an A/B of drafting
     // needs, and the way out if a head ever costs more than it saves.
-    let mtp = match mtp_head_path(&weights_source) {
+    let mtp = match dflash_head.or_else(|| mtp_head_path(&weights_source)) {
         Some(path) if !crate::engine::env::flag_on("ORANGU_NO_MTP") => {
             let attach = || -> Result<engine::generate::MtpDraft> {
                 let head = load_mtp_head(
@@ -2615,29 +2747,6 @@ fn prepare(args: Args) -> Result<Prepared> {
             }
         }
         _ => None,
-    };
-
-    let draft = match &conf.draft_model {
-        Some(spec) => {
-            let draft = load_draft_model(
-                &conf.models,
-                spec,
-                draft_tokens(conf.draft_tokens),
-                &tokenizer,
-                &backend,
-                &backend_label,
-            )
-            .with_context(|| format!("loading draft model '{spec}'"))?;
-            // Both halves are probed before anything is served, because
-            // `forward_all_logits` is optional on `ModelForward` and the
-            // architectures that implement it are a minority. Discovering
-            // that on the first request would mean a server that starts,
-            // reports a draft on its banner, and then fails every generation.
-            supports_multi_position(model.as_ref(), &architecture)?;
-            supports_multi_position(draft.model.as_ref(), &draft.label)?;
-            Some(Arc::new(draft))
-        }
-        None => None,
     };
 
     // `[workers]`: this process's place in a tree of nodes sharing one
@@ -2743,6 +2852,28 @@ fn prepare(args: Args) -> Result<Prepared> {
             ),
         };
 
+    // Slots a coordinator saved when it swapped this model out, back before
+    // the prefix warm-up starts: the warm-up then fills its prefix from the
+    // restored conversation instead of prefilling it.
+    if let Some(prefix) = std::env::var("ORANGU_SLOT_RESTORE")
+        .ok()
+        .filter(|p| !p.is_empty() && p != "0")
+        && let Some(store) = &slot_store
+    {
+        let restored = store.restore_all(&prefix);
+        let tokens: usize = restored.iter().sum();
+        if tokens > 0 {
+            engine::adapt::note(
+                "slot restore",
+                format!(
+                    "{tokens} tokens across {} slot(s)",
+                    restored.iter().filter(|&&n| n > 0).count()
+                ),
+                format!("from the {prefix}-<slot>.bin files a swap saved"),
+            );
+        }
+    }
+    let recurrent = model.new_kv_cache(1).has_recurrent();
     let engine = Arc::new(Engine {
         paged_kv: paged_kv.clone(),
         metrics: Arc::new(engine::metrics::ServerMetrics::new()),
@@ -2750,6 +2881,10 @@ fn prepare(args: Args) -> Result<Prepared> {
         draft,
         mtp,
         tokenizer,
+        recurrent,
+        chat_template: chat_template_source
+            .clone()
+            .map(|source| Arc::new(engine::chat_template::ChatTemplate::new(source))),
         chat_template_source,
         slots,
         prefix_cache,
@@ -2979,7 +3114,10 @@ fn load_draft_model(
     target_tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
     backend_label: &str,
-) -> Result<engine::generate::DraftModel> {
+) -> Result<(
+    engine::generate::DraftModel,
+    Option<engine::footprint::DeviceFootprint>,
+)> {
     let (path, label) = orangu::model_spec::resolve_load_target(models_dir, spec)
         .with_context(|| format!("resolving draft model '{spec}'"))?;
     let gguf = GgufFile::open(&path)?;
@@ -3004,11 +3142,24 @@ fn load_draft_model(
         );
     }
     let model = build_model(&loaded, backend).context("building draft model")?;
-    Ok(engine::generate::DraftModel {
-        model,
-        tokens,
-        label,
-    })
+    // One sequence: the pool's pages are shared by the slots, and so is the
+    // context the draft's caches follow.
+    let footprint = backend.as_wgpu().map(|wgpu| {
+        engine::footprint::DeviceFootprint::measure(
+            &loaded,
+            &model.new_kv_cache(1),
+            Some(wgpu.kv_storage()),
+            1,
+        )
+    });
+    Ok((
+        engine::generate::DraftModel {
+            model,
+            tokens,
+            label,
+        },
+        footprint,
+    ))
 }
 
 /// Every `snapshots/<commit>/` directory of the hub-cache repository `path`
@@ -3114,7 +3265,8 @@ fn load_mtp_head(
     backend: &Arc<dyn Backend>,
     tokens: usize,
 ) -> Result<engine::generate::MtpDraft> {
-    let loaded = engine::loader::LoadedModel::open(path).context("loading draft head weights")?;
+    let loaded =
+        engine::loader::LoadedModel::open_head(path).context("loading draft head weights")?;
     let unsupported = engine::backend::unsupported_tensor_types(loaded.tensor_types(), &**backend);
     if !unsupported.is_empty() {
         bail!(
@@ -3155,14 +3307,21 @@ fn supports_multi_position_with_states(model: &dyn ModelForward, label: &str) ->
 ///
 /// Probed rather than declared, because `ModelForward::forward_all_logits` is
 /// a defaulted trait method — there is nothing to ask a type about, only
-/// something to try. One token through it costs a single forward at startup
-/// and answers the question for certain, which beats a hand-kept list of which
+/// something to try. Two tokens through it cost a single forward at startup
+/// and answer the question for certain, which beats a hand-kept list of which
 /// architectures implement it going quietly out of date.
+///
+/// Through [`ModelForward::forward_verify`], the call a pair actually makes,
+/// so the probe places on the device exactly the weights speculation goes on
+/// to read. A probe down another path places that path's own layout of them
+/// (the separate projections a fused one replaces) and keeps it for the
+/// server's life, which on a card the pair already fills pushes the rest of
+/// the process into host memory.
 fn supports_multi_position(model: &dyn ModelForward, label: &str) -> Result<()> {
-    let mut cache = model.new_kv_cache(1);
+    let mut cache = model.new_kv_cache(2);
     // Token 0 exists in every vocabulary; what comes back is discarded.
     model
-        .forward_all_logits(&mut cache, &[0], 0, 0)
+        .forward_verify(&mut cache, &[0, 0], 0, 0)
         .with_context(|| {
             format!(
                 "{label} cannot be used in a speculative pair: speculation verifies several \
@@ -3211,6 +3370,303 @@ fn vocabulary_mismatch(target: &Tokenizer, draft: &Tokenizer) -> Option<String> 
 /// already on screen.
 fn gate(configured: bool) -> &'static str {
     if configured { "Yes" } else { "No" }
+}
+
+/// Whether the decode kernels and the prompts' GEMMs take the integer dot,
+/// each timed rather than taken from the driver's word
+/// (`VulkanBackend::decode_mmvq`, `VulkanBackend::prefill_mmq`): a few
+/// decode steps, or a prompt pass, each way, alternating, the faster kept —
+/// and kept for later starts of this build on this device and file
+/// (`engine::probe_cache`). The integer dot keeps a tie.
+fn choose_integer_dot(model: &Arc<dyn engine::arch::ModelForward>, path: &Path) {
+    /// How much faster one arm's first round must be to settle it.
+    const CLEAR_WIN: f64 = 1.15;
+    let Some(vulkan) = model.vulkan_backend() else {
+        return;
+    };
+    if !engine::decode_backend::enabled() {
+        return;
+    }
+    let key = engine::backend::tuning_profile::device_key()
+        .and_then(|device| engine::probe_cache::key(device, path));
+    /// One kernel-family choice: its probe-cache name, the log's name for
+    /// it, whether it may be chosen, how to set it and how to time it.
+    struct Choice<'a> {
+        what: &'static str,
+        layer: &'static str,
+        tunable: bool,
+        set: &'a dyn Fn(bool),
+        time: &'a dyn Fn() -> Option<f64>,
+    }
+    let choices = [
+        Choice {
+            what: "i8",
+            layer: "decode kernels",
+            tunable: vulkan.integer_dot_decode_tunable(),
+            set: &|on| vulkan.set_integer_dot_decode(on),
+            time: &|| engine::decode_backend::seconds_per_token(model),
+        },
+        Choice {
+            what: "mmq",
+            layer: "prompt kernels",
+            tunable: vulkan.integer_dot_prefill_tunable(),
+            set: &|on| vulkan.set_integer_dot_prefill(on),
+            // The integer-dot GEMM's own token tile, not the narrow probe's
+            // width: what decides a prompt is how its chunks run.
+            time: &|| engine::prefill_backend::seconds_per_prompt_pass_of(model, 128),
+        },
+    ];
+    for Choice {
+        what,
+        layer,
+        tunable,
+        set,
+        time,
+    } in choices
+    {
+        if !tunable {
+            continue;
+        }
+        if let Some(on) = key
+            .as_deref()
+            .and_then(|k| engine::probe_cache::choice(what, k))
+        {
+            set(on);
+            engine::adapt::note(
+                layer,
+                if on { "integer dot" } else { "float" }.to_string(),
+                "measured at an earlier start, kept in the probe cache".to_string(),
+            );
+            continue;
+        }
+        // A second round only when the first is close: a prompt pass on a
+        // slow device takes seconds, and a clear answer needs no second look.
+        let (mut on_s, mut off_s) = (f64::INFINITY, f64::INFINITY);
+        for round in 0..2 {
+            if round == 1 && (on_s.max(off_s) / on_s.min(off_s)) > CLEAR_WIN {
+                break;
+            }
+            for on in [true, false] {
+                set(on);
+                if let Some(s) = time() {
+                    let best = if on { &mut on_s } else { &mut off_s };
+                    *best = best.min(s);
+                }
+            }
+        }
+        if !on_s.is_finite() || !off_s.is_finite() {
+            set(true);
+            continue;
+        }
+        let on = on_s <= off_s;
+        set(on);
+        if let Some(k) = key.as_deref() {
+            engine::probe_cache::keep_choice(what, k, on, on_s, off_s);
+        }
+        engine::adapt::note(
+            layer,
+            if on { "integer dot" } else { "float" }.to_string(),
+            format!(
+                "{} took {:.1} ms on the integer dot, {:.1} ms on the float kernels",
+                if what == "i8" {
+                    "a one-token decode step"
+                } else {
+                    "a prompt pass"
+                },
+                on_s * 1e3,
+                off_s * 1e3
+            ),
+        );
+    }
+}
+
+/// The short-row `Q4_K` form's rows a slot, `0` for off
+/// (`VulkanBackend::set_q4k_short_rows`), timed rather than fixed: which is
+/// fastest moves with the device. A verify-sized and a prompt-sized pass
+/// each way, alternating, two rounds, the least total kept — and kept for
+/// later starts, like [`choose_integer_dot`]'s. The count in force untimed
+/// (the first built) is kept unless another is clearly faster.
+fn choose_q4k_short_rows(model: &Arc<dyn engine::arch::ModelForward>, path: &Path) {
+    /// How much faster another count must be to replace the first.
+    const CLEAR_WIN: f64 = 1.03;
+    /// The widths timed: a verify's, and a prompt's within the form's reach.
+    const WIDTHS: [usize; 2] = [5, 38];
+    const WHAT: &str = "q4k-short";
+    let Some(vulkan) = model.vulkan_backend() else {
+        return;
+    };
+    let choices = vulkan.q4k_short_rows_choices();
+    if choices.is_empty() || !engine::decode_backend::enabled() {
+        return;
+    }
+    let describe = |rows: usize| {
+        if rows == 0 {
+            "off".to_string()
+        } else {
+            format!("{rows} rows a slot")
+        }
+    };
+    let key = engine::backend::tuning_profile::device_key()
+        .and_then(|device| engine::probe_cache::key(device, path));
+    if let Some(rows) = key
+        .as_deref()
+        .and_then(|k| engine::probe_cache::count(WHAT, k))
+        .filter(|rows| choices.contains(rows))
+    {
+        vulkan.set_q4k_short_rows(rows);
+        engine::adapt::note(
+            "short-row Q4_K",
+            describe(rows),
+            "measured at an earlier start, kept in the probe cache".to_string(),
+        );
+        return;
+    }
+    let mut best = vec![f64::INFINITY; choices.len()];
+    for _ in 0..2 {
+        for (i, &rows) in choices.iter().enumerate() {
+            vulkan.set_q4k_short_rows(rows);
+            let total: Option<f64> = WIDTHS
+                .iter()
+                .map(|&n| engine::prefill_backend::seconds_per_prompt_pass_of(model, n))
+                .sum();
+            if let Some(s) = total {
+                best[i] = best[i].min(s);
+            }
+        }
+    }
+    // The untimed default: the first count built.
+    let default = choices[1];
+    let default_s = best[1];
+    let (fastest, fastest_s) = choices
+        .iter()
+        .zip(&best)
+        .min_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(&r, &s)| (r, s))
+        .unwrap_or((default, default_s));
+    if !fastest_s.is_finite() {
+        vulkan.set_q4k_short_rows(default);
+        return;
+    }
+    let rows = if default_s <= fastest_s * CLEAR_WIN {
+        default
+    } else {
+        fastest
+    };
+    vulkan.set_q4k_short_rows(rows);
+    let timings: Vec<(usize, f64)> = choices.iter().copied().zip(best.iter().copied()).collect();
+    if let Some(k) = key.as_deref() {
+        engine::probe_cache::keep_count(WHAT, k, rows, &timings);
+    }
+    engine::adapt::note(
+        "short-row Q4_K",
+        describe(rows),
+        format!(
+            "passes of {} tokens took {}",
+            WIDTHS.map(|n| n.to_string()).join(" and "),
+            timings
+                .iter()
+                .map(|&(r, s)| format!("{:.1} ms {}", s * 1e3, describe(r)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+}
+
+/// The prompt GEMM's widest token tile (`VulkanBackend::set_mmq_toks_cap`),
+/// timed rather than fixed: whether a 64-token tile runs a wide prompt faster
+/// than the widest one the padding rule prefers moves with the device. A
+/// pass wide enough to take the widest tile each way,
+/// alternating, a second round only when close, the faster kept — and kept
+/// for later starts, like [`choose_q4k_short_rows`]'s. Not timed where such a
+/// pass is slow, since this runs at start-up; the adapter's cap stays.
+fn choose_mmq_toks_cap(model: &Arc<dyn engine::arch::ModelForward>, path: &Path) {
+    /// How much faster 64 must be to replace the widest tile.
+    const CLEAR_WIN: f64 = 1.03;
+    /// The width timed: wide enough that the rule takes the widest tile.
+    const WIDTH: usize = 1024;
+    /// The longest a timed pass may be predicted to take.
+    const PASS_BUDGET_S: f64 = 1.5;
+    const WHAT: &str = "mmq-toks";
+    let Some(vulkan) = model.vulkan_backend() else {
+        return;
+    };
+    let choices = vulkan.mmq_toks_cap_choices();
+    if choices.is_empty() {
+        return;
+    }
+    let key = engine::backend::tuning_profile::device_key()
+        .and_then(|device| engine::probe_cache::key(device, path));
+    if let Some(cap) = key
+        .as_deref()
+        .and_then(|k| engine::probe_cache::count(WHAT, k))
+        .filter(|cap| choices.contains(&(*cap as u32)))
+    {
+        vulkan.set_mmq_toks_cap(cap as u32);
+        engine::adapt::note(
+            "prompt GEMM tile",
+            format!("up to {cap} tokens"),
+            "measured at an earlier start, kept in the probe cache".to_string(),
+        );
+        return;
+    }
+    // Priced from a narrow pass: the wide one on a slow device would cost
+    // more start-up than the tile could ever return to it.
+    let Some(narrow) = engine::prefill_backend::seconds_per_prompt_pass_of(model, WIDTH / 8) else {
+        return;
+    };
+    if narrow * 8.0 > PASS_BUDGET_S {
+        engine::adapt::note(
+            "prompt GEMM tile",
+            format!("up to {} tokens", choices[0]),
+            format!(
+                "not timed: a {WIDTH}-token pass would take about {:.1} s",
+                narrow * 8.0
+            ),
+        );
+        return;
+    }
+    let mut best = vec![f64::INFINITY; choices.len()];
+    for round in 0..2 {
+        if round == 1 && best[0].max(best[1]) / best[0].min(best[1]) > CLEAR_WIN {
+            break;
+        }
+        for (i, &cap) in choices.iter().enumerate() {
+            vulkan.set_mmq_toks_cap(cap);
+            if let Some(s) = engine::prefill_backend::seconds_per_prompt_pass_of(model, WIDTH) {
+                best[i] = best[i].min(s);
+            }
+        }
+    }
+    if !best.iter().all(|s| s.is_finite()) {
+        vulkan.set_mmq_toks_cap(choices[0]);
+        return;
+    }
+    let cap = if best[0] <= best[1] * CLEAR_WIN {
+        choices[0]
+    } else {
+        choices[1]
+    };
+    vulkan.set_mmq_toks_cap(cap);
+    let timings: Vec<(usize, f64)> = choices
+        .iter()
+        .map(|&c| c as usize)
+        .zip(best.iter().copied())
+        .collect();
+    if let Some(k) = key.as_deref() {
+        engine::probe_cache::keep_count(WHAT, k, cap as usize, &timings);
+    }
+    engine::adapt::note(
+        "prompt GEMM tile",
+        format!("up to {cap} tokens"),
+        format!(
+            "a {WIDTH}-token pass took {}",
+            timings
+                .iter()
+                .map(|&(c, s)| format!("{:.1} ms with tiles up to {c}", s * 1e3))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
 }
 
 /// Seconds per one-token decode step of `model` on the cores, in the faster
@@ -4081,7 +4537,7 @@ fn run_command(
             );
             Ok(())
         }
-        Command::Plan { file, deep } => {
+        Command::Plan { file, deep, json } => {
             let conf = load_config(config_arg, None, false)?;
             let path = match file {
                 Some(spec) => orangu::model_spec::resolve_show_target(&conf.models, &spec)?,
@@ -4090,21 +4546,15 @@ fn run_command(
             let plan = engine::plan::analyze(&path)?;
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-            print!(
-                "{}",
-                engine::plan::format_plan(
-                    &plan,
-                    cpu.available_memory_bytes,
-                    plan_device(&gpus).as_ref().map(|(n, v)| (n.as_str(), *v)),
-                )
-            );
+            // Everything the plan assumed, checked. A plan is only worth
+            // acting on if the files it described are actually there and
+            // this build can actually read them.
+            let mut problems = Vec::new();
+            let mut shard_count = 0;
             if deep {
-                // Everything the plan assumed, checked. A plan is only worth
-                // acting on if the files it described are actually there and
-                // this build can actually read them.
                 let gguf = GgufFile::open(&path)?;
                 let shards = engine::loader::shard_paths(&path, &gguf)?;
-                let mut problems = Vec::new();
+                shard_count = shards.len();
                 for shard in &shards {
                     match std::fs::metadata(shard) {
                         Ok(meta) if meta.len() > 0 => {}
@@ -4115,11 +4565,47 @@ fn run_command(
                 if let Err(err) = engine::loader::resolve_arch_family(&plan.architecture) {
                     problems.push(format!("architecture: {err}"));
                 }
+            }
+            if json {
+                // Against the machine's *total* memory, not what is free: the
+                // caller is typically about to stop another model to make
+                // room, and what it needs to know is whether any amount of
+                // room would do.
+                let runs = problems.is_empty() && plan.dense_fits_in(cpu.total_memory_bytes);
+                if !plan.dense_fits_in(cpu.total_memory_bytes) {
+                    problems.push(format!(
+                        "the weights every token touches ({}) are more than this machine's memory ({})",
+                        orangu::format::format_bytes(plan.dense_bytes),
+                        orangu::format::format_bytes(cpu.total_memory_bytes)
+                    ));
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "model": path.display().to_string(),
+                        "architecture": plan.architecture,
+                        "total_bytes": plan.total_bytes,
+                        "dense_bytes": plan.dense_bytes,
+                        "device_bytes": plan.device_bytes,
+                        "memory_bytes": cpu.total_memory_bytes,
+                        "checked": deep,
+                        "runs": runs,
+                        "problems": problems,
+                    })
+                );
+                return Ok(());
+            }
+            print!(
+                "{}",
+                engine::plan::format_plan(
+                    &plan,
+                    cpu.available_memory_bytes,
+                    plan_device(&gpus).as_ref().map(|(n, v)| (n.as_str(), *v)),
+                )
+            );
+            if deep {
                 if problems.is_empty() {
-                    println!(
-                        "Check      {} shard(s) readable, architecture supported",
-                        shards.len()
-                    );
+                    println!("Check      {shard_count} shard(s) readable, architecture supported");
                 } else {
                     for problem in &problems {
                         println!("Problem    {problem}");
@@ -4205,15 +4691,24 @@ fn run_command(
             };
             npu_tool::head_probe(&path, tokens, run, Path::new(&artifact))
         }
-        Command::Download { repo, yes } => {
+        Command::Download {
+            repo,
+            yes,
+            with_drafter,
+        } => {
             let conf = load_config(config_arg, None, false)?;
-            let repo = orangu::model_download::strip_hub_url(&repo).to_string();
+            let repo = orangu::model_catalogue::with_catalogue_quant(
+                orangu::model_download::strip_hub_url(&repo),
+            );
             if !plan_before_download(&repo, yes)? {
                 println!("Nothing downloaded.");
                 return Ok(());
             }
             let path = orangu::model_download::download_model(&conf.models, &repo)?;
             println!("Downloaded to {}", path.display());
+            if with_drafter {
+                download_catalogue_drafter(&conf.models, &repo)?;
+            }
             Ok(())
         }
         Command::Delete { model, yes } => {
@@ -5329,6 +5824,31 @@ fn expert_tier_projection(
 /// (`ORANGU_KV_DEVICE_SHARE`; the rest is the prefill's transient scratch
 /// and the streaming region's growth). See the pool's sizing for how the
 /// default was measured.
+/// `download --with-drafter`: the drafter the catalogue pairs with `spec`'s
+/// repo, fetched beside it — a draft model into the models directory, an
+/// MTP head from the model's own repo — and how to use it. A model the
+/// catalogue does not pair says so and fetches nothing.
+fn download_catalogue_drafter(models: &std::path::Path, spec: &str) -> Result<()> {
+    use orangu::model_catalogue::Drafter;
+    let repo = spec.split(':').next().unwrap_or(spec);
+    match orangu::model_catalogue::entry_for(repo).and_then(|e| e.drafter) {
+        Some(Drafter::Model(draft)) => {
+            let path = orangu::model_download::download_model(models, draft)?;
+            println!("Downloaded the drafter to {}", path.display());
+            println!("Set `draft_model = {draft}` in [orangu-server] to draft with it.");
+        }
+        Some(Drafter::MtpHead(file)) => {
+            let path = orangu::model_download::download_repo_file(models, repo, file, None)?;
+            println!("Downloaded the MTP head to {}", path.display());
+            println!("The server attaches it from beside the model.");
+        }
+        None => {
+            println!("The catalogue pairs no drafter with {repo}; prompt lookup drafts for it.")
+        }
+    }
+    Ok(())
+}
+
 fn kv_device_share_percent() -> u64 {
     engine::backend::env_tuning_value(
         "ORANGU_KV_DEVICE_SHARE",
@@ -5336,6 +5856,19 @@ fn kv_device_share_percent() -> u64 {
         "a percentage from 1 to 95",
         |v: u64| (1..=95).contains(&v),
     )
+}
+
+/// The device bytes the KV pages may take out of the driver's `budget`:
+/// what is left after this process's weights (`planned`, placed or not),
+/// the bytes `reserved` for the streaming region and other tenants, and
+/// `scratch`, the prefill's. What the process `usage` already holds counts
+/// in place of the weights and scratch when it is more: the prefill's
+/// scratch is held for reuse once a pass has run — the start-up probes run
+/// them — so it is then part of `usage`, and counted once.
+fn kv_pages_from_budget(budget: u64, usage: u64, planned: u64, reserved: u64, scratch: u64) -> u64 {
+    budget
+        .saturating_sub(usage.max(planned + scratch))
+        .saturating_sub(reserved)
 }
 
 /// Device memory kept out of the KV pool, and out of a requested context's
@@ -6383,11 +6916,29 @@ fn is_x86_feature_detected() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListSort, dominant_tensor_types, list_order};
+    use super::{ListSort, dominant_tensor_types, kv_pages_from_budget, list_order};
     use crate::engine::quant::{GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
     use clap::Parser;
     use orangu::model_spec::ModelGroup;
     use std::path::PathBuf;
+
+    /// The KV pages come out the same whether the start-up probes ran — the
+    /// weights placed and the prefill's scratch held — or the pool is sized
+    /// before either is on the card: the held scratch is the reserve's, not
+    /// a second claim beside it.
+    #[test]
+    fn kv_pages_from_the_budget_count_held_scratch_once() {
+        const MIB: u64 = 1024 * 1024;
+        let (budget, planned, reserved, scratch) = (3700 * MIB, 2000 * MIB, 10 * MIB, 450 * MIB);
+        let before = kv_pages_from_budget(budget, 0, planned, reserved, scratch);
+        assert_eq!(before, 1240 * MIB);
+        let probed = kv_pages_from_budget(budget, 2450 * MIB, planned, reserved, scratch);
+        assert_eq!(probed, before, "the held scratch was taken out twice");
+        // More held than the plan and the reserve: something else of this
+        // process's is on the card, and it is not the pages' to take.
+        let more = kv_pages_from_budget(budget, 2600 * MIB, planned, reserved, scratch);
+        assert_eq!(more, 1090 * MIB);
+    }
 
     fn listed_group(label: &str, size_bytes: u64) -> ModelGroup {
         ModelGroup {
@@ -6618,6 +7169,7 @@ mod tests {
             Command::Plan {
                 file: None,
                 deep: false,
+                json: false,
             }
             .mode(),
             Command::Show {
@@ -6630,6 +7182,7 @@ mod tests {
             Command::Download {
                 repo: String::new(),
                 yes: false,
+                with_drafter: false,
             }
             .mode(),
             Command::Delete {
@@ -6834,6 +7387,7 @@ mod tests {
                 Command::Download {
                     repo: String::new(),
                     yes: false,
+                    with_drafter: false,
                 }
                 .mode()
             ),

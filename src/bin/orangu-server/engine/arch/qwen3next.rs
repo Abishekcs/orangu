@@ -115,4 +115,17 @@ impl ModelForward for Qwen3NextModel {
     fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
         self.trunk.head_rows(hidden, n_rows)
     }
+
+    /// The trunk's prompt loop with the head over every row; a recurrent
+    /// layer's state takes in every token, and speculation returns it to a
+    /// copy saved before the verify (`KvCache::rollback`).
+    fn forward_all_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.trunk.forward_all_logits(cache, tokens, start_pos)
+    }
 }

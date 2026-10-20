@@ -236,6 +236,9 @@ pub async fn proxy(
         }
     };
 
+    // Counted from here until the response body has been streamed out, so a
+    // swap to another profile waits for this answer instead of cutting it off.
+    let in_flight = coordinator.begin_request(&origin);
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let target = format!("{origin}{path_and_query}");
 
@@ -299,7 +302,23 @@ pub async fn proxy(
         response_headers.insert(name.clone(), value.clone());
     }
 
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    // The guard rides inside the stream, so it drops with it: when the last
+    // chunk has gone out, or when the client hangs up and the body is dropped.
+    let mut upstream = upstream;
+    let stream = async_stream::stream! {
+        let _in_flight = in_flight;
+        loop {
+            match upstream.chunk().await {
+                Ok(Some(chunk)) => yield Ok::<_, reqwest::Error>(chunk),
+                Ok(None) => break,
+                Err(err) => {
+                    yield Err(err);
+                    break;
+                }
+            }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     response

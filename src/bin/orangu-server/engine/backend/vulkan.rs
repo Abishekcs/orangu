@@ -65,7 +65,7 @@ use layouts::{
     attn_paged_bind_group_layout, bind_group_layout, elem2_bind_group_layout,
     elem3_bind_group_layout, elem4_bind_group_layout, elem5_bind_group_layout,
     elem6_bind_group_layout, indexed_bind_group_layout, kv_epilogue_bind_group_layout,
-    norm_pair_bind_group_layout,
+    norm_pair_bind_group_layout, recurrent_rows_bind_group_layout,
 };
 use pipeline_cache::{pipeline_cache_file_path, save_pipeline_cache};
 // `RopeYarn` and `rope_layout_code` keep their `vulkan::` path: four
@@ -887,6 +887,10 @@ pub struct VulkanBackend {
     /// — see `elem6_bind_group_layout`.
     elem6_bind_group_layout: wgpu::BindGroupLayout,
     elem6_pipeline_layout: wgpu::PipelineLayout,
+    /// For `record_recurrent_rows`'s kernels — see
+    /// `recurrent_rows_bind_group_layout`.
+    recurrent_rows_bind_group_layout: wgpu::BindGroupLayout,
+    recurrent_rows_pipeline_layout: wgpu::PipelineLayout,
     /// The pre-norm pair (a residual add, then the norm of the sum) as one
     /// dispatch, for the Qwen hybrid trunk's decode chain — see
     /// `vulkan_shaders::shader_source_add_rmsnorm_wide`. Wide form only:
@@ -906,6 +910,16 @@ pub struct VulkanBackend {
     /// The prep kernel of `fused_recurrent_layer`, per `(conv channels,
     /// d_conv, value width, value heads)`, built on first use.
     recurrent_prep_pipelines: Mutex<HashMap<(u32, u32, u32, u32), wgpu::ComputePipeline>>,
+    /// `record_recurrent_rows`'s prep and delta kernels, per `(conv
+    /// channels, d_conv, head dim, key heads, value heads, sigmoid gate,
+    /// grouped)`, built on first use.
+    #[allow(clippy::type_complexity)]
+    recurrent_rows_pipelines: Mutex<
+        HashMap<
+            (u32, u32, u32, u32, u32, bool, bool),
+            (wgpu::ComputePipeline, wgpu::ComputePipeline),
+        >,
+    >,
     /// The Qwen hybrid trunk's device-resident decode step
     /// (`hybrid_decode_begin`), per model width — see `HybridChainResources`.
     hybrid_chains: Mutex<HashMap<usize, Arc<HybridChainResources>>>,
@@ -1040,7 +1054,8 @@ pub struct VulkanBackend {
     /// (`vulkan_shaders::shader_source_attention_prefill_tiled`: a tile of
     /// queries per workgroup, the window in blocks) rather than the
     /// per-query kernels. On by default with subgroups; `ORANGU_PREFILL_TILED_ATTN=0`
-    /// is the control arm.
+    /// is the control arm. A narrow pass splits its window over positions
+    /// (`Self::attn_prefill_split_form`).
     prefill_tiled_attn: bool,
     /// Multi-query attention — prefill's counterpart to `attn_pipeline`. Built
     /// lazily **per (head_dim, heads-per-workgroup)**: per head_dim like
@@ -1197,6 +1212,23 @@ pub struct VulkanBackend {
     /// [`Self::mmq_kernel_for`].
     mmq_q4k_wide_pipeline: Option<wgpu::ComputePipeline>,
     mmq_q4k_mid_pipeline: Option<wgpu::ComputePipeline>,
+    /// The `Q4_K` GEMM under its narrowest tile: the integer-dot decode
+    /// kernel's multi-position form reading the GEMMs' staging
+    /// (`vulkan_shaders::shader_source_q4k_i8_tokens`), so a short chunk
+    /// (see `narrow_form_max_tokens`) decodes each weight block once rather
+    /// than once a token.
+    mmq_q4k_narrow_pipeline: Option<wgpu::ComputePipeline>,
+    /// That form for rows of a few blocks
+    /// (`vulkan_shaders::shader_source_q4k_i8_tokens_short`), one pipeline
+    /// per row count a slot may take.
+    mmq_q4k_short_pipelines: Vec<(usize, wgpu::ComputePipeline)>,
+    /// The row count [`MmqKernel::Q4kShort`] runs at, `0` for none — chosen
+    /// at start-up among [`Self::mmq_q4k_short_pipelines`]
+    /// ([`Self::set_q4k_short_rows`]) unless `ORANGU_Q4K_SHORT_ROWS` names it.
+    q4k_short_rows: std::sync::atomic::AtomicUsize,
+    /// The `Q6_K` twin of [`Self::mmq_q4k_narrow_pipeline`]
+    /// (`vulkan_shaders::shader_source_q6k_i8_tokens`).
+    mmq_q6k_narrow_pipeline: Option<wgpu::ComputePipeline>,
     mmq_q6k_pipeline: Option<wgpu::ComputePipeline>,
     mmq_q6k_wide_pipeline: Option<wgpu::ComputePipeline>,
     mmq_q6k_mid_pipeline: Option<wgpu::ComputePipeline>,
@@ -1220,10 +1252,15 @@ pub struct VulkanBackend {
     /// see `ORANGU_CHECKED_MMQ`; a lazily built one has to know too.
     checked_mmq: bool,
     quantize_q8_rows_pipeline: Option<wgpu::ComputePipeline>,
-    /// Whether the integer-dot GEMM is built on this device: the flag, or
-    /// where it is unset, the driver's own word that the packed dot is a
-    /// native instruction (`vulkan_replay::integer_dot_accelerated`).
-    prefill_mmq: bool,
+    /// Whether the prompts' GEMMs take the integer dot.
+    ///
+    /// Like [`Self::decode_mmvq`], built wherever the packed dot exists and
+    /// chosen at start-up by timing a prompt pass both ways
+    /// ([`Self::set_integer_dot_prefill`]) unless `ORANGU_PREFILL_MMQ`
+    /// names it; the driver's word is only where it starts.
+    prefill_mmq: std::sync::atomic::AtomicBool,
+    /// Whether start-up may choose [`Self::prefill_mmq`].
+    prefill_mmq_tunable: bool,
     /// The reduce
     /// kernel's `f32`-dequant + `f32`-dot inner loop, replaced with a
     /// `Q4_K`-only packed `vec2<f16>` dot —
@@ -1320,6 +1357,13 @@ pub struct VulkanBackend {
     /// pass of its own, then the packed dot) — see `decode_mmvq`.
     block_hoisted_i8_pipelines: HashMap<u32, wgpu::ComputePipeline>,
     block_hoisted_i8_wide_pipelines: HashMap<u32, wgpu::ComputePipeline>,
+    /// The integer-dot `Q4_K` kernel's multi-position form
+    /// (`vulkan_shaders::shader_source_q4k_i8_tokens`), taken for 2 or more
+    /// tokens wherever the row-group form would serve each token alone, and
+    /// the tokens one workgroup of it takes. `None` under
+    /// `ORANGU_Q4K_I8_TOKENS=0` (or `1`).
+    q4_k_i8_tokens_pipeline: Option<wgpu::ComputePipeline>,
+    q4_k_i8_tokens_tile: usize,
     /// The word-reading types on the light skeleton
     /// (`vulkan_shaders::shader_source_reduce_kq_light`), taken ahead of the
     /// block-hoisted form at decode under `ORANGU_KQ_LIGHT=1`. Off: measured
@@ -1351,7 +1395,17 @@ pub struct VulkanBackend {
     /// token to its dispatches and the fusions it gives up; this form takes
     /// the E2B UD-Q2_K_XL token from 14.8 to 12.0 ms (gate/up −34%, down
     /// −37%). The CPU-orchestrated batch paths quantize per op themselves.
-    decode_mmvq: bool,
+    ///
+    /// Whether the device *accelerates* the packed dot is where this starts,
+    /// not what decides it: the kernels are built wherever the dot exists,
+    /// and start-up times a decode step both ways and keeps the faster
+    /// ([`Self::set_integer_dot_decode`]) unless `ORANGU_DECODE_MMVQ` names
+    /// it. An integrated GPU the driver calls unaccelerated decoded a
+    /// `Q4_K_M` model a third faster on it.
+    decode_mmvq: std::sync::atomic::AtomicBool,
+    /// Whether start-up may choose [`Self::decode_mmvq`]: the kernels are
+    /// built and `ORANGU_DECODE_MMVQ` did not name the answer.
+    decode_mmvq_tunable: bool,
     /// The integer-dot decode kernels for Prism's ternary types
     /// (`vulkan_shaders::shader_source_ternary_idot`), at
     /// [`BLOCK_HOISTED_WIDE_ROWS`] rows per workgroup, taken ahead of
@@ -1446,6 +1500,13 @@ pub struct VulkanBackend {
     /// files. The dual kernel it replaces reads `ql`/`qh` a byte at a time and
     /// re-reads a scale byte per element.
     q6_k_light_pipeline: Option<wgpu::ComputePipeline>,
+    /// [`Self::q6_k_light_pipeline`]'s multi-position form
+    /// (`vulkan_shaders::shader_source_reduce_q6k_light_tokens`), taken for
+    /// 2–31 tokens where the integer-dot GEMM does not take them (see
+    /// `Self::uses_q6k_tokens`); its tile is
+    /// [`Q4K_I8_TOKENS`], and `None` where that turns the forms off or a
+    /// workgroup takes more than one row.
+    q6_k_light_tokens_pipeline: Option<wgpu::ComputePipeline>,
     /// The **glslc-compiled** `Q4_K` decode kernel
     /// (`backend/shaders/q4k_gemv.comp` → SPIR-V), a line-for-line twin of the
     /// light WGSL kernel loaded via `create_shader_module_passthrough` so RADV
@@ -1517,8 +1578,12 @@ pub struct VulkanBackend {
     /// 32 on an ARM Mali. There the 128-token tile ran Llama-3.2-3B's FFN
     /// gate and up at 149 ms a layer against 66 with 64-token tiles, and a
     /// 494-token prompt at 14.5 tok/s against 42.8 with 32-token ones.
-    /// `ORANGU_MMQ_TOKS` still pins one.
-    mmq_toks_cap: u32,
+    /// `ORANGU_MMQ_TOKS` still pins one. Elsewhere the cap is timed at start-up
+    /// against 64 ([`Self::set_mmq_toks_cap`]), since which pads less and runs
+    /// faster at a wide prompt moves with the device.
+    mmq_toks_cap: std::sync::atomic::AtomicU32,
+    /// [`Self::mmq_toks_cap`]'s value for this adapter, before any timing.
+    mmq_toks_cap_adapter: u32,
     /// Adapter subgroup support — the dual-nibble `Q4_K`/`Q6_K` reduce kernels
     /// are built with `subgroupAdd` whenever this is true (an unconditional win
     /// for them, unlike the 64-thread kernels `subgroup_reduce` gates). Stored
@@ -1765,6 +1830,11 @@ thread_local! {
     /// what was left out of order.
     static PREFILL_ENCODER: std::cell::RefCell<Option<wgpu::CommandEncoder>> =
         const { std::cell::RefCell::new(None) };
+    /// This thread's last prefill group submission, which the next one waits
+    /// for while the prompt makes way for decode steps — see
+    /// `VulkanBackend::end_prefill_group`.
+    static PREVIOUS_PREFILL_GROUP: std::cell::RefCell<Option<wgpu::SubmissionIndex>> =
+        const { std::cell::RefCell::new(None) };
     /// Set by a test that compares a fused chain against its unfused
     /// float sequence bit for bit: the integer-dot GEMM is a different
     /// arithmetic (8-bit activations), and on this module's random test
@@ -1980,6 +2050,11 @@ struct PleProjectionResources {
     total: usize,
     per_layer: usize,
     n_layer: usize,
+    /// The projection op's output `bg_scale1` reads, which rebuilds with
+    /// the op entry: an entry dropped by a kernel switch comes back with
+    /// a new buffer, and a bind group over the old one reads a projection
+    /// nothing writes any more.
+    projection: (wgpu::Buffer, u64),
     scaled: wgpu::Buffer,
     norm_w: wgpu::Buffer,
     gathered: wgpu::Buffer,
@@ -2408,6 +2483,42 @@ fn paging_code(paging: vulkan_shaders::KvPaging) -> u32 {
     }
 }
 
+/// The most runs a narrow pass's attention splits into — what the split
+/// reduce merges.
+const ATTN_PREFILL_MAX_SPLITS: usize = 64;
+
+/// What decides whether a prefill pass's attention splits its window.
+struct AttnPrefillShape {
+    head_dim: usize,
+    n_head: usize,
+    n_tokens: usize,
+    start_pos: usize,
+    n_swa: usize,
+    causal: bool,
+}
+
+/// A pass's tiled attention split over its window — see
+/// `VulkanBackend::attn_prefill_split_form`.
+struct AttnPrefillSplit {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    splits: u32,
+    reduce: wgpu::BindGroup,
+    rows: u32,
+}
+
+/// The workgroups a narrow pass's split attention aims for —
+/// `VulkanBackend::attn_prefill_splits`.
+fn attn_prefill_split_target() -> usize {
+    static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var("ORANGU_ATTN_PREFILL_SPLIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256)
+    })
+}
+
 /// The token stripe of one `wgpu` prefill submission: [`WGPU_STRIPE_TOKENS`]
 /// unless `ORANGU_MAX_TOKENS_PER_SUBMISSION` says otherwise, and never below
 /// the tiled/reduce crossover [`COOP_MIN_N_TOKENS`], so a tuned run cannot
@@ -2513,6 +2624,10 @@ const ROLE_MOE_HEAD: usize = 500;
 /// A convolution's matrix over its gathered windows
 /// ([`VulkanBackend::conv_gather_matmul`]).
 const ROLE_CONV: usize = 600;
+/// A batched decode step's head ([`VulkanBackend::decode_batch_tail`]).
+const ROLE_DECODE_TAIL: usize = 700;
+/// [`VulkanBackend::record_recurrent_rows`]'s four projections.
+const ROLE_RECURRENT: usize = 800;
 
 /// Rows a submission will produce, not yet waited for — the MoE shared
 /// MLP's, running on the card while the host runs the experts. Taken with
@@ -2641,6 +2756,114 @@ static TERNARY_IDOT_GROUPS: std::sync::LazyLock<usize> = std::sync::LazyLock::ne
         TERNARY_IDOT_GROUPS_DEFAULT,
         "an integer in 1..=16",
         |n| (1..=16).contains(&n),
+    )
+});
+/// Tokens one workgroup of the integer-dot `Q4_K` kernel's multi-position
+/// form takes (`vulkan_shaders::shader_source_q4k_i8_tokens`).
+/// `ORANGU_Q4K_I8_TOKENS`; `0` or `1` turns the form off, and every token
+/// gets its own workgroup of the one-token kernel.
+static Q4K_I8_TOKENS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_Q4K_I8_TOKENS",
+        Q4K_I8_TOKENS_DEFAULT,
+        "an integer in 0..=16",
+        |n| n <= 16,
+    )
+});
+const Q4K_I8_TOKENS_DEFAULT: usize = 8;
+/// [`Q4K_I8_GROUPS`] for the multi-position form: one run a workgroup.
+/// A pass of a few tokens has a decode step's grid and several times its
+/// arithmetic, so more workgroups in flight beat fewer that each repeat
+/// the walk (measured 5–28% faster than four runs, at every projection
+/// shape and width probed). `ORANGU_Q4K_I8_TOKENS_GROUPS` overrides it.
+const Q4K_I8_TOKENS_GROUPS_DEFAULT: usize = 1;
+static Q4K_I8_TOKENS_GROUPS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_Q4K_I8_TOKENS_GROUPS",
+        Q4K_I8_TOKENS_GROUPS_DEFAULT,
+        "an integer in 1..=16",
+        |n| (1..=16).contains(&n),
+    )
+});
+/// The most tokens a `Q4_K` or `Q6_K` projection takes the integer-dot
+/// GEMM's multi-position forms ([`MmqKernel::Q4kNarrow`],
+/// [`MmqKernel::Q6kNarrow`]) at, rather than its tiles. The forms spread a
+/// row's blocks over a workgroup, the tiles spread the rows: a projection
+/// that narrows (`down`, `8192 → 3072`) keeps the forms ahead to about 48
+/// tokens — `Q6_K` 743 µs against 1061, `Q4_K` 679 against 892 — and one
+/// that widens (`gate`, `1536 → 6144`) has the tiles ahead from about 24
+/// (`Q4_K` 377 against 265 at 32). Under 24 the forms win at every shape
+/// measured (`Q6_K` 145 µs against 284 for the float light form at 5
+/// tokens).
+fn narrow_form_max_tokens(w: &QuantMatrix) -> usize {
+    if w.in_dim > w.out_dim { 48 } else { 23 }
+}
+/// Rows each eight-lane slot of the short-row `Q4_K` form may take
+/// ([`MmqKernel::Q4kShort`]), the first where nothing has timed them: which
+/// is fastest moves with the device, so start-up times each and the form
+/// off ([`VulkanBackend::set_q4k_short_rows`]).
+const Q4K_SHORT_ROWS_CANDIDATES: [usize; 2] = [2, 4];
+/// `ORANGU_Q4K_SHORT_ROWS`, when it names the row count: `0` keeps every
+/// row on [`MmqKernel::Q4kNarrow`], and nothing is timed.
+static Q4K_SHORT_ROWS_FORCED: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+    super::tuning_profile::var("ORANGU_Q4K_SHORT_ROWS").map(|_| {
+        super::env_tuning_value(
+            "ORANGU_Q4K_SHORT_ROWS",
+            Q4K_SHORT_ROWS_CANDIDATES[0],
+            "an integer in 0..=4",
+            |n| (0..=4).contains(&n),
+        )
+    })
+});
+/// The longest row, in 256-element blocks, the short-row form takes: one
+/// that fills the multi-position form's eight block slots fewer than this
+/// many times.
+const Q4K_SHORT_MAX_BLOCKS: usize = 16;
+/// The most tokens it takes, rather than the multi-position form or the
+/// GEMM's tiles: past 48 the tiles are ahead at every shape measured, and
+/// under it they are ahead only where their 32-token tile nearly fits the
+/// batch ([`Q4K_SHORT_TILE_FITS`]). `ORANGU_Q4K_SHORT_MAX_TOKENS` overrides it.
+const Q4K_SHORT_MAX_TOKENS_DEFAULT: usize = 48;
+static Q4K_SHORT_MAX_TOKENS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_Q4K_SHORT_MAX_TOKENS",
+        Q4K_SHORT_MAX_TOKENS_DEFAULT,
+        "an integer in 2..=128",
+        |n| (2..=128).contains(&n),
+    )
+});
+/// Batches the GEMM's 32-token tile holds with under an eighth of it
+/// padding, where the tile is ahead of the short-row form.
+const Q4K_SHORT_TILE_FITS: std::ops::RangeInclusive<usize> = 29..=32;
+/// The fewest rows it takes: at sixteen rows a workgroup, a K/V or a
+/// single-head projection is too few workgroups to fill the device, and
+/// the multi-position form, at a few rows a workgroup, is ahead there.
+const Q4K_SHORT_MIN_ROWS: usize = 1536;
+/// Tokens up to which that form also stands in for the 64 × 32 tile where
+/// no wider one applies — the widest measured.
+const Q6K_NARROW_FOR_FALLBACK_MAX_TOKENS: usize = 64;
+/// Rows a workgroup of that form takes. `ORANGU_Q6K_I8_TOKENS_ROWS`
+/// overrides it.
+const Q6K_I8_TOKENS_ROWS_DEFAULT: usize = 4;
+static Q6K_I8_TOKENS_ROWS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_Q6K_I8_TOKENS_ROWS",
+        Q6K_I8_TOKENS_ROWS_DEFAULT,
+        "an integer in 1..=8",
+        |n| (1..=8).contains(&n),
+    )
+});
+/// Rows a workgroup of the multi-position `Q6_K` light kernel takes
+/// (`vulkan_shaders::shader_source_reduce_q6k_light_tokens`), each token's
+/// activation loaded once for all of them. `ORANGU_Q6K_TOKENS_ROWS`
+/// overrides it.
+const Q6K_TOKENS_ROWS_DEFAULT: usize = 2;
+static Q6K_TOKENS_ROWS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_Q6K_TOKENS_ROWS",
+        Q6K_TOKENS_ROWS_DEFAULT,
+        "an integer in 1..=8",
+        |n| (1..=8).contains(&n),
     )
 });
 /// Rows per run of the integer-dot `Q4_K` decode kernel
@@ -4244,19 +4467,21 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 "q4_k_contig": self.q4_k_contig_pipeline.is_some(),
                 "q4_k_glsl": self.q4_k_glsl_pipeline.is_some(),
                 "q4_k_mmvq": self.q4_k_mmvq,
-                "decode_mmvq": self.decode_mmvq,
+                "decode_mmvq": self.decode_mmvq(),
                 "q6_k_dual": self.q6_k_dual_pipeline.is_some(),
                 "packed_dot_f16": self.packed_dot_f16,
                 // Whether the prefill's integer-dot GEMM is built on this
                 // device — off where the driver does not accelerate the
                 // packed dot, which a split model's overflow device may not.
-                "prefill_mmq": self.prefill_mmq,
+                "prefill_mmq": self.prefill_mmq(),
                 "ternary_idot": !self.ternary_idot_pipelines.is_empty(),
                 "prefill_mmq_wide": self.mmq_q4k_wide_pipeline.is_some(),
             },
             "tuning": {
+                "profile": super::tuning_profile::loaded_path()
+                    .map(|p| p.display().to_string()),
                 "coop_min_n_tokens": self.coop_min_n_tokens,
-                "mmq_toks_cap": self.mmq_toks_cap,
+                "mmq_toks_cap": self.mmq_toks_cap(),
                 // Weight bytes below which a decode matmul goes to the host
                 // instead of here. Reported because it is machine-dependent
                 // and silently changes which backend ran most of a decode
@@ -4343,8 +4568,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 "single"
             },
             self.coop_min_n_tokens,
-            if self.mmq_toks_cap < vulkan_shaders::MMQ_WIDE_TILE_TOKENS {
-                format!(" · gemm tile ≤{} tok", self.mmq_toks_cap)
+            if self.mmq_toks_cap() < vulkan_shaders::MMQ_WIDE_TILE_TOKENS {
+                format!(" · gemm tile ≤{} tok", self.mmq_toks_cap())
             } else {
                 String::new()
             },
@@ -4391,6 +4616,9 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         selected: Vec<usize>,
     ) -> Option<Self> {
         let info = adapter.get_info();
+        // Before any knob is resolved below, so the profile's values are the
+        // ones they read.
+        super::tuning_profile::install(&info);
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
         let wgpu_backend = info.backend;
         // Request the adapter's own limits rather than wgpu's conservative
@@ -5096,6 +5324,13 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             vulkan_shaders::shader_source_rmsnorm_add_wide(),
         );
         let elem6_bind_group_layout = elem6_bind_group_layout(&device);
+        let recurrent_rows_bind_group_layout = recurrent_rows_bind_group_layout(&device);
+        let recurrent_rows_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orangu-server recurrent rows pipeline layout"),
+                bind_group_layouts: &[Some(&recurrent_rows_bind_group_layout)],
+                immediate_size: 0,
+            });
         let elem6_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("orangu-server elem6 pipeline layout"),
@@ -5283,9 +5518,19 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // The sub-`Q4_K` types' integer-dot decode — see `Self::decode_mmvq`.
         // Like the prefill's integer-dot GEMM, on where the driver says the
         // packed dot is a native instruction.
-        let decode_mmvq = match std::env::var("ORANGU_DECODE_MMVQ") {
-            Ok(_) => crate::engine::env::flag_on_unless_disabled("ORANGU_DECODE_MMVQ"),
-            Err(_) => super::vulkan_replay::integer_dot_accelerated(&device).unwrap_or(false),
+        let accelerated = super::vulkan_replay::integer_dot_accelerated(&device);
+        let decode_mmvq_forced = std::env::var_os("ORANGU_DECODE_MMVQ").is_some();
+        let decode_mmvq_start = if decode_mmvq_forced {
+            crate::engine::env::flag_on_unless_disabled("ORANGU_DECODE_MMVQ")
+        } else {
+            accelerated.unwrap_or(false)
+        };
+        // Built wherever the packed dot exists, so start-up can time it —
+        // see `Self::decode_mmvq`.
+        let decode_mmvq = if decode_mmvq_forced {
+            decode_mmvq_start
+        } else {
+            accelerated.is_some()
         };
         // `wide` selects the ternary types' row-group form; the narrow one
         // is a single run of one row (see `TERNARY_IDOT_ROWS`).
@@ -5372,6 +5617,17 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 HashMap::new()
             };
         let block_hoisted_i8_wide_pipelines = build_i8(BLOCK_HOISTED_WIDE_ROWS, true);
+        let q4_k_i8_tokens_tile = *Q4K_I8_TOKENS;
+        let q4_k_i8_tokens_pipeline =
+            (decode_mmvq && q4k_i8_on && q4_k_i8_tokens_tile >= 2).then(|| {
+                build_pipeline(vulkan_shaders::shader_source_q4k_i8_tokens(
+                    *Q4K_I8_ROWS,
+                    *Q4K_I8_TOKENS_GROUPS,
+                    q4_k_i8_tokens_tile,
+                    false,
+                    true,
+                ))
+            });
         let q8_quantize_pipeline = (q4_k_mmvq || decode_mmvq).then(|| {
             build_elem_pipeline(
                 &elem3_pipeline_layout,
@@ -5384,18 +5640,26 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             ))
         });
         // The prefill's integer-dot GEMM — the same `dot4I8Packed` builtin
-        // the decode MMVQ kernel uses. On by default only where the driver
-        // says the builtin is a native instruction: where it is not (an
-        // integrated GPU on this machine, say — a split model's overflow
-        // layers), the emulated dot loses to the float kernel by ~15% at a
-        // 128-token prefill, so that device keeps the float GEMM. An
-        // explicit `ORANGU_PREFILL_MMQ=1` overrides the property for the
-        // control arm of exactly that measurement.
+        // the decode MMVQ kernel uses. Where the driver says the builtin is a
+        // native instruction it starts on; elsewhere off, and start-up times
+        // a prompt pass both ways (`Self::set_integer_dot_prefill`). An
+        // integrated GPU the driver calls unaccelerated ran a whole model's
+        // prompts twice as fast on it; a split model's overflow layers there
+        // measured 15% slower, which is why it is timed, not assumed.
+        // `ORANGU_PREFILL_MMQ=1|0` names it.
         let integer_dot_accelerated =
             super::vulkan_replay::integer_dot_accelerated(&device).unwrap_or(false);
-        let prefill_mmq = match std::env::var("ORANGU_PREFILL_MMQ") {
-            Ok(_) => crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ"),
-            Err(_) => integer_dot_accelerated,
+        let prefill_mmq_forced = std::env::var_os("ORANGU_PREFILL_MMQ").is_some();
+        let prefill_mmq_start = if prefill_mmq_forced {
+            crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ")
+        } else {
+            integer_dot_accelerated
+        };
+        // Built wherever the packed dot exists, so start-up can time it.
+        let prefill_mmq = if prefill_mmq_forced {
+            prefill_mmq_start
+        } else {
+            super::vulkan_replay::integer_dot_accelerated(&device).is_some()
         };
         let mmq_q4k_pipeline =
             prefill_mmq.then(|| build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q4k()));
@@ -5413,6 +5677,35 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 vulkan_shaders::MMQ_MID_TILE_ROWS,
             ))
         });
+        let mmq_q4k_narrow_pipeline = (prefill_mmq && supports_subgroup && *Q4K_I8_TOKENS >= 2)
+            .then(|| {
+                build_mmq_pipeline(vulkan_shaders::shader_source_q4k_i8_tokens(
+                    *Q4K_I8_ROWS,
+                    *Q4K_I8_TOKENS_GROUPS,
+                    *Q4K_I8_TOKENS,
+                    true,
+                    true,
+                ))
+            });
+        let short_rows = match *Q4K_SHORT_ROWS_FORCED {
+            Some(0) => Vec::new(),
+            Some(rows) => vec![rows],
+            None => Q4K_SHORT_ROWS_CANDIDATES.to_vec(),
+        };
+        let mmq_q4k_short_pipelines: Vec<(usize, wgpu::ComputePipeline)> =
+            if mmq_q4k_narrow_pipeline.is_some() {
+                short_rows
+                    .into_iter()
+                    .map(|rows| {
+                        let source =
+                            vulkan_shaders::shader_source_q4k_i8_tokens_short(rows, *Q4K_I8_TOKENS);
+                        (rows, build_mmq_pipeline(source))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let q4k_short_rows = mmq_q4k_short_pipelines.first().map_or(0, |&(rows, _)| rows);
         // The `Q6_K` form: 21% faster than the float kernel on the probe and
         // ~3% on a prefill (its staging reads the 210-byte blocks a word at
         // a time, half of them misaligned); `ORANGU_PREFILL_MMQ_Q6K=0` keeps
@@ -5421,6 +5714,14 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             prefill_mmq && crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ_Q6K");
         let mmq_q6k_pipeline =
             mmq_q6k.then(|| build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q6k()));
+        let mmq_q6k_narrow_pipeline =
+            (mmq_q6k && supports_subgroup && *Q4K_I8_TOKENS >= 2).then(|| {
+                build_mmq_pipeline(vulkan_shaders::shader_source_q6k_i8_tokens(
+                    *Q6K_I8_TOKENS_ROWS,
+                    1,
+                    *Q4K_I8_TOKENS,
+                ))
+            });
         let mmq_q6k_wide_pipeline = (mmq_q6k && mmq_wide).then(|| {
             build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q6k_wide(
                 vulkan_shaders::MMQ_WIDE_TILE_ROWS,
@@ -5673,6 +5974,18 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 subgroup_reduce,
             ))
         });
+        let q6_k_light_tokens_pipeline = (wide_unroll
+            && q6k_light
+            && reduce_n_rows() == 1
+            && *Q4K_I8_TOKENS >= 2
+            && !crate::engine::env::flag_on("ORANGU_Q6K_V4"))
+        .then(|| {
+            build_pipeline(vulkan_shaders::shader_source_reduce_q6k_light_tokens(
+                *Q6K_TOKENS_ROWS,
+                *Q4K_I8_TOKENS,
+                subgroup_reduce,
+            ))
+        });
 
         // See `Self::q4_k_glsl_pipeline`. glslc-compiled twin of the
         // light kernel, handed to RADV via SPIR-V passthrough — same algorithm
@@ -5882,6 +6195,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             elem4_pipeline_layout,
             gated_delta_pipelines: Mutex::new(HashMap::new()),
             recurrent_prep_pipelines: Mutex::new(HashMap::new()),
+            recurrent_rows_pipelines: Mutex::new(HashMap::new()),
             attention_tail_bind_groups: Mutex::new(HashMap::new()),
             hybrid_chains: Mutex::new(HashMap::new()),
             ffn_decode_bind_groups: Mutex::new(HashMap::new()),
@@ -5908,6 +6222,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             elem5_bind_group_layout,
             elem6_bind_group_layout,
             elem6_pipeline_layout,
+            recurrent_rows_bind_group_layout,
+            recurrent_rows_pipeline_layout,
             add_rmsnorm_wide_pipeline,
             rmsnorm_add_pipeline,
             rmsnorm_rows_pipeline,
@@ -5971,6 +6287,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             q8_quantize_pipeline,
             q4_k_mmvq_fused_pipeline,
             mmq_q4k_pipeline,
+            mmq_q4k_narrow_pipeline,
+            mmq_q4k_short_pipelines,
+            q4k_short_rows: std::sync::atomic::AtomicUsize::new(q4k_short_rows),
+            mmq_q6k_narrow_pipeline,
             mmq_q4k_wide_pipeline,
             mmq_q4k_mid_pipeline,
             mmq_q6k_pipeline,
@@ -5982,7 +6302,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             indexed_bind_group_layout,
             checked_mmq,
             quantize_q8_rows_pipeline,
-            prefill_mmq,
+            prefill_mmq: std::sync::atomic::AtomicBool::new(prefill_mmq_start),
+            prefill_mmq_tunable: prefill_mmq && !prefill_mmq_forced,
             packed_dot_f16,
             q4_k_packed_f16_pipeline,
             wide_load,
@@ -5994,13 +6315,16 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             block_hoisted_wide_pipelines,
             block_hoisted_i8_pipelines,
             block_hoisted_i8_wide_pipelines,
+            q4_k_i8_tokens_pipeline,
+            q4_k_i8_tokens_tile,
             kq_light_pipelines,
             q8_placeholder,
             placeholder_ro,
             gelu_mul_q8_pipeline,
             silu_mul_q8_pipeline,
             rmsnorm_wide_q8_pipeline,
-            decode_mmvq,
+            decode_mmvq: std::sync::atomic::AtomicBool::new(decode_mmvq_start),
+            decode_mmvq_tunable: decode_mmvq && !decode_mmvq_forced,
             ternary_idot_pipelines,
             float_wide_pipelines,
             q4_k_unroll_packed_pipeline,
@@ -6008,12 +6332,14 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             q4_k_light_pipeline,
             q5_k_light_pipeline,
             q6_k_light_pipeline,
+            q6_k_light_tokens_pipeline,
             q4_k_glsl_pipeline,
             q4_k_contig_pipeline,
             q6_k_dual_pipeline,
             tiled_prefill,
             coop_min_n_tokens,
-            mmq_toks_cap,
+            mmq_toks_cap: std::sync::atomic::AtomicU32::new(mmq_toks_cap),
+            mmq_toks_cap_adapter: mmq_toks_cap,
             supports_subgroup,
             subgroup_lanes,
             thin_tile,
@@ -6390,6 +6716,12 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             .map(|(x, n, w)| self.matmul(x, *n, w))
             .collect();
         let saved = self.disable_optional_decode_kernels(ggml_type);
+        // An entry's grid is the grid of the kernel it was built for, and a
+        // tuned kernel's can be narrower than the fallback's (a token tile
+        // a workgroup where the fallback takes one token): the fallback
+        // reusing it would run on part of its grid and disagree with the
+        // tuned answer for that alone.
+        self.op_cache.lock().expect("op cache poisoned").clear();
         let plain: Vec<Vec<f32>> = cases
             .iter()
             .map(|(x, n, w)| self.matmul(x, *n, w))
@@ -8586,6 +8918,21 @@ impl VulkanBackend {
     /// pipeline built for this type. Both `pipeline_for` (which kernel) and
     /// `build_op_resources` (dispatch count) gate on this one predicate so
     /// they can never disagree.
+    /// Whether the multi-position `Q6_K` light kernel serves this
+    /// `(ggml_type, n_tokens)` — the one predicate `pipeline_for` (which
+    /// kernel) and `build_op_resources` (its grid) share. Only while the
+    /// one-token light kernel it reproduces is itself live. Up to the
+    /// integer-dot GEMM's tile even past the float GEMM's crossover: at 24
+    /// to 31 tokens the float GEMM's tiles cost several times this
+    /// kernel's.
+    fn uses_q6k_tokens(&self, ggml_type: u32, n_tokens: usize) -> bool {
+        ggml_type == crate::engine::quant::GGML_TYPE_Q6_K
+            && n_tokens >= 2
+            && n_tokens < (vulkan_shaders::MMQ_Q4K_TILE_TOKENS as usize).max(self.coop_min_n_tokens)
+            && self.q6_k_light_pipeline.is_some()
+            && self.q6_k_light_tokens_pipeline.is_some()
+    }
+
     fn uses_thin_tile(&self, ggml_type: u32, in_dim: usize, n_tokens: usize) -> bool {
         self.thin_tile
             && n_tokens >= 2
@@ -8691,6 +9038,9 @@ impl VulkanBackend {
         if self.q4_k_mmvq && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q4_K {
             return self.q4_k_mmvq_fused_pipeline.as_ref().map(|p| (p, 1));
         }
+        if !self.decode_mmvq() {
+            return None;
+        }
         // `Q4_K`'s integer-dot kernel stands in for its float dual kernel,
         // which is not a block-hoisted one; every other type's only where
         // its float kernel is.
@@ -8723,6 +9073,12 @@ impl VulkanBackend {
         if w.out_dim >= wide_min
             && let Some(p) = self.block_hoisted_i8_wide_pipelines.get(&w.ggml_type())
         {
+            if q4k
+                && n_tokens >= 2
+                && let Some(tokens) = &self.q4_k_i8_tokens_pipeline
+            {
+                return Some((tokens, *Q4K_I8_ROWS * *Q4K_I8_TOKENS_GROUPS));
+            }
             let rows = if ternary {
                 *TERNARY_IDOT_ROWS * *TERNARY_IDOT_GROUPS
             } else if q4k {
@@ -8735,6 +9091,182 @@ impl VulkanBackend {
         self.block_hoisted_i8_pipelines
             .get(&w.ggml_type())
             .map(|p| (p, if ternary || q4k { 1 } else { reduce_n_rows() }))
+    }
+
+    /// Whether the decode kernels take the integer dot — see
+    /// [`Self::decode_mmvq`].
+    fn decode_mmvq(&self) -> bool {
+        self.decode_mmvq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether start-up may choose the integer-dot decode kernels with
+    /// [`Self::set_integer_dot_decode`].
+    pub fn integer_dot_decode_tunable(&self) -> bool {
+        self.decode_mmvq_tunable
+    }
+
+    /// Turns the integer-dot decode kernels on or off. Every cached op and
+    /// fused-chain resource is dropped, since each was built for the
+    /// setting in force — an entry with a quantized input buffer, or
+    /// without one — and is rebuilt on its next use. For start-up, before
+    /// any request: a request in flight would rebuild what it is using.
+    pub fn set_integer_dot_decode(&self, on: bool) {
+        if !self.decode_mmvq_tunable {
+            return;
+        }
+        self.decode_mmvq
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+        self.drop_cached_op_resources();
+    }
+
+    fn prefill_mmq(&self) -> bool {
+        self.prefill_mmq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether start-up may choose the prompt GEMMs' integer dot with
+    /// [`Self::set_integer_dot_prefill`].
+    pub fn integer_dot_prefill_tunable(&self) -> bool {
+        self.prefill_mmq_tunable
+    }
+
+    /// Turns the prompt GEMMs' integer dot on or off — see
+    /// [`Self::prefill_mmq`]. For start-up, before any request.
+    pub fn set_integer_dot_prefill(&self, on: bool) {
+        if !self.prefill_mmq_tunable {
+            return;
+        }
+        self.prefill_mmq
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+        self.drop_cached_op_resources();
+    }
+
+    /// The row counts start-up may choose for the short-row `Q4_K` form
+    /// with [`Self::set_q4k_short_rows`], `0` (the form off) among them;
+    /// empty when `ORANGU_Q4K_SHORT_ROWS` names it, the form is not built,
+    /// or the prompts' GEMMs are off the integer dot.
+    pub fn q4k_short_rows_choices(&self) -> Vec<usize> {
+        if Q4K_SHORT_ROWS_FORCED.is_some()
+            || self.mmq_q4k_short_pipelines.is_empty()
+            || !self.prefill_mmq()
+        {
+            return Vec::new();
+        }
+        std::iter::once(0)
+            .chain(self.mmq_q4k_short_pipelines.iter().map(|&(rows, _)| rows))
+            .collect()
+    }
+
+    /// The short-row `Q4_K` form's rows a slot, `0` when it is off — see
+    /// [`Self::q4k_short_rows`]'s field.
+    fn q4k_short_rows(&self) -> usize {
+        self.q4k_short_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Runs the short-row `Q4_K` form at `rows` a slot, or not at all for
+    /// `0`; a count with no pipeline is ignored. Drops every cached op, as
+    /// [`Self::set_integer_dot_prefill`] does. For start-up, before any
+    /// request.
+    pub fn set_q4k_short_rows(&self, rows: usize) {
+        if rows != 0 && !self.mmq_q4k_short_pipelines.iter().any(|&(r, _)| r == rows) {
+            return;
+        }
+        self.q4k_short_rows
+            .store(rows, std::sync::atomic::Ordering::Relaxed);
+        self.drop_cached_op_resources();
+    }
+
+    /// The caps [`Self::set_mmq_toks_cap`] can choose between: the widest
+    /// tile and 64, or none when `ORANGU_MMQ_TOKS` pins a tile, the adapter's
+    /// cap is narrower, or prompts do not run on the integer-dot GEMM.
+    pub fn mmq_toks_cap_choices(&self) -> Vec<u32> {
+        let full = vulkan_shaders::MMQ_WIDE_TILE_TOKENS;
+        let pinned = std::env::var("ORANGU_MMQ_TOKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .is_some_and(|t| [16, 32, 64, 128].contains(&t));
+        if pinned || self.mmq_toks_cap_adapter < full || !self.prefill_mmq() {
+            return Vec::new();
+        }
+        vec![full, 64]
+    }
+
+    /// The widest token tile [`Self::mmq_toks_for`] may choose.
+    fn mmq_toks_cap(&self) -> u32 {
+        self.mmq_toks_cap.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Caps the prompt GEMM's token tile at `cap` (one of
+    /// [`Self::mmq_toks_cap_choices`]; anything else is ignored). Drops every
+    /// cached op, as [`Self::set_q4k_short_rows`] does.
+    pub fn set_mmq_toks_cap(&self, cap: u32) {
+        if !self.mmq_toks_cap_choices().contains(&cap) {
+            return;
+        }
+        self.mmq_toks_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+        self.drop_cached_op_resources();
+    }
+
+    /// Drops every cached op and fused-chain resource, each rebuilt on its
+    /// next use for the kernels then in force — the bind groups built over
+    /// an op's buffers among them, which would otherwise outlive the op
+    /// (the hybrid decode chain's, the FFN's and attention tail's, and the
+    /// gated-delta layers').
+    fn drop_cached_op_resources(&self) {
+        self.op_cache.lock().expect("op cache poisoned").clear();
+        self.hybrid_chains
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.ffn_decode_bind_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.attention_tail_bind_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        for resources in self
+            .gated_delta_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            resources
+                .layer_bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        self.fused_cache
+            .lock()
+            .expect("fused cache poisoned")
+            .clear();
+        self.fused_attn_layer_cache
+            .lock()
+            .expect("fused attention cache poisoned")
+            .clear();
+        self.fused_layer_cache
+            .lock()
+            .expect("fused layer cache poisoned")
+            .clear();
+    }
+
+    /// Tokens one workgroup of [`Self::mmvq_pipeline_for`]'s pick takes:
+    /// the multi-position `Q4_K` kernel's tile where it picked that, one
+    /// otherwise. Read from the pick itself so the grid and the kernel
+    /// cannot disagree.
+    fn mmvq_token_tile(&self, w: &QuantMatrix, n_tokens: usize) -> usize {
+        match (
+            self.mmvq_pipeline_for(w, n_tokens),
+            &self.q4_k_i8_tokens_pipeline,
+        ) {
+            (Some((picked, _)), Some(tokens)) if std::ptr::eq(picked, tokens) => {
+                self.q4_k_i8_tokens_tile
+            }
+            _ => 1,
+        }
     }
 
     /// [`Self::pipeline_for`] for a matmul op — the wide block-hoisted
@@ -8798,6 +9330,11 @@ impl VulkanBackend {
             && let Some(pipeline) = self.thin_tile_pipelines.get(&ggml_type)
         {
             return (pipeline, "thin-tile");
+        }
+        if self.uses_q6k_tokens(ggml_type, n_tokens)
+            && let Some(pipeline) = &self.q6_k_light_tokens_pipeline
+        {
+            return (pipeline, "q6_k-light-tokens");
         }
         // glslc-compiled `Q4_K` decode kernel — checked *first* when
         // built (`ORANGU_Q4K_GLSL`), ahead of the WGSL light/contig/dual
@@ -9410,7 +9947,17 @@ impl VulkanBackend {
                 // model after one long prompt — the difference between its
                 // weights staying on the card through the prompt and not.
                 // Every width up to a stripe now shares one region.
-                let rows = prefill_rows_capacity(n_tokens);
+                //
+                // Except where a stripe's region is itself the problem: a
+                // vocabulary projection over several rows (a speculative
+                // verify's head) at a whole stripe is 512 rows of the
+                // vocabulary, 250 MiB on a 128k-entry model, for a pass of
+                // five. A region larger than an arena chunk is sized to the
+                // width, rounded up to a power of two.
+                let mut rows = prefill_rows_capacity(n_tokens);
+                if (rows * out_dim.max(in_dim)) as u64 * 4 > OP_ARENA_CHUNK_BYTES {
+                    rows = n_tokens.next_power_of_two();
+                }
                 self.pooled_regions(
                     align,
                     (rows * in_dim) as u64 * 4,
@@ -9505,6 +10052,9 @@ impl VulkanBackend {
             // One workgroup per (REDUCE_N_ROWS-row group, thin_tile_size-token
             // tile) — matches `thin_tile_reduce_suffix`'s own grid.
             (out_dim.div_ceil(reduce_n_rows()) * n_tokens.div_ceil(self.thin_tile_size)) as u32
+        } else if self.uses_q6k_tokens(w.ggml_type(), n_tokens) {
+            // One workgroup per (row group, token tile).
+            (out_dim.div_ceil(*Q6K_TOKENS_ROWS) * n_tokens.div_ceil(*Q4K_I8_TOKENS)) as u32
         } else if self.use_tiled_coop(n_tokens) {
             let geom = vulkan_shaders::coop_geom();
             let row_tiles = out_dim.div_ceil(geom.tile_rows() as usize);
@@ -9547,7 +10097,9 @@ impl VulkanBackend {
                 BindSrc::Slice(&output_buffer, output_offset, output_len),
                 BindSrc::Slice(&meta_chunk, meta_offset, meta_size),
             );
-            let mmvq_workgroups = Self::workgroup_dims((out_dim.div_ceil(rows) * n_tokens) as u32);
+            let tile = self.mmvq_token_tile(w, n_tokens);
+            let mmvq_workgroups =
+                Self::workgroup_dims((out_dim.div_ceil(rows) * n_tokens.div_ceil(tile)) as u32);
             MmvqOp {
                 q8_buffer,
                 q8_len,
@@ -9983,6 +10535,7 @@ struct RecurrentPrepared<'a> {
     eps: f32,
     out_rotation: Option<&'a crate::engine::hadamard::Rotation>,
     ssm_out: &'a QuantMatrix,
+    mirror: &'a VulkanStateMirror,
 }
 
 /// A recurrent layer's state matrices resident on this device — the
@@ -10009,6 +10562,37 @@ struct VulkanStateMirror {
     /// bind groups every token measured at tens of milliseconds a call on
     /// the fused FFN, and a recurrent step has five of them.
     bind_groups: Mutex<HashMap<RecurrentBgKey, Arc<MirrorBindGroups>>>,
+    /// The state and conv history behind each row of the last
+    /// `record_recurrent_rows` but its last, packed as a checkpoint is
+    /// (`[state | conv]` a row) — grown to the widest pass, made on first
+    /// use — and how many rows of it are current: zero after any other step.
+    row_states: Mutex<Option<wgpu::Buffer>>,
+    row_states_current: std::sync::atomic::AtomicUsize,
+}
+
+impl VulkanStateMirror {
+    /// [`Self::row_states`] with room for `rows` rows.
+    fn row_states_for(&self, rows: usize) -> wgpu::Buffer {
+        let l = self.layout;
+        let bytes = ((rows.max(1) * (l.state_len + l.conv_len)) as u64) * 4;
+        let mut held = self
+            .row_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*held {
+            Some(b) if b.size() >= bytes => b.clone(),
+            _ => {
+                let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("orangu-server recurrent row states"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                *held = Some(b.clone());
+                b
+            }
+        }
+    }
 }
 
 /// A rotation's identity for a bind-group cache: its block and its sign
@@ -10141,8 +10725,113 @@ impl crate::engine::kv_cache::DeviceStateMirror for VulkanStateMirror {
         self.readback.unmap();
     }
 
+    fn checkpoint(&self) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        let l = self.layout;
+        let bytes = ((l.state_len + l.conv_len) as u64) * 4;
+        let saved = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server recurrent state checkpoint"),
+            size: bytes.max(4),
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.copy_state(&self.scratch, &saved, true);
+        Some(Box::new(StateCheckpoint {
+            of: self.scratch.clone(),
+            saved,
+        }))
+    }
+
+    fn restore(&self, checkpoint: &(dyn std::any::Any + Send + Sync)) -> bool {
+        match checkpoint.downcast_ref::<StateCheckpoint>() {
+            Some(c) if c.of == self.scratch => {
+                self.copy_state(&c.saved, &self.scratch, false);
+                self.row_states_current
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn restore_row(&self, row: usize) -> bool {
+        if row
+            >= self
+                .row_states_current
+                .swap(0, std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let Some(rows) = self
+            .row_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return false;
+        };
+        let l = self.layout;
+        let state_bytes = (l.state_len as u64) * 4;
+        let conv_bytes = (l.conv_len as u64) * 4;
+        let at = (row as u64) * (state_bytes + conv_bytes);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("orangu-server recurrent row state restore"),
+            });
+        if state_bytes > 0 {
+            encoder.copy_buffer_to_buffer(&rows, at, &self.scratch, 0, state_bytes);
+        }
+        if conv_bytes > 0 {
+            encoder.copy_buffer_to_buffer(
+                &rows,
+                at + state_bytes,
+                &self.scratch,
+                (l.conv_off() as u64) * 4,
+                conv_bytes,
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// A [`VulkanStateMirror`]'s state and conv history copied aside on the
+/// device, packed — the mirror's `checkpoint` — with the scratch it came
+/// from, so it goes back into that mirror only.
+struct StateCheckpoint {
+    of: wgpu::Buffer,
+    saved: wgpu::Buffer,
+}
+
+impl VulkanStateMirror {
+    /// Copies the state and conv history between the scratch and a packed
+    /// checkpoint buffer (`to_packed`: scratch → checkpoint), submitted
+    /// without waiting: the queue orders it against the steps around it.
+    fn copy_state(&self, from: &wgpu::Buffer, to: &wgpu::Buffer, to_packed: bool) {
+        let l = self.layout;
+        let state_bytes = (l.state_len as u64) * 4;
+        let conv_bytes = (l.conv_len as u64) * 4;
+        let (conv_from, conv_to) = if to_packed {
+            ((l.conv_off() as u64) * 4, state_bytes)
+        } else {
+            (state_bytes, (l.conv_off() as u64) * 4)
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("orangu-server recurrent state checkpoint copy"),
+            });
+        if state_bytes > 0 {
+            encoder.copy_buffer_to_buffer(from, 0, to, 0, state_bytes);
+        }
+        if conv_bytes > 0 {
+            encoder.copy_buffer_to_buffer(from, conv_from, to, conv_to, conv_bytes);
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 }
 
@@ -10859,6 +11548,17 @@ pub struct MoeCombine {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum MmqKernel {
     Q4k,
+    /// `Q4_K` below [`MmqKernel::Q4k`]'s tile — see
+    /// `VulkanBackend::mmq_q4k_narrow_pipeline`.
+    Q4kNarrow,
+    /// [`MmqKernel::Q4kNarrow`] for short rows, `rows` a slot — see
+    /// `VulkanBackend::mmq_q4k_short_pipelines`.
+    Q4kShort {
+        rows: u32,
+    },
+    /// `Q6_K`'s counterpart — see
+    /// `VulkanBackend::mmq_q6k_narrow_pipeline`.
+    Q6kNarrow,
     Q4kWide,
     Q4kMid,
     Q6k,
@@ -10901,6 +11601,12 @@ impl MmqKernel {
                 vulkan_shaders::MMQ_WIDE_TILE_ROWS,
                 vulkan_shaders::MMQ_WIDE_TILE_TOKENS,
             ),
+            MmqKernel::Q4kNarrow => (
+                (*Q4K_I8_ROWS * *Q4K_I8_TOKENS_GROUPS) as u32,
+                *Q4K_I8_TOKENS as u32,
+            ),
+            MmqKernel::Q4kShort { rows } => (8 * rows, *Q4K_I8_TOKENS as u32),
+            MmqKernel::Q6kNarrow => (*Q6K_I8_TOKENS_ROWS as u32, *Q4K_I8_TOKENS as u32),
             MmqKernel::Q6k => (
                 vulkan_shaders::MMQ_TILE_ROWS,
                 vulkan_shaders::MMQ_Q6K_TILE_TOKENS,
@@ -10925,6 +11631,9 @@ impl MmqKernel {
         match self {
             MmqKernel::Q4k => "mmq-q4k",
             MmqKernel::Q4kWide => "mmq-q4k-wide",
+            MmqKernel::Q4kNarrow => "mmq-q4k-narrow",
+            MmqKernel::Q4kShort { .. } => "mmq-q4k-short",
+            MmqKernel::Q6kNarrow => "mmq-q6k-narrow",
             MmqKernel::Q6k => "mmq-q6k",
             MmqKernel::Q6kWide => "mmq-q6k-wide",
             MmqKernel::Q4kMid => "mmq-q4k-mid",
@@ -11159,7 +11868,11 @@ impl VulkanBackend {
             && row_fits
             && w.out_dim
                 .is_multiple_of(vulkan_shaders::MMQ_TILE_ROWS as usize)
-            && n_tokens >= vulkan_shaders::MMQ_Q4K_TILE_TOKENS as usize
+            && (n_tokens >= vulkan_shaders::MMQ_Q4K_TILE_TOKENS as usize
+                || (n_tokens >= 2 && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q4_K)
+                || (n_tokens >= 2
+                    && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q6_K
+                    && self.mmq_kernel_for(w, n_tokens) != Some(MmqKernel::Q6k)))
             && self.mmq_kernel_for(w, n_tokens).is_some()
     }
 
@@ -11170,7 +11883,31 @@ impl VulkanBackend {
     /// stays on it where the type has one.
     fn mmq_kernel_for(&self, w: &QuantMatrix, n_tokens: usize) -> Option<MmqKernel> {
         use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+        // Off, every kernel is: what admits an op and what records it ask
+        // the same question.
+        if !self.prefill_mmq() {
+            return None;
+        }
         let ggml_type = w.ggml_type();
+        let short_rows = self.q4k_short_rows();
+        if ggml_type == GGML_TYPE_Q4_K
+            && w.in_dim / 256 < Q4K_SHORT_MAX_BLOCKS
+            && w.out_dim >= Q4K_SHORT_MIN_ROWS
+            && (2..=*Q4K_SHORT_MAX_TOKENS).contains(&n_tokens)
+            && !Q4K_SHORT_TILE_FITS.contains(&n_tokens)
+            && short_rows > 0
+        {
+            return Some(MmqKernel::Q4kShort {
+                rows: short_rows as u32,
+            });
+        }
+        let narrow_form = (2..=narrow_form_max_tokens(w)).contains(&n_tokens);
+        if ggml_type == GGML_TYPE_Q4_K && narrow_form && self.mmq_q4k_narrow_pipeline.is_some() {
+            return Some(MmqKernel::Q4kNarrow);
+        }
+        if ggml_type == GGML_TYPE_Q6_K && narrow_form && self.mmq_q6k_narrow_pipeline.is_some() {
+            return Some(MmqKernel::Q6kNarrow);
+        }
         let (narrow, wide, mid) = match ggml_type {
             GGML_TYPE_Q6_K => (Some(MmqKernel::Q6k), MmqKernel::Q6kWide, MmqKernel::Q6kMid),
             GGML_TYPE_Q4_K => (Some(MmqKernel::Q4k), MmqKernel::Q4kWide, MmqKernel::Q4kMid),
@@ -11235,6 +11972,15 @@ impl VulkanBackend {
                 return Some(kernel);
             }
         }
+        // `Q6_K`'s 64 × 32 tile, where nothing wider fills the device, is
+        // slower than its multi-position form well past the form's own
+        // range: 831 µs against 410 at `6144 → 1536` and 64 tokens.
+        if narrow == Some(MmqKernel::Q6k)
+            && n_tokens <= Q6K_NARROW_FOR_FALLBACK_MAX_TOKENS
+            && self.mmq_q6k_narrow_pipeline.is_some()
+        {
+            return Some(MmqKernel::Q6kNarrow);
+        }
         narrow.filter(|k| self.mmq_pipeline(*k).is_some())
     }
 
@@ -11258,9 +12004,19 @@ impl VulkanBackend {
         // reported from an `M2 Max`, and reproducible anywhere with
         // `ORANGU_PREFILL_MMQ=0`.
         self.quantize_q8_rows_pipeline.as_ref()?;
+        if !self.prefill_mmq() {
+            return None;
+        }
         match kernel {
             MmqKernel::Q4k => self.mmq_q4k_pipeline.clone(),
             MmqKernel::Q4kWide => self.mmq_q4k_wide_pipeline.clone(),
+            MmqKernel::Q4kNarrow => self.mmq_q4k_narrow_pipeline.clone(),
+            MmqKernel::Q4kShort { rows } => self
+                .mmq_q4k_short_pipelines
+                .iter()
+                .find(|&&(r, _)| r == rows as usize)
+                .map(|(_, p)| p.clone()),
+            MmqKernel::Q6kNarrow => self.mmq_q6k_narrow_pipeline.clone(),
             MmqKernel::Q6k => self.mmq_q6k_pipeline.clone(),
             MmqKernel::Q6kWide => self.mmq_q6k_wide_pipeline.clone(),
             MmqKernel::Q4kMid => self.mmq_q4k_mid_pipeline.clone(),
@@ -11329,16 +12085,23 @@ impl VulkanBackend {
         // Largest first: the tile that pads least is not the shortest one
         // but the longest one that pads little enough — up to the device's
         // cap ([`Self::mmq_toks_cap`]).
-        for toks in [full, 64, 32]
-            .into_iter()
-            .filter(|t| *t <= self.mmq_toks_cap)
-        {
+        let cap = self.mmq_toks_cap();
+        for toks in [full, 64, 32].into_iter().filter(|t| *t <= cap) {
             let padded = (n_tokens as u32).div_ceil(toks) * toks;
             if padded * 4 <= n_tokens as u32 * 5 {
                 return toks;
             }
         }
-        16
+        // Past one 16-token tile, never 16-token tiles: one costs 0.77 of a
+        // 32-token tile, so two of them lose to it and three (48 tokens,
+        // 1.6 ms at `8192 → 3072`) lose to one 64-token tile (1.06 ms).
+        if n_tokens <= 16 {
+            16
+        } else {
+            (n_tokens.next_power_of_two() as u32)
+                .clamp(32, full)
+                .min(cap.max(32))
+        }
     }
 
     /// [`Self::mmq_pipeline`]'s builder for a kernel first needed after
@@ -11424,7 +12187,7 @@ impl VulkanBackend {
     /// padding rows computed and discarded.
     fn mmq_indexed_kernel_for(&self, ggml_type: u32, n_rows: usize) -> Option<MmqKernel> {
         use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
-        if !self.prefill_mmq || self.quantize_q8_rows_pipeline.is_none() {
+        if !self.prefill_mmq() || self.quantize_q8_rows_pipeline.is_none() {
             return None;
         }
         let known = matches!(ggml_type, GGML_TYPE_Q4_K | GGML_TYPE_Q6_K)
@@ -12791,6 +13554,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         (q8, bg, wg, meta)
     }
 
+    /// One projection of a prefill chain: on the integer-dot GEMM over the
+    /// staged `q8` when it fits it and there is a staging, on the float
+    /// kernel over the entry's own input otherwise.
+    fn record_projection(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        w: &QuantMatrix,
+        entry: &CachedOpResources,
+        q8: Option<&wgpu::Buffer>,
+        n_tokens: usize,
+    ) {
+        match q8.filter(|_| self.mmq_for(w, n_tokens)) {
+            Some(q8) => {
+                let op = self.mmq_op(w, entry, q8);
+                self.record_mmq(pass, &op.0, op.1, op.2);
+            }
+            None => self.record_matmul(pass, w, entry),
+        }
+    }
+
     /// Records the quantize dispatch of an [`Self::mmq_stage`].
     fn record_mmq_quantize(&self, pass: &mut wgpu::ComputePass<'_>, bg: &wgpu::BindGroup, wg: u32) {
         pass.set_pipeline(
@@ -12818,11 +13601,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .mmq_kernel_for(w, entry.n_tokens)
             .expect("mmq_for admitted the op");
         let (rows, toks) = kernel.tile();
-        let grid = (
-            (w.out_dim as u32) / rows,
-            (entry.n_tokens as u32).div_ceil(toks),
-            1,
-        );
+        let grid = if matches!(
+            kernel,
+            MmqKernel::Q4kNarrow | MmqKernel::Q4kShort { .. } | MmqKernel::Q6kNarrow
+        ) {
+            // A flat index over (row group, token tile), and row groups of a
+            // few rows: a vocabulary head is more of them than one
+            // dimension holds.
+            Self::workgroup_dims(
+                (w.out_dim as u32).div_ceil(rows) * (entry.n_tokens as u32).div_ceil(toks),
+            )
+        } else {
+            (
+                (w.out_dim as u32) / rows,
+                (entry.n_tokens as u32).div_ceil(toks),
+                1,
+            )
+        };
         // `ORANGU_MMQ_TRACE=1`: one line per distinct shape the integer-dot
         // GEMM serves, naming the kernel it picked and the grid — the answer
         // to "which kernel is this op actually running", which a device
@@ -13066,40 +13861,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             )
         });
 
-        // The norm, into a staging buffer the three projections copy from.
-        let normed = self.scratch_buffer(n_rows * n_embd);
+        // The norm, written straight into each projection's own input
+        // region and in the same pass as the projections: a copy between
+        // them would end the pass, at every layer of every step.
         let norm_w = self.upload_new(attn_norm);
         let norm_meta = self.elem_meta_buffer(n_embd as u32, input.eps);
-        let norm_bg = self.elem4_bind_group(
-            BindSrc::Slice(x_buf, x_off, row_bytes * n_rows as u64),
-            &norm_w,
-            &normed,
-            &norm_meta,
-        );
-        let (mut encoder, grouped) =
-            self.take_prefill_encoder("orangu-server batched decode attention encoder");
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server batched decode norm pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
-            pass.set_bind_group(0, &norm_bg, &[]);
-            pass.dispatch_workgroups(n_rows as u32, 1, 1);
-        }
-        let normed_bytes = row_bytes * n_rows as u64;
-        encoder.copy_buffer_to_buffer(&normed, 0, &q_g.x_buffer, q_g.x_offset, normed_bytes);
+        let rows_bytes = row_bytes * n_rows as u64;
+        let norm_into = |g: &CachedOpResources| {
+            self.elem4_bind_group(
+                BindSrc::Slice(x_buf, x_off, rows_bytes),
+                &norm_w,
+                BindSrc::Slice(&g.x_buffer, g.x_offset, rows_bytes),
+                &norm_meta,
+            )
+        };
+        let mut norm_bgs = vec![norm_into(&q_g)];
         if let Some((_, k_g, v_g)) = &kv_guards {
-            encoder.copy_buffer_to_buffer(&normed, 0, &k_g.x_buffer, k_g.x_offset, normed_bytes);
+            norm_bgs.push(norm_into(k_g));
             if let Some(g) = v_g {
-                encoder.copy_buffer_to_buffer(&normed, 0, &g.x_buffer, g.x_offset, normed_bytes);
+                norm_bgs.push(norm_into(g));
             }
         }
+        let (mut encoder, grouped) =
+            self.take_prefill_encoder("orangu-server batched decode attention encoder");
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server batched decode qkv pass"),
                 timestamp_writes: None,
             });
+            pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
+            for bg in &norm_bgs {
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(n_rows as u32, 1, 1);
+            }
             self.record_matmul(&mut pass, wq, &q_g);
             self.op_stamp(&mut pass, "bd.attn.wq");
             if let Some((proj, k_g, v_g)) = &kv_guards {
@@ -13146,46 +13940,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             (k_rows, v_rows)
         });
 
-        // Each sequence's rows into its own single-token regions, then its
-        // own attention.
-        let out = self.scratch_buffer(n_rows * q_dim);
-        for (i, row) in rows.iter_mut().enumerate() {
+        // Every sequence's rows into its own single-token regions first, and
+        // its attention output back after them all: each copy ends a compute
+        // pass, so copies between the sequences' passes cost a break apiece.
+        // A slot's entries are the cache's own (its attention dispatch binds
+        // the Q region of the slot that first attended through it), which is
+        // why the rows are copied rather than read where the batch wrote
+        // them.
+        for (i, row) in rows.iter().enumerate() {
             let slot = row.slot + slot_offset;
-            // The slot's own entries, locked only for the copies: the
-            // attention chain below locks them itself.
-            {
-                let sq = self.op_entry_for(wq, slot);
-                let sq_g = sq.lock().unwrap_or_else(|p| p.into_inner());
+            let sq = self.op_entry_for(wq, slot);
+            let sq_g = sq.lock().unwrap_or_else(|p| p.into_inner());
+            encoder.copy_buffer_to_buffer(
+                &q_rows,
+                (i * q_dim) as u64 * 4,
+                &sq_g.output_buffer,
+                sq_g.output_offset,
+                (q_dim as u64) * 4,
+            );
+            if let (Some((proj, ..)), Some((k_rows, v_rows))) = (&kv_guards, &kv_rows) {
+                let sk = self.op_entry_for(proj.wk, slot);
+                let sk_g = sk.lock().unwrap_or_else(|p| p.into_inner());
                 encoder.copy_buffer_to_buffer(
-                    &q_rows,
-                    (i * q_dim) as u64 * 4,
-                    &sq_g.output_buffer,
-                    sq_g.output_offset,
-                    (q_dim as u64) * 4,
+                    k_rows,
+                    (i * kv_dim) as u64 * 4,
+                    &sk_g.output_buffer,
+                    sk_g.output_offset,
+                    (kv_dim as u64) * 4,
                 );
-                if let (Some((proj, ..)), Some((k_rows, v_rows))) = (&kv_guards, &kv_rows) {
-                    let sk = self.op_entry_for(proj.wk, slot);
-                    let sk_g = sk.lock().unwrap_or_else(|p| p.into_inner());
+                if let (Some(wv), Some(v_rows)) = (proj.wv, v_rows) {
+                    let sv = self.op_entry_for(wv, slot);
+                    let sv_g = sv.lock().unwrap_or_else(|p| p.into_inner());
                     encoder.copy_buffer_to_buffer(
-                        k_rows,
+                        v_rows,
                         (i * kv_dim) as u64 * 4,
-                        &sk_g.output_buffer,
-                        sk_g.output_offset,
+                        &sv_g.output_buffer,
+                        sv_g.output_offset,
                         (kv_dim as u64) * 4,
                     );
-                    if let (Some(wv), Some(v_rows)) = (proj.wv, v_rows) {
-                        let sv = self.op_entry_for(wv, slot);
-                        let sv_g = sv.lock().unwrap_or_else(|p| p.into_inner());
-                        encoder.copy_buffer_to_buffer(
-                            v_rows,
-                            (i * kv_dim) as u64 * 4,
-                            &sv_g.output_buffer,
-                            sv_g.output_offset,
-                            (kv_dim as u64) * 4,
-                        );
-                    }
                 }
             }
+        }
+        let out = self.scratch_buffer(n_rows * q_dim);
+        let mut attn_outs = Vec::with_capacity(n_rows);
+        for row in rows.iter_mut() {
+            let slot = row.slot + slot_offset;
             // The solo path's own normed buffer for this slot, so the
             // layer's cached resources are built the same way whichever
             // path builds them first.
@@ -13196,7 +13995,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 n_swa => pos.saturating_sub(n_swa - 1),
             };
             let mut cursor = PassCursor::new(&mut encoder);
-            let attn_out = self.record_fused_attention(
+            attn_outs.push(self.record_fused_attention(
                 &mut cursor,
                 FusedAttnInput {
                     projections_ready: true,
@@ -13234,10 +14033,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     batch_slot: slot,
                     attn_ts: None,
                 },
-            );
+            ));
             drop(cursor);
+        }
+        for (i, attn_out) in attn_outs.iter().enumerate() {
             encoder.copy_buffer_to_buffer(
-                &attn_out,
+                attn_out,
                 0,
                 &out,
                 (i * q_dim) as u64 * 4,
@@ -13357,12 +14158,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// (`vulkan_shaders::shader_source_rmsnorm_add_scale`). Every other shader
     /// leaves `out_scale` at `0.0` (via `elem_meta_buffer`) and never reads it.
     fn elem_meta_buffer_scaled(&self, len: u32, extra: f32, out_scale: f32) -> wgpu::Buffer {
-        let meta = ElemMeta {
+        self.elem_meta_buffer_of(ElemMeta {
             len,
             aux: 0,
             extra,
             out_scale,
-        };
+        })
+    }
+
+    /// A meta buffer holding `meta` as given, every field the caller's.
+    fn elem_meta_buffer_of(&self, meta: ElemMeta) -> wgpu::Buffer {
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server elem meta scaled"),
             size: std::mem::size_of::<ElemMeta>() as u64,
@@ -13477,6 +14282,43 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     resource: meta.resource(),
                 },
             ],
+        })
+    }
+
+    /// See `recurrent_rows_bind_group_layout`: three read-only, two
+    /// read-write, the meta, the rows' states.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_rows_bind_group<'a>(
+        &self,
+        a: impl Into<BindSrc<'a>>,
+        b: impl Into<BindSrc<'a>>,
+        c: impl Into<BindSrc<'a>>,
+        d: impl Into<BindSrc<'a>>,
+        e: impl Into<BindSrc<'a>>,
+        meta: impl Into<BindSrc<'a>>,
+        row_states: impl Into<BindSrc<'a>>,
+    ) -> wgpu::BindGroup {
+        let srcs: [BindSrc<'a>; 7] = [
+            a.into(),
+            b.into(),
+            c.into(),
+            d.into(),
+            e.into(),
+            meta.into(),
+            row_states.into(),
+        ];
+        let entries: Vec<wgpu::BindGroupEntry<'_>> = srcs
+            .iter()
+            .enumerate()
+            .map(|(i, src)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: src.resource(),
+            })
+            .collect();
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server recurrent rows bind group"),
+            layout: &self.recurrent_rows_bind_group_layout,
+            entries: &entries,
         })
     }
 
@@ -15034,7 +15876,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             && meta_embd_post.is_none()
             && !Self::capture_active()
             && (attn_post_norm_w.is_some() || add_norm_pair());
-        let ffn_q8 = (self.decode_mmvq
+        let ffn_q8 = (self.decode_mmvq()
             && norm_pair_applies
             && n_embd / 4 <= vulkan_shaders::NORM_WIDE_SLOTS * vulkan_shaders::NORM_WIDE_WG
             && gate_g.mmvq.is_some()
@@ -15160,7 +16002,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 &meta_ffn_plain,
             )
         });
-        let down_q8 = (self.decode_mmvq
+        let down_q8 = (self.decode_mmvq()
             && bg_gelu_mul.is_some()
             && down_g.mmvq.is_some()
             && ffn_len.is_multiple_of(32))
@@ -16805,7 +17647,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let n = storage("orangu-server hybrid normed");
                     // The q8 twin, in the per-op quantize's layout.
                     let n_q8 =
-                        (self.decode_mmvq && self.q8_quantize_pipeline.is_some()).then(|| {
+                        (self.decode_mmvq() && self.q8_quantize_pipeline.is_some()).then(|| {
                             let len = (n_embd / 32 * 10) as u64 * 4;
                             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                                 label: Some("orangu-server hybrid normed q8"),
@@ -17730,21 +18572,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         };
 
         // The prep kernel's constants and meta, and its pipeline.
-        if !core.res.consts_uploaded {
-            let mut consts: Vec<f32> = Vec::with_capacity(conv_channels * d_conv + 2 * n_v);
-            consts.extend_from_slice(conv_kernel);
-            consts.extend_from_slice(dt_bias);
-            consts.extend_from_slice(ssm_a);
-            self.queue
-                .write_buffer(&core.res.consts, 0, bytemuck::cast_slice(&consts));
-            let mut cache = self
-                .gated_delta_resources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(r) = cache.get_mut(&ssm_out.cache_key()) {
-                r.consts_uploaded = true;
-            }
-        }
+        self.upload_recurrent_consts(&core, conv_kernel, dt_bias, ssm_a);
         let prep_meta = ElemMeta {
             len: core.layout.inputs_off() as u32,
             aux: core.layout.conv_off() as u32,
@@ -17877,6 +18705,330 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         self.record_recurrent_delta_and_out(encoder, &core, true);
         Some(self.finish_recurrent_recorded(core))
+    }
+
+    /// The prep kernel's constants `[conv kernel | dt_bias | A]`, uploaded
+    /// on the layer's first call.
+    fn upload_recurrent_consts(
+        &self,
+        core: &RecurrentPrepared<'_>,
+        conv_kernel: &[f32],
+        dt_bias: &[f32],
+        ssm_a: &[f32],
+    ) {
+        if core.res.consts_uploaded {
+            return;
+        }
+        let mut consts: Vec<f32> =
+            Vec::with_capacity(conv_kernel.len() + dt_bias.len() + ssm_a.len());
+        consts.extend_from_slice(conv_kernel);
+        consts.extend_from_slice(dt_bias);
+        consts.extend_from_slice(ssm_a);
+        self.queue
+            .write_buffer(&core.res.consts, 0, bytemuck::cast_slice(&consts));
+        let mut cache = self
+            .gated_delta_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(r) = cache.get_mut(&core.ssm_out.cache_key()) {
+            r.consts_uploaded = true;
+        }
+    }
+
+    /// A recurrent layer over `n_rows` consecutive tokens with the residual
+    /// stream on the device — a speculative verify's rows, recorded into
+    /// the open prefill group like the resident stream's other chains: the
+    /// attention norm over `x`'s rows, the four projections once over all of
+    /// them, then the conv step and the delta rule walking the tokens in
+    /// order inside one dispatch each (`shader_source_recurrent_prep_rows`,
+    /// `shader_source_gated_delta_rows`), the state stepped in place in its
+    /// mirror. Returns where the gated rows `[n_rows, n_v · head_dim]` are,
+    /// `(buffer, byte offset)` — `ssm_out`'s input; the caller records
+    /// `ssm_out` and what follows (`fused_post_attention_prefill_rows`).
+    /// With `keep_rows` (a verify's, whose later rows may be rejected) the
+    /// state behind every row but the last is kept on the mirror
+    /// (`DeviceStateMirror::restore_row`). `None`, with nothing recorded,
+    /// for a folded layer or a shape outside the kernels.
+    pub fn record_recurrent_rows(
+        &self,
+        x: (&wgpu::Buffer, u64),
+        attn_norm: &[f32],
+        n_rows: usize,
+        keep_rows: bool,
+        input: RecurrentLayerInput<'_>,
+    ) -> Option<(wgpu::Buffer, u64)> {
+        let RecurrentLayerInput {
+            normed: _,
+            qkv_rotation,
+            ba_rotation,
+            wqkv,
+            wgate,
+            wbeta,
+            walpha,
+            conv_kernel,
+            d_conv,
+            dt_bias,
+            ssm_a,
+            state,
+            ssm_norm,
+            eps,
+            sigmoid_gate,
+            grouped,
+            n_k,
+            n_v,
+            head_dim,
+            out_rotation,
+            ssm_out,
+            batch_slot,
+        } = input;
+        if qkv_rotation.is_some() || ba_rotation.is_some() || out_rotation.is_some() {
+            return None;
+        }
+        let hd = head_dim;
+        let n_embd = wqkv.in_dim;
+        let key_dim = n_k * hd;
+        let value_dim = n_v * hd;
+        let conv_channels = 2 * key_dim + value_dim;
+        if attn_norm.len() != n_embd
+            || wqkv.out_dim != conv_channels
+            || [wgate, wbeta, walpha].iter().any(|w| w.in_dim != n_embd)
+            || wgate.out_dim != value_dim
+            || wbeta.out_dim != n_v
+            || walpha.out_dim != n_v
+            || conv_kernel.len() != conv_channels * d_conv
+            || dt_bias.len() != n_v
+            || ssm_a.len() != n_v
+            || state.conv.len() != conv_channels * (d_conv - 1)
+            || !(1..=8).contains(&d_conv)
+            || !hd.is_multiple_of(4)
+            || n_rows == 0
+        {
+            return None;
+        }
+        let core = self.recurrent_core(RecurrentCore {
+            state,
+            ssm_norm,
+            eps,
+            sigmoid_gate,
+            grouped,
+            n_k,
+            n_v,
+            head_dim,
+            out_rotation: None,
+            ssm_out,
+            batch_slot,
+        })?;
+        self.upload_recurrent_consts(&core, conv_kernel, dt_bias, ssm_a);
+        let state_len = core.layout.state_len;
+        let conv_len = core.layout.conv_len;
+        let (prep, delta) = {
+            let key = (
+                conv_channels as u32,
+                d_conv as u32,
+                hd as u32,
+                n_k as u32,
+                n_v as u32,
+                sigmoid_gate,
+                grouped,
+            );
+            let mut pipelines = self
+                .recurrent_rows_pipelines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pipelines
+                .entry(key)
+                .or_insert_with(|| {
+                    let build = |label: &str, source: String| {
+                        let module =
+                            self.device
+                                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                                    label: Some(label),
+                                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                                });
+                        self.device
+                            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                                label: Some(label),
+                                layout: Some(&self.recurrent_rows_pipeline_layout),
+                                module: &module,
+                                entry_point: Some("main"),
+                                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                                cache: None,
+                            })
+                    };
+                    (
+                        build(
+                            "orangu-server recurrent prep rows",
+                            vulkan_shaders::shader_source_recurrent_prep_rows(
+                                key.0,
+                                key.1,
+                                value_dim as u32,
+                                key.4,
+                                state_len as u32,
+                            ),
+                        ),
+                        build(
+                            "orangu-server gated delta rows",
+                            vulkan_shaders::shader_source_gated_delta_rows(
+                                key.2,
+                                key.3,
+                                key.4,
+                                sigmoid_gate,
+                                grouped,
+                                conv_len as u32,
+                            ),
+                        ),
+                    )
+                })
+                .clone()
+        };
+
+        let _region_guard = self.prefill_region_guard();
+        let projections = [wqkv, wgate, wbeta, walpha];
+        let entries: Vec<_> = projections
+            .iter()
+            .enumerate()
+            .map(|(k, w)| {
+                self.op_entry_at(
+                    &MatmulOp {
+                        x: &[],
+                        n_tokens: n_rows,
+                        w,
+                    },
+                    0,
+                    ROLE_RECURRENT + k,
+                )
+            })
+            .collect();
+        let guards: Vec<_> = entries
+            .iter()
+            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()))
+            .collect();
+        let row_elems = n_rows * n_embd;
+        let normed = self.scratch_buffer(row_elems);
+        let norm_w = self.upload_new(attn_norm);
+        let meta_embd = self.elem_meta_buffer(n_embd as u32, eps);
+        let bg_norm = self.elem4_bind_group(
+            BindSrc::Slice(x.0, x.1, (row_elems as u64) * 4),
+            &norm_w,
+            &normed,
+            &meta_embd,
+        );
+        let stage = projections
+            .iter()
+            .any(|w| self.mmq_for(w, n_rows))
+            .then(|| self.mmq_stage(BindSrc::Whole(&normed), n_rows, n_embd));
+        // The projections back to back, in the prep kernel's order, and the
+        // rows' delta inputs followed by their outputs.
+        let proj_len = n_rows * (conv_channels + value_dim + 2 * n_v);
+        let proj = self.scratch_buffer(proj_len);
+        let inp = conv_channels + 2 * n_v + value_dim;
+        let out_off = n_rows * inp;
+        let rows = self.scratch_buffer(out_off + n_rows * value_dim);
+        // `out_scale` set: the kernels write the states behind the rows. Off,
+        // the binding is the rows' own buffer, which they then never touch.
+        let keep = if keep_rows { 1.0 } else { 0.0 };
+        let row_states = if keep_rows {
+            core.mirror.row_states_for(n_rows - 1)
+        } else {
+            rows.clone()
+        };
+        let prep_meta = self.elem_meta_buffer_of(ElemMeta {
+            len: n_rows as u32,
+            aux: core.layout.conv_off() as u32,
+            extra: 0.0,
+            out_scale: keep,
+        });
+        let delta_meta = self.elem_meta_buffer_of(ElemMeta {
+            len: n_rows as u32,
+            aux: out_off as u32,
+            extra: eps,
+            out_scale: keep,
+        });
+        let bg_prep = self.recurrent_rows_bind_group(
+            &proj,
+            &core.res.consts,
+            &core.res.consts,
+            &core.scratch,
+            &rows,
+            &prep_meta,
+            &row_states,
+        );
+        let bg_delta = self.recurrent_rows_bind_group(
+            &core.res.norm,
+            &core.res.norm,
+            &core.res.norm,
+            &core.scratch,
+            &rows,
+            &delta_meta,
+            &row_states,
+        );
+
+        let (mut encoder, grouped_enc) =
+            self.take_prefill_encoder("orangu-server recurrent rows encoder");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server recurrent rows norm pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
+            pass.set_bind_group(0, &bg_norm, &[]);
+            pass.dispatch_workgroups(n_rows as u32, 1, 1);
+            self.op_stamp(&mut pass, "rr.norm");
+        }
+        // The float kernels read their entry's own input region.
+        for (w, g) in projections.iter().zip(&guards) {
+            if stage.is_none() || !self.mmq_for(w, n_rows) {
+                encoder.copy_buffer_to_buffer(
+                    &normed,
+                    0,
+                    &g.x_buffer,
+                    g.x_offset,
+                    (row_elems as u64) * 4,
+                );
+            }
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server recurrent rows projection pass"),
+                timestamp_writes: None,
+            });
+            if let Some((_, qbg, qwg, _)) = &stage {
+                self.record_mmq_quantize(&mut pass, qbg, *qwg);
+            }
+            for (w, g) in projections.iter().zip(&guards) {
+                self.record_projection(&mut pass, w, g, stage.as_ref().map(|s| &s.0), n_rows);
+            }
+            self.op_stamp(&mut pass, "rr.proj");
+        }
+        let mut at = 0u64;
+        for (w, g) in projections.iter().zip(&guards) {
+            let bytes = (n_rows * w.out_dim) as u64 * 4;
+            encoder.copy_buffer_to_buffer(&g.output_buffer, g.output_offset, &proj, at, bytes);
+            at += bytes;
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server recurrent rows step pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&prep);
+            pass.set_bind_group(0, &bg_prep, &[]);
+            pass.dispatch_workgroups(self.strided_workgroups(inp), 1, 1);
+            self.op_stamp(&mut pass, "rr.prep");
+            pass.set_pipeline(&delta);
+            pass.set_bind_group(0, &bg_delta, &[]);
+            pass.dispatch_workgroups(n_v as u32, 1, 1);
+            self.op_stamp(&mut pass, "rr.delta");
+        }
+        self.park_or_submit(encoder, grouped_enc);
+        drop(guards);
+        *core.fresh = crate::engine::kv_cache::Fresh::Device;
+        if keep_rows {
+            core.mirror
+                .row_states_current
+                .store(n_rows - 1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some((rows, (out_off as u64) * 4))
     }
 
     /// What the two recurrent entry points share: the shape checks, the
@@ -18041,13 +19193,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 layout,
                 backend: self.identity(),
                 bind_groups: Mutex::new(HashMap::new()),
+                row_states: Mutex::new(None),
+                row_states_current: std::sync::atomic::AtomicUsize::new(0),
             }));
             *fresh = crate::engine::kv_cache::Fresh::Host;
         }
+        let mirror: &'a Option<Box<dyn crate::engine::kv_cache::DeviceStateMirror>> = mirror;
         let vm = mirror
             .as_ref()
             .and_then(|m| m.as_any().downcast_ref::<VulkanStateMirror>())
             .expect("the mirror was just checked or made");
+        // A step of any kind leaves the rows behind the last rows pass
+        // stale; that pass marks its own afterwards.
+        vm.row_states_current
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let scratch = vm.scratch.clone();
         let bgs = {
             let key: RecurrentBgKey = (
@@ -18110,6 +19269,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             eps,
             out_rotation,
             ssm_out,
+            mirror: vm,
         })
     }
 
@@ -18926,6 +20086,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.prefill_fused_attn
     }
 
+    /// Brings home the rows only `cache`'s device mirrors hold — see
+    /// [`crate::engine::kv_cache::LayerCache::fetch_device_rows`].
+    pub fn fetch_kv_rows(&self, cache: &mut crate::engine::kv_cache::KvCache) -> bool {
+        cache.fetch_device_rows(&self.device, &self.queue)
+    }
+
     /// Brings `cache`'s device mirror up to date for `n_head` heads — what
     /// [`Self::gpu_attention_prefill`] does first, as its own step, for a
     /// caller that times the upload apart from the attention.
@@ -19070,12 +20236,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             entries: &entries,
         });
 
-        let (prefill_pipeline, grid_x, grid_y) = self.attn_prefill_dispatch(
-            head_dim,
-            n_head,
-            n_head_kv,
-            n_tokens,
-            Self::kv_paging_for(paged.is_some(), cache.ring_rows()),
+        let paging = Self::kv_paging_for(paged.is_some(), cache.ring_rows());
+        let (prefill_pipeline, grid_x, grid_y) =
+            self.attn_prefill_dispatch(head_dim, n_head, n_head_kv, n_tokens, paging);
+        let split = self.attn_prefill_split_form(
+            &AttnPrefillShape {
+                head_dim,
+                n_head,
+                n_tokens,
+                start_pos,
+                n_swa,
+                causal,
+            },
+            paging,
+            &entries,
+            BindSrc::Slice(out_buf, 0, out_len as u64 * 4),
         );
         let mut encoder = self.new_encoder("orangu-server prefill attention encoder");
         {
@@ -19083,9 +20258,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 label: Some("orangu-server prefill attention pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&prefill_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid_x, grid_y, 1);
+            match &split {
+                Some(split) => self.record_attn_prefill_split(&mut pass, split, grid_x, grid_y),
+                None => {
+                    pass.set_pipeline(&prefill_pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.dispatch_workgroups(grid_x, grid_y, 1);
+                }
+            }
         }
         self.submit_and_readback(encoder, out_buf, 0, out_len)
     }
@@ -19482,6 +20662,93 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             n_tokens,
             w: wq,
         };
+        // The cache's own rows, synced before the region guard is taken: the
+        // sync converts rows on the thread pool, whose join may run another
+        // request's prefill on this thread, and that prefill takes the guard.
+        // Resolved before the meta because the meta carries the page geometry.
+        // This call appends exactly `n_tokens` positions starting here, and a
+        // range that long generally crosses page boundaries — so unlike the
+        // decode step it gets back a list of runs rather than one row.
+        //
+        // A layer without its own K/V reads a donor's cache, which the donor
+        // has already advanced past this batch — so for it the range is the
+        // batch's own positions, not `len` onward. Asked from `len`, the pool
+        // handed out pages for positions nothing would ever write, and a
+        // sequence reserved for exactly its capacity outgrew its block table
+        // one layer in.
+        let write_pos = if kv.is_some() { cache.len } else { start_pos };
+        let paged = cache.paged_range_refs(&self.queue, write_pos, n_tokens);
+        // The write, as runs. A contiguous cache is the one-run case, so the
+        // cast dispatches and the `f32` copies below are written once and both
+        // paths take the same code — the mirror is simply a pool of one very
+        // large page.
+        let write_runs: Vec<crate::engine::kv_cache::PageRun> = match &paged {
+            Some(p) => p.runs.clone(),
+            // The mirror's rows for these positions — one run, or two where
+            // a ring wraps.
+            None => cache.mirror_write_runs(write_pos, n_tokens),
+        };
+
+        // Attention writes into this stripe's slice of the caller's buffer.
+        let out_byte_off = (out_row * n_head * head_dim) as u64 * 4;
+        let out_slice = BindSrc::Slice(out_buf, out_byte_off, (q_elems as u64) * 4);
+        let attn_meta = AttnMeta {
+            n_head: n_head as u32,
+            n_head_kv: n_head_kv as u32,
+            head_dim: head_dim as u32,
+            window_start: 0,
+            n_pos: 0,
+            capacity: cache.capacity() as u32,
+            scale,
+            start_pos: start_pos as u32,
+            n_query: n_tokens as u32,
+            n_swa: n_swa as u32,
+            causal: u32::from(causal),
+            kv_page_base: paged.as_ref().map_or(0, |p| p.table_base),
+            kv_page_tokens: paged.as_ref().map_or(0, |p| p.page_tokens),
+            kv_ring_rows: cache.ring_rows().unwrap_or(0),
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let attn_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server fused prefill attention meta"),
+            size: std::mem::size_of::<AttnMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&attn_meta_buf, 0, bytemuck::bytes_of(&attn_meta));
+
+        // The pool's pages, or the per-request mirror when there are none.
+        let (kv_buf, probs_buf, k_off, k_size, v_off, v_size) = match &paged {
+            Some(p) => {
+                cache.pool_scratch(&self.device, n_head, self.kv_storage);
+                let probs = cache
+                    .probs_scratch()
+                    .expect("pool_scratch built the mirror above");
+                (p.layer_buffer.clone(), probs, 0u64, p.half, p.half, p.half)
+            }
+            None => {
+                // Sized for the rows this call writes (a KV-owning layer) or
+                // reads past `len` (a donor's window), not for one.
+                let kv_refs = cache.sync_gpu_ahead(
+                    &self.device,
+                    &self.queue,
+                    n_head,
+                    self.kv_storage,
+                    (write_pos + n_tokens).saturating_sub(cache.len),
+                );
+                (
+                    kv_refs.buffer.clone(),
+                    kv_refs.probs.clone(),
+                    kv_refs.k_off,
+                    kv_refs.k_size,
+                    kv_refs.v_off,
+                    kv_refs.v_size,
+                )
+            }
+        };
+
         // Q/K/V are live together in one submission, so each takes its own
         // pooled-region slot (see `pooled_regions`).
         let _region_guard = self.prefill_region_guard();
@@ -19575,90 +20842,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 );
                 let bg = self.elem3_bind_group(&ff_buf, q_g.output_src(), &meta);
                 PrefillKNormRope::RopeOnly { bg, _meta: meta }
-            }
-        };
-
-        // Resolved before the meta because the meta carries the page geometry.
-        // This call appends exactly `n_tokens` positions starting here, and a
-        // range that long generally crosses page boundaries — so unlike the
-        // decode step it gets back a list of runs rather than one row.
-        //
-        // A layer without its own K/V reads a donor's cache, which the donor
-        // has already advanced past this batch — so for it the range is the
-        // batch's own positions, not `len` onward. Asked from `len`, the pool
-        // handed out pages for positions nothing would ever write, and a
-        // sequence reserved for exactly its capacity outgrew its block table
-        // one layer in.
-        let write_pos = if kv.is_some() { cache.len } else { start_pos };
-        let paged = cache.paged_range_refs(&self.queue, write_pos, n_tokens);
-        // The write, as runs. A contiguous cache is the one-run case, so the
-        // cast dispatches and the `f32` copies below are written once and both
-        // paths take the same code — the mirror is simply a pool of one very
-        // large page.
-        let write_runs: Vec<crate::engine::kv_cache::PageRun> = match &paged {
-            Some(p) => p.runs.clone(),
-            // The mirror's rows for these positions — one run, or two where
-            // a ring wraps.
-            None => cache.mirror_write_runs(write_pos, n_tokens),
-        };
-
-        // Attention writes into this stripe's slice of the caller's buffer.
-        let out_byte_off = (out_row * n_head * head_dim) as u64 * 4;
-        let out_slice = BindSrc::Slice(out_buf, out_byte_off, (q_elems as u64) * 4);
-        let attn_meta = AttnMeta {
-            n_head: n_head as u32,
-            n_head_kv: n_head_kv as u32,
-            head_dim: head_dim as u32,
-            window_start: 0,
-            n_pos: 0,
-            capacity: cache.capacity() as u32,
-            scale,
-            start_pos: start_pos as u32,
-            n_query: n_tokens as u32,
-            n_swa: n_swa as u32,
-            causal: u32::from(causal),
-            kv_page_base: paged.as_ref().map_or(0, |p| p.table_base),
-            kv_page_tokens: paged.as_ref().map_or(0, |p| p.page_tokens),
-            kv_ring_rows: cache.ring_rows().unwrap_or(0),
-            _pad1: 0,
-            _pad2: 0,
-        };
-        let attn_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server fused prefill attention meta"),
-            size: std::mem::size_of::<AttnMeta>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue
-            .write_buffer(&attn_meta_buf, 0, bytemuck::bytes_of(&attn_meta));
-
-        // The pool's pages, or the per-request mirror when there are none.
-        let (kv_buf, probs_buf, k_off, k_size, v_off, v_size) = match &paged {
-            Some(p) => {
-                cache.pool_scratch(&self.device, n_head, self.kv_storage);
-                let probs = cache
-                    .probs_scratch()
-                    .expect("pool_scratch built the mirror above");
-                (p.layer_buffer.clone(), probs, 0u64, p.half, p.half, p.half)
-            }
-            None => {
-                // Sized for the rows this call writes (a KV-owning layer) or
-                // reads past `len` (a donor's window), not for one.
-                let kv_refs = cache.sync_gpu_ahead(
-                    &self.device,
-                    &self.queue,
-                    n_head,
-                    self.kv_storage,
-                    (write_pos + n_tokens).saturating_sub(cache.len),
-                );
-                (
-                    kv_refs.buffer.clone(),
-                    kv_refs.probs.clone(),
-                    kv_refs.k_off,
-                    kv_refs.k_size,
-                    kv_refs.v_off,
-                    kv_refs.v_size,
-                )
             }
         };
 
@@ -19863,6 +21046,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             n_tokens,
             Self::kv_paging_for(paged.is_some(), cache.ring_rows()),
         );
+        let attn_split = self.attn_prefill_split_form(
+            &AttnPrefillShape {
+                head_dim,
+                n_head,
+                n_tokens,
+                start_pos,
+                n_swa,
+                causal,
+            },
+            Self::kv_paging_for(paged.is_some(), cache.ring_rows()),
+            &attn_entries,
+            BindSrc::Slice(out_buf, out_byte_off, (q_elems as u64) * 4),
+        );
 
         let (mut encoder, grouped) =
             self.take_prefill_encoder("orangu-server fused prefill attention encoder");
@@ -19932,74 +21128,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 label: Some("orangu-server fused prefill qkv pass"),
                 timestamp_writes: None,
             });
-            // The projections on the integer-dot GEMM where every one of
-            // them fits it — the normed rows quantized once for all three
-            // — and on the float kernels otherwise.
+            // Each projection on the integer-dot GEMM where it fits it, the
+            // normed rows quantized once for all that do, and on the float
+            // kernel otherwise: one `Q6_K` V must not take a `Q4_K` Q and K
+            // off the integer dot with it.
             let mmq_qkv = {
-                let all_fit = self.mmq_for(wq, n_tokens)
-                    && kv_side.as_ref().is_none_or(|(proj, ..)| {
+                let any_fit = self.mmq_for(wq, n_tokens)
+                    || attn_gate.is_some_and(|w| self.mmq_for(w, n_tokens))
+                    || kv_side.as_ref().is_some_and(|(proj, ..)| {
                         self.mmq_for(proj.wk, n_tokens)
-                            && proj.wv.is_none_or(|wv| self.mmq_for(wv, n_tokens))
+                            || proj.wv.is_some_and(|wv| self.mmq_for(wv, n_tokens))
                     });
-                all_fit.then(|| self.mmq_stage(BindSrc::Whole(&normed_staging), n_tokens, n_embd))
+                any_fit.then(|| self.mmq_stage(BindSrc::Whole(&normed_staging), n_tokens, n_embd))
             };
-            match &mmq_qkv {
-                Some((q8, qbg, qwg, _)) => {
-                    self.record_mmq_quantize(&mut pass, qbg, *qwg);
-                    self.op_stamp(&mut pass, "pp.attn.quantize");
-                    let op = self.mmq_op(wq, &q_g, q8);
-                    self.record_mmq(&mut pass, &op.0, op.1, op.2);
-                    self.op_stamp(&mut pass, "pp.attn.wq");
-                    if let (Some(w), Some(g)) = (attn_gate, &gate_g) {
-                        match self
-                            .mmq_for(w, n_tokens)
-                            .then_some(mmq_qkv.as_ref())
-                            .flatten()
-                        {
-                            Some((q8, ..)) => {
-                                let op = self.mmq_op(w, g, q8);
-                                self.record_mmq(&mut pass, &op.0, op.1, op.2);
-                            }
-                            None => self.record_matmul(&mut pass, w, g),
-                        }
-                        self.op_stamp(&mut pass, "pp.attn.gate");
-                    }
-                    if let Some((proj, k_g, v_g, ..)) = &kv_side {
-                        let op = self.mmq_op(proj.wk, k_g, q8);
-                        self.record_mmq(&mut pass, &op.0, op.1, op.2);
-                        self.op_stamp(&mut pass, "pp.attn.wk");
-                        if let (Some(wv), Some(g)) = (proj.wv, v_g) {
-                            let op = self.mmq_op(wv, g, q8);
-                            self.record_mmq(&mut pass, &op.0, op.1, op.2);
-                            self.op_stamp(&mut pass, "pp.attn.wv");
-                        }
-                    }
-                }
-                None => {
-                    self.record_matmul(&mut pass, wq, &q_g);
-                    self.op_stamp(&mut pass, "pp.attn.wq");
-                    if let (Some(w), Some(g)) = (attn_gate, &gate_g) {
-                        match self
-                            .mmq_for(w, n_tokens)
-                            .then_some(mmq_qkv.as_ref())
-                            .flatten()
-                        {
-                            Some((q8, ..)) => {
-                                let op = self.mmq_op(w, g, q8);
-                                self.record_mmq(&mut pass, &op.0, op.1, op.2);
-                            }
-                            None => self.record_matmul(&mut pass, w, g),
-                        }
-                        self.op_stamp(&mut pass, "pp.attn.gate");
-                    }
-                    if let Some((proj, k_g, v_g, ..)) = &kv_side {
-                        self.record_matmul(&mut pass, proj.wk, k_g);
-                        self.op_stamp(&mut pass, "pp.attn.wk");
-                        if let (Some(wv), Some(g)) = (proj.wv, v_g) {
-                            self.record_matmul(&mut pass, wv, g);
-                            self.op_stamp(&mut pass, "pp.attn.wv");
-                        }
-                    }
+            if let Some((_, qbg, qwg, _)) = &mmq_qkv {
+                self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                self.op_stamp(&mut pass, "pp.attn.quantize");
+            }
+            let q8 = mmq_qkv.as_ref().map(|(q8, ..)| q8);
+            self.record_projection(&mut pass, wq, &q_g, q8, n_tokens);
+            self.op_stamp(&mut pass, "pp.attn.wq");
+            if let (Some(w), Some(g)) = (attn_gate, &gate_g) {
+                self.record_projection(&mut pass, w, g, q8, n_tokens);
+                self.op_stamp(&mut pass, "pp.attn.gate");
+            }
+            if let Some((proj, k_g, v_g, ..)) = &kv_side {
+                self.record_projection(&mut pass, proj.wk, k_g, q8, n_tokens);
+                self.op_stamp(&mut pass, "pp.attn.wk");
+                if let (Some(wv), Some(g)) = (proj.wv, v_g) {
+                    self.record_projection(&mut pass, wv, g, q8, n_tokens);
+                    self.op_stamp(&mut pass, "pp.attn.wv");
                 }
             }
 
@@ -20193,9 +21351,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 timestamp_writes: None,
             });
             if split_window.is_none() {
-                pass.set_pipeline(&attn_pipeline);
-                pass.set_bind_group(0, &attn_bg, &[]);
-                pass.dispatch_workgroups(grid_x, grid_y, 1);
+                match &attn_split {
+                    Some(split) => self.record_attn_prefill_split(&mut pass, split, grid_x, grid_y),
+                    None => {
+                        pass.set_pipeline(&attn_pipeline);
+                        pass.set_bind_group(0, &attn_bg, &[]);
+                        pass.dispatch_workgroups(grid_x, grid_y, 1);
+                    }
+                }
                 self.op_stamp(&mut pass, "pp.attn.attention");
             }
             if let Some(g) = &gate_g {
@@ -22269,7 +23432,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             };
 
         let producer_q8: [Option<wgpu::BindGroup>; 4] = match input.normed_q8 {
-            Some((q8, len)) if self.decode_mmvq => {
+            Some((q8, len)) if self.decode_mmvq() => {
                 let bg = |w: &QuantMatrix, g: &CachedOpResources| {
                     (g.mmvq.is_some() && self.mmvq_pipeline_for(w, 1).is_some())
                         .then(|| self.matmul_bind_group_with_input(w, q8, 0, len, g))
@@ -22375,7 +23538,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let tile = vulkan_shaders::FaPrefillTile::for_head_dim(head_dim as u32);
         if self.prefill_tiled_attn && head_dim.is_multiple_of(8 * tile.dlanes as usize) {
             return (
-                self.attn_prefill_tiled_pipeline_for(head_dim, paging, tile),
+                self.attn_prefill_tiled_pipeline_for(head_dim, paging, tile, false),
                 n_tokens.div_ceil(4 * tile.rows as usize) as u32,
                 n_head as u32,
             );
@@ -22394,6 +23557,124 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         )
     }
 
+    /// The split form of a pass's tiled attention, ready to record: `None`
+    /// when [`Self::attn_prefill_splits`] keeps the pass whole. `entries`
+    /// are the whole form's bindings; the runs' partials bind where its
+    /// scratch and output do, and the reduce writes `out`.
+    fn attn_prefill_split_form(
+        &self,
+        shape: &AttnPrefillShape,
+        paging: vulkan_shaders::KvPaging,
+        entries: &[wgpu::BindGroupEntry<'_>],
+        out: BindSrc<'_>,
+    ) -> Option<AttnPrefillSplit> {
+        let AttnPrefillShape {
+            head_dim,
+            n_head,
+            n_tokens,
+            start_pos,
+            n_swa,
+            causal,
+        } = *shape;
+        if !causal || n_tokens < 2 {
+            return None;
+        }
+        // The longest window a query of the pass reads.
+        let span = if n_swa > 0 {
+            (n_swa + n_tokens - 1).min(start_pos + n_tokens)
+        } else {
+            start_pos + n_tokens
+        };
+        let splits = self.attn_prefill_splits(head_dim, n_head, n_tokens, span);
+        if splits < 2 {
+            return None;
+        }
+        let tile = vulkan_shaders::FaPrefillTile::for_head_dim(head_dim as u32);
+        let paged = matches!(paging, vulkan_shaders::KvPaging::Paged);
+        let pipeline = self.attn_prefill_tiled_pipeline_for(head_dim, paging, tile, true);
+        let partial_ml = self.scratch_buffer(n_tokens * n_head * splits as usize * 2);
+        let partial_acc = self.scratch_buffer(n_tokens * n_head * splits as usize * head_dim);
+        let mut entries = entries.to_vec();
+        entries[3].resource = partial_ml.as_entire_binding();
+        entries[4].resource = partial_acc.as_entire_binding();
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server split prefill attention bind group"),
+            layout: self.attn_bind_layout_for(paged),
+            entries: &entries,
+        });
+        let reduce_meta = AttnReduceMeta {
+            head_dim: head_dim as u32,
+            k_num: splits,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let reduce_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server split prefill attention reduce meta"),
+            size: std::mem::size_of::<AttnReduceMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&reduce_meta_buf, 0, bytemuck::bytes_of(&reduce_meta));
+        let reduce = self.elem4_bind_group(&partial_ml, &partial_acc, out, &reduce_meta_buf);
+        Some(AttnPrefillSplit {
+            pipeline,
+            bind_group,
+            splits,
+            reduce,
+            rows: (n_tokens * n_head) as u32,
+        })
+    }
+
+    /// Records [`Self::attn_prefill_split_form`]'s two dispatches over the
+    /// whole form's grid.
+    fn record_attn_prefill_split(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        split: &AttnPrefillSplit,
+        grid_x: u32,
+        grid_y: u32,
+    ) {
+        pass.set_pipeline(&split.pipeline);
+        pass.set_bind_group(0, &split.bind_group, &[]);
+        pass.dispatch_workgroups(grid_x, grid_y, split.splits);
+        pass.set_pipeline(&self.attn_split_reduce_pipeline);
+        pass.set_bind_group(0, &split.reduce, &[]);
+        pass.dispatch_workgroups(split.rows, 1, 1);
+    }
+
+    /// How many runs of the window a narrow pass's tiled attention splits
+    /// into, `1` for none. A pass of a few queries is a few tiles, one
+    /// workgroup per tile and head, each walking the whole window: at five
+    /// queries and eight heads, eight workgroups on the card. Split over
+    /// positions, the dispatch reaches `ORANGU_ATTN_PREFILL_SPLIT`
+    /// workgroups (default 256; `0` is off), each run at least two blocks
+    /// of positions long, and the decode step's reduce merges the runs.
+    /// `span` is the longest window a query of the pass reads.
+    fn attn_prefill_splits(
+        &self,
+        head_dim: usize,
+        n_head: usize,
+        n_tokens: usize,
+        span: usize,
+    ) -> u32 {
+        let tile = vulkan_shaders::FaPrefillTile::for_head_dim(head_dim as u32);
+        if !self.prefill_tiled_attn || !head_dim.is_multiple_of(8 * tile.dlanes as usize) {
+            return 1;
+        }
+        let target = attn_prefill_split_target();
+        let workgroups = n_tokens.div_ceil(4 * tile.rows as usize) * n_head;
+        if target == 0 || workgroups >= target {
+            return 1;
+        }
+        let block = (tile.cols * tile.lanes / tile.dlanes) as usize;
+        let splits = target
+            .div_ceil(workgroups)
+            .min(span / (2 * block))
+            .min(ATTN_PREFILL_MAX_SPLITS);
+        splits.max(1) as u32
+    }
+
     /// The tiled prefill attention pipeline for this `head_dim`, built on
     /// first use into `attn_prefill_pipelines` under its own key.
     fn attn_prefill_tiled_pipeline_for(
@@ -22401,12 +23682,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         head_dim: usize,
         paging: vulkan_shaders::KvPaging,
         tile: vulkan_shaders::FaPrefillTile,
+        split: bool,
     ) -> wgpu::ComputePipeline {
         let hd = head_dim as u32;
         let paged = matches!(paging, vulkan_shaders::KvPaging::Paged);
         let key = (
             hd,
             (1 << 18)
+                | u32::from(split) << 19
                 | paging_code(paging) << 16
                 | tile.dlanes << 12
                 | tile.lanes << 8
@@ -22425,6 +23708,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             hd,
             paging,
             tile,
+            split,
         );
         let module = self
             .device
@@ -23241,7 +24525,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // layer's Q output).
         let wq_key = wq.cache_key();
         if cache.attn_dispatch(wq_key).is_none() {
-            let out_buf = self.scratch_buffer(n_head * head_dim);
+            // Kept on the cache for every later step, so never a pooled
+            // scratch buffer: a lease open around this call would hand it
+            // to the next caller asking for the same size.
+            let out_buf = self.fresh_buffer(n_head * head_dim);
             let meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("orangu-server fused attention meta"),
                 size: std::mem::size_of::<AttnMeta>() as u64,
@@ -24285,7 +25572,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             BindSrc::Slice(&normed_buf, normed_buf_offset, n_embd_bytes),
             &meta,
         );
-        let attn_q8 = (self.decode_mmvq
+        let attn_q8 = (self.decode_mmvq()
             && self
                 .block_hoisted_i8_pipelines
                 .contains_key(&wq.ggml_type())
@@ -24694,6 +25981,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.submit_and_readback(encoder, src, 0, len_f32)
     }
 
+    /// Copies `len_f32` values from `src` to `dst` (offsets in values),
+    /// recorded into the open prefill group, so it is ordered against the
+    /// chains recorded before and after it.
+    pub fn copy_rows(
+        &self,
+        src: &wgpu::Buffer,
+        src_offset: usize,
+        dst: &wgpu::Buffer,
+        dst_offset: usize,
+        len_f32: usize,
+    ) {
+        let (mut encoder, grouped) = self.take_prefill_encoder("orangu-server rows copy");
+        encoder.copy_buffer_to_buffer(
+            src,
+            (src_offset as u64) * 4,
+            dst,
+            (dst_offset as u64) * 4,
+            (len_f32 as u64) * 4,
+        );
+        self.park_or_submit(encoder, grouped);
+    }
+
     /// Writes `rows` at the start of `buf` — ordered before the next
     /// submission, which is where a batched step's first chain reads it.
     pub fn upload_rows(&self, buf: &wgpu::Buffer, rows: &[f32]) {
@@ -24815,6 +26124,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     /// Submits the open group's encoder, if anything was recorded into it,
     /// and closes the group.
+    ///
+    /// While the prompt makes way for another request's decode steps
+    /// (`generate::prompt_yields_to_decode`), it then waits for its own
+    /// previous group: the queue holds one group of this prompt besides the
+    /// one running, so a decode step submitted now runs after those two
+    /// instead of after the whole chunk.
     pub fn end_prefill_group(&self) {
         let taken = PREFILL_ENCODER.with(|slot| slot.borrow_mut().take());
         if let Some(encoder) = taken {
@@ -24822,7 +26137,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             *self
                 .last_group_submission
                 .lock()
-                .expect("group submission poisoned") = Some(index);
+                .expect("group submission poisoned") = Some(index.clone());
+            let previous = PREVIOUS_PREFILL_GROUP.with(|slot| slot.replace(Some(index)));
+            if let Some(previous) = previous
+                && crate::engine::generate::prompt_yields_to_decode()
+            {
+                self.poll_blocking_with(
+                    wgpu::PollType::Wait {
+                        submission_index: Some(previous),
+                        timeout: None,
+                    },
+                    "a prompt making way for decode steps",
+                );
+            }
         }
     }
 
@@ -25563,17 +26890,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             match cache.get(&batch_slot) {
-                Some(r) if r.total == total && r.per_layer == per_layer && r.n_layer == n_layer => {
+                Some(r)
+                    if r.total == total
+                        && r.per_layer == per_layer
+                        && r.n_layer == n_layer
+                        && r.projection.0 == proj_g.output_buffer
+                        && r.projection.1 == proj_g.output_offset =>
+                {
                     r.clone()
                 }
                 _ => {
                     let projection_scale = 1.0 / (proj_w.in_dim as f32).sqrt();
                     let input_scale = 1.0 / 2f32.sqrt();
-                    let scaled = self.scratch_buffer(total);
+                    // Cached for the next call, so fresh rather than pooled
+                    // scratch (see `record_fused_attention`'s dispatch).
+                    let scaled = self.fresh_buffer(total);
                     let norm_w = self.upload_new(proj_norm);
-                    let gathered = self.scratch_buffer(total);
-                    let summed = self.scratch_buffer(total);
-                    let final_buf = self.scratch_buffer(total);
+                    let gathered = self.fresh_buffer(total);
+                    let summed = self.fresh_buffer(total);
+                    let final_buf = self.fresh_buffer(total);
                     let meta_scale1 = self.elem_meta_buffer(total as u32, projection_scale);
                     let norm_meta = PerHeadNormMeta {
                         n_head: n_layer as u32,
@@ -25603,6 +26938,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         total,
                         per_layer,
                         n_layer,
+                        projection: (proj_g.output_buffer.clone(), proj_g.output_offset),
                         scaled,
                         norm_w,
                         gathered,
@@ -26170,6 +27506,162 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let k = k.clamp(1, vulkan_shaders::TOPK_MAX) as usize;
         let raw = self.submit_and_readback(encoder, out, 0, 2 * k);
         (0..k).map(|i| (raw[k + i].to_bits(), raw[i])).collect()
+    }
+
+    /// A batched decode step's tail on the device: the output norm over the
+    /// `n_rows` residual rows in `x`, the head over all of them in one
+    /// projection, then each row's own sampler — the greedy token or the top
+    /// `k` candidates its [`GreedySampleParams`] asks for, the whole row of
+    /// logits where it asks for none — read back together in one wait. What
+    /// comes back is a token or a few dozen pairs a row instead of the
+    /// rows' logits, and the host samples nothing it does not have to.
+    ///
+    /// `slots[r]` is row `r`'s request slot: its sampler scratch is the one
+    /// its solo step uses, so no two rows share one. A `Logits` row is the
+    /// raw head output; the caller applies whatever the architecture does
+    /// to logits after the head. `None`, with nothing recorded, where the
+    /// fused rows path does not run or the batch is wider than one stripe.
+    ///
+    /// [`GreedySampleParams`]: crate::engine::arch::GreedySampleParams
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_batch_tail(
+        &self,
+        x: AttnOutSrc<'_>,
+        n_rows: usize,
+        output_norm: &[f32],
+        eps: f32,
+        head: &QuantMatrix,
+        logit_softcap: Option<f32>,
+        samples: &[Option<crate::engine::arch::GreedySampleParams<'_>>],
+        slots: &[usize],
+    ) -> Option<Vec<crate::engine::arch::ForwardOutcome>> {
+        use crate::engine::arch::ForwardOutcome;
+        let (n_embd, n_vocab) = (head.in_dim, head.out_dim);
+        if self.q4_k_mmvq
+            || n_rows == 0
+            || samples.len() != n_rows
+            || slots.len() != n_rows
+            || n_rows > max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(n_embd))
+        {
+            return None;
+        }
+        let row_elems = n_rows * n_embd;
+        let op = MatmulOp {
+            x: &[],
+            n_tokens: n_rows,
+            w: head,
+        };
+        let _region_guard = self.prefill_region_guard();
+        let entry = self.op_entry_at(&op, 0, ROLE_DECODE_TAIL);
+        let g = entry.lock().unwrap_or_else(|p| p.into_inner());
+        let normed_bytes = (row_elems as u64) * 4;
+        let x_owned;
+        let x_src = match x {
+            AttnOutSrc::Host(rows) => {
+                x_owned = self.upload_new(rows);
+                BindSrc::Whole(&x_owned)
+            }
+            AttnOutSrc::Gpu(b, off, _) => BindSrc::Slice(b, off, normed_bytes),
+        };
+        let norm_w = self.upload_new(output_norm);
+        let meta_embd = self.elem_meta_buffer(n_embd as u32, eps);
+        // The norm writes straight into the head's input region.
+        let bg_norm = self.elem4_bind_group(
+            x_src,
+            &norm_w,
+            BindSrc::Slice(&g.x_buffer, g.x_offset, normed_bytes),
+            &meta_embd,
+        );
+        let mmq_head = self.mmq_for(head, n_rows).then(|| {
+            let (q8, qbg, qwg, qmeta) = self.mmq_stage(
+                BindSrc::Slice(&g.x_buffer, g.x_offset, normed_bytes),
+                n_rows,
+                n_embd,
+            );
+            let op = self.mmq_op(head, &g, &q8);
+            (q8, qbg, qwg, qmeta, op)
+        });
+
+        let (mut encoder, _grouped) = self.take_prefill_encoder("orangu-server decode batch tail");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server decode batch tail pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
+            pass.set_bind_group(0, &bg_norm, &[]);
+            pass.dispatch_workgroups(n_rows as u32, 1, 1);
+            self.op_stamp(&mut pass, "tail.output_norm");
+            match &mmq_head {
+                Some((_, qbg, qwg, _, op)) => {
+                    self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                    self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                }
+                None => self.record_matmul(&mut pass, head, &g),
+            }
+            self.op_stamp(&mut pass, "tail.matmul");
+        }
+        let (logits_buf, logits_offset) = match g.output_src() {
+            BindSrc::Slice(b, o, _) => (b.clone(), o),
+            BindSrc::Whole(b) => (b.clone(), 0),
+        };
+        // Each row's answer, in order, packed into one buffer for one
+        // readback: (source, its length in values).
+        let mut parts: Vec<(wgpu::Buffer, u64, usize)> = Vec::with_capacity(n_rows);
+        for (r, (sample, &slot)) in samples.iter().zip(slots).enumerate() {
+            let row_offset = logits_offset + (r * n_vocab) as u64 * 4;
+            let Some(params) = sample else {
+                parts.push((logits_buf.clone(), row_offset, n_vocab));
+                continue;
+            };
+            let input = GpuArgmaxSampleInput {
+                logits: GpuInput::Gpu(&logits_buf, (row_offset / 4) as usize),
+                n_vocab,
+                recent_tokens: params.recent_tokens,
+                repeat_penalty: params.repeat_penalty,
+                logit_softcap,
+            };
+            if params.top_k == 0 {
+                let out = self.record_argmax_sample(&mut encoder, input, slot + 1);
+                parts.push((out, 0, 1));
+            } else {
+                let k = params.top_k.clamp(1, vulkan_shaders::TOPK_MAX);
+                let out = self.record_topk_sample(&mut encoder, input, k, slot + 1);
+                parts.push((out, 0, 2 * k as usize));
+            }
+        }
+        let total: usize = parts.iter().map(|(_, _, len)| len).sum();
+        let packed = self.scratch_buffer(total);
+        let mut at = 0u64;
+        for (src, offset, len) in &parts {
+            let bytes = (*len as u64) * 4;
+            encoder.copy_buffer_to_buffer(src, *offset, &packed, at, bytes);
+            at += bytes;
+        }
+        let raw = self.submit_and_readback(encoder, &packed, 0, total);
+        drop(g);
+        let mut at = 0usize;
+        let outcomes = samples
+            .iter()
+            .zip(&parts)
+            .map(|(sample, (_, _, len))| {
+                let values = &raw[at..at + len];
+                at += len;
+                match sample {
+                    None => ForwardOutcome::Logits(values.to_vec()),
+                    Some(params) if params.top_k == 0 => ForwardOutcome::Token(values[0].to_bits()),
+                    Some(_) => {
+                        let k = len / 2;
+                        ForwardOutcome::Candidates(
+                            (0..k)
+                                .map(|i| (values[k + i].to_bits(), values[i]))
+                                .collect(),
+                        )
+                    }
+                }
+            })
+            .collect();
+        Some(outcomes)
     }
 }
 

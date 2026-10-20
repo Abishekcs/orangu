@@ -183,6 +183,18 @@ impl ArmProbe {
         self.decided.unwrap_or(self.arm)
     }
 
+    /// Takes `arm` as the standing answer without timing the arms: an
+    /// answer a vote reached at an earlier start. It is revisited on the
+    /// long window, as a later answer is.
+    pub(crate) fn adopt(&mut self, arm: usize) {
+        if arm < self.arms {
+            self.decided = Some(arm);
+            self.arm = arm;
+            self.settled_steps = 0;
+            self.answers = self.answers.max(2);
+        }
+    }
+
     /// Whether an answer stands — the probe is not timing arms.
     pub(crate) fn is_decided(&self) -> bool {
         self.decided.is_some()
@@ -393,6 +405,23 @@ mod tests {
     }
 
     /// A pause drops the round in progress and keeps the rounds voted.
+    /// An adopted answer stands from the first step, and is timed again
+    /// only after the long window.
+    #[test]
+    fn an_adopted_answer_stands_until_the_long_window() {
+        let mut probe = ArmProbe::new(2, 10);
+        probe.adopt(1);
+        assert!(probe.is_decided());
+        assert_eq!(probe.arm(), 1);
+        for _ in 0..probe.reprobe() - 1 {
+            probe.note(ms(10));
+        }
+        assert_eq!(probe.decided_arm(), Some(1));
+        probe.note(ms(10));
+        assert_eq!(probe.decided_arm(), None, "timed again after the window");
+        assert!(probe.reprobe() > probe.reprobe_first());
+    }
+
     #[test]
     fn a_pause_drops_the_round_in_progress() {
         let mut probe = ArmProbe::new(2, 10);

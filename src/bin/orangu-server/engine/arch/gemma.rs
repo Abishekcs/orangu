@@ -398,6 +398,10 @@ pub struct GemmaModel {
     /// are mapped for both; K/V rows the host writes reach the device's
     /// mirror the way a CPU-orchestrated pass's always have.
     prefill_backend: Option<Arc<dyn Backend>>,
+    /// The layers whose inputs a state row carries, once a draft head that
+    /// reads them is attached (`engine::arch::dflash`); unset, a state row
+    /// is the post-output-norm hidden state the gemma-4 assistant reads.
+    state_taps: std::sync::OnceLock<Vec<usize>>,
 }
 
 impl GemmaModel {
@@ -823,6 +827,7 @@ gemma 4 checkpoint."
             per_layer_proj_norm,
             layers,
             decode_replay: std::sync::Mutex::new(None),
+            state_taps: std::sync::OnceLock::new(),
         };
         let _ = rms_eps; // used inline below via self.config.rms_eps override per layer call sites
         // Where a prompt runs (`engine::prefill_backend`): under `auto`,
@@ -1458,14 +1463,58 @@ gemma 4 checkpoint."
     #[allow(clippy::too_many_arguments)]
     fn run_layers(
         &self,
-        mut one: Option<&mut KvCache>,
-        mut batch: Option<&mut [crate::engine::arch::DecodeRow<'_>]>,
+        one: Option<&mut KvCache>,
+        batch: Option<&mut [crate::engine::arch::DecodeRow<'_>]>,
         x0: &[f32],
         tokens: &[u32],
         start_pos: usize,
         want_x: bool,
         layers: std::ops::Range<usize>,
         embd: Option<&[f32]>,
+    ) -> Result<Vec<f32>> {
+        self.run_layers_to(
+            one,
+            batch,
+            &[],
+            x0,
+            tokens,
+            start_pos,
+            want_x,
+            layers,
+            embd,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::run_layers`], and with `device_out` a residual that ends the
+    /// pass on the device stays there: its buffer lands in `device_out`
+    /// (`[n_tokens, n_embd]` from its start) and the returned rows are
+    /// stale. One that ends on the host is returned as usual, and
+    /// `device_out` stays `None`.
+    ///
+    /// `widths`: with `batch`, how many of `tokens` each row takes, in row
+    /// order — empty for one each. The one-token rows come first; a wider
+    /// row verifies a draft, its tokens from its own position, and its
+    /// attention runs as a prompt's does, over its own tokens.
+    ///
+    /// `taps`: filled with every position's inputs to the layers
+    /// [`Self::state_taps`] names, `[n_tokens, n_taps * n_embd]` — the state
+    /// rows a DFlash head reads.
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers_to(
+        &self,
+        mut one: Option<&mut KvCache>,
+        mut batch: Option<&mut [crate::engine::arch::DecodeRow<'_>]>,
+        widths: &[usize],
+        x0: &[f32],
+        tokens: &[u32],
+        start_pos: usize,
+        want_x: bool,
+        layers: std::ops::Range<usize>,
+        embd: Option<&[f32]>,
+        device_out: Option<&mut Option<wgpu::Buffer>>,
+        mut taps: Option<&mut Vec<f32>>,
     ) -> Result<Vec<f32>> {
         let embd = embd.unwrap_or(x0);
         let n_tokens = tokens.len();
@@ -1512,6 +1561,42 @@ gemma 4 checkpoint."
                     .sum();
                 v.kv_readback_stage(bytes as u64)
             });
+        // A batch's verifying rows: each a stage of its own for its K/V rows,
+        // filled after the pass as a prompt chunk's are.
+        let n_dec = widths.iter().take_while(|&&w| w == 1).count();
+        let mut verify_stages: Vec<crate::engine::backend::vulkan::KvReadbackStage> = Vec::new();
+        let mut verify_pending: Vec<
+            Vec<(usize, Vec<crate::engine::backend::vulkan::PendingKvRows>)>,
+        > = Vec::new();
+        if let (Some(rows), false) = (batch.as_deref_mut(), widths.is_empty()) {
+            anyhow::ensure!(
+                widths.len() == rows.len() && widths.iter().sum::<usize>() == n_tokens,
+                "one width per row, summing to the pass"
+            );
+            anyhow::ensure!(
+                widths[n_dec..].iter().all(|&w| w > 1),
+                "the one-token rows of a batch come first"
+            );
+            let vulkan = backend
+                .as_wgpu()
+                .context("a batched verify needs the device")?;
+            for (row, &w) in rows[n_dec..].iter_mut().zip(&widths[n_dec..]) {
+                let bytes: usize = self
+                    .layers
+                    .iter()
+                    .filter(|l| l.has_kv)
+                    .filter_map(|l| l.wk.as_ref())
+                    .map(|wk| w * wk.out_dim * 2 * 4)
+                    .sum();
+                verify_stages.push(
+                    vulkan
+                        .kv_readback_stage(bytes as u64)
+                        .context("no K/V readback stage for a verifying row")?,
+                );
+                verify_pending.push(Vec::new());
+                row.cache.discard_pending_rows();
+            }
+        }
 
         // Hoisted scratch, refilled (clear + extend/resize) each layer
         // rather than freshly allocated — the prefill's dominant CPU cost was
@@ -1701,6 +1786,25 @@ gemma 4 checkpoint."
                 && !capturing
                 && (has_ple_stage || prefill_stream_dense())
                 && backend.as_wgpu_on(layer.wo.device()).is_some();
+            if let Some(rows) = taps.as_deref_mut()
+                && let Some(k) = self
+                    .state_taps
+                    .get()
+                    .and_then(|t| t.iter().position(|&l| l == il))
+            {
+                let n_taps = self.state_taps.get().map_or(0, Vec::len);
+                let width = n_taps * n_embd;
+                rows.resize(n_tokens * width, 0.0);
+                let current = match (&x_dev, backend.as_wgpu()) {
+                    (Some(b), Some(v)) => {
+                        std::borrow::Cow::Owned(v.readback_rows(b, n_tokens * n_embd))
+                    }
+                    _ => std::borrow::Cow::Borrowed(&x[..]),
+                };
+                for (t, row) in current.chunks_exact(n_embd).take(n_tokens).enumerate() {
+                    rows[t * width + k * n_embd..t * width + (k + 1) * n_embd].copy_from_slice(row);
+                }
+            }
             if !stays {
                 land(&mut x, &mut x_dev);
             }
@@ -1803,10 +1907,17 @@ gemma 4 checkpoint."
                         want_attn_out_host: (layer.moe.is_some() || ffn_on_npu || capturing)
                             && !moe_head_takes_device_attn,
                     };
+                    let gathered =
+                        |attn_out_buf| crate::engine::backend::vulkan::FusedAttnPrefillOutput {
+                            attn_out_buf,
+                            attn_out: Vec::new(),
+                            k_rows: Vec::new(),
+                            v_rows: Vec::new(),
+                        };
                     match (batch.as_deref_mut(), one.as_deref_mut()) {
                         // `slot_id + 1`, as `forward` passes its own
                         // `record_decode_forward`.
-                        (Some(rows), _) => vulkan
+                        (Some(rows), _) if verify_stages.is_empty() => vulkan
                             .fused_attention_decode_batch(
                                 &attn_input,
                                 &layer.attn_norm,
@@ -1814,14 +1925,57 @@ gemma 4 checkpoint."
                                 cache_index,
                                 1,
                             )
-                            .map(|attn_out_buf| {
-                                crate::engine::backend::vulkan::FusedAttnPrefillOutput {
-                                    attn_out_buf,
-                                    attn_out: Vec::new(),
-                                    k_rows: Vec::new(),
-                                    v_rows: Vec::new(),
+                            .map(gathered),
+                        // With verifying rows: the one-token rows' attention
+                        // as above, each verifying row's as a prompt's over
+                        // its own tokens from its own position, and every
+                        // row's output gathered for the one post-attention
+                        // chain.
+                        (Some(rows), _) => {
+                            let (dec_rows, verify_rows) = rows.split_at_mut(n_dec);
+                            let x_buf = x_dev.as_ref().expect("a batch starts on the device");
+                            let q_dim = self.n_head * head_dim;
+                            let decoded = if n_dec > 0 {
+                                let input = crate::engine::backend::vulkan::FusedAttnPrefillInput {
+                                    n_tokens: n_dec,
+                                    ..attn_input
+                                };
+                                Some(vulkan.fused_attention_decode_batch(
+                                    &input,
+                                    &layer.attn_norm,
+                                    dec_rows,
+                                    cache_index,
+                                    1,
+                                )?)
+                            } else {
+                                None
+                            };
+                            let all = vulkan.prefill_rows_buffer(device_rows * q_dim);
+                            if let Some(decoded) = &decoded {
+                                vulkan.copy_rows(decoded, 0, &all, 0, n_dec * q_dim);
+                            }
+                            let mut at = n_dec;
+                            for (j, row) in verify_rows.iter_mut().enumerate() {
+                                let w = widths[n_dec + j];
+                                let input = crate::engine::backend::vulkan::FusedAttnPrefillInput {
+                                    x_gpu: Some((x_buf, (at * n_embd * 4) as u64)),
+                                    n_tokens: w,
+                                    start_pos: row.pos,
+                                    ..attn_input
+                                };
+                                let (out, pending) = vulkan.fused_attention_prefill_deferred(
+                                    input,
+                                    &mut row.cache.layers[cache_index],
+                                    &mut verify_stages[j],
+                                )?;
+                                if !pending.is_empty() {
+                                    verify_pending[j].push((cache_index, pending));
                                 }
-                            }),
+                                vulkan.copy_rows(&out.attn_out_buf, 0, &all, at * q_dim, w * q_dim);
+                                at += w;
+                            }
+                            Some(gathered(all))
+                        }
                         // On the device-resident stream the chain does not
                         // wait for its K/V rows; they are filled at the end
                         // of the chunk (`fill_kv_rows`).
@@ -2105,7 +2259,7 @@ gemma 4 checkpoint."
                         // the whole layer, scale included, and the result is
                         // the next layer's input already.
                         group_layers += 1;
-                        if group_layers >= layers_per_submit.max(1)
+                        if group_layers >= prefill_group_layers(layers_per_submit)
                             && let Some(v) = backend.as_wgpu()
                         {
                             v.end_prefill_group();
@@ -2449,7 +2603,7 @@ gemma 4 checkpoint."
                                 x_dev = Some(bufs[0].clone());
                             }
                             group_layers += 1;
-                            if group_layers >= layers_per_submit.max(1)
+                            if group_layers >= prefill_group_layers(layers_per_submit)
                                 && let Some(v) = backend.as_wgpu()
                             {
                                 v.end_prefill_group();
@@ -2512,9 +2666,26 @@ gemma 4 checkpoint."
         if let (Some(vulkan), Some(cache)) = (backend.as_wgpu(), one.as_deref_mut()) {
             vulkan.fill_deferred_kv_rows(cache);
         }
+        // Each verifying row's K/V rows, home before its owner reads its cache.
+        if let (Some(vulkan), Some(rows), false) =
+            (backend.as_wgpu(), batch, verify_stages.is_empty())
+        {
+            let pending = std::mem::take(&mut verify_pending);
+            for ((row, stage), pending) in rows[n_dec..]
+                .iter_mut()
+                .zip(std::mem::take(&mut verify_stages))
+                .zip(pending)
+            {
+                vulkan.fill_deferred_kv_rows(row.cache);
+                vulkan.fill_kv_rows(stage, pending, row.cache);
+            }
+        }
         phase("fill-previous", &mut phases);
         if want_x {
-            land(&mut x, &mut x_dev);
+            match device_out {
+                Some(out) if x_dev.is_some() => *out = x_dev.take(),
+                _ => land(&mut x, &mut x_dev),
+            }
         }
         phase("land", &mut phases);
         // Every group is submitted, so the rows are on their way. A chunk
@@ -2559,6 +2730,125 @@ gemma 4 checkpoint."
         }
 
         Ok(x)
+    }
+
+    /// [`ModelForward::forward_decode_batch_sampling`]'s body, and with no
+    /// `samples` [`ModelForward::forward_decode_batch`]'s. The batch runs on
+    /// the device-resident prefill chains, and with `samples` the head and
+    /// each row's sampler run after them on the device
+    /// (`VulkanBackend::decode_batch_tail`); otherwise the residual comes
+    /// home for the head.
+    ///
+    /// `widths`: how many of `tokens` each row takes (empty: one each), as
+    /// `Self::run_layers_to` takes them; a verifying row's tokens all come
+    /// back as outcomes, in order.
+    fn decode_batch(
+        &self,
+        rows: &mut [crate::engine::arch::DecodeRow<'_>],
+        widths: &[usize],
+        tokens: &[u32],
+        samples: Option<&[Option<GreedySampleParams<'_>>]>,
+    ) -> Result<Option<Vec<ForwardOutcome>>> {
+        // The batch runs on the device-resident prefill chains, so it needs
+        // the device and a dense model; anything else steps one by one.
+        if self.backend.as_wgpu().is_none() || self.is_moe || !self.causal || rows.len() < 2 {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            tokens.len()
+                == if widths.is_empty() {
+                    rows.len()
+                } else {
+                    widths.iter().sum()
+                },
+            "one token per row of the pass"
+        );
+        let n_tokens = tokens.len();
+        let n_embd = self.config.n_embd;
+        let n_vocab = self.config.n_vocab;
+        let eps = self.rms_eps();
+        let mut x = vec![0f32; n_tokens * n_embd];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            anyhow::ensure!(tok < n_vocab, "token id {tok} is out of vocab range");
+            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+        }
+        for v in x.iter_mut() {
+            *v *= (n_embd as f32).sqrt();
+        }
+        let vulkan = self
+            .backend
+            .as_wgpu()
+            .filter(|v| samples.is_some() && v.gpu_sample());
+        // Each row of the pass is its request's: a verifying request's
+        // tokens all take its slot.
+        let slots: Vec<usize> = if widths.is_empty() {
+            rows.iter().map(|r| r.slot).collect()
+        } else {
+            rows.iter()
+                .zip(widths)
+                .flat_map(|(r, &w)| std::iter::repeat_n(r.slot, w))
+                .collect()
+        };
+        let mut h_dev = None;
+        let mut h = self.run_layers_to(
+            None,
+            Some(rows),
+            widths,
+            &x,
+            tokens,
+            0,
+            true,
+            0..self.layers.len(),
+            None,
+            vulkan.map(|_| &mut h_dev),
+            None,
+        )?;
+        if let (Some(vulkan), Some(samples)) = (vulkan, samples) {
+            let x = match &h_dev {
+                Some(buf) => crate::engine::backend::vulkan::AttnOutSrc::Gpu(buf, 0, n_tokens),
+                None => crate::engine::backend::vulkan::AttnOutSrc::Host(&h),
+            };
+            if let Some(mut outcomes) = vulkan.decode_batch_tail(
+                x,
+                n_tokens,
+                &self.output_norm,
+                eps,
+                &self.output_weight,
+                self.final_logit_softcapping,
+                samples,
+                &slots,
+            ) {
+                for outcome in &mut outcomes {
+                    if let (ForwardOutcome::Logits(row), Some(cap)) =
+                        (outcome, self.final_logit_softcapping)
+                    {
+                        tensor::softcap_inplace(row, cap);
+                    }
+                }
+                return Ok(Some(outcomes));
+            }
+            if let Some(buf) = h_dev.take() {
+                h = vulkan.readback_rows(&buf, n_tokens * n_embd);
+            }
+        }
+        tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_tokens, n_embd, eps);
+        let flat = self.backend.matmul(&h, n_tokens, &self.output_weight);
+        anyhow::ensure!(
+            flat.len() == n_tokens * n_vocab,
+            "output projection produced {} logits, expected {}",
+            flat.len(),
+            n_tokens * n_vocab
+        );
+        let mut out = Vec::with_capacity(n_tokens);
+        for t in 0..n_tokens {
+            let mut row = flat[t * n_vocab..(t + 1) * n_vocab].to_vec();
+            if let Some(cap) = self.final_logit_softcapping {
+                tensor::softcap_inplace(&mut row, cap);
+            }
+            out.push(ForwardOutcome::Logits(row));
+        }
+        Ok(Some(out))
     }
 
     /// The inclusive `[start, end]` key/value position range a query at
@@ -2839,6 +3129,113 @@ impl GemmaModel {
             r.logits_off,
             r.n_vocab,
         )))
+    }
+}
+
+impl GemmaModel {
+    /// The gemma-4 assistant head in `loaded`, wired to the layers of this
+    /// model it reads (`engine::arch::gemma4_assistant`).
+    fn assistant_head(
+        &self,
+        loaded: &crate::engine::loader::LoadedModel,
+    ) -> Result<super::gemma4_assistant::Gemma4Assistant> {
+        anyhow::ensure!(
+            self.mtp_state_width().is_some(),
+            "only a gemma4 model drives a gemma-4 assistant head"
+        );
+        let served = |swa: bool| -> Result<super::gemma4_assistant::ServedLayer> {
+            let layer = self
+                .layers
+                .iter()
+                .rev()
+                .find(|l| l.is_swa == swa)
+                .context("the served model has no layer of the kind the head reads")?;
+            let donor = &self.layers[layer.kv_donor];
+            Ok(super::gemma4_assistant::ServedLayer {
+                cache_layer: layer.kv_donor,
+                n_head_kv: donor.n_head_kv,
+                head_dim: donor.head_dim,
+            })
+        };
+        super::gemma4_assistant::Gemma4Assistant::load(
+            loaded,
+            super::gemma4_assistant::Served {
+                tok_embeddings: self.tok_embeddings.clone(),
+                n_embd: self.config.n_embd,
+                swa: served(true)?,
+                full: served(false)?,
+            },
+        )
+    }
+
+    /// [`ModelForward::forward_all_logits`], with every position's
+    /// post-output-norm hidden state beside its logits.
+    fn all_logits_and_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+        anyhow::ensure!(
+            self.causal,
+            "'{}' is an embeddings-only architecture and does not support text generation",
+            self.config.architecture
+        );
+        let n_tokens = tokens.len();
+        let n_embd = self.config.n_embd;
+        let n_vocab = self.config.n_vocab;
+        let eps = self.rms_eps();
+
+        // Same embedding lookup + sqrt(n_embd) scaling as `forward`. This path
+        // is deliberately the CPU-orchestrated one (never the single-token
+        // GPU-fused decode branch): the keys/values it appends stay CPU-side,
+        // so a caller can read them back or roll them off with
+        // `KvCache::truncate`, and one weight stream covers every position.
+        let mut x = vec![0f32; n_tokens * n_embd];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            anyhow::ensure!(tok < n_vocab, "token id {tok} is out of vocab range");
+            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+        }
+        for v in x.iter_mut() {
+            *v *= (n_embd as f32).sqrt();
+        }
+
+        // One projection of every position through the output norm + vocab
+        // matrix, batched — the weight-heavy `lm_head` read is amortized across
+        // the whole draft in a single `matmul`, not one per position.
+        let mut taps = self.state_taps.get().map(|_| Vec::new());
+        let mut h = self.run_layers_to(
+            Some(cache),
+            None,
+            &[],
+            &x,
+            tokens,
+            start_pos,
+            true,
+            0..self.layers.len(),
+            None,
+            None,
+            taps.as_mut(),
+        )?;
+        tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_tokens, n_embd, eps);
+        let flat = self.backend.matmul(&h, n_tokens, &self.output_weight);
+        anyhow::ensure!(
+            flat.len() == n_tokens * n_vocab,
+            "output projection produced {} logits, expected {}",
+            flat.len(),
+            n_tokens * n_vocab
+        );
+
+        let mut out = Vec::with_capacity(n_tokens);
+        for t in 0..n_tokens {
+            let mut row = flat[t * n_vocab..(t + 1) * n_vocab].to_vec();
+            if let Some(cap) = self.final_logit_softcapping {
+                tensor::softcap_inplace(&mut row, cap);
+            }
+            out.push(row);
+        }
+        Ok((out, taps.unwrap_or(h)))
     }
 }
 
@@ -3188,52 +3585,66 @@ impl ModelForward for GemmaModel {
         rows: &mut [crate::engine::arch::DecodeRow<'_>],
         tokens: &[u32],
     ) -> Result<Option<Vec<Vec<f32>>>> {
-        // The batch runs on the device-resident prefill chains, so it needs
-        // the device and a dense model; anything else steps one by one.
-        if self.backend.as_wgpu().is_none() || self.is_moe || !self.causal || rows.len() < 2 {
+        Ok(self.decode_batch(rows, &[], tokens, None)?.map(|outcomes| {
+            outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    ForwardOutcome::Logits(logits) => logits,
+                    _ => unreachable!("a batch asked for no sampling returns logits"),
+                })
+                .collect()
+        }))
+    }
+
+    fn forward_decode_batch_sampling(
+        &self,
+        rows: &mut [crate::engine::arch::DecodeRow<'_>],
+        tokens: &[u32],
+        samples: &[Option<GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<ForwardOutcome>>> {
+        self.decode_batch(rows, &[], tokens, Some(samples))
+    }
+
+    fn batches_verify(&self) -> bool {
+        crate::engine::arch::batch_verify()
+            && !self.is_moe
+            && self.causal
+            && self
+                .backend
+                .as_wgpu()
+                .is_some_and(|v| v.prefill_fused_attention_enabled())
+    }
+
+    fn forward_decode_batch_verify(
+        &self,
+        rows: &mut [crate::engine::arch::DecodeRow<'_>],
+        tokens: &[&[u32]],
+        samples: &[Option<GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<Vec<ForwardOutcome>>>> {
+        if !self.batches_verify() || tokens.len() != rows.len() || samples.len() != rows.len() {
             return Ok(None);
         }
-        anyhow::ensure!(rows.len() == tokens.len(), "one token per row");
-        let n_tokens = tokens.len();
-        let n_embd = self.config.n_embd;
-        let n_vocab = self.config.n_vocab;
-        let eps = self.rms_eps();
-        let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(tok < n_vocab, "token id {tok} is out of vocab range");
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
-        }
-        for v in x.iter_mut() {
-            *v *= (n_embd as f32).sqrt();
-        }
-        let mut h = self.run_layers(
-            None,
-            Some(rows),
-            &x,
-            tokens,
-            0,
-            true,
-            0..self.layers.len(),
-            None,
-        )?;
-        tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_tokens, n_embd, eps);
-        let flat = self.backend.matmul(&h, n_tokens, &self.output_weight);
-        anyhow::ensure!(
-            flat.len() == n_tokens * n_vocab,
-            "output projection produced {} logits, expected {}",
-            flat.len(),
-            n_tokens * n_vocab
-        );
-        let mut out = Vec::with_capacity(n_tokens);
-        for t in 0..n_tokens {
-            let mut row = flat[t * n_vocab..(t + 1) * n_vocab].to_vec();
-            if let Some(cap) = self.final_logit_softcapping {
-                tensor::softcap_inplace(&mut row, cap);
-            }
-            out.push(row);
-        }
-        Ok(Some(out))
+        let widths: Vec<usize> = tokens.iter().map(|t| t.len()).collect();
+        let flat: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
+        // A verifying row's tokens all come back as logits.
+        let row_samples: Vec<Option<GreedySampleParams<'_>>> = samples
+            .iter()
+            .zip(&widths)
+            .flat_map(|(sample, &w)| {
+                let one = if w == 1 { *sample } else { None };
+                std::iter::once(one).chain(std::iter::repeat_n(None, w - 1))
+            })
+            .collect();
+        let Some(outcomes) = self.decode_batch(rows, &widths, &flat, Some(&row_samples))? else {
+            return Ok(None);
+        };
+        let mut outcomes = outcomes.into_iter();
+        Ok(Some(
+            widths
+                .iter()
+                .map(|&w| outcomes.by_ref().take(w).collect())
+                .collect(),
+        ))
     }
 
     fn forward_all_logits(
@@ -3243,53 +3654,108 @@ impl ModelForward for GemmaModel {
         start_pos: usize,
         _slot_id: usize,
     ) -> Result<Vec<Vec<f32>>> {
+        Ok(self.all_logits_and_states(cache, tokens, start_pos)?.0)
+    }
+
+    /// The post-output-norm hidden state — what the gemma-4 assistant head
+    /// reads beside a token (`engine::arch::gemma4_assistant`) — or, with a
+    /// DFlash head attached, the inputs of the layers it reads.
+    fn mtp_state_width(&self) -> Option<usize> {
+        (self.causal && self.config.architecture == "gemma4").then(|| {
+            self.state_taps
+                .get()
+                .map_or(self.config.n_embd, |t| t.len() * self.config.n_embd)
+        })
+    }
+
+    /// A prompt chunk's last logits and every position's tapped layer
+    /// inputs, for a DFlash head (`Self::state_taps`); the assistant head
+    /// reads no prompt states.
+    fn forward_with_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         anyhow::ensure!(
-            self.causal,
-            "'{}' is an embeddings-only architecture and does not support text generation",
-            self.config.architecture
+            self.causal && self.state_taps.get().is_some(),
+            "this model exports no prompt states"
         );
-        let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
-        let n_vocab = self.config.n_vocab;
-        let eps = self.rms_eps();
-
-        // Same embedding lookup + sqrt(n_embd) scaling as `forward`. This path
-        // is deliberately the CPU-orchestrated one (never the single-token
-        // GPU-fused decode branch): the keys/values it appends stay CPU-side,
-        // so a caller can read them back or roll them off with
-        // `KvCache::truncate`, and one weight stream covers every position.
-        let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(tok < n_vocab, "token id {tok} is out of vocab range");
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+        let x = self.scaled_token_embeddings(tokens)?;
+        let mut taps = Vec::new();
+        let h = self.run_layers_to(
+            Some(cache),
+            None,
+            &[],
+            &x,
+            tokens,
+            start_pos,
+            true,
+            0..self.layers.len(),
+            None,
+            None,
+            Some(&mut taps),
+        )?;
+        let mut last = h[(tokens.len() - 1) * n_embd..].to_vec();
+        tensor::rmsnorm_inplace(&mut last, &self.output_norm, 1, n_embd, self.rms_eps());
+        let mut logits =
+            crate::engine::head_split::matmul(self.backend.as_ref(), &last, &self.output_weight);
+        if let Some(cap) = self.final_logit_softcapping {
+            tensor::softcap_inplace(&mut logits, cap);
         }
-        for v in x.iter_mut() {
-            *v *= (n_embd as f32).sqrt();
-        }
+        Ok((logits, taps))
+    }
 
-        // One projection of every position through the output norm + vocab
-        // matrix, batched — the weight-heavy `lm_head` read is amortized across
-        // the whole draft in a single `matmul`, not one per position.
-        let mut h = self.run_layers_cpu(cache, &x, tokens, start_pos)?;
-        tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_tokens, n_embd, eps);
-        let flat = self.backend.matmul(&h, n_tokens, &self.output_weight);
+    fn forward_all_logits_with_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+        self.all_logits_and_states(cache, tokens, start_pos)
+    }
+
+    /// Off unless `ORANGU_MTP_ASSISTANT=1`: the head drafts from the served
+    /// model's states, so every step is a verify through the host path that
+    /// exports them, and on a model that fits its device that costs more
+    /// than the decode steps the accepted guesses save.
+    fn load_mtp_head(
+        &self,
+        loaded: &crate::engine::loader::LoadedModel,
+        _backend: &Arc<dyn Backend>,
+    ) -> Result<Arc<dyn super::MtpHead>> {
+        if loaded.config.architecture == "dflash" {
+            anyhow::ensure!(
+                self.causal && self.config.architecture == "gemma4",
+                "only a gemma4 model exports the layer inputs a dflash draft reads"
+            );
+            let head = super::dflash::DFlashHead::load(
+                loaded,
+                super::dflash::Target {
+                    tok_embeddings: self.tok_embeddings.clone(),
+                    output: self.output_weight.clone(),
+                    backend: self.backend.clone(),
+                    n_embd: self.config.n_embd,
+                    n_layer: self.layers.len(),
+                },
+            )?;
+            let layers = head.target_layers().to_vec();
+            anyhow::ensure!(
+                self.state_taps.get_or_init(|| layers.clone()) == &layers,
+                "a draft head reading other layers is already attached"
+            );
+            return Ok(Arc::new(head));
+        }
         anyhow::ensure!(
-            flat.len() == n_tokens * n_vocab,
-            "output projection produced {} logits, expected {}",
-            flat.len(),
-            n_tokens * n_vocab
+            crate::engine::env::flag_on("ORANGU_MTP_ASSISTANT"),
+            "the gemma-4 assistant head is off unless ORANGU_MTP_ASSISTANT=1: every step it \
+             drafts is a verify through the host path, which costs more than the steps it \
+             saves on a model that fits its device"
         );
-
-        let mut out = Vec::with_capacity(n_tokens);
-        for t in 0..n_tokens {
-            let mut row = flat[t * n_vocab..(t + 1) * n_vocab].to_vec();
-            if let Some(cap) = self.final_logit_softcapping {
-                tensor::softcap_inplace(&mut row, cap);
-            }
-            out.push(row);
-        }
-        Ok(out)
+        Ok(Arc::new(self.assistant_head(loaded)?))
     }
 
     /// Takes the GPU-argmax fast path only when every one of its
@@ -4352,6 +4818,17 @@ fn prefill_stream_ple_inputs() -> bool {
     crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_PLE_INPUTS")
 }
 
+/// How many layers a prompt's next submission groups: `configured`, or one
+/// while it makes way for another request's decode steps
+/// (`generate::prompt_yields_to_decode`).
+pub(crate) fn prefill_group_layers(configured: usize) -> usize {
+    if configured > 0 && crate::engine::generate::prompt_yields_to_decode() {
+        1
+    } else {
+        configured.max(1)
+    }
+}
+
 pub(crate) fn prefill_layers_per_submit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -4427,6 +4904,155 @@ mod real_model_tests {
     #[ignore]
     fn gemma4_predicts_paris_after_capital_of_france() {
         check_predicts_paris(Arc::new(crate::engine::backend::CpuBackend));
+    }
+
+    /// A verify taken into a batched step (`forward_decode_batch_verify`)
+    /// gives the verifying sequence the logits of its own `forward_verify`
+    /// at every position and the decoding one the logits of its own step,
+    /// over SWA layers and the layers reading a donor's K/V alike — mixed
+    /// rounds with the roles alternating and a rollback after each, then
+    /// both sequences verifying, then a solo step on each. To gemma's
+    /// floor between its prompt and decode kernels, which is wide: a solo
+    /// `forward_verify` is up to rms 0.12 from the same tokens stepped one
+    /// by one, a draft row read from the wrong offset 0.67. Run with
+    /// `ORANGU_TEST_MODEL=/path/to/gemma-4-E2B.gguf cargo test --release
+    /// --bin orangu-server batch_verifies -- --ignored`.
+    #[test]
+    #[ignore]
+    fn gemma4_decode_batch_verifies_a_draft_as_its_own_pass_would() {
+        use crate::engine::arch::{DecodeRow, ForwardOutcome};
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model = GemmaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        assert!(model.batches_verify(), "this model batches a verify");
+        let prompts: [Vec<u32>; 2] = [
+            std::iter::once(2)
+                .chain((0..40u32).map(|i| 100 + (i * 37) % 2000))
+                .collect(),
+            std::iter::once(2)
+                .chain((0..23u32).map(|i| 300 + (i * 53) % 1700))
+                .collect(),
+        ];
+        let prefilled = || -> Vec<KvCache> {
+            prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let mut cache = model.new_kv_cache(96);
+                    model.forward(&mut cache, p, 0, i).expect("prefill");
+                    cache
+                })
+                .collect()
+        };
+        let compare = |what: &str, b: &[f32], s: &[f32]| {
+            let (mut diff2, mut val2) = (0f64, 0f64);
+            for (x, y) in b.iter().zip(s) {
+                diff2 += f64::from((x - y) * (x - y));
+                val2 += f64::from(y * y);
+            }
+            let rms = (diff2 / val2).sqrt();
+            let (ab, as_) = (
+                crate::engine::sampling::argmax(b),
+                crate::engine::sampling::argmax(s),
+            );
+            // The batched pick, scored by the solo logits: a near-tie may
+            // fall either way.
+            let short = s[as_ as usize] - s[ab as usize];
+            println!("{what}: rms {rms:.2e}, argmax {ab} / {as_}, {short:.2} short");
+            assert!(rms < 0.25, "{what} rms {rms}");
+            assert!(
+                short <= 0.5,
+                "{what} picks a token {short} logits short of the top"
+            );
+        };
+        let logits_of = |o: &ForwardOutcome| match o {
+            ForwardOutcome::Logits(l) => l.clone(),
+            _ => panic!("no sampling was asked for"),
+        };
+        let mut solo = prefilled();
+        let mut batched = prefilled();
+        let mut pos = [prompts[0].len(), prompts[1].len()];
+        // Each round: per sequence, its tokens (one: a step; more: a draft)
+        // and how many of them it keeps.
+        let rounds: [[(Vec<u32>, usize); 2]; 8] = [
+            [(vec![911], 1), (vec![1207, 640, 88, 1500, 7], 2)],
+            [(vec![57, 1302, 400, 12], 2), (vec![33], 1)],
+            [(vec![12], 1), (vec![5, 1606, 7], 3)],
+            [(vec![808, 9, 1010], 1), (vec![13], 1)],
+            [(vec![14], 1), (vec![11, 1212, 13], 2)],
+            [(vec![16, 1717, 18], 2), (vec![15], 1)],
+            [(vec![71, 802, 13, 1999], 1), (vec![640, 5, 1201, 77], 2)],
+            [(vec![18, 990, 4], 3), (vec![1450, 3, 760, 41, 1102, 9], 1)],
+        ];
+        for (round, seqs) in rounds.iter().enumerate() {
+            let solo_out: Vec<Vec<Vec<f32>>> = (0..2)
+                .map(|i| {
+                    let tokens = &seqs[i].0;
+                    if tokens.len() == 1 {
+                        vec![
+                            model
+                                .forward(&mut solo[i], tokens, pos[i], i)
+                                .expect("solo step"),
+                        ]
+                    } else {
+                        model
+                            .forward_verify(&mut solo[i], tokens, pos[i], i)
+                            .expect("solo verify")
+                    }
+                })
+                .collect();
+            // The one-token row first, as the batcher orders them.
+            let order: [usize; 2] = if seqs[1].0.len() == 1 { [1, 0] } else { [0, 1] };
+            let (lo, hi) = batched.split_at_mut(1);
+            let mut caches = [Some(&mut lo[0]), Some(&mut hi[0])];
+            let mut rows: Vec<DecodeRow<'_>> = order
+                .iter()
+                .map(|&i| DecodeRow {
+                    cache: caches[i].take().expect("each cache once"),
+                    pos: pos[i],
+                    slot: i,
+                })
+                .collect();
+            let tokens: Vec<&[u32]> = order.iter().map(|&i| seqs[i].0.as_slice()).collect();
+            let out = model
+                .forward_decode_batch_verify(&mut rows, &tokens, &[None, None])
+                .expect("batched verify")
+                .expect("the batch serves this model");
+            drop(rows);
+            for (o, &i) in out.iter().zip(&order) {
+                assert_eq!(o.len(), seqs[i].0.len());
+                for (k, (b, s)) in o.iter().zip(&solo_out[i]).enumerate() {
+                    compare(
+                        &format!("round {round}: sequence {i} position {k}"),
+                        &logits_of(b),
+                        s,
+                    );
+                }
+            }
+            for i in 0..2 {
+                let kept = pos[i] + seqs[i].1;
+                if seqs[i].0.len() > 1 {
+                    for caches in [&mut solo, &mut batched] {
+                        caches[i].truncate(kept).expect("roll back");
+                    }
+                }
+                pos[i] = kept;
+            }
+        }
+        for i in 0..2 {
+            let s = model
+                .forward(&mut solo[i], &[5], pos[i], i)
+                .expect("solo step");
+            let b = model
+                .forward(&mut batched[i], &[5], pos[i], i)
+                .expect("solo step after the batch");
+            compare(&format!("sequence {i} after the batch"), &b, &s);
+            assert_eq!(batched[i].committed_len(), solo[i].committed_len());
+        }
     }
 
     /// The same end-to-end assertion on a real GGUF, run through
@@ -4605,6 +5231,51 @@ mod real_model_tests {
             "forward pass disagrees with llama.cpp on this context; the sampler \
              is not in play here, so this is the engine"
         );
+    }
+
+    /// On the CPU, how far a batch of tokens through the first `l` layers
+    /// lands from the same tokens one at a time, for every `l` — the depth
+    /// where the two paths part is where to look. Printed, not bounded:
+    /// the two take different kernels.
+    /// `ORANGU_TEST_MODEL=… cargo test --release --bin orangu-server
+    /// batch_against_steps_by_depth -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cpu_batch_against_steps_by_depth() {
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model =
+            GemmaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build model");
+        let n_embd = model.config.n_embd;
+        let tokens: Vec<u32> = vec![2, 818, 5279, 529, 7001, 563, 9079, 236761, 669, 5279];
+        let n = tokens.len();
+        let x = model.embed(&tokens).expect("embed");
+        for l in 1..=model.config.n_layer {
+            let mut cache = model.new_kv_cache(n + 1);
+            let batch = model
+                .forward_layers(&mut cache, x.clone(), &tokens, 0..l, 0)
+                .expect("batch");
+            let mut cache = model.new_kv_cache(n + 1);
+            let mut stepped = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                let xt = x[pos * n_embd..(pos + 1) * n_embd].to_vec();
+                stepped.extend(
+                    model
+                        .forward_layers(&mut cache, xt, &[tok], 0..l, pos)
+                        .expect("step"),
+                );
+            }
+            let worst = batch
+                .chunks_exact(n_embd)
+                .zip(stepped.chunks_exact(n_embd))
+                .map(|(a, b)| {
+                    let mag = b.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+                    a.iter().zip(b).fold(0f32, |m, (p, q)| m.max((p - q).abs())) / mag
+                })
+                .fold(0f32, f32::max);
+            println!("layers 0..{l:>2}: worst row {worst:.3e}");
+        }
     }
 
     fn check_predicts_paris(backend: Arc<dyn crate::engine::backend::Backend>) {
@@ -4894,6 +5565,189 @@ mod real_model_tests {
         assert!(
             cosine > 0.999,
             "cosine similarity to real llama.cpp's embedding was only {cosine}, expected > 0.999"
+        );
+    }
+
+    /// The DFlash draft's first token against the token the model then
+    /// emits, each draft made from the context the model's own tapped layer
+    /// inputs cached and the token it is about to read. Every guess is
+    /// verified, so a draft wired wrongly still yields the right answer,
+    /// only no faster: taps from the wrong layers, a context row a position
+    /// out, or a causal mask over the block all leave it guessing far less
+    /// often. Run with `ORANGU_TEST_MODEL=/path/to/gemma-4-12b-it-Q4_K_M.gguf
+    /// ORANGU_TEST_DFLASH=/path/to/gemma4-12B-it-DFlash-Q4_K_M.gguf cargo
+    /// test --release --bin orangu-server dflash_head -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_dflash_head_guesses_what_the_model_goes_on_to_say() {
+        const STEPS: usize = 24;
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let head_path = std::env::var("ORANGU_TEST_DFLASH").expect("set ORANGU_TEST_DFLASH");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let gguf = orangu::gguf::GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+        let tokenizer =
+            crate::engine::tokenizer::Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        let backend: Arc<dyn Backend> = Arc::new(crate::engine::backend::CpuBackend);
+        let model = GemmaModel::load_with_backend(&loaded, backend.clone()).expect("build model");
+        let head_loaded =
+            LoadedModel::open_head(std::path::Path::new(&head_path)).expect("load head");
+        let head = model
+            .load_mtp_head(&head_loaded, &backend)
+            .expect("build head");
+        let width = head.state_width();
+        assert_eq!(model.mtp_state_width(), Some(width));
+
+        // A chat turn, as the server renders one with thinking off: on raw
+        // text the instruction-tuned 12B degenerates (" a a a …") whatever
+        // drafts for it.
+        let prompt = tokenizer.encode(
+            "<|turn>user\nList the months of the year, separated by commas.<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>",
+            true,
+        );
+        let n = prompt.len();
+        let mut cache = model.new_kv_cache(256);
+        let mut context = head.new_kv_cache(256);
+        let (logits, states) = model
+            .forward_with_states(&mut cache, &prompt, 0, 0)
+            .expect("prefill");
+        // Each prompt token with the state behind it, as a catch-up pairs
+        // them: position 0 with the zero row.
+        let mut paired = vec![0f32; width];
+        paired.extend_from_slice(&states[..(n - 1) * width]);
+        head.forward(&mut context, &prompt, &paired, 0, 0)
+            .expect("cache the prompt");
+        let mut behind = states[(n - 1) * width..].to_vec();
+        let mut next = crate::engine::sampling::argmax(&logits);
+        let (mut accepted, mut tried) = (0usize, 0usize);
+        for pos in (n..).take(STEPS) {
+            head.forward(&mut context, &[next], &behind, pos, 0)
+                .expect("cache the last row");
+            let guess = head
+                .draft_block(&mut context, next, pos, 2, 0)
+                .expect("draft");
+            assert_eq!(guess.len(), 2, "a whole context drafts a whole block");
+            let (logits, produced) = model
+                .forward_all_logits_with_states(&mut cache, &[next], pos, 0)
+                .expect("decode");
+            next = crate::engine::sampling::argmax(&logits[0]);
+            behind = produced;
+            if tokenizer.is_special(next) {
+                break;
+            }
+            tried += 1;
+            if guess[0] == next {
+                accepted += 1;
+            }
+            eprintln!(
+                "pos {pos}: model {:?}, draft {:?}{}",
+                tokenizer.decode(&[next]),
+                tokenizer.decode(&guess),
+                if guess[0] == next {
+                    "  <-- accepted"
+                } else {
+                    ""
+                },
+            );
+        }
+        eprintln!("acceptance: {accepted}/{tried}");
+        assert!(
+            tried >= STEPS / 2,
+            "the model ended its text after {tried} tokens"
+        );
+        // Wired correctly it agrees on 21 of 22 here; with each context row
+        // cached a position out, on 10.
+        assert!(
+            accepted * 4 >= tried * 3,
+            "the draft agreed with the model {accepted} times out of {tried}"
+        );
+    }
+
+    /// The gemma-4 assistant head guesses, step after step, the token the
+    /// model then emits — the only check that tells a head wired correctly
+    /// from one wired plausibly, since every guess is verified and a broken
+    /// head still yields the right answer, only no faster. The head reads
+    /// the served model's own cache at the position the model is about to
+    /// fill, so this steps the model through the same host path its
+    /// verifies take. The pair concatenated the wrong way round, or a block
+    /// reading another layer's rows, fails it; a query rotated a position
+    /// off does not, since on text this regular the head guesses as well
+    /// one position out. Run with `ORANGU_TEST_MODEL=/path/to/gemma-4-E2B.gguf
+    /// ORANGU_TEST_MTP=/path/to/MTP/mtp-gemma-4-E2B-it-Q8_0.gguf cargo test
+    /// --release --bin orangu-server assistant_head -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_assistant_head_guesses_what_the_model_goes_on_to_say() {
+        use crate::engine::arch::MtpHead;
+        const STEPS: usize = 32;
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let head_path = std::env::var("ORANGU_TEST_MTP").expect("set ORANGU_TEST_MTP");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let gguf = orangu::gguf::GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+        let tokenizer =
+            crate::engine::tokenizer::Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        let model =
+            GemmaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build model");
+        let head_loaded =
+            LoadedModel::open_head(std::path::Path::new(&head_path)).expect("load head");
+        let head = model.assistant_head(&head_loaded).expect("build head");
+        let width = head.state_width();
+
+        // A continuation that stays in text: the model goes on through the
+        // months, where a turn-ending prompt would have it repeat a control
+        // token any head guesses.
+        let prompt = tokenizer.encode(
+            "Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday. January, \
+             February, March,",
+            true,
+        );
+        let n = prompt.len();
+        let mut cache = model.new_kv_cache(256);
+        let (logits, states) = model
+            .forward_all_logits_with_states(&mut cache, &prompt, 0, 0)
+            .expect("prefill");
+        let mut next = crate::engine::sampling::argmax(&logits[n - 1]);
+        let mut state = states[(n - 1) * width..].to_vec();
+        let (mut accepted, mut tried) = (0usize, 0usize);
+        for pos in (n..).take(STEPS) {
+            // The head's guess at the token after `next`, from `next` and
+            // the state behind it, before the model has read `next`.
+            let step = head
+                .forward_served(&cache, next, &state, pos)
+                .expect("head step")
+                .expect("every row the head reads is on the host");
+            let guess = crate::engine::sampling::argmax(&step.logits);
+            let (logits, produced) = model
+                .forward_all_logits_with_states(&mut cache, &[next], pos, 0)
+                .expect("decode");
+            next = crate::engine::sampling::argmax(&logits[0]);
+            state = produced;
+            if tokenizer.is_special(next) {
+                break;
+            }
+            tried += 1;
+            if guess == next {
+                accepted += 1;
+            }
+            eprintln!(
+                "pos {pos}: model {:?}, head {:?}{}",
+                tokenizer.decode(&[next]),
+                tokenizer.decode(&[guess]),
+                if guess == next { "  <-- accepted" } else { "" },
+            );
+        }
+        eprintln!("acceptance: {accepted}/{tried}");
+        assert!(
+            tried >= STEPS / 2,
+            "the model ended its text after {tried} tokens"
+        );
+        assert!(
+            accepted * 3 >= tried,
+            "the head agreed with the model {accepted} times out of {tried}; a head wired \
+             correctly agrees on most of a factual continuation and one wired wrongly almost \
+             never"
         );
     }
 }

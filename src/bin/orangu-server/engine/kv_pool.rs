@@ -526,9 +526,27 @@ struct PoolInner {
     /// finished sequences have handed back.
     table_next: usize,
     free_tables: Vec<(usize, usize)>,
+    /// The ages ([`Occupant::age`]) of the sequences drawing on the pool
+    /// now, and of those among them waiting for pages it could not promise
+    /// — what decides who yields when the pool runs short.
+    occupants: std::collections::BTreeSet<u64>,
+    waiting: std::collections::BTreeSet<u64>,
+    /// Occupants holding no pages while they wait to rebuild — none to
+    /// give back.
+    parked: std::collections::BTreeSet<u64>,
+    next_age: u64,
 }
 
 impl PoolInner {
+    /// Whether an occupant older than `age` (`None`: than anyone) is
+    /// waiting for pages.
+    fn waits_before(&self, age: Option<u64>) -> bool {
+        match age {
+            None => !self.waiting.is_empty(),
+            Some(age) => self.waiting.first().is_some_and(|&oldest| oldest < age),
+        }
+    }
+
     /// One reclaimable page, preferring never-used, or `None` when every page
     /// is held.
     ///
@@ -738,6 +756,12 @@ pub struct KvPool {
     /// sharing *this*.
     device: Option<DevicePages>,
     inner: Mutex<PoolInner>,
+    /// How many times a sequence has given its pages back to an older one
+    /// ([`Occupant::yielded`]), for the operator and the tests.
+    yields: std::sync::atomic::AtomicU64,
+    /// `PoolInner::waiting`'s length, read without the lock by the
+    /// question every decode step asks ([`Occupant::yield_due`]).
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
 /// The pool's device-side pages: one buffer per layer, plus the block tables
@@ -755,7 +779,7 @@ pub struct DevicePages {
     pub table: wgpu::Buffer,
     /// How many `u32` entries `table` holds.
     pub table_len: usize,
-    storage: crate::engine::backend::vulkan_shaders::KvStorage,
+    pub storage: crate::engine::backend::vulkan_shaders::KvStorage,
 }
 
 /// # Safety
@@ -803,6 +827,107 @@ impl std::fmt::Display for AllocError {
                 "KV pool exhausted: {wanted} pages wanted, {available} reclaimable"
             ),
         }
+    }
+}
+
+/// A sequence drawing on the pool, from its admission to its end, by age:
+/// what orders who gets pages when the pool cannot promise everyone theirs.
+///
+/// A sequence is promised its prompt when it is admitted and the pages each
+/// step needs as it reaches them, not the whole length its answer may run
+/// to. When the pool cannot promise a step's pages, the sequence waits
+/// ([`Self::wait`]) and every younger one gives its pages back at its next
+/// step ([`Self::yield_due`]) — publishing what it built, to rebuild later
+/// from whatever of it is still resident — so the oldest always goes on,
+/// and a waiter is refused nothing for the sake of a younger one
+/// ([`KvPool::try_reserve_trading`]). A sequence with no younger one to
+/// wait for gives its own back instead.
+pub struct Occupant {
+    pool: std::sync::Arc<KvPool>,
+    age: u64,
+}
+
+impl Occupant {
+    pub fn age(&self) -> u64 {
+        self.age
+    }
+
+    pub fn pool(&self) -> &std::sync::Arc<KvPool> {
+        &self.pool
+    }
+
+    /// Whether an older occupant is waiting for pages, so this one should
+    /// give its own back.
+    pub fn yield_due(&self) -> bool {
+        if self.pool.waiters.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.pool
+            .inner
+            .lock()
+            .expect("kv pool poisoned")
+            .waits_before(Some(self.age))
+    }
+
+    /// Whether some younger occupant holds pages it would give back.
+    pub fn has_younger(&self) -> bool {
+        let inner = self.pool.inner.lock().expect("kv pool poisoned");
+        inner
+            .occupants
+            .range(self.age + 1..)
+            .any(|age| !inner.parked.contains(age))
+    }
+
+    /// Marks this occupant as holding no pages while it waits to rebuild,
+    /// or holding them again.
+    pub fn park(&self, parked: bool) {
+        let mut inner = self.pool.inner.lock().expect("kv pool poisoned");
+        if parked {
+            inner.parked.insert(self.age);
+        } else {
+            inner.parked.remove(&self.age);
+        }
+    }
+
+    /// Marks this occupant as waiting for pages, or done waiting.
+    pub fn wait(&self, waiting: bool) {
+        let mut inner = self.pool.inner.lock().expect("kv pool poisoned");
+        if waiting {
+            inner.waiting.insert(self.age);
+        } else {
+            inner.waiting.remove(&self.age);
+        }
+        self.pool
+            .waiters
+            .store(inner.waiting.len(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// [`KvPool::try_reserve_trading`] at this occupant's age.
+    pub fn try_reserve(&self, pages: usize, held: usize) -> bool {
+        self.pool.try_reserve_aged(pages, held, Some(self.age))
+    }
+
+    /// Counts a yield ([`KvPool::yields`]).
+    pub fn yielded(&self) {
+        self.pool
+            .yields
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for Occupant {
+    fn drop(&mut self) {
+        let mut inner = self
+            .pool
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.occupants.remove(&self.age);
+        inner.waiting.remove(&self.age);
+        inner.parked.remove(&self.age);
+        self.pool
+            .waiters
+            .store(inner.waiting.len(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -893,7 +1018,13 @@ impl KvPool {
                 sealed: vec![false; num_pages],
                 table_next: 0,
                 free_tables: Vec::new(),
+                occupants: std::collections::BTreeSet::new(),
+                waiting: std::collections::BTreeSet::new(),
+                parked: std::collections::BTreeSet::new(),
+                next_age: 0,
             }),
+            yields: std::sync::atomic::AtomicU64::new(0),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -940,7 +1071,11 @@ impl KvPool {
             layers.push(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("orangu-server kv pool layer"),
                 size: size.max(4),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                // `COPY_SRC` for `KvCache::fill_decoded_pages`: decode writes its rows
+                // here only, and a finished reply is read back to be shared.
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
         }
@@ -1267,12 +1402,115 @@ impl KvPool {
     /// returning the remainder ([`Self::release_reserved`]) — or the pool
     /// shrinks by that much for the life of the process.
     pub fn try_reserve(&self, pages: usize) -> bool {
+        self.try_reserve_trading(pages, 0)
+    }
+
+    /// [`Self::try_reserve`] by a caller already promised `held` pages,
+    /// which this promise replaces: in one step, so the `held` pages cannot
+    /// go to anyone else between giving them back and promising anew. On
+    /// refusal the `held` promise stands.
+    pub fn try_reserve_trading(&self, pages: usize, held: usize) -> bool {
+        self.try_reserve_aged(pages, held, None)
+    }
+
+    /// [`Self::try_reserve_trading`] for the occupant of age `age` (`None`:
+    /// younger than every occupant). Pages beyond `held` go to the oldest
+    /// waiter first: while an older occupant waits for pages, a younger one
+    /// is refused any more, so pages given back reach the one waiting
+    /// longest rather than whoever asks next.
+    pub fn try_reserve_aged(&self, pages: usize, held: usize, age: Option<u64>) -> bool {
         let mut inner = self.inner.lock().expect("kv pool poisoned");
-        if self.num_pages - inner.live - inner.reserved < pages {
+        if pages > held && inner.waits_before(age) {
             return false;
         }
-        inner.reserved += pages;
+        let others = inner.reserved.saturating_sub(held);
+        if self.num_pages - inner.live - others < pages {
+            return false;
+        }
+        inner.reserved = others + pages;
         true
+    }
+
+    /// Promises `pages` again unconditionally — a promise
+    /// [`Self::try_reserve_trading`] took in and its caller could not use
+    /// after all, handed back to the holder it came from.
+    pub fn restore_reserved(&self, pages: usize) {
+        let mut inner = self.inner.lock().expect("kv pool poisoned");
+        inner.reserved += pages;
+    }
+
+    /// [`Self::try_reserve`] for a sequence that will share the pages behind
+    /// `tags`: when every one of them is held by a live sequence right now,
+    /// takes a reference to each and promises only the `pages` beyond them.
+    /// `None` (nothing taken) otherwise, and the caller reserves in full.
+    ///
+    /// A page another sequence holds costs nothing to share — its reference
+    /// count rises, the pool's live count does not — so promising it again
+    /// is what kept a second request off a pool sized for little more than
+    /// one: two agents handed the same 3 800-token file each reserved its
+    /// 60 pages, and a 109-page pool admitted one of them. The references
+    /// are taken in the same step as the promise, so a page cannot be
+    /// reclaimed between the two.
+    pub fn try_reserve_sharing(&self, tags: &[u64], pages: usize) -> Option<Vec<u32>> {
+        self.try_reserve_sharing_trading(tags, pages, 0, None)
+    }
+
+    /// [`Self::try_reserve_sharing`] replacing a `held` promise, as
+    /// [`Self::try_reserve_trading`] does, for the occupant of age `age` as
+    /// [`Self::try_reserve_aged`] weighs it.
+    pub fn try_reserve_sharing_trading(
+        &self,
+        tags: &[u64],
+        pages: usize,
+        held: usize,
+        age: Option<u64>,
+    ) -> Option<Vec<u32>> {
+        if tags.is_empty() {
+            return None;
+        }
+        let mut inner = self.inner.lock().expect("kv pool poisoned");
+        let shared: Vec<u32> = tags
+            .iter()
+            .map(|tag| {
+                inner
+                    .by_tag
+                    .get(tag)
+                    .copied()
+                    .filter(|&page| inner.refs[page as usize] > 0)
+            })
+            .collect::<Option<_>>()?;
+        let rest = pages.saturating_sub(shared.len());
+        if rest > held && inner.waits_before(age) {
+            return None;
+        }
+        let others = inner.reserved.saturating_sub(held);
+        if self.num_pages - inner.live - others < rest {
+            return None;
+        }
+        for &page in &shared {
+            inner.refs[page as usize] += 1;
+            inner.seen_again[page as usize] = true;
+        }
+        inner.reserved = others + rest;
+        Some(shared)
+    }
+
+    /// A sequence starting to draw on the pool, younger than every one
+    /// before it — see [`Occupant`].
+    pub fn enter(self: &std::sync::Arc<Self>) -> Occupant {
+        let mut inner = self.inner.lock().expect("kv pool poisoned");
+        let age = inner.next_age;
+        inner.next_age += 1;
+        inner.occupants.insert(age);
+        Occupant {
+            pool: self.clone(),
+            age,
+        }
+    }
+
+    /// How many times a sequence has given its pages back to an older one.
+    pub fn yields(&self) -> u64 {
+        self.yields.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Gives back `pages` of a promise that were never claimed — what a
@@ -1408,6 +1646,8 @@ impl KvPool {
         };
         let available = self.num_pages - inner.live - inner.reserved;
         if wanted > available {
+            // Refused whole, the promise included: the caller still holds it.
+            inner.reserved += promised;
             return Err(AllocError::Exhausted { wanted, available });
         }
 
@@ -1511,6 +1751,23 @@ impl KvPool {
                 inner.on_release(p);
             }
         }
+    }
+
+    /// Gives back `pages` that an [`Self::acquire_for`] took against
+    /// `promised` pages of a promise, and keeps that promise: the caller
+    /// will claim those pages again for whatever it builds instead.
+    pub fn unclaim(&self, pages: &[u32], promised: usize) {
+        let mut inner = self.inner.lock().expect("kv pool poisoned");
+        for &p in pages {
+            let refs = &mut inner.refs[p as usize];
+            assert!(*refs > 0, "released page {p} was not held");
+            *refs -= 1;
+            if *refs == 0 {
+                inner.live -= 1;
+                inner.on_release(p);
+            }
+        }
+        inner.reserved += promised;
     }
 
     /// The reference count of `page`, for tests and introspection.
@@ -1647,6 +1904,29 @@ impl KvPool {
         }
     }
 
+    /// Gives a sealed page that was built without a name — its tokens were
+    /// not known when it was taken, as for every page decode fills — the tag
+    /// its content has turned out to have, making it findable.
+    ///
+    /// Declined (returns `false`) for a page that already has a name, one
+    /// that is not sealed, one nobody holds, and a tag another page already
+    /// answers to: the pool keeps one page per content.
+    pub fn name_sealed(&self, page: u32, tag: u64) -> bool {
+        let mut inner = self.inner.lock().expect("kv pool poisoned");
+        let p = page as usize;
+        if tag == 0
+            || inner.refs[p] == 0
+            || !inner.sealed[p]
+            || inner.tag[p] != 0
+            || inner.by_tag.contains_key(&tag)
+        {
+            return false;
+        }
+        inner.tag[p] = tag;
+        inner.by_tag.insert(tag, page);
+        true
+    }
+
     /// Whether `page` has been published.
     pub fn is_sealed(&self, page: u32) -> bool {
         self.inner.lock().expect("kv pool poisoned").sealed[page as usize]
@@ -1667,6 +1947,26 @@ impl KvPool {
 
 #[cfg(test)]
 mod tests {
+    /// A page read back from `Q8_0` device storage comes back as the host
+    /// would have quantized and dequantized it.
+    #[test]
+    fn q8_0_storage_reads_back_as_its_dequantized_values() {
+        let rows: Vec<f32> = (0..96).map(|i| ((i as f32) * 0.37).sin() * 3.0).collect();
+        let bytes = crate::engine::kv_cache::f32_to_q8_0_bytes(&rows);
+        let back = crate::engine::kv_cache::device_rows_to_f32(
+            &bytes,
+            crate::engine::backend::vulkan_shaders::KvStorage::Q8_0,
+        );
+        assert_eq!(back.len(), rows.len());
+        for block in 0..3 {
+            let src = &rows[block * 32..][..32];
+            let step = src.iter().fold(0f32, |a, &b| a.max(b.abs())) / 127.0;
+            for (a, b) in src.iter().zip(&back[block * 32..][..32]) {
+                assert!((a - b).abs() <= step * 0.5 + 1e-6, "{a} vs {b}");
+            }
+        }
+    }
+
     /// The default policy has two independent definitions — the `Default`
     /// derive on the enum and the empty-string arm of the parse — and nothing
     /// makes them agree. They have to be pinned together, because a change to
@@ -1699,6 +1999,58 @@ mod tests {
     }
 
     use super::*;
+
+    /// A held promise is replaced in one step: the trade succeeds where
+    /// the held pages are what make the room, a refused trade leaves the
+    /// held promise standing, and a restored one counts again.
+    /// While an older occupant waits for pages, a younger one is refused
+    /// more and told to give its own back; a request arriving later is
+    /// refused too, an older occupant is not, and an occupant parked with
+    /// nothing held is not one to wait for.
+    #[test]
+    fn an_older_occupant_waiting_comes_first() {
+        let pool = std::sync::Arc::new(pool(8));
+        let older = pool.enter();
+        let younger = pool.enter();
+        assert!(older.age() < younger.age());
+        assert!(older.try_reserve(3, 0) && younger.try_reserve(3, 0));
+        assert!(!younger.yield_due() && older.has_younger());
+        older.wait(true);
+        assert!(younger.yield_due() && !older.yield_due());
+        assert!(
+            !younger.try_reserve(1, 0),
+            "a younger occupant took pages an older one waits for"
+        );
+        assert!(
+            !pool.try_reserve(1),
+            "a new request took pages an older one waits for"
+        );
+        // A trade that takes no more than it holds is still made.
+        assert!(younger.try_reserve(3, 3));
+        assert!(older.try_reserve(5, 3), "the waiter itself is refused");
+        younger.park(true);
+        assert!(!older.has_younger());
+        drop(younger);
+        older.wait(false);
+        assert!(pool.try_reserve(0));
+    }
+
+    #[test]
+    fn a_held_promise_is_traded_for_a_larger_one_in_one_step() {
+        let p = pool(8);
+        assert!(p.try_reserve(5));
+        // 5 more would not fit beside the 5 promised; traded for, it does.
+        assert!(!p.try_reserve(5));
+        assert!(p.try_reserve_trading(7, 5));
+        assert_eq!(p.available(), 1);
+        // Too large even with the 7 back: refused, the 7 still promised.
+        assert!(!p.try_reserve_trading(9, 7));
+        assert_eq!(p.available(), 1);
+        p.release_reserved(7);
+        assert_eq!(p.available(), 8);
+        p.restore_reserved(3);
+        assert_eq!(p.available(), 5);
+    }
 
     fn pool(pages: usize) -> KvPool {
         KvPool::new(
@@ -2566,6 +2918,58 @@ mod tests {
         for _ in 0..3 {
             assert!(p.acquire_for(&[0], 1).is_ok());
         }
+    }
+
+    /// Pages another sequence holds are shared at admission and not promised
+    /// again; a page nobody holds any more is not, since making it live
+    /// again takes room like any other.
+    #[test]
+    fn a_sharing_promise_covers_only_the_pages_beyond_a_live_prefix() {
+        let p = pool_with(4, Policy::Lru);
+        let held = p.acquire(&[11, 12]).unwrap();
+        let per = p.layers()[0].floats_per_page(p.page_tokens());
+        let rows = vec![0.5f32; per];
+        for got in &held {
+            p.fill(0, got.page, &rows, &rows);
+            p.seal(got.page);
+        }
+        assert!(!p.try_reserve(4), "two whole copies do not fit");
+        let shared = p
+            .try_reserve_sharing(&[11, 12], 4)
+            .expect("the prefix is held, so two more pages are enough");
+        assert_eq!(shared, held.iter().map(|a| a.page).collect::<Vec<_>>());
+        assert_eq!(
+            p.available(),
+            0,
+            "the two pages beyond the prefix are promised"
+        );
+        assert_eq!(p.refs(shared[0]), 2);
+        p.release(&shared);
+        p.release_reserved(2);
+        // The first holder leaves: its pages are cached, not held, and sharing
+        // one of them would make it live again.
+        p.release(&held.iter().map(|a| a.page).collect::<Vec<_>>());
+        assert!(p.try_reserve_sharing(&[11, 12], 4).is_none());
+        assert!(p.try_reserve_sharing(&[], 4).is_none());
+        assert_eq!(p.available(), 4, "a declined sharing promise takes nothing");
+    }
+
+    /// A promised acquire that is refused keeps the promise it was made
+    /// against, and so does one whose pages are given back unused: the
+    /// promise still stands, so nobody else may take its pages.
+    #[test]
+    fn a_promise_survives_a_refused_or_returned_claim() {
+        let p = pool(4);
+        assert!(p.try_reserve(2));
+        let _others = p.acquire(&[0, 0]).unwrap();
+        assert!(p.acquire_for(&[0, 0, 0], 2).is_err());
+        assert_eq!(p.available(), 0, "a refused claim gave its promise away");
+        let got = p.acquire_for(&[0, 0], 2).expect("the promise covers it");
+        p.unclaim(&got.iter().map(|a| a.page).collect::<Vec<_>>(), 2);
+        assert_eq!(p.available(), 0, "returned pages gave their promise away");
+        assert!(!p.try_reserve(1), "the promised pages went to someone else");
+        p.release_reserved(2);
+        assert_eq!(p.available(), 2);
     }
 
     /// An unclaimed promise has to come back, or a server that answers a

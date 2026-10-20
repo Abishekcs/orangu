@@ -311,14 +311,29 @@ pub fn start(
         let child = command
             .spawn()
             .map_err(|e| anyhow::anyhow!("could not start the server ({cmd:?}): {e}"))?;
-        let server = Server {
+        let mut server = Server {
             child,
             port,
             log: log.to_path_buf(),
         };
         // From here on the guard owns the child, so every error path below stops
         // it rather than leaking it into the next point.
-        if !wait_for(timeout, || port_is_busy(port)) {
+        //
+        // A server that exits during start-up — a configuration it refuses, a
+        // model it cannot load — is reported as soon as it is gone, not after
+        // the whole start-up timeout.
+        let mut exited = None;
+        let listening = wait_for(timeout, || {
+            exited = server.child.try_wait().ok().flatten();
+            exited.is_some() || port_is_busy(port)
+        });
+        if let Some(status) = exited {
+            anyhow::bail!(
+                "the server exited ({status}) before listening on port {port} — see {}",
+                log.display()
+            );
+        }
+        if !listening {
             anyhow::bail!(
                 "the server did not start listening on port {port} within {}s — see {}",
                 timeout.as_secs(),

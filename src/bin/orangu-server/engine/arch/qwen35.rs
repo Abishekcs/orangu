@@ -123,6 +123,23 @@ impl ModelForward for Qwen35Model {
     fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
         self.trunk.head_rows(hidden, n_rows)
     }
+
+    fn verifies_recurrent_on_device(&self) -> bool {
+        self.trunk.verifies_on_device()
+    }
+
+    /// The trunk's prompt loop with the head over every row; a recurrent
+    /// layer's state takes in every token, and speculation returns it to a
+    /// copy saved before the verify (`KvCache::rollback`).
+    fn forward_all_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.trunk.forward_all_logits(cache, tokens, start_pos)
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +176,131 @@ mod real_model_tests {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .unwrap();
         assert_eq!(top_id, 11751, "expected ' Paris' (11751) as top prediction");
+    }
+
+    /// A verify on the device (`Trunk::rows_on_device`) gives every
+    /// position the logits the one-token loop gives it stepped a token at a
+    /// time, to the batched kernels' rounding, and leaves the recurrent
+    /// states where the steps leave them: the steps after it agree, and so
+    /// do the steps after a verify that keeps two of its rows
+    /// (`KvCache::keep_verified`) and after one rolled back to its
+    /// checkpoint with its kept tokens run again. The bound is the host verify's own: it sits
+    /// 1.2–2.1e-2 (rms) from the steps on Qwen3.5-0.8B, the batched
+    /// kernels' rounding carried through the recurrence; a wrong conv
+    /// shift or decay is orders of magnitude past it. On the GPU, so
+    /// ignored by default: run with
+    /// `ORANGU_TEST_MODEL=/path/to/Qwen3.5-0.8B.gguf cargo test --release
+    /// --bin orangu-server verify_on_the_device -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_verify_on_the_device_steps_as_the_token_loop_does() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        assert_eq!(loaded.config.architecture, "qwen35");
+        let model = Qwen35Model::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        let compare = |what: &str, a: &[f32], b: &[f32]| {
+            let (mut diff2, mut val2) = (0f64, 0f64);
+            for (x, y) in a.iter().zip(b) {
+                diff2 += f64::from((x - y) * (x - y));
+                val2 += f64::from(y * y);
+            }
+            let rms = (diff2 / val2).sqrt();
+            let (pa, pb) = (
+                crate::engine::sampling::argmax(a),
+                crate::engine::sampling::argmax(b),
+            );
+            println!("{what}: rms {rms:.2e}, argmax {pa} / {pb}");
+            assert!(rms < 4e-2, "{what} rms {rms}");
+            assert!(
+                pa == pb || (a[pb as usize] - a[pa as usize]).abs() < 0.5,
+                "{what} picks {pa} where the steps pick {pb}"
+            );
+        };
+        let prompt: Vec<u32> = (0..37u32).map(|i| 200 + (i * 41) % 5000).collect();
+        // Both caches past the prompt and three one-token steps, so the
+        // attention layers hold rows on the device only.
+        let prepared = || {
+            let mut cache = model.new_kv_cache(128);
+            model.forward(&mut cache, &prompt, 0, 0).expect("prompt");
+            for (k, t) in [11u32, 4000, 77].into_iter().enumerate() {
+                model
+                    .forward(&mut cache, &[t], prompt.len() + k, 0)
+                    .expect("step");
+            }
+            cache
+        };
+        // A prompt through the rows, against the same prompt a token at a
+        // time.
+        {
+            let mut rows = model.new_kv_cache(128);
+            let a = model.forward(&mut rows, &prompt, 0, 0).expect("prompt");
+            let mut steps = model.new_kv_cache(128);
+            let mut b = Vec::new();
+            for (k, &t) in prompt.iter().enumerate() {
+                b = model.forward(&mut steps, &[t], k, 0).expect("step");
+            }
+            compare("prompt", &a, &b);
+        }
+        let mut verified = prepared();
+        let mut stepped = prepared();
+        let mut pos = prompt.len() + 3;
+        let draft = [1500u32, 9, 2701, 640, 33];
+        let step = |cache: &mut KvCache, tokens: &[u32], at: usize| -> Vec<Vec<f32>> {
+            tokens
+                .iter()
+                .enumerate()
+                .map(|(k, &t)| model.forward(cache, &[t], at + k, 0).expect("step"))
+                .collect()
+        };
+        let rows = model
+            .forward_all_logits(&mut verified, &draft, pos, 0)
+            .expect("verify");
+        for (k, (v, s)) in rows.iter().zip(step(&mut stepped, &draft, pos)).enumerate() {
+            compare(&format!("verify row {k}"), v, &s);
+        }
+        pos += draft.len();
+        for (k, t) in [5u32, 812].into_iter().enumerate() {
+            let a = model
+                .forward(&mut verified, &[t], pos + k, 0)
+                .expect("step");
+            let b = model.forward(&mut stepped, &[t], pos + k, 0).expect("step");
+            compare(&format!("step {k} after the verify"), &a, &b);
+        }
+        pos += 2;
+        // A verify of four with two kept, from the states behind them.
+        let point = verified.rollback_point(pos).expect("checkpoint");
+        model
+            .forward_all_logits(&mut verified, &[40, 41, 42, 43], pos, 0)
+            .expect("verify");
+        assert!(
+            verified.keep_verified(&point, 2),
+            "the device kept the rows"
+        );
+        step(&mut stepped, &[40, 41], pos);
+        pos += 2;
+        let a = model.forward(&mut verified, &[98], pos, 0).expect("step");
+        let b = model.forward(&mut stepped, &[98], pos, 0).expect("step");
+        compare("step after keeping two rows", &a, &b);
+        pos += 1;
+        // The same, rolled back to the anchor and the two run again.
+        let point = verified.rollback_point(pos).expect("checkpoint");
+        model
+            .forward_all_logits(&mut verified, &[70, 71, 72, 73], pos, 0)
+            .expect("verify");
+        verified.rollback(&point).expect("roll back");
+        let a = step(&mut verified, &[70, 71], pos);
+        let b = step(&mut stepped, &[70, 71], pos);
+        for (k, (a, b)) in a.iter().zip(&b).enumerate() {
+            compare(&format!("replay {k}"), a, b);
+        }
+        pos += 2;
+        let a = model.forward(&mut verified, &[99], pos, 0).expect("step");
+        let b = model.forward(&mut stepped, &[99], pos, 0).expect("step");
+        compare("step after the replay", &a, &b);
     }
 
     /// The same cross-check for `unsloth/Qwen3.8-27B-GGUF:Q4_K_M`, which is

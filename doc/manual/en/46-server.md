@@ -223,8 +223,17 @@ than fetching it again:
 
 ```sh
 orangu-server download unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
-orangu-server download ggml-org/embeddinggemma-300M-GGUF   # no :quant -> prefers Q4_K_M, then Q8_0
+orangu-server download someone/Model-GGUF   # no :quant -> prefers Q4_K_M, then Q8_0
 ```
+
+A repo in the model catalogue (the models `suggest` lists) fetched without a
+`:quant` takes the catalogue's quantization instead — `orangu-server download
+unsloth/Qwen3.6-35B-A3B-GGUF` fetches `UD-Q4_K_M`. `--with-drafter` also
+fetches the drafter the catalogue pairs with it: a smaller model of the same
+vocabulary, after which the command prints the `draft_model` line that turns
+it on, or a multi-token-prediction head from the model's own repo, which the
+server attaches from beside the model. For a model the catalogue pairs with
+nothing it says so; prompt lookup drafts for every model without a download.
 
 Every download **plans the model against this machine first**, and prints
 what it found before fetching anything:
@@ -917,7 +926,19 @@ Suggested model size (Dedicated)
   -------  -----------------  -------------------  -----------------
   1K       ~9B parameters     ~4B parameters       ~3B parameters
   ...
+
+  Catalogue models that fit, with the context that fits:
+    unsloth/gemma-4-E2B-it-GGUF:Q4_K_M            3.1 GB    8K  all,code,review  MTP head
+    unsloth/Qwen3-4B-GGUF:Q4_K_M                  2.5 GB   16K  all,code  draft_model unsloth/Qwen3-0.6B-GGUF:Q4_K_M
+    ...
 ```
+
+Under each budget's table come the models of a small curated catalogue that
+fit it — each a model this server serves, at the quantization `download`
+fetches for it, with its file's size, the largest context up to the one it
+is sized for whose memory fits beside the file, the roles it suits, and the
+drafter that pairs with it where there is one. A model listed at a shorter
+context than another of its size has a larger cache per token.
 
 Both budgets are a **largest single pool**, never a sum of pools: a model
 is loaded onto one device and runs on one backend, with no tensor split
@@ -1480,11 +1501,11 @@ models = ~/models
 model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
 host = all
 port = 8100
-slots = 1
+slots = 4
 api_key = a-long-random-string
 tls_cert = ~/certs/cert.pem
 tls_key = ~/certs/key.pem
-queue_limit = 0
+queue_limit = 16
 backend = auto
 device = auto
 kv_cache = f16
@@ -1546,8 +1567,23 @@ port = 8300
   overrides `[prometheus].port` — see **Overriding the
   address and ports** above.
 - `slots` — how many requests generate concurrently, each with its own KV
-  cache (default `1`). Raise it to serve overlapping requests without
-  queuing behind each other.
+  cache (default `4`; `1` for `review`, which serves one request at a time,
+  and for an image model, which draws one picture at a time; `8` for
+  `embedding`). Decoding requests share one forward pass a step, so four
+  agents get about twice the tokens of one; requests that arrive together
+  with the same new prompt build it once; and a long prompt makes way for the
+  others' decode steps between its layers. The KV pool is shared rather than
+  split, so a slot costs a single request nothing. A request whose prompt
+  the pool cannot hold beside what the running requests hold waits for
+  them to give pages back, rather than starting beside them on a cache of
+  its own that crowds the card for all of them; a prompt larger than the
+  whole pool starts at once on a cache of its own. A request is promised
+  its prompt and then each step's rows as it reaches them, not its whole
+  `max_tokens`, so a large answer cap keeps nobody waiting; when the
+  running answers outgrow the pool, the most recently started request
+  gives its pages back, waits for the older ones and resumes where it was,
+  reusing what of its own work is still cached. `1` serves one request at
+  a time.
 - `tls_cert` / `tls_key` — PEM paths for serving **HTTPS** instead of HTTP.
   Both or neither: setting one alone is a startup error rather than a
   half-enabled server, because the alternative is serving in the clear while
@@ -1584,11 +1620,11 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   `/v1/*`, `/metrics`, `/slots`, `/v1/shutdown` — answers `401` with
   `WWW-Authenticate: Bearer`.
 - `queue_limit` — how many requests may **wait** for a slot before the server
-  starts refusing (default `0`, unbounded). Beyond the limit a request is
+  starts refusing (default `16`; `0` is unbounded). Beyond the limit a request is
   answered immediately with `503 Service Unavailable` and `Retry-After: 1`
-  rather than joining the queue. Unbounded is fine for one developer at a
-  workstation, where the only thing behind you is you; a shared server wants a
-  number, because without one overload turns into every client waiting
+  rather than joining the queue. The default leaves room for a burst of agents
+  beyond the slots; a shared server may want a tighter number, because
+  without one overload turns into every client waiting
   indefinitely with nothing to tell them why. A `503` arriving in milliseconds
   is more useful than a token arriving in minutes. Requests pinned to a slot
   with `id_slot` bypass the limit — they are waiting for one specific slot's
@@ -1672,7 +1708,9 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   P1 the eight big cores now out-decode the Mali (`gemma-4-E2B`: ~46 against
   ~64 ms a step, and faster at every depth to 4096), so decode moves to them;
   `backend = vulkan` keeps the GPU. `ORANGU_DECODE_PROBE=0` skips it and keeps the
-  device.
+  device. A device win is remembered for the same device, driver, model
+  file and build (`~/.orangu/server/tuning/probes.json`, for a week), so a
+  restart skips the measurement; the `[adapt] decode:` line says so.
   When decode leaves a GPU idle, **the output head may be shared with it**
   (gemma): a fresh backend on the GPU takes a share of the head's rows, and
   each token's head runs on the cores and on the GPU at once, where the two
@@ -1820,8 +1858,8 @@ shown.
 | `host`                  | `all`                                      | bind address; `all` (or `*`) means every interface, a literal address narrows it                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `port`                  | `8100`                                     | HTTP API port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `role`                  | `all`                                      | `all`, `code`, `review`, `explorer`, `embedding`, `image`; read under `--daemon`, an image model is always `image`                                                                                                                                                                                                                                                                                                                                                                                   |
-| `slots`                 | `8` for `embedding`, else `1`              | concurrent requests, each with its own KV cache                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `queue_limit`           | `0`                                        | requests allowed to wait for a slot before `503`; `0` is unbounded                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `slots`                 | `4`; `1` for `review`/image, `8` embedding | concurrent requests, each with its own KV cache                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `queue_limit`           | `16`                                       | requests allowed to wait for a slot before `503`; `0` is unbounded                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `context`               | —                                          | tokens one request must fit on the device; set, layers move to the host until the card has room for that much KV cache                                                                                                                                                                                                                                                                                                                                                                               |
 | `api_key`               | —                                          | bearer token every request must carry; unset leaves the server open                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `tls_cert` / `tls_key`  | —                                          | PEM paths for serving HTTPS; both or neither                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -1976,11 +2014,33 @@ forward (the Llama family — `llama`, `qwen2`, `qwen3`, `qwen3moe`, `mistral`,
 `muse-glimmer` today). Either
 failure stops the server with a message naming what is wrong.
 
-**Speculation only runs for greedy requests** (`temperature: 0`), unconstrained
-by `response_format`.
-steps. A drafted token is accepted only when it equals what the sampler would
-itself have chosen, which is what makes the output identical — and that
-comparison has no meaning for a sampled or grammar-constrained request.
+**Speculation runs for greedy, sampled and constrained requests alike.** A drafted token is
+accepted only when it equals what the request's own sampler picks at that
+position, and the sampler's random draw for a position depends on the seed and
+the position alone — not on how many draws came before — so the verifier picks
+at every drafted position what plain decoding would have picked there, and the
+output is identical. Under a `response_format` constraint the verifier picks
+each position in order and the grammar advances once per pick, so at every
+position it has seen exactly the tokens accepted before it; a drafted token the
+grammar forbids differs from the pick and ends the accepted run. A hybrid model — `qwen35`, `qwen35moe`,
+`qwen3next`, `qwen4exp`, `nemotron_h_moe`, `kimi3`, `inkling` and the other
+linear-attention families — carries a state with no per-position history, and
+a verify steps it through every drafted token. Such a model speculates
+where it verifies on its device: a dense `qwen35` file on a Vulkan card runs
+the whole draft through every layer at once with its state on the card,
+and keeps the state behind each drafted token, so when part of a draft is
+rejected the state behind the last accepted token is put back and nothing
+runs again, so it decodes faster with speculation than without, on prose
+and on a reply that echoes its context alike. Elsewhere — a mixture-of-experts hybrid, the
+other recurrent families, the CPU — the verify is the model's host prompt
+path, which costs more than the decode steps the draft saves, so those
+speculate only with `ORANGU_SPEC_RECURRENT=1`: the state is saved before
+each verify (on the device, where it lives there), and when part of a draft
+is rejected it goes back to that copy and the accepted tokens run again.
+`ORANGU_SPEC_RECURRENT=0` turns it off everywhere. Either way the output is
+what plain decoding emits. A draft
+model that is itself hybrid is not built, and neither is an MTP head on a
+hybrid model, nor any drafter for a model split across nodes of a tree.
 
 **Whether it pays is a question about your hardware, not about the models.**
 Measured here on a 4 GiB card with a target that does not fit on it
@@ -1988,8 +2048,8 @@ Measured here on a 4 GiB card with a target that does not fit on it
 
 | drafter                                 |    tok/s | accepted per verification |
 | :-------------------------------------- | -------: | ------------------------: |
-| none                                    |     1.43 |                         — |
-| prompt-lookup (`ORANGU_SPECULATIVE=1`)  | **3.01** |                      1.67 |
+| none (`ORANGU_SPECULATIVE=0`)           |     1.43 |                         — |
+| prompt lookup (the default)             | **3.01** |                      1.67 |
 | `draft_model` (`gemma-4-E4B`), 4 tokens |     1.02 |                      2.15 |
 | `draft_model` (`gemma-4-E4B`), 8 tokens |     0.67 |                      2.56 |
 
@@ -2005,9 +2065,28 @@ read the acceptance line the server logs at the end of each request:
 orangu-server: [speculative/draft model] 43 drafted tokens accepted over 20 steps (2.15 extra tokens/forward)
 ```
 
-Prompt-lookup speculation needs no second model and stays behind
-`ORANGU_SPECULATIVE`; see the _Inference server internals_ chapter. Setting
-`draft_model` takes precedence over it.
+A target that fits on its device has a fast decode step, and a verify pass
+over five positions costs a few of them; there a draft pays only when it is
+accepted deep — a reply that writes out a file it was given, with a rename,
+accepts two to four extra tokens per verification — and a draft model rarely
+pays at all.
+
+**The pair shares the card.** The draft's weights, and a cache that follows
+every context the served model holds, are charged against the device before
+its KV pages are sized, so a pair that fills the card advertises a shorter
+context than the served model alone — the `[kv] one request may hold up to`
+line at startup says how much.
+
+Prompt-lookup speculation needs no second model and is on unless
+`ORANGU_SPECULATIVE=0`; each draft is verified only while verifying is the
+faster way to the next tokens (`ORANGU_SPEC_ADAPTIVE`), so it costs little
+where nothing echoes and pays where a reply copies its context. While
+several requests share a batched decode step, a model that batches its
+decode steps verifies a draft as extra rows of that step, so the other requests step with it and
+pay only the time the verify adds; elsewhere the batch waits for a verify,
+which must then beat the whole step. See the
+_Inference server internals_ chapter. Setting `draft_model` takes precedence
+over it.
 
 ### Multi-token-prediction heads
 
@@ -2047,8 +2126,8 @@ worth.
 
 Three limits are worth knowing, and none of them can affect what is emitted:
 
-- A head drafts only for **greedy, unconstrained** requests, like every other
-  drafter here, for the reason above.
+- A head drafts only on a model without recurrent layers. A head shipped
+  with a hybrid model is attached and not used.
 - A head sees only the prompt the server actually forwarded for this request.
   A prefix served out of the KV cache (a follow-up turn in the same
   conversation) never reaches it, because the hidden states it would pair
@@ -2061,9 +2140,72 @@ Three limits are worth knowing, and none of them can affect what is emitted:
   where there is no spare capacity to trade. If this server is busy, measure
   it against `ORANGU_NO_MTP=1` before assuming it helps.
 
+**gemma-4 assistant heads** (`MTP/mtp-gemma-4-*.gguf`, beside the `gemma4`
+models) are a different kind: a few narrow blocks with query projections
+only, which attend over the served model's own keys and values instead of
+keeping a cache, and draft every guess at the position the served model is
+about to fill. orangu-server drives them, but **leaves them off** unless
+`ORANGU_MTP_ASSISTANT=1`:
+
+```text
+orangu-server: multi-token-prediction head …/MTP/mtp-gemma-4-E2B-it-Q8_0.gguf not attached: the gemma-4 assistant head is off unless ORANGU_MTP_ASSISTANT=1: …
+```
+
+Each draft starts from the hidden state the served model's last verify
+exported, so with the head on every step is a verify through the path that
+exports it, and on a model that fits its device that verify costs more than
+the steps the accepted guesses save. On replies it decodes slower than prompt
+lookup, which the head would replace — on a model split across devices as
+well as on one that fits; a reply that copies its context closely is where
+it comes out ahead.
+
 Naming a head file as the model serves the model it drafts for instead, the
 same redirect a `dflash` sidecar gets: a head has one block and no trunk, so
 there is nothing else the request could mean.
+
+### DFlash drafts
+
+A **DFlash** draft (`general.architecture = dflash`, such as
+`Anbeeld/gemma4-12B-it-DFlash-GGUF` for `gemma-4-12b-it`) is a few decoder
+blocks that draft a whole run of tokens in one pass. It reads the served
+model's residual stream at the inputs of the layers its file names
+(`dflash.target_layers`), and drafts through the served model's own token
+embedding and output head. Name it as the `draft_model`:
+
+```ini
+[orangu-server]
+draft_model = Anbeeld/gemma4-12B-it-DFlash-GGUF:Q4_K_M
+draft_tokens = 2
+```
+
+```text
+orangu-server: multi-token-prediction head gemma4-12B-it-DFlash-Q4_K_M.gguf attached (2 drafted tokens per verification)
+```
+
+It attaches the way a multi-token-prediction head does, not as a second model:
+
+- **Context.** Every position the served model commits, prompt and reply,
+  passes its tapped layer inputs through the draft's `fc` projection into
+  the draft's own small cache.
+- **Draft.** The token the served model is about to read, followed by mask
+  tokens, goes through the draft's blocks in one pass, attending to that
+  cache and to the whole block at once. The draft's guess at each mask is
+  read off the served model's output head.
+- **Copies.** Where the reply repeats its context, prompt lookup drafts the
+  step instead, at its own width. Through a long copy the draft's cache
+  catches up in one batch when the copy ends (`ORANGU_SPEC_COPY_CONTEXT` in
+  the _Inference server internals_ chapter).
+
+Every step is a verify, since the next draft starts from the layer inputs
+this verify exports. That makes a short draft the one that pays: a draft of 2
+on prose, where prompt lookup rarely finds anything to copy. Wider drafts
+are accepted less often per token and verify more rows. The draft's blocks
+run on the CPU.
+
+Only a `gemma4` model exports the layer inputs. On any other architecture the
+draft is not attached and the startup log says why. A file with the DFlash2
+convolution and selector, or the DSpark Markov head, is refused, since those
+heads are not run. `ORANGU_NO_MTP=1` turns the draft off for a run.
 
 ### The `[web]` section
 
@@ -2346,8 +2488,9 @@ the top-level node logs where its time went, locally and at each worker
 (network and subtree included), for prefill and decode separately, and
 tells the client too: `timings.workers` in the answer, and a
 `Server-Timing` header on a whole (not streamed) answer. With
-several slots, `ORANGU_DECODE_BATCH=1` sends one decode step of every slot
-as a single message per worker, at every level of the tree.
+several slots, one decode step of every slot goes as a single message per
+worker, at every level of the tree (`ORANGU_DECODE_BATCH=0` sends them one
+by one).
 
 A top-level node switches between its tree and serving alone through
 `POST /props` with `{"workers": {"enabled": false}}` (or `true`): alone is
@@ -4086,11 +4229,8 @@ table and LM head — so there is no standalone model in the file to serve.
 Selecting one therefore serves the _paired target model_ from the same
 Hugging Face repo, downloading it first if the models directory does not
 have it yet; the startup banner names the model actually being served.
-Running a `dflash` draft as an actual draft would need it to read the target's
-hidden states from _inside_ the target's own layers, which the speculative
-path here does not offer — unlike a multi-token-prediction head, which reads
-one state at the end of the trunk and _is_ run (see **Multi-token-prediction
-heads** above).
+Named as the `draft_model` of a `gemma4` model instead, a `dflash` draft is
+run as one (see **DFlash drafts** above).
 
 The Qwen4 preview (`qwen4exp`, e.g. `unsloth/Qwen3.8-Flash-Next-GGUF`) runs
 on the CPU path only. Its two sub-layers are the ones the Qwen 3.5 family
@@ -4150,9 +4290,9 @@ here, so its ~26 GiB of the file is never resident: sixteen rows per token
 are all that is ever touched. It does mean the on-disk size overstates what
 the forward pass streams, and understates nothing.
 
-Like every recurrent family here it has no per-position history to roll
-back, so the opt-in prompt-lookup speculative decoding is not available for
-this model, and a cached prompt prefix is reusable only in full. The
+Like every recurrent family here it has no per-position history, so it
+speculates only with `ORANGU_SPEC_RECURRENT`, and a cached prompt prefix is
+reusable only in full. The
 multi-section RoPE these files declare (`rope.dimension_sections`) is run
 as plain rope, which is exact for text-only input; image and video input is
 out of scope, and with it `ple.image_token_id`, which only names the
@@ -4316,9 +4456,8 @@ on the chat endpoints, a collapsed _Thinking_ pane in the console). Tool calls
 come back in the
 `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
 form GLM and Ling 3.0 share, already parsed. Like every recurrent family
-here it has no per-position history to roll back, so a cached prompt prefix
-is reusable only in full and the opt-in prompt-lookup speculative decoding
-is not available for it. Embeddings requests are not implemented.
+here it has no per-position history, so a cached prompt prefix is reusable
+only in full and it speculates only with `ORANGU_SPEC_RECURRENT`. Embeddings requests are not implemented.
 
 DeepSeek-V4 (`deepseek4`) runs on the CPU path only, and differs from every
 other family here in four ways at once: the residual stream is
@@ -4395,9 +4534,8 @@ key and value projections, and on the output of each sub-layer before its
 residual add. Each carries the previous few inputs forward, which is state
 that outlives a decode step, so it lives in the same per-sequence recurrent
 slot Qwen3.5's linear-attention layers use. That state has no per-position
-history to roll back, so the opt-in prompt-lookup speculative decoding is
-not available for this model, exactly as for the other recurrent families
-here.
+history, so it speculates only with `ORANGU_SPEC_RECURRENT`, exactly as for
+the other recurrent families here.
 
 The rest is assembled from parts already present: an alternating
 sliding-window/full-attention pattern read per layer, per-head query and
@@ -4463,8 +4601,7 @@ timestep. That state is `ssm.inner_size / ssm.time_step_rank` by
 `ssm.state_size` per head — rectangular, unlike the square accumulator the
 gated-DeltaNet families here carry — and it is fixed, independent of how
 long the conversation gets. Like every recurrent family here it has no
-per-position history to roll back, so the opt-in prompt-lookup speculative
-decoding is not available for this model.
+per-position history, so it speculates only with `ORANGU_SPEC_RECURRENT`.
 
 Its expert layers differ from every other mixture-of-experts model here in
 one respect worth naming: the FFN has **no gate projection**. Both the
@@ -4506,8 +4643,7 @@ a nonzero one marks a full-attention layer. Three of the first for every one
 of the second, so on the 24-layer tiny model six layers carry a key/value
 cache and eighteen do not — a long conversation costs a quarter of the
 cache its context length suggests. Like every recurrent family here it has
-no per-position history to roll back, so the opt-in prompt-lookup
-speculative decoding is not available for this model.
+no per-position history, so it speculates only with `ORANGU_SPEC_RECURRENT`.
 
 The delta-net layers are the same Kimi Delta Attention `unsloth/Kimi-K3-GGUF`
 uses, and they share one implementation with it: a short causal convolution

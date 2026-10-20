@@ -1463,17 +1463,22 @@ fn prompt_serving_keys(role: Role) -> Result<ServingKeys> {
             _ => Err(anyhow!("expected a whole number of 1 or more")),
         }
     })?;
-    let queue_limit = prompt_checked("queue_limit (0 = unbounded)", "0", |value| {
-        value
-            .parse::<usize>()
-            .map(|_| ())
-            .map_err(|_| anyhow!("expected a whole number"))
-    })?;
+    let default_queue_limit = crate::config::DEFAULT_QUEUE_LIMIT.to_string();
+    let queue_limit = prompt_checked(
+        "queue_limit (0 = unbounded)",
+        &default_queue_limit,
+        |value| {
+            value
+                .parse::<usize>()
+                .map(|_| ())
+                .map_err(|_| anyhow!("expected a whole number"))
+        },
+    )?;
     let mut keys = ServingKeys {
         tls_cert: changed(tls_cert, ""),
         tls_key: changed(tls_key, ""),
         slots: changed(slots, &default_slots),
-        queue_limit: changed(queue_limit, "0"),
+        queue_limit: changed(queue_limit, &default_queue_limit),
         ..ServingKeys::default()
     };
     if text {
@@ -2248,7 +2253,7 @@ mod tests {
         std::fs::write(&path, format!("[orangu-server]\nmodels = {models}\n")).unwrap();
         let defaults = crate::config::load_server_configuration(&path, None, false).unwrap();
         assert_eq!(defaults.slots, Role::default().default_slots());
-        assert_eq!(defaults.queue_limit, 0);
+        assert_eq!(defaults.queue_limit, crate::config::DEFAULT_QUEUE_LIMIT);
         assert_eq!(defaults.context, None);
         assert_eq!(defaults.kv_cache.tag(), KvCache::default().tag());
         assert_eq!(defaults.draft_tokens, DEFAULT_DRAFT_TOKENS);

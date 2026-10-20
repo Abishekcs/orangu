@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::AppState;
-use crate::engine::chat_template::{ChatMessage, ChatTemplate};
+use crate::engine::chat_template::ChatMessage;
 use crate::engine::generate::{FinishReason, GenerateRequest, StreamEvent};
 use crate::engine::sampling::SamplingParams;
 
@@ -646,6 +646,90 @@ pub async fn tokenize(
 }
 
 #[derive(Deserialize)]
+pub struct LogitsRequest {
+    /// The text to run, tokenised with the model's special tokens. Ignored
+    /// when `tokens` is given.
+    #[serde(default)]
+    content: Option<String>,
+    /// The exact tokens to run — what a comparison sends the second server,
+    /// so both see the same sequence whatever their tokenisers do.
+    #[serde(default)]
+    tokens: Option<Vec<u32>>,
+    /// Positions a pass: 1 is a decode step each, more a verify pass.
+    #[serde(default = "one")]
+    rows: usize,
+    /// Candidates kept per position.
+    #[serde(default = "default_logits_top")]
+    top: usize,
+}
+
+fn one() -> usize {
+    1
+}
+
+fn default_logits_top() -> usize {
+    32
+}
+
+#[derive(Serialize)]
+pub struct LogitsResponse {
+    tokens: Vec<u32>,
+    rows: usize,
+    /// After each prefix of `tokens`, `[id, log-probability]` pairs, most
+    /// likely first.
+    positions: Vec<Vec<(u32, f32)>>,
+    seconds: f64,
+}
+
+/// Teacher-forced next-token distributions — see `engine::teacher`.
+pub async fn logits(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LogitsRequest>,
+) -> axum::response::Response {
+    use crate::engine::teacher::{MAX_ROWS, MAX_TOP};
+    let tokens = match (req.tokens, req.content) {
+        (Some(tokens), _) => tokens,
+        (None, Some(content)) => state.engine.tokenizer.encode(&content, true),
+        (None, None) => {
+            return (StatusCode::BAD_REQUEST, "give `content` or `tokens`").into_response();
+        }
+    };
+    if tokens.is_empty() {
+        return (StatusCode::BAD_REQUEST, "nothing to run").into_response();
+    }
+    let n_vocab = state.engine.model.config().n_vocab;
+    if let Some(bad) = tokens.iter().find(|&&t| t as usize >= n_vocab) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("token {bad} is outside the vocabulary"),
+        )
+            .into_response();
+    }
+    if !(1..=MAX_ROWS).contains(&req.rows) || !(1..=MAX_TOP).contains(&req.top) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("`rows` is 1 to {MAX_ROWS} and `top` 1 to {MAX_TOP}"),
+        )
+            .into_response();
+    }
+    let started = std::time::Instant::now();
+    match state
+        .engine
+        .teacher_forced(tokens.clone(), req.rows, req.top)
+        .await
+    {
+        Ok(positions) => Json(LogitsResponse {
+            tokens,
+            rows: req.rows,
+            positions,
+            seconds: started.elapsed().as_secs_f64(),
+        })
+        .into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct DetokenizeRequest {
     tokens: Vec<u32>,
 }
@@ -717,10 +801,12 @@ pub async fn completion(
     // The file's own answer, not `true`: a model trained without a
     // BOS gets a prompt one token longer than the same text is
     // anywhere else, and only the continuation shows it.
-    let tokens = state
-        .engine
-        .tokenizer
-        .encode(&req.prompt, state.engine.tokenizer.wants_bos());
+    let tokens = super::encode_off_runtime(
+        &state.engine.tokenizer,
+        req.prompt.clone(),
+        state.engine.tokenizer.wants_bos(),
+    )
+    .await;
     if let Some(rejection) = super::reject_oversized_context(tokens.len()) {
         return rejection;
     }
@@ -740,6 +826,8 @@ pub async fn completion(
             id_slot: req.id_slot,
             timings_per_token: false,
             role: Some(role),
+            cache_point: None,
+            background: false,
         })
         .await;
 
@@ -894,14 +982,13 @@ pub async fn apply_template(
     // Same role as a real request would be served under, or this endpoint
     // would report a prompt the server does not build.
     let role = super::openai::request_role(&state, &headers);
-    let Some(source) = &state.engine.chat_template_source else {
+    let Some(template) = state.engine.chat_template.clone() else {
         return (
             StatusCode::NOT_IMPLEMENTED,
             "model has no tokenizer.chat_template",
         )
             .into_response();
     };
-    let template = ChatTemplate::new(source.clone());
     // As `openai::chat_completions` treats it: an empty array is no tools.
     let tools = req
         .tools

@@ -132,10 +132,12 @@ impl SessionStore {
             Message::Truncate { session, len } => {
                 let entry = self.sessions.lock().unwrap().get(&session).cloned();
                 match entry {
-                    Some(entry) => {
-                        entry.lock().unwrap().cache.truncate(len as usize);
-                        Message::Truncate { session, len }
-                    }
+                    Some(entry) => match entry.lock().unwrap().cache.truncate(len as usize) {
+                        Ok(()) => Message::Truncate { session, len },
+                        Err(err) => {
+                            Message::Error(self.error(ErrorCode::Unsupported, err.to_string()))
+                        }
+                    },
                     None => Message::Error(self.error(
                         ErrorCode::UnknownSession,
                         format!("no session {session} to truncate"),
@@ -353,7 +355,10 @@ impl SessionStore {
     fn ready(&self, state: &mut Session, forward: &Forward) -> Result<Vec<f32>, WorkerError> {
         state.last_used = Instant::now();
         if let Some(len) = forward.kv_truncate_to {
-            state.cache.truncate(len as usize);
+            state
+                .cache
+                .truncate(len as usize)
+                .map_err(|err| self.error(ErrorCode::Unsupported, err.to_string()))?;
         }
         let held = state.cache.committed_len();
         if held != forward.start_pos as usize {

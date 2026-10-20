@@ -90,9 +90,20 @@ impl CachedPrefill {
             return 0;
         }
         // Recurrent state has no per-position history to rewind to a shorter
-        // prefix — only a full-length carryover is valid.
-        if !self.cache.recurrent.is_empty() && prefix_len != cached_len {
-            return 0;
+        // prefix — only a full-length carryover is valid. Full length is the
+        // *state's*: every position the forward pass ran, which on the fused
+        // GPU decode path is more than the host holds rows for. A prefix that
+        // matches the host rows and stops short of the decoded tail would
+        // hand on a state that has already seen that tail.
+        if !self.cache.recurrent.is_empty() {
+            let state_len = if self.cache.layers.is_empty() {
+                cached_len
+            } else {
+                self.cache.committed_len()
+            };
+            if prefix_len != cached_len || cached_len != state_len {
+                return 0;
+            }
         }
         prefix_len
     }
@@ -549,6 +560,25 @@ mod tests {
         let (prefix_len, entry) = pool.take_best_match(&[1, 2, 3, 4]).unwrap();
         assert_eq!(prefix_len, 3);
         assert_eq!(entry.tokens, vec![1, 2, 3]);
+    }
+
+    /// Rows the fused decode wrote on the device only: the host holds three,
+    /// the state has run five. A prompt matching the three must not get a
+    /// state that has seen five.
+    #[test]
+    fn a_recurrent_cache_whose_decode_rows_are_on_the_device_is_not_reused() {
+        let pool = PrefixCache::new(4);
+        let mut mixed = KvCache::new_mixed(8, &[4], &[RecurrentSpec::delta_net(2, 3, 1, 2)]);
+        for layer in &mut mixed.layers {
+            for _ in 0..3 {
+                layer.push(&[0.0; 4], &[0.0; 4]);
+            }
+            layer.advance_gpu_only();
+            layer.advance_gpu_only();
+        }
+        pool.store(vec![1, 2, 3, 4, 5, 6], mixed);
+        assert!(pool.take_best_match(&[1, 2, 3, 9]).is_none());
+        assert!(pool.take_best_match(&[1, 2, 3, 4, 5, 6, 7]).is_none());
     }
 
     #[test]

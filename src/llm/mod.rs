@@ -120,6 +120,32 @@ impl StreamMetrics {
     }
 }
 
+/// Prompt tokens this process's chat requests carried, and how many of them
+/// the server answered from its prefix cache — summed over every response's
+/// final chunk. A conversation whose prompt stops extending the previous one
+/// (a reordered tool list, a rewritten history) shows as a falling share.
+static PROMPT_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CACHED_PROMPT_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(prompt tokens, of which cached)` since the process started.
+pub fn prompt_cache_totals() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PROMPT_TOKENS.load(Relaxed),
+        CACHED_PROMPT_TOKENS.load(Relaxed),
+    )
+}
+
+/// Adds one finished response's prompt to [`prompt_cache_totals`].
+pub(crate) fn note_prompt_cache(progress: &StreamPromptProgress) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PROMPT_TOKENS.fetch_add(progress.total.max(0) as u64, Relaxed);
+    CACHED_PROMPT_TOKENS.fetch_add(
+        progress.cache.clamp(0, progress.total.max(0)) as u64,
+        Relaxed,
+    );
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct StreamPromptProgress {
     pub total: i32,

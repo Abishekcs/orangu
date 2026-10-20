@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::AppState;
 use super::native::finish_reason_str;
-use crate::engine::chat_template::{ChatMessage, ChatTemplate};
+use crate::engine::chat_template::ChatMessage;
 use crate::engine::generate::{GenerateRequest, GenerateStats, StreamEvent};
 use crate::engine::image::ImageEvent;
 use crate::engine::loader::PoolingType;
@@ -240,6 +240,14 @@ pub struct ChatCompletionRequest {
     tools: Option<serde_json::Value>,
 }
 
+/// Where `head`'s tokens end in `tokens`, if they are a strict prefix of them
+/// — a rendering's text being a prefix of another's does not make its tokens
+/// one, since a merge can cross the join.
+pub(crate) fn cache_point_of(head: &[u32], tokens: &[u32]) -> Option<usize> {
+    (!head.is_empty() && head.len() < tokens.len() && tokens.starts_with(head))
+        .then_some(head.len())
+}
+
 pub(crate) fn default_cache_prompt() -> bool {
     true
 }
@@ -439,7 +447,7 @@ pub async fn chat_completions(
     if state.engine.image.is_some() {
         return image_chat(state, req).await;
     }
-    let Some(template_source) = &state.engine.chat_template_source else {
+    let Some(template) = state.engine.chat_template.clone() else {
         return (
             StatusCode::NOT_IMPLEMENTED,
             "model has no tokenizer.chat_template; use /v1/completions instead",
@@ -449,7 +457,6 @@ pub async fn chat_completions(
     if let Some(rejection) = reject_unknown_slot(&state, req.id_slot) {
         return rejection;
     }
-    let template = ChatTemplate::new(template_source.clone());
     let (bos, eos) = (
         state
             .engine
@@ -483,7 +490,35 @@ pub async fn chat_completions(
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
     append_reasoning_suppression(&mut prompt, role, &state.engine.tokenizer);
-    let tokens = state.engine.tokenizer.encode(&prompt, false);
+    // Rendered a second time, without the generation prompt, for a model
+    // whose state cannot be rewound: the end of that rendering is where the
+    // next turn's prompt still agrees with this one — see
+    // `GenerateRequest::cache_point`.
+    let head = state
+        .engine
+        .recurrent
+        .then(|| {
+            template
+                .render_with_tools(
+                    &req.messages,
+                    false,
+                    bos,
+                    eos,
+                    state.engine.reasoning_as(role),
+                    tools,
+                )
+                .ok()
+        })
+        .flatten()
+        .filter(|head| prompt.starts_with(head.as_str()) && head.len() < prompt.len());
+    let tokens = crate::http::encode_off_runtime(&state.engine.tokenizer, prompt, false).await;
+    let cache_point = match head {
+        Some(head) => {
+            let head = crate::http::encode_off_runtime(&state.engine.tokenizer, head, false).await;
+            cache_point_of(&head, &tokens)
+        }
+        None => None,
+    };
 
     let sampling = sampling_for(
         role,
@@ -516,6 +551,8 @@ pub async fn chat_completions(
             id_slot: req.id_slot,
             timings_per_token: req.stream && req.timings_per_token,
             role: Some(role),
+            cache_point,
+            background: false,
         })
         .await;
 
@@ -981,10 +1018,12 @@ pub async fn completions(
     // The file's own answer, not `true`: a model trained without a
     // BOS gets a prompt one token longer than the same text is
     // anywhere else, and only the continuation shows it.
-    let tokens = state
-        .engine
-        .tokenizer
-        .encode(&req.prompt, state.engine.tokenizer.wants_bos());
+    let tokens = crate::http::encode_off_runtime(
+        &state.engine.tokenizer,
+        req.prompt.clone(),
+        state.engine.tokenizer.wants_bos(),
+    )
+    .await;
     let sampling = sampling_for(
         role,
         RequestSampling {
@@ -1022,6 +1061,8 @@ pub async fn completions(
             id_slot: req.id_slot,
             timings_per_token: false,
             role: Some(role),
+            cache_point: None,
+            background: false,
         })
         .await;
 

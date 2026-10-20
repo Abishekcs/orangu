@@ -616,26 +616,20 @@ impl Role {
     pub fn default_slots(&self) -> usize {
         match self {
             Role::Embedding => 8,
-            // orangu is a local, single-user AI, so generation defaults to one
-            // slot. Concurrent decode is GPU/weight-bandwidth-bound — extra
-            // slots don't raise throughput
-            // (each token already streams the whole weight set), they only add
-            // KV-cache memory. A multi-user deployment can still set `slots` in
-            // the config file.
+            // Generation defaults to four slots: one user's agents run
+            // several requests at once, and the server serves them together.
+            // Decoding slots share one forward pass a step
+            // (`engine::decode_batch`), so four streams make about twice the
+            // tokens of one; a request whose prompt another is building waits
+            // for it and shares it (`engine::prefix_index`); and a prompt makes
+            // way for the others' decode steps between its layers. A slot
+            // costs a single stream nothing: the KV pool is shared, not split.
             //
-            // **That reasoning is about one device.** On a machine with an
-            // NPU the feed-forward moves off the GPU for decode, the two
-            // slots stop queueing for the same weights, and a second slot
-            // is worth 1.62x rather than 1.09x — see
-            // `npu_tool::decode_enabled`, which switches the decode width
-            // on precisely when `slots` is more than one. Still not the
-            // default here: it is KV-cache memory spent on concurrency a
-            // single user does not have.
-            //
-            // An image model draws one picture at a time (`engine::image::
-            // Pipeline` holds a single busy lock), so a second slot would
-            // only queue.
-            Role::All | Role::Code | Role::Review | Role::Explorer | Role::Image => 1,
+            // A review is one request at a time, and an image model draws one
+            // picture at a time (`engine::image::Pipeline` holds a single busy
+            // lock), so a second slot there would only queue.
+            Role::All | Role::Code | Role::Explorer => 4,
+            Role::Review | Role::Image => 1,
         }
     }
 
@@ -1044,8 +1038,8 @@ pub struct ServerConfiguration {
     /// backup of it.
     pub api_key: Option<String>,
     /// `[orangu-server].queue_limit`: how many requests may wait for a slot
-    /// before the server starts refusing with `503`. `0` — the default —
-    /// queues without bound, which is the behaviour before this key existed.
+    /// before the server starts refusing with `503`; [`DEFAULT_QUEUE_LIMIT`]
+    /// unset, and `0` queues without bound.
     pub queue_limit: usize,
     /// `[orangu-server].context`: the context, in tokens, one request must
     /// be able to hold on the device. Unset, the model's layers all go to
@@ -1290,6 +1284,11 @@ pub fn default_server_config_path() -> Option<PathBuf> {
     let config_path = home::home_dir()?.join(".orangu/orangu-server.conf");
     config_path.exists().then_some(config_path)
 }
+
+/// How many requests may wait for a slot when `queue_limit` is not set: a
+/// burst of agents queues, a runaway client is told the server is busy
+/// instead of growing the queue without end.
+pub const DEFAULT_QUEUE_LIMIT: usize = 16;
 
 /// `cli_role` is whichever of `--all`/`--code`/`--review`/`--explorer`/
 /// `--embedding` was passed on the command line, already resolved by the
@@ -1648,7 +1647,7 @@ pub fn load_server_configuration(
             .trim()
             .parse::<usize>()
             .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].queue_limit: {err}"))?,
-        None => 0,
+        None => DEFAULT_QUEUE_LIMIT,
     };
 
     let context = match section.get("context") {
@@ -2311,8 +2310,8 @@ mod tests {
         assert_eq!(conf.models, PathBuf::from("/srv/models"));
         assert_eq!(conf.host, "all");
         assert_eq!(conf.port, 8100);
-        // orangu is local/single-user: generation defaults to one slot.
-        assert_eq!(conf.slots, 1);
+        assert_eq!(conf.slots, 4);
+        assert_eq!(conf.queue_limit, DEFAULT_QUEUE_LIMIT);
         assert_eq!(conf.web, 0);
         assert_eq!(conf.model, None);
         assert_eq!(conf.backend, BackendPreference::Auto);

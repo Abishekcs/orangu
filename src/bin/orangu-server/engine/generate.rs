@@ -145,6 +145,19 @@ pub struct GenerateRequest {
     /// `None` means "this process's role", which is every request that arrives
     /// without a coordinator in front of it.
     pub role: Option<crate::config::Role>,
+    /// Where in `prompt_tokens` the conversation's last user message ends —
+    /// the point every next turn's prompt repeats verbatim, whatever the
+    /// template does with this turn's reply. A model with recurrent state
+    /// keeps a checkpoint there (see `run`), since its state at the end of
+    /// the prompt has run tokens the next turn will not repeat. `None` when
+    /// unknown, or for a model without recurrent state.
+    pub cache_point: Option<usize>,
+    /// Work the server does for itself — the prefix warm-up after a restart
+    /// (`engine::warm_prefixes`) — rather than for a client. Its cache fills
+    /// a slot that retains nothing and never replaces what a client's request
+    /// left there: a slot keeps one conversation, and the one a client is in
+    /// the middle of is worth more than a guess at an earlier one.
+    pub background: bool,
 }
 
 impl Default for GenerateRequest {
@@ -159,6 +172,8 @@ impl Default for GenerateRequest {
             id_slot: None,
             timings_per_token: false,
             role: None,
+            cache_point: None,
+            background: false,
         }
     }
 }
@@ -269,6 +284,11 @@ pub struct Engine {
     pub mtp: Option<Arc<MtpDraft>>,
     pub tokenizer: Arc<Tokenizer>,
     pub chat_template_source: Option<String>,
+    /// [`Self::chat_template_source`], compiled once for every request.
+    pub chat_template: Option<Arc<crate::engine::chat_template::ChatTemplate>>,
+    /// Whether the model's cache carries recurrent state — what decides
+    /// whether a chat request computes a [`GenerateRequest::cache_point`].
+    pub recurrent: bool,
     pub slots: Arc<SlotPool>,
     /// Cross-request KV-cache prefix reuse (`engine::prefix_cache`) —
     /// `None` disables it entirely (same as `Some(PrefixCache::new(0))`,
@@ -505,6 +525,30 @@ impl Engine {
 }
 
 impl Engine {
+    /// [`super::teacher::teacher_forced`] in one of the request slots, so it
+    /// waits its turn beside generation instead of racing it for the device.
+    pub async fn teacher_forced(
+        &self,
+        tokens: Vec<u32>,
+        rows: usize,
+        top: usize,
+    ) -> Result<Vec<super::teacher::TopLogprobs>, String> {
+        let guard = self
+            .slots
+            .try_acquire()
+            .await
+            .ok_or("every slot is busy and the queue is full")?;
+        let model = self.serving().model;
+        tokio::task::spawn_blocking(move || {
+            super::cpu_pools::for_request(move || {
+                super::teacher::teacher_forced(model.as_ref(), &tokens, rows, top, guard.id())
+            })
+        })
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| format!("{err:#}"))
+    }
+
     /// Starts generating in the background (on tokio's blocking pool) and
     /// returns a channel of [`StreamEvent`]s — waits for a free slot first
     /// if every one is already busy.
@@ -588,6 +632,44 @@ impl Engine {
                 // panic capture below, which must stay on one thread — in
                 // the CPU pool its phase measured faster in
                 // (`engine::cpu_pools`).
+                // Waits here, on this blocking thread, for the pool to have
+                // room for the prompt where others hold it (see
+                // `wait_for_prompt_pages`), and for a peer building the
+                // same new prompt prefix (`PrefixIndex::wait_or_claim`) — not
+                // inside the CPU pool below. A pool worker that blocks can be
+                // the one holding a stolen piece of the builder's own
+                // parallel work, and then the builder never finishes.
+                let prompt_pages = paged_kv.as_ref().and_then(|(pool, _)| {
+                    wait_for_prompt_pages(
+                        pool,
+                        req.prompt_tokens.len(),
+                        slot_store.as_deref(),
+                        || task_tx.is_closed(),
+                    )
+                });
+                let prefix_claim = paged_kv
+                    .as_ref()
+                    .filter(|_| {
+                        req.cache_prompt && prefix_wait() && !model.new_kv_cache(1).has_recurrent()
+                    })
+                    .map(|(pool, index)| {
+                        // The pages `run` will promise this request first:
+                        // its prompt and the first answer token's row (see
+                        // `KvCache::try_into_paged_promising`).
+                        let tokens =
+                            (req.prompt_tokens.len() + 1).min(model.config().n_ctx_train.max(1));
+                        let pages = pool.pages_for(tokens);
+                        // This request's own admission promise is traded
+                        // for that one.
+                        let held = prompt_pages.as_ref().map_or(0, |p| p.pages);
+                        index.wait_or_claim(
+                            &req.prompt_tokens,
+                            || task_tx.is_closed(),
+                            // Pages another request holds are shared, not
+                            // promised again (`KvPool::try_reserve_sharing`).
+                            |shared| pool.available() + held + shared >= pages,
+                        )
+                    });
                 super::cpu_pools::for_request(move || {
                     // `catch_unwind` here (not left to `spawn_blocking`'s own
                     // panic-to-`JoinError` conversion below) so a panic's real
@@ -617,6 +699,8 @@ impl Engine {
                             &metrics,
                             arrived,
                             task_tx.clone(),
+                            prefix_claim,
+                            prompt_pages,
                         )
                     }));
                     if let Err(_panic) = result {
@@ -643,6 +727,96 @@ impl Engine {
         });
 
         rx
+    }
+}
+
+/// Pages of the pool promised to a request's prompt from its admission
+/// until its sequence's own promise takes them in
+/// (`KvCache::try_into_paged_promising`) — see [`wait_for_prompt_pages`].
+/// Given back when dropped.
+struct PromptPages {
+    pool: Arc<super::kv_pool::KvPool>,
+    pages: usize,
+}
+
+impl PromptPages {
+    /// Ends the promise without giving its pages back: the sequence's own
+    /// promise took them in (`KvCache::try_into_paged_promising`).
+    fn traded(mut self) {
+        self.pages = 0;
+    }
+}
+
+impl Drop for PromptPages {
+    fn drop(&mut self) {
+        self.pool.release_reserved(self.pages);
+    }
+}
+
+/// Admits a request against the pool by its prompt: promises the pages the
+/// prompt needs and returns that promise, waiting while the pool cannot
+/// make it and other requests hold the pages it would need, until one of
+/// them gives them back (or the client goes). Without the wait it is
+/// admitted anyway, on a contiguous cache of its own beside the pool
+/// (`run`'s fallback when `try_into_paged_promising` is refused): several such caches
+/// at once outgrow the device's room, and every request on the card slows
+/// with them, the ones already running too, and answers stop early when the
+/// room runs out. Waiting turns the same requests into ones that each run
+/// on the pool, one after the other.
+///
+/// Only the prompt is weighed — the answer is promised step by step as it
+/// grows ([`room_for_step`]), so a long answer cap reserves nothing. The promise
+/// is what stops several requests arriving together from all seeing the
+/// same free pages. A prompt larger than the whole pool, or one arriving at
+/// an empty pool that still cannot promise it, takes no promise and does
+/// not wait: there is nothing to wait for. The slots' retained
+/// conversations go before anyone waits (`SlotStore::release_paged`): an
+/// idle cache gives nobody its pages back by itself.
+/// `ORANGU_KV_ADMIT_WAIT=0` turns the admission off.
+fn wait_for_prompt_pages(
+    pool: &Arc<super::kv_pool::KvPool>,
+    prompt_tokens: usize,
+    slot_store: Option<&super::slot_store::SlotStore>,
+    closed: impl Fn() -> bool,
+) -> Option<PromptPages> {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        crate::engine::env::flag_on_unless_disabled("ORANGU_KV_ADMIT_WAIT")
+    });
+    let pages = pool.pages_for(prompt_tokens + 1);
+    if !*ON || pages > pool.num_pages() {
+        return None;
+    }
+    let mut started: Option<Instant> = None;
+    loop {
+        if pool.try_reserve(pages) {
+            if let Some(started) = started {
+                log::info!(
+                    "orangu-server: [kv] the prompt went ahead after {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            return Some(PromptPages {
+                pool: pool.clone(),
+                pages,
+            });
+        }
+        if slot_store.is_some_and(super::slot_store::SlotStore::release_paged) {
+            continue;
+        }
+        // Nothing to wait for: no one else holds or has been promised a
+        // page, or the client has gone.
+        if pool.available() == pool.num_pages() || closed() {
+            return None;
+        }
+        if started.is_none() {
+            log::info!(
+                "orangu-server: [kv] a {prompt_tokens}-token prompt waits for {pages} pages of \
+                 the pool ({} free)",
+                pool.available()
+            );
+            started = Some(Instant::now());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -688,6 +862,183 @@ impl Drop for OutcomeGuard<'_> {
     }
 }
 
+/// What [`room_for_step`] found.
+enum StepRoom {
+    /// The step's pages are promised.
+    Ready,
+    /// An older sequence waits for pages, or the pool cannot promise this
+    /// one's and nothing younger would give any back: this sequence gives
+    /// its own back ([`rebuild_on_pool`]).
+    Yield,
+    /// The client went while this waited.
+    Gone,
+}
+
+/// Promises the pages a step needs — the first `tokens` positions of
+/// `cache` — before the step runs, while the sequence can still wait.
+/// Short of them, the sequence waits for younger ones to give theirs back
+/// (`KvPool`'s [`Occupant`] order), leaving the decode batch while it does
+/// (`leave_batch`: the batch waits for every member, and a younger one
+/// gives its pages back only at its own next step). With nothing younger to
+/// wait for, the slots' retained conversations go first
+/// (`SlotStore::release_paged`), then this sequence's own pages.
+///
+/// [`Occupant`]: super::kv_pool::Occupant
+fn room_for_step(
+    cache: &KvCache,
+    occupant: &super::kv_pool::Occupant,
+    tokens: usize,
+    slot_store: Option<&super::slot_store::SlotStore>,
+    closed: &dyn Fn() -> bool,
+    leave_batch: &mut dyn FnMut(),
+) -> StepRoom {
+    loop {
+        if occupant.yield_due() {
+            return StepRoom::Yield;
+        }
+        if cache.ensure_room(tokens, Some(occupant.age())) {
+            occupant.wait(false);
+            return StepRoom::Ready;
+        }
+        occupant.wait(true);
+        if !occupant.has_younger() {
+            if slot_store.is_some_and(super::slot_store::SlotStore::release_paged) {
+                continue;
+            }
+            return StepRoom::Yield;
+        }
+        if closed() {
+            occupant.wait(false);
+            return StepRoom::Gone;
+        }
+        leave_batch();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Publishes the pages `cache` sealed of `tokens`, the positions it holds,
+/// so a later sequence with the same tokens shares them instead of
+/// recomputing them — the next turn of a conversation, whose prompt is this
+/// one's prompt and reply, and this sequence itself when it rebuilds after
+/// giving its pages back. The pages decode built were taken before their
+/// tokens were known, so they are named here. A reply the client re-renders
+/// differently hashes differently and is simply not found.
+///
+/// Recorded once the sequence is done with the pages rather than as each
+/// seals: an aborted request leaves pages the pool reclaims, and an index
+/// entry for one of those promises content that is gone. Only what the pool
+/// actually holds is recorded — an index entry for a page the pool never
+/// sealed is worse than no entry: `resolve` promises it, the adoption then
+/// fails, and the request pays a full prefill having been told it would
+/// not have to.
+fn publish_pages(
+    model: &dyn ModelForward,
+    pool: &super::kv_pool::KvPool,
+    index: &super::prefix_index::PrefixIndex,
+    cache: &KvCache,
+    tokens: &[u32],
+) {
+    let page_tokens = pool.page_tokens();
+    let page_tags = super::prefix_index::page_tags(tokens, page_tokens);
+    if let Some(vulkan) = model.vulkan_backend() {
+        cache.fill_decoded_pages(vulkan, page_tokens);
+    }
+    cache.name_sealed_pages(&page_tags);
+    for (i, &tag) in page_tags.iter().enumerate() {
+        if pool.holds(tag) {
+            index.remember(tag, &tokens[i * page_tokens..(i + 1) * page_tokens]);
+        }
+    }
+}
+
+/// Gives a sequence's pages back to the pool and rebuilds its cache once
+/// the pool can promise it again: `built`, the positions `cache` holds, are
+/// published first ([`publish_pages`]), so whatever of them is still
+/// resident when the sequence returns is adopted rather than recomputed,
+/// and the rest is prefilled. Waits in the pool's age order with nothing
+/// held. `None` when the client goes first.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_on_pool(
+    model: &dyn ModelForward,
+    pool: &Arc<super::kv_pool::KvPool>,
+    index: &super::prefix_index::PrefixIndex,
+    occupant: &super::kv_pool::Occupant,
+    cache: KvCache,
+    built: &[u32],
+    tokens: usize,
+    capacity: usize,
+    slot_id: usize,
+    cache_prompt: bool,
+    closed: &dyn Fn() -> bool,
+) -> Result<Option<KvCache>> {
+    occupant.yielded();
+    occupant.wait(true);
+    publish_pages(model, pool, index, &cache, built);
+    drop(cache);
+    occupant.park(true);
+    let pages = pool.pages_for(tokens);
+    let held = loop {
+        if closed() {
+            occupant.park(false);
+            occupant.wait(false);
+            return Ok(None);
+        }
+        if occupant.try_reserve(pages, 0) {
+            break PromptPages {
+                pool: pool.clone(),
+                pages,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    occupant.park(false);
+    let resolved = cache_prompt.then(|| index.resolve(built, true));
+    let shared: &[u64] = resolved.as_ref().map_or(&[], |r| &r.shared);
+    let age = Some(occupant.age());
+    let Ok(mut cache) = model
+        .new_kv_cache(capacity)
+        .try_into_paged_sharing_promising(pool.clone(), shared, held.pages, tokens, age)
+        .or_else(|cache| cache.try_into_paged_promising(pool.clone(), held.pages, tokens, age))
+    else {
+        occupant.wait(false);
+        anyhow::bail!("the KV pool could not take back a sequence it had promised room");
+    };
+    held.traded();
+    let mut reused = 0;
+    if !shared.is_empty()
+        && let Some(tokens) = cache.adopt_shared_pages(shared, pool.page_tokens())
+    {
+        reused = tokens;
+    }
+    cache.set_page_tags(&super::prefix_index::page_tags(built, pool.page_tokens()));
+    let filled = prefill(
+        model,
+        &mut cache,
+        &built[reused..],
+        reused,
+        slot_id,
+        None,
+        &mut |_| {
+            if closed() {
+                Err(anyhow::Error::new(PrefillCancelled))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    occupant.wait(false);
+    match filled {
+        Ok(_) => {}
+        Err(err) if err.is::<PrefillCancelled>() => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    if let Some(vulkan) = model.vulkan_backend() {
+        vulkan.fill_deferred_kv_rows(&mut cache);
+    }
+    cache.commit_pages();
+    Ok(Some(cache))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     model: &dyn ModelForward,
@@ -712,6 +1063,14 @@ fn run(
     metrics: &super::metrics::ServerMetrics,
     arrived: Instant,
     tx: mpsc::UnboundedSender<StreamEvent>,
+    // This request's claim on the prompt pages it is about to build — see
+    // `Engine::generate`, which takes it before the request enters the CPU
+    // pool. Ended once they are published, after the prefill.
+    prefix_claim: Option<super::prefix_index::Claim>,
+    // The pages the prompt was admitted against — see
+    // `wait_for_prompt_pages` — traded for the request's own promise for
+    // its whole length, or given back where it takes none.
+    prompt_pages: Option<PromptPages>,
 ) -> Result<()> {
     let mut outcome = OutcomeGuard {
         metrics,
@@ -772,7 +1131,6 @@ fn run(
     // below rather than layering on them: those hand a whole cache to one
     // request at a time, and the point of the pool is that a prefix has as many
     // holders as want it.
-    let mut page_tags: Vec<u64> = Vec::new();
     let mut reused_len = 0usize;
     // The pool can only promise room it has. A request longer than the whole
     // pool — a review prompt carrying a few thousand lines of source can be
@@ -783,37 +1141,106 @@ fn run(
     // was the server: the sequence discovered the pool was full a page at a
     // time, deep inside a forward pass with nowhere to report it.
     //
-    // `try_into_paged` hands the cache back on refusal, so the fallback is the
+    // `try_into_paged_promising` hands the cache back on refusal, so the fallback is the
     // very cache that was already built rather than a second one.
+    //
+    // The prefix is resolved first, so a request sharing pages another one
+    // holds is promised only the rest of its prompt
+    // (`KvCache::try_into_paged_sharing_promising`), and adopts exactly what it was
+    // promised against. `keep_last`: a fully matched prompt still needs one
+    // page of real work to produce fresh logits from — the same reason the
+    // contiguous path clamps a full match by one token.
+    let resolved = paged_kv
+        .filter(|_| req.cache_prompt)
+        .map(|(_, index)| index.resolve(&req.prompt_tokens, true));
+    // The admission's promise is traded for the sequence's in one step, so
+    // nobody else can take its pages in between.
+    let held = prompt_pages.as_ref().map_or(0, |p| p.pages);
+    // Promised its prompt and the first answer token's row, as admitted;
+    // every step after that is promised its own rows as it comes
+    // (`room_for_step`), so an answer cap far beyond what the reply will use
+    // keeps nobody else off the pool.
+    let first_room = req.prompt_tokens.len() + 1;
+    let mut occupant = None;
     let (mut new_cache, paged_kv) = match paged_kv {
-        Some((pool, index)) => match model.new_kv_cache(capacity).try_into_paged(pool.clone()) {
-            Ok(cache) => (cache, Some((pool, index))),
-            Err(cache) => (cache, None),
-        },
+        Some((pool, index)) => {
+            let shared: &[u64] = resolved.as_ref().map_or(&[], |r| &r.shared);
+            let entered = pool.enter();
+            let age = Some(entered.age());
+            match model
+                .new_kv_cache(capacity)
+                .try_into_paged_sharing_promising(pool.clone(), shared, held, first_room, age)
+                .or_else(|cache| {
+                    cache.try_into_paged_promising(pool.clone(), held, first_room, age)
+                }) {
+                Ok(cache) => {
+                    // Its pages are the sequence's now.
+                    if let Some(p) = prompt_pages {
+                        p.traded();
+                    }
+                    occupant = Some(entered);
+                    (cache, Some((pool, index)))
+                }
+                Err(cache) => {
+                    log::info!(
+                        "orangu-server: [kv] slot {} runs on a cache of its own: the pool \
+                         could not promise its {}-token prompt",
+                        guard.id(),
+                        req.prompt_tokens.len()
+                    );
+                    (cache, None)
+                }
+            }
+        }
         None => (model.new_kv_cache(capacity), None),
     };
     if let Some((pool, index)) = paged_kv {
         // The architecture builds its own cache — recurrent state included —
         // and only its positional layers move into the pool.
-        if req.cache_prompt {
-            // `keep_last`: a fully matched prompt still needs one page of real
-            // work to produce fresh logits from — the same reason the
-            // contiguous path clamps a full match by one token.
-            let resolved = index.resolve(&req.prompt_tokens, true);
+        if let Some(resolved) = resolved.filter(|_| req.cache_prompt) {
+            if crate::engine::env::flag_on("ORANGU_KV_TRACE") {
+                eprintln!(
+                    "[kv-trace] resolve: {} prompt tokens, {} pages shared of {} known",
+                    req.prompt_tokens.len(),
+                    resolved.shared.len(),
+                    index.len()
+                );
+            }
             if !resolved.shared.is_empty()
                 && let Some(tokens) =
                     new_cache.adopt_shared_pages(&resolved.shared, pool.page_tokens())
             {
                 reused_len = tokens;
             }
-            page_tags = super::prefix_index::page_tags(&req.prompt_tokens, pool.page_tokens());
-        } else {
-            page_tags = super::prefix_index::page_tags(&req.prompt_tokens, pool.page_tokens());
+            // Nothing shared: this slot's own conversation, retained at its
+            // last request's end or loaded by a `restore`, may still hold the
+            // prefix — after a restart the pool and index start empty.
+            if reused_len == 0
+                && let Some(store) = slot_store
+            {
+                reused_len = store.reuse_into_paged(guard.id(), &req.prompt_tokens, &mut new_cache);
+            }
+            if crate::engine::env::flag_on("ORANGU_KV_TRACE") {
+                let stats = pool.stats();
+                eprintln!(
+                    "[kv-trace] slot {} reuses {reused_len} of {} prompt tokens; pool {} live, {} \
+                     cached, {} never used, {} available",
+                    guard.id(),
+                    req.prompt_tokens.len(),
+                    stats.live_pages,
+                    stats.cached_pages,
+                    stats.free_pages,
+                    pool.available()
+                );
+            }
         }
         // Pages this request seals become findable under these identities. Set
         // even when nothing was adopted: this request is the one that makes the
         // prefix available to the next.
-        new_cache.set_page_tags(&page_tags);
+        new_cache.set_page_tags(&super::prefix_index::page_tags(
+            &req.prompt_tokens,
+            pool.page_tokens(),
+        ));
     }
     if paged_kv.is_none()
         && req.cache_prompt
@@ -860,16 +1287,35 @@ fn run(
     }
     let mut history = req.prompt_tokens.clone();
 
-    // Speculative decoding, greedy-only, and not while fused batching is
-    // running the decode step. `spec_buf` (below) holds tokens a speculative
-    // step already verified and committed to the KV cache, waiting to be
-    // emitted before the next forward.
+    // Speculative decoding, greedy or sampled, and not while fused batching
+    // is running the decode step. Sampled is exact because the sampler's draw
+    // for a position depends on the seed and the position alone
+    // (`sampling::position_draw`), so the verifier picks at each drafted
+    // position what plain decoding would pick there. `spec_buf` (below) holds
+    // tokens a speculative step already verified and committed to the KV
+    // cache, waiting to be emitted before the next forward.
     //
-    // Not under a constraint: speculation drafts several tokens and accepts
-    // them where they match what greedy decoding *would* have produced, and
-    // greedy decoding knows nothing about the grammar. A drafted token the
-    // constraint forbids would be accepted on that comparison alone.
-    let may_speculate = sampler.is_greedy() && !sampler.is_constrained();
+    // Under a constraint too: verification picks each position with the
+    // request's own sampler, in order, so the constraint has accepted exactly
+    // the tokens before a position when that position is picked. A drafted
+    // token it forbids differs from the pick and ends the accepted run there.
+    //
+    // A target with recurrent layers verifies from a checkpoint of its
+    // state and returns to it when a draft is rejected
+    // (`KvCache::rollback`), then runs the accepted tokens again, or keeps
+    // the state the verify left behind its last accepted token where the
+    // device kept one (`KvCache::keep_verified`) — by default only where it
+    // verifies on its device (`spec_recurrent`): the host's prompt loop costs
+    // more than the steps it saves. One whose layers other nodes hold
+    // cannot roll back, and does not speculate. A draft model's cache
+    // follows the target's with `KvCache::truncate` alone, so a recurrent
+    // draft model is not built, and neither is an MTP head on a recurrent
+    // target, whose states the rollback would have to replay too.
+    let target_recurrent = cache.as_ref().is_some_and(KvCache::has_recurrent);
+    let may_speculate = (!target_recurrent
+        || (spec_recurrent(model) && cache.as_ref().is_some_and(KvCache::can_roll_back)))
+        && !draft.is_some_and(|d| d.model.new_kv_cache(1).has_recurrent());
+    let mtp = mtp.filter(|_| !target_recurrent);
     // A configured draft model wins over the model's own MTP head, which
     // wins over prompt-lookup. All three guess at the same tokens, so
     // running more than one only turns the loser's misses into a second,
@@ -894,7 +1340,14 @@ fn run(
             cache: draft.model.new_kv_cache(capacity),
             committed: 0,
         }),
-        (true, None, Some(mtp), _) => Some(Drafter::Mtp {
+        (true, None, Some(mtp), _) if mtp.head.reads_served_cache() => Some(Drafter::Assistant {
+            head: mtp.head.as_ref(),
+            tokens: mtp.tokens,
+            states: Vec::new(),
+            states_start: 0,
+            width: mtp.head.state_width(),
+        }),
+        (true, None, Some(mtp), lookup) => Some(Drafter::Mtp {
             head: mtp.head.as_ref(),
             tokens: mtp.tokens,
             cache: mtp.head.new_kv_cache(capacity),
@@ -903,10 +1356,21 @@ fn run(
             states: Vec::new(),
             states_start: 0,
             width: mtp.head.state_width(),
+            echo: mtp
+                .head
+                .block_size()
+                .and(lookup)
+                .map(|(ngram, max_draft)| EchoLookup {
+                    ngram,
+                    max_draft,
+                    echo_draft: spec_echo_draft(model.vulkan_backend().is_some()),
+                }),
         }),
-        (true, None, None, Some((ngram, max_draft))) => {
-            Some(Drafter::PromptLookup { ngram, max_draft })
-        }
+        (true, None, None, Some((ngram, max_draft))) => Some(Drafter::PromptLookup {
+            ngram,
+            max_draft,
+            echo_draft: spec_echo_draft(model.vulkan_backend().is_some()),
+        }),
         (true, None, None, None) => None,
     };
 
@@ -938,15 +1402,55 @@ fn run(
     // untouched by the rest. The only moment a span of positions is known to
     // have been through every layer is when the pass returns, which is why this
     // is the caller's call to make and not something the cache can infer.
-    let logits = match prefill(
-        model,
-        cache.as_mut().expect("cache is always Some here"),
-        &req.prompt_tokens[reused_len..],
-        reused_len,
-        guard.id(),
-        drafter.as_mut(),
-        &mut on_chunk,
-    ) {
+    // A recurrent model's checkpoint at the conversation's cache point, for
+    // the slot store to keep in place of the end state — see
+    // `GenerateRequest::cache_point`. Only where something will keep it.
+    let checkpoint_at = req.cache_point.filter(|&at| {
+        slot_store.is_some()
+            && paged_kv.is_none()
+            && at > reused_len
+            && at < req.prompt_tokens.len()
+            && cache.as_ref().is_some_and(KvCache::has_recurrent)
+    });
+    let mut checkpoint: Option<(usize, Vec<crate::engine::kv_cache::RecurrentLayerState>)> = None;
+    let prefilled = match checkpoint_at {
+        Some(at) => {
+            let cache = cache.as_mut().expect("cache is always Some here");
+            let head = &req.prompt_tokens[reused_len..at];
+            prefill(
+                model,
+                cache,
+                head,
+                reused_len,
+                guard.id(),
+                None,
+                &mut on_chunk,
+            )
+            .and_then(|_| {
+                checkpoint = Some((at, cache.recurrent_checkpoint()));
+                let done = head.len();
+                prefill(
+                    model,
+                    cache,
+                    &req.prompt_tokens[at..],
+                    at,
+                    guard.id(),
+                    None,
+                    &mut |processed| on_chunk(done + processed),
+                )
+            })
+        }
+        None => prefill(
+            model,
+            cache.as_mut().expect("cache is always Some here"),
+            &req.prompt_tokens[reused_len..],
+            reused_len,
+            guard.id(),
+            drafter.as_mut(),
+            &mut on_chunk,
+        ),
+    };
+    let logits = match prefilled {
         Ok(l) => l,
         Err(err) if err.is::<PrefillCancelled>() => {
             outcome.finish(
@@ -968,16 +1472,38 @@ fn run(
             return Ok(());
         }
     };
-    if paged_kv.is_some()
+    if let Some((pool, index)) = paged_kv
         && let Some(cache) = cache.as_mut()
     {
+        // The last chunk's parked rows first: a page is sealed only once
+        // every layer holds all of it.
+        if let Some(vulkan) = model.vulkan_backend() {
+            vulkan.fill_deferred_kv_rows(cache);
+        }
         cache.commit_pages();
+        // The prompt's whole pages are final once the prefill returns, so
+        // they are published now rather than at the request's end: a peer
+        // waiting on this prompt (`prefix_claim`) adopts them and builds only
+        // its own suffix while this one decodes.
+        if prefix_claim.is_some() {
+            let page_tokens = pool.page_tokens();
+            let tags = super::prefix_index::page_tags(&req.prompt_tokens, page_tokens);
+            for (i, &tag) in tags.iter().enumerate() {
+                if pool.holds(tag) {
+                    index.remember(
+                        tag,
+                        &req.prompt_tokens[i * page_tokens..(i + 1) * page_tokens],
+                    );
+                }
+            }
+        }
     }
+    drop(prefix_claim);
     let prompt_time = prompt_start.elapsed();
     // Prefill is never decode-shaped (`n_tokens > 1`), so it never takes a
     // GPU-fused sampling fast path either way — this first sample always
     // runs the plain CPU chain.
-    let mut next = sampler.sample(&logits, &history);
+    let mut next = sampler.sample(&logits, &history, history.len());
 
     let generate_start = Instant::now();
     let mut generated = 0usize;
@@ -985,6 +1511,7 @@ fn run(
     let mut last_report = Instant::now();
     let mut reported = false;
     let mut spec_buf: VecDeque<u32> = VecDeque::new();
+    let mut draft_control = super::draft_control::DraftControl::new();
     let mut spec_accepted = 0usize;
     let mut spec_steps = 0usize;
     let mut header = MessageHeader::for_prompt(tokenizer, &req.prompt_tokens, role);
@@ -998,9 +1525,11 @@ fn run(
     // This slot decodes with the others from here on — one forward for all
     // of them per step (`engine::decode_batch`). Only the plain path: a
     // draft or a multi-token head steps on its own schedule.
-    let batch_registration = (draft.is_none() && mtp.is_none())
-        .then(|| decode_batcher.register())
-        .flatten();
+    let batches = draft.is_none() && mtp.is_none();
+    let mut batch_registration = batches.then(|| decode_batcher.register()).flatten();
+    // Another request's prefill narrows its chunks while this one decodes —
+    // see `decode_yield_width`.
+    let decoding = Decoding::enter();
     loop {
         if generated >= req.max_tokens {
             finish_reason = FinishReason::Length;
@@ -1141,14 +1670,112 @@ fn run(
         let recent_start = history.len().saturating_sub(repeat_last_n);
         let start_pos = history.len() - 1;
 
-        next = if let Some(tok) = spec_buf.pop_front() {
-            // A token an earlier speculative step already verified and
-            // committed to the KV cache — emit it without another forward.
-            tok
-        } else if let Some(drafter) = drafter.as_mut() {
-            // Draft a continuation and verify it in one multi-position
-            // forward; returns the model's own next token (any further
-            // accepted tokens are queued in `spec_buf`).
+        // The rows this step writes — its token's, and a draft's behind it
+        // when it verifies — promised before it runs, while the sequence can
+        // still wait for them or give its pages back: inside the forward
+        // pass a page that is not there has nowhere to be reported.
+        if spec_buf.is_empty()
+            && let Some(occupant) = occupant.as_ref()
+            && let Some((pool, index)) = paged_kv
+        {
+            let rows = 1 + drafter.as_ref().map_or(0, Drafter::max_tokens);
+            let room = (start_pos + rows).min(capacity);
+            let closed = || tx.is_closed();
+            let found = room_for_step(
+                cache
+                    .as_ref()
+                    .expect("cache is always Some between iterations"),
+                occupant,
+                room,
+                slot_store,
+                &closed,
+                &mut || drop(batch_registration.take()),
+            );
+            match found {
+                StepRoom::Ready => {}
+                StepRoom::Gone => {
+                    outcome.finish(
+                        super::metrics::Outcome::Cancelled,
+                        req.prompt_tokens.len(),
+                        reused_len,
+                        generated,
+                    );
+                    return Ok(());
+                }
+                StepRoom::Yield => {
+                    drop(batch_registration.take());
+                    log::info!(
+                        "orangu-server: [kv] slot {} gives its {start_pos} positions back to \
+                         the pool for an older request, and rebuilds them when there is room",
+                        guard.id()
+                    );
+                    let rebuilt = rebuild_on_pool(
+                        model,
+                        pool,
+                        index,
+                        occupant,
+                        cache
+                            .take()
+                            .expect("cache is always Some between iterations"),
+                        &history[..start_pos],
+                        room,
+                        capacity,
+                        guard.id(),
+                        req.cache_prompt,
+                        &closed,
+                    );
+                    match rebuilt {
+                        Ok(Some(rebuilt)) => cache = Some(rebuilt),
+                        Ok(None) => {
+                            outcome.finish(
+                                super::metrics::Outcome::Cancelled,
+                                req.prompt_tokens.len(),
+                                reused_len,
+                                generated,
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
+                            return Ok(());
+                        }
+                    }
+                    // A head that reads the served model's states from its
+                    // last forward has none for the rebuilt positions.
+                    if drafter.as_ref().is_some_and(Drafter::verifies_with_states) {
+                        drafter = None;
+                    }
+                }
+            }
+            if batches && batch_registration.is_none() {
+                batch_registration = decode_batcher.register();
+            }
+        }
+
+        // Draft a continuation and verify it in one multi-position forward,
+        // when there is nothing already verified to emit and verifying has
+        // been paying (`engine::draft_control`); the model's own next token,
+        // with any further accepted tokens queued in `spec_buf`.
+        // An echo in progress is verified whatever the gate says, at the
+        // width that has been yielding more tokens a millisecond.
+        let echo = spec_buf.is_empty() && drafter.as_ref().is_some_and(|d| d.echoes(&history));
+        let wide = echo
+            && drafter.as_ref().is_some_and(Drafter::has_echo_draft)
+            && draft_control.echo_wide();
+        let speculated = if spec_buf.is_empty()
+            && let Some(drafter) = drafter.as_mut()
+            && (drafter.verifies_with_states()
+                || draft_control.should_verify(
+                    if batch_registration.is_some() {
+                        decode_batcher.rows()
+                    } else {
+                        1
+                    },
+                    batch_registration.is_some() && model.batches_verify(),
+                )
+                || echo)
+        {
+            let started = Instant::now();
             match speculative_next(
                 model,
                 cache
@@ -1161,17 +1788,39 @@ fn run(
                 capacity,
                 drafter,
                 guard.id(),
+                drafter.draft_len(wide),
                 &mut spec_buf,
                 &mut spec_accepted,
                 &mut spec_steps,
+                batch_registration
+                    .as_ref()
+                    .filter(|_| model.batches_verify())
+                    .map(|registration| (decode_batcher, registration)),
             ) {
-                Ok(t) => t,
+                Ok(Some((t, yielded))) => {
+                    if !drafter.verifies_with_states() || echo {
+                        draft_control.verified(yielded, started.elapsed(), echo.then_some(wide));
+                    }
+                    Some(t)
+                }
+                Ok(None) => None,
                 Err(err) => {
                     let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
                     return Ok(());
                 }
             }
         } else {
+            None
+        };
+
+        next = if let Some(tok) = speculated {
+            tok
+        } else if let Some(tok) = spec_buf.pop_front() {
+            // A token an earlier speculative step already verified and
+            // committed to the KV cache — emit it without another forward.
+            tok
+        } else {
+            let step_started = drafter.is_some().then(Instant::now);
             // The device-side argmax picks a token without ever consulting
             // the grammar, so a constrained request has to come back to the
             // CPU sampler for every step. It costs the fast path; the
@@ -1218,6 +1867,9 @@ fn run(
                     guard.id(),
                 )
             });
+            if let Some(started) = step_started {
+                draft_control.stepped(started.elapsed());
+            }
             if let Some(before) = submissions_before
                 && let Some(v) = model.vulkan_backend()
             {
@@ -1237,10 +1889,12 @@ fn run(
             }
             match outcome {
                 Ok(ForwardOutcome::Token(t)) => t,
-                Ok(ForwardOutcome::Candidates(c)) => sampler.sample_from_candidates(c),
+                Ok(ForwardOutcome::Candidates(c)) => {
+                    sampler.sample_from_candidates(c, history.len())
+                }
                 Ok(ForwardOutcome::Logits(l)) => {
                     let t0 = std::time::Instant::now();
-                    let t = sampler.sample(&l, &history);
+                    let t = sampler.sample(&l, &history, history.len());
                     if std::env::var_os("ORANGU_CPU_TIMESTAMPS").is_some() {
                         eprintln!(
                             "orangu-server: [cpu-trace] pos {start_pos}: host sampler {:.3}ms over {} logits",
@@ -1257,6 +1911,7 @@ fn run(
             }
         };
     }
+    drop(decoding);
     // Generation can stop part-way through a character — a token limit, a stop
     // token — and those bytes are still bytes the model produced. Sent through
     // the same filter every other token's text goes through, so a stream that
@@ -1297,42 +1952,54 @@ fn run(
     // gets a `duplicate()` and the slot keeps the original, since each needs
     // to own its copy.
     let mut workers = Vec::new();
-    if let Some(final_cache) = cache.take() {
+    if let Some(mut final_cache) = cache.take() {
         workers = final_cache.request_finished();
         let history = std::mem::take(&mut history);
         if let Some((pool, index)) = paged_kv {
-            // Publish what this request sealed, so the next one with the same
-            // prompt shares it instead of recomputing it. Only whole pages of
-            // the *prompt* are recorded: the generated tail is still being
-            // produced page by page and the last one is partial, and a page is
-            // shareable exactly when it is complete.
-            //
-            // Recorded here rather than as each page seals, because a page is
-            // only worth advertising once the request that built it is known to
-            // have finished with it — an aborted request leaves pages the pool
-            // reclaims, and an index entry for one of those promises content
-            // that is gone.
-            let page_tokens = pool.page_tokens();
-            for (i, &tag) in page_tags.iter().enumerate() {
-                // Only what the pool actually holds. The index and the pool are
-                // separate structures, and an index entry for a page the pool
-                // never sealed is worse than no entry: `resolve` promises it,
-                // the adoption then fails, and the request pays a full prefill
-                // having been told it would not have to.
-                if !pool.holds(tag) {
-                    continue;
+            // Every whole page of the sequence, the reply's too.
+            publish_pages(model, pool, index, &final_cache, &history);
+            // A request that asked for a slot keeps its conversation there for
+            // a `save`, as a contiguous cache does. Only then: a kept paged
+            // cache holds its pages, which the pool cannot reclaim until the
+            // slot's next request replaces it.
+            match slot_store {
+                Some(store) if req.id_slot.is_some() && req.background => {
+                    store.fill_if_empty(guard.id(), history, final_cache)
                 }
-                let run = &history[i * page_tokens..(i + 1) * page_tokens];
-                index.remember(tag, run);
+                Some(store) if req.id_slot.is_some() => {
+                    store.retain(guard.id(), history, final_cache)
+                }
+                _ => drop(final_cache),
             }
-            drop(final_cache);
         } else {
+            // A recurrent model keeps its checkpoint, not its end: the next
+            // turn repeats the prompt up to the cache point and not what the
+            // state ran after it.
+            let mut history = history;
+            if let Some((at, state)) = checkpoint.take()
+                && final_cache.rewind_to_checkpoint(at, state)
+            {
+                history.truncate(at);
+            } else if (prefix_cache.is_some() || slot_store.is_some())
+                && let Some(vulkan) = model.vulkan_backend()
+            {
+                // What outlives the request is reused only as far as its host
+                // rows reach; the reply's are on the device.
+                final_cache.pull_decoded_rows(vulkan);
+            }
             match (prefix_cache, slot_store) {
                 (Some(pool), Some(store)) => {
-                    store.retain(guard.id(), history.clone(), final_cache.duplicate());
+                    if req.background {
+                        store.fill_if_empty(guard.id(), history.clone(), final_cache.duplicate());
+                    } else {
+                        store.retain(guard.id(), history.clone(), final_cache.duplicate());
+                    };
                     pool.store(history, final_cache);
                 }
                 (Some(pool), None) => pool.store(history, final_cache),
+                (None, Some(store)) if req.background => {
+                    store.fill_if_empty(guard.id(), history, final_cache)
+                }
                 (None, Some(store)) => store.retain(guard.id(), history, final_cache),
                 (None, None) => {}
             }
@@ -2413,7 +3080,9 @@ fn run_in_chunks(
     // Past one batch the comparison inverts — see the table on `snap` —
     // because the sizer is no longer choosing between one pass and many but
     // between many narrow ones that miss the device and many that hit it.
-    if batch == 0 || (tokens.len() <= batch && start_pos == 0) {
+    if (batch == 0 || (tokens.len() <= batch && start_pos == 0))
+        && tokens.len() <= decode_yield_width(last_chunk_wall(), policy, batch)
+    {
         // `chunk` rather than a bare `forward`: it is the one that also
         // feeds the drafter its state rows. The pass still has to be
         // counted — `forward_passes` is what the NPU work measures chunking
@@ -2446,7 +3115,7 @@ fn run_in_chunks(
         // deliberately narrow and exists to learn this machine's cost; there
         // is nothing to plan a split around before it has run, and narrowing
         // it further buys nothing.
-        ChunkPolicy::Adaptive => match cost.opening_width(start_pos, budget, batch) {
+        ChunkPolicy::Adaptive => match cost.opening_width(start_pos, tokens.len(), budget, batch) {
             Some(priced) if even_chunks() => even_chunk_width(tokens.len(), priced),
             Some(priced) => priced,
             None => PREFILL_PROBE_TOKENS.max(chunk_floor()).min(batch),
@@ -2463,7 +3132,13 @@ fn run_in_chunks(
     let chunks_report = chunk_widths_reported();
     let mut widths: Vec<usize> = Vec::new();
     while done < tokens.len() {
-        let n = width.min(tokens.len() - done);
+        // Checked per chunk: a decode that starts mid-prompt narrows the rest
+        // of it, and one that finishes lets the prompt widen again.
+        let cap = decode_yield_width(last_chunk_wall(), policy, batch);
+        // A width of 0 is the no-limit opt-out, which reaches this loop only
+        // when the cap applies.
+        let uncapped = if width == 0 { usize::MAX } else { width };
+        let n = uncapped.min(cap).min(tokens.len() - done);
         let started = Instant::now();
         let submits_before = crate::engine::decode_stages::submissions_so_far();
         let last = done + n >= tokens.len();
@@ -2474,6 +3149,7 @@ fn run_in_chunks(
         crate::engine::note_forward_pass();
         let elapsed = started.elapsed();
         let submits = crate::engine::decode_stages::submissions_so_far() - submits_before;
+        note_chunk_wall(n, elapsed);
         pos += n;
         done += n;
         // After the forward, not before: progress means work finished.
@@ -2520,6 +3196,145 @@ fn run_in_chunks(
     }
     Ok(logits)
 }
+
+/// Whether a model with recurrent layers speculates: `ORANGU_SPEC_RECURRENT`
+/// where it is set, otherwise where the model verifies on its device
+/// (`ModelForward::verifies_recurrent_on_device`); always in this module's
+/// tests, which check the rollback.
+fn spec_recurrent(model: &dyn ModelForward) -> bool {
+    static SET: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    cfg!(test)
+        || SET
+            .get_or_init(|| crate::engine::env::flag_setting("ORANGU_SPEC_RECURRENT"))
+            .unwrap_or_else(|| model.verifies_recurrent_on_device())
+}
+
+/// Whether a request waits for a peer that is building the same new prompt
+/// prefix instead of building it too (`PrefixIndex::wait_or_claim`). On
+/// unless `ORANGU_PREFIX_WAIT=0`.
+fn prefix_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PREFIX_WAIT"))
+}
+
+/// How many requests are in their decode loop.
+static DECODING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// Whether this thread's request is in its decode loop — so the passes
+    /// it runs there (a batched step, a verify) are not taken for another
+    /// request's prompt.
+    static DECODING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One request's membership of [`DECODING`], for as long as it decodes.
+struct Decoding;
+
+impl Decoding {
+    fn enter() -> Self {
+        DECODING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DECODING_HERE.with(|here| here.set(true));
+        Self
+    }
+}
+
+impl Drop for Decoding {
+    fn drop(&mut self) {
+        DECODING_HERE.with(|here| here.set(false));
+        DECODING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a prompt on this thread should make way for decode steps between
+/// its layers: another request is decoding, and this thread is not.
+///
+/// Requests share one device whose queue runs submissions in order, and a
+/// prompt records a whole chunk's layers ahead of the device, so a decode
+/// step issued mid-chunk waited for all of it — up to the chunk budget of
+/// seconds. While this holds, a prompt submits one layer at a time and keeps
+/// at most one more queued (`VulkanBackend::end_prefill_group`), so a decode
+/// step waits for about two layers of the chunk. `ORANGU_PREFILL_YIELD_LAYERS=0`
+/// turns it off.
+pub(crate) fn prompt_yields_to_decode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_YIELD_LAYERS"))
+        && !DECODING_HERE.with(|here| here.get())
+        && DECODING.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// The widest prefill chunk the next pass may take, given that other
+/// requests may be decoding: unbounded when none is.
+///
+/// Requests share one device and its queue runs submissions in order, so a
+/// decode step issued behind a prefill chunk waits for the whole chunk. The
+/// sizer's chunks are bounded by a time budget of seconds, which is what a
+/// decoding stream would stall for. While another request decodes, the chunk
+/// is sized to `ORANGU_PREFILL_YIELD_MS` instead — a time, not a width, so a
+/// model whose chunks are already that short keeps them and pays nothing.
+///
+/// **Off unless set** (`0`). Prefill on a card is compute-bound and a narrow
+/// chunk still pays for the GEMM's padded token tile, so narrowing multiplies
+/// the prompt's cost; and a queued decode step still waits for whatever the
+/// prompt has in flight. On a 3B model at 150 ms it made a 2 048-token prompt
+/// seven times slower and left the decoding stream stalling for half a second.
+/// [`prompt_yields_to_decode`] bounds the stall instead, by putting decode
+/// steps between a prompt's layers.
+///
+/// Priced from `wall`, the last chunk's tokens and **wall time**
+/// ([`note_chunk_wall`]), not from the sizer's estimate: that one prices a
+/// chunk per submission (`ORANGU_PREFILL_CHUNK_SPREAD`), since its budget
+/// guards one submission against the driver's timeout, and on the
+/// device-resident stream it reads several times cheaper than the wait a
+/// queued decode step sees. Only under the adaptive policy, and only once a
+/// chunk has been timed: the flat policy streams its weights once a pass, and
+/// narrowing it multiplies that read.
+fn decode_yield_width(wall: Option<(usize, Duration)>, policy: ChunkPolicy, batch: usize) -> usize {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("ORANGU_PREFILL_YIELD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(PREFILL_YIELD_MS_DEFAULT)
+    });
+    yield_width_at(ms, wall, policy, batch)
+}
+
+/// [`decode_yield_width`] at a budget of `ms`.
+fn yield_width_at(
+    ms: u64,
+    wall: Option<(usize, Duration)>,
+    policy: ChunkPolicy,
+    batch: usize,
+) -> usize {
+    let Some((n, elapsed)) = wall else {
+        return usize::MAX;
+    };
+    if ms == 0
+        || policy != ChunkPolicy::Adaptive
+        || DECODING.load(std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        return usize::MAX;
+    }
+    let max_width = if batch == 0 { usize::MAX } else { batch };
+    next_chunk_width(n, elapsed, Duration::from_millis(ms), max_width)
+}
+
+/// The last prefill chunk's width and wall time, whichever request ran it —
+/// carried across requests as the cost estimate is, so a prompt that starts
+/// while another decodes is capped from its first chunk.
+static LAST_CHUNK_WALL: Mutex<Option<(usize, Duration)>> = Mutex::new(None);
+
+fn note_chunk_wall(n: usize, elapsed: Duration) {
+    if n > 0 {
+        *LAST_CHUNK_WALL.lock().unwrap_or_else(|p| p.into_inner()) = Some((n, elapsed));
+    }
+}
+
+fn last_chunk_wall() -> Option<(usize, Duration)> {
+    *LAST_CHUNK_WALL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+const PREFILL_YIELD_MS_DEFAULT: u64 = 0;
 
 /// Whether `ORANGU_PREFILL_CHUNKS=1` asked for one line per prefill naming the
 /// widths the sizer chose.
@@ -2828,21 +3643,35 @@ impl ChunkCost {
         }
     }
 
-    /// How wide to open a *new* prompt, for a machine already priced by an
-    /// earlier one — or `None` to open with the probe.
+    /// How wide to open a prompt of `remaining` tokens at `start_pos`, for a
+    /// machine already priced by an earlier one — or `None` to open with the
+    /// probe.
     ///
-    /// Offered only from position zero. The probe exists to keep the opening
-    /// submission small at a depth where a token costs many times what it did
-    /// at the start, and an estimate carried in from an earlier request knows
-    /// nothing about the depth this one begins at. So the continuation path —
-    /// the one the probe was built for, and the one that used to reset the
-    /// GPU — keeps probing, and only a prompt starting from nothing opens at
-    /// the width this machine has already been shown to sustain.
-    fn opening_width(&self, start_pos: usize, budget: Duration, max_width: usize) -> Option<usize> {
-        if start_pos != 0 {
-            return None;
+    /// From position zero, the width this machine has been shown to sustain.
+    /// The probe exists to keep the opening submission small at a depth where
+    /// a token costs many times what it did at the start, and an estimate
+    /// carried in from an earlier request knows nothing about the depth a
+    /// continuation begins at — so a continuation probes, **unless the whole
+    /// of it fits the budget many times over**: at [`continuation_margin`]
+    /// times the carried per-token cost, which grows with the depth. A chat
+    /// turn's few hundred new tokens are such a continuation, and probing
+    /// them made two passes of one, each paying the GEMM's padded token tile.
+    fn opening_width(
+        &self,
+        start_pos: usize,
+        remaining: usize,
+        budget: Duration,
+        max_width: usize,
+    ) -> Option<usize> {
+        let fit = self.fit?;
+        if start_pos == 0 {
+            return Some(self.next_width(budget, max_width));
         }
-        self.fit.map(|_| self.next_width(budget, max_width))
+        // The margin on the per-token term only: depth makes a token dearer,
+        // not the submission around it.
+        let cost = fit.fixed + continuation_margin(start_pos) * fit.per_token * remaining as f64;
+        (remaining <= max_width && cost <= budget.as_secs_f64() * PREFILL_BUDGET_HEADROOM)
+            .then_some(remaining)
     }
 }
 
@@ -2868,6 +3697,14 @@ fn clamp_chunk_width(fits: f64, max_width: usize) -> usize {
 /// next one will start from, so using the full budget as the target leaves no
 /// room for the cost curve to rise between them.
 const PREFILL_BUDGET_HEADROOM: f64 = 0.75;
+
+/// How many times the carried per-token cost a continuation at `start_pos`
+/// is charged when deciding whether it may skip the probe: four, and one more
+/// for every 4 096 positions of depth, since attention's share of a token
+/// grows with the context it attends over.
+fn continuation_margin(start_pos: usize) -> f64 {
+    4.0 * (start_pos as f64 / 4096.0).max(1.0)
+}
 
 /// Tokens in the opening probe chunk. Small enough to stay well inside the
 /// driver's limit even at the deepest context this server will accept.
@@ -2907,8 +3744,27 @@ fn gpu_trace() -> bool {
     *TRACE.get_or_init(|| crate::engine::env::flag_on("ORANGU_GPU_TRACE"))
 }
 
+/// Prompt lookup's draft length for an echo in progress
+/// (`ORANGU_SPEC_ECHO_DRAFT`, `0` off); taken only while its verifies yield
+/// more tokens a millisecond than the plain length's (`engine::draft_control`).
+///
+/// Off by default for a model with no device (`on_device` false). On the CPU
+/// backend a verify's cost grows with its rows nearly as fast as an echo's
+/// yield does, so the longer draft barely leads even when every token of it
+/// is accepted, and an echo that breaks off — an edit — leaves it behind; the
+/// measuring costs more than it finds.
+fn spec_echo_draft(on_device: bool) -> usize {
+    std::env::var("ORANGU_SPEC_ECHO_DRAFT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(if on_device { 16 } else { 0 })
+}
+
 fn speculative_config() -> Option<(usize, usize)> {
-    if std::env::var("ORANGU_SPECULATIVE").is_err() {
+    // On unless turned off: with `engine::draft_control` deciding per step,
+    // a draft is verified only while verifying pays, and an empty one costs
+    // nothing. Off under test, where a request's forward count is asserted.
+    if cfg!(test) || !crate::engine::env::flag_on_unless_disabled("ORANGU_SPECULATIVE") {
         return None;
     }
     let read = |name: &str, default: usize| {
@@ -2919,6 +3775,42 @@ fn speculative_config() -> Option<(usize, usize)> {
             .unwrap_or(default)
     };
     Some((read("ORANGU_SPEC_NGRAM", 2), read("ORANGU_SPEC_DRAFT", 4)))
+}
+
+/// How far back prompt lookup's match must reach for a block head to copy
+/// it instead of drafting a block (`ORANGU_SPEC_COPY_CONTEXT`, by default
+/// prompt lookup's own n-gram; `0` copies echoes alone, [`ECHO_CONTEXT`]).
+/// A copy drafts the whole of prompt lookup's width where a block drafts
+/// the head's, and prose seldom matches at all.
+fn copy_context() -> usize {
+    static CONTEXT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONTEXT.get_or_init(|| {
+        match std::env::var("ORANGU_SPEC_COPY_CONTEXT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(0) => ECHO_CONTEXT,
+            Some(n) => n,
+            None => COPY_CONTEXT,
+        }
+    })
+}
+
+/// [`copy_context`]'s default.
+const COPY_CONTEXT: usize = 2;
+
+/// The most positions a block head copying an echo leaves out of its
+/// context before caching them: each one holds a state row of every tapped
+/// layer until it is.
+const DEFERRED_CONTEXT: usize = 64;
+
+/// Prompt lookup's settings, kept by a block head to draft an echo with
+/// ([`Drafter::Mtp`]'s `echo`).
+#[derive(Debug, Clone, Copy)]
+struct EchoLookup {
+    ngram: usize,
+    max_draft: usize,
+    echo_draft: usize,
 }
 
 /// Where a speculative step's candidate tokens come from.
@@ -2936,8 +3828,15 @@ fn speculative_config() -> Option<(usize, usize)> {
 /// emitted text is identical either way. A drafter can only change how fast
 /// the answer arrives, never what it is.
 enum Drafter<'a> {
-    /// Copy the continuation of an earlier occurrence of the trailing n-gram.
-    PromptLookup { ngram: usize, max_draft: usize },
+    /// Copy the continuation of an earlier occurrence of the trailing n-gram:
+    /// up to `max_draft` tokens, or `echo_draft` for a draft that
+    /// [`Drafter::echoes`] where wider verifies pay
+    /// (`engine::draft_control`).
+    PromptLookup {
+        ngram: usize,
+        max_draft: usize,
+        echo_draft: usize,
+    },
     /// Run the served model's own multi-token-prediction head — one decoder
     /// block that reads the token just produced *and* the state the served
     /// model was in when it produced it (`engine::arch::qwen4exp_mtp`).
@@ -2970,6 +3869,26 @@ enum Drafter<'a> {
         states_start: usize,
         /// One state row's width, from `ModelForward::mtp_state_width`.
         width: usize,
+        /// For a head that drafts a block (`MtpHead::block_size`): prompt
+        /// lookup's n-gram, plain width and echo width, with which an echo
+        /// is drafted as prompt lookup would draft it — a copy is longer and
+        /// surer than any block the head proposes. The head's context is
+        /// cached on those steps all the same.
+        echo: Option<EchoLookup>,
+    },
+    /// Run a draft head that attends over the served model's own cache
+    /// (`MtpHead::reads_served_cache`, e.g. `engine::arch::gemma4_assistant`).
+    /// It keeps no cache and runs no catch-up — every draft step reads the
+    /// served model's committed rows at the position it is about to fill —
+    /// so all it holds is the served model's state rows from its last
+    /// forward, of which a step reads the one behind the token it starts
+    /// from.
+    Assistant {
+        head: &'a dyn MtpHead,
+        tokens: usize,
+        states: Vec<f32>,
+        states_start: usize,
+        width: usize,
     },
     /// Run a second, smaller model autoregressively.
     Model {
@@ -2997,9 +3916,18 @@ impl Drafter<'_> {
     /// capacity, that is a write into whatever is next rather than an error.
     /// Only reachable in the last few tokens of a full context, which is why
     /// it survived unnoticed on the prompt-lookup path.
-    fn draft(&mut self, history: &[u32], room: usize, slot_id: usize) -> Result<Vec<u32>> {
+    fn draft(
+        &mut self,
+        history: &[u32],
+        room: usize,
+        served: &KvCache,
+        slot_id: usize,
+    ) -> Result<Vec<u32>> {
         if room == 0 {
             return Ok(Vec::new());
+        }
+        if let Drafter::Assistant { .. } = self {
+            return self.draft_from_served(history, room, served);
         }
         // Dispatched before the match rather than inside it: the head's own
         // step borrows the drafter, and an arm already holds it.
@@ -3007,10 +3935,16 @@ impl Drafter<'_> {
             return self.draft_from_head(history, room);
         }
         match self {
-            Drafter::PromptLookup { ngram, max_draft } => {
-                Ok(ngram_draft(history, *ngram, (*max_draft).min(room)))
-            }
-            Drafter::Mtp { .. } => unreachable!("dispatched above"),
+            Drafter::PromptLookup {
+                ngram,
+                max_draft,
+                echo_draft,
+            } => Ok(ngram_draft(
+                history,
+                *ngram,
+                (*max_draft).max(*echo_draft).min(room),
+            )),
+            Drafter::Mtp { .. } | Drafter::Assistant { .. } => unreachable!("dispatched above"),
             Drafter::Model {
                 model,
                 tokens,
@@ -3027,7 +3961,8 @@ impl Drafter<'_> {
                     // to forward, and `committed` never runs past it.
                     anyhow::bail!("draft cache is ahead of the committed history");
                 }
-                let mut logits = draft_forward(*model, cache, catch_up, *committed, slot_id)?;
+                let mut logits =
+                    draft_forward(*model, cache, catch_up, *committed, *tokens, slot_id)?;
                 *committed = history.len();
                 let mut drafted = Vec::with_capacity(*tokens);
                 for i in 0..*tokens {
@@ -3045,7 +3980,7 @@ impl Drafter<'_> {
                     if i + 1 == *tokens {
                         break;
                     }
-                    logits = draft_forward(*model, cache, &[token], *committed, slot_id)?;
+                    logits = draft_forward(*model, cache, &[token], *committed, *tokens, slot_id)?;
                     *committed += 1;
                 }
                 Ok(drafted)
@@ -3061,7 +3996,7 @@ impl Drafter<'_> {
     /// keep producing tokens, they would simply stop resembling anything the
     /// target would say, and the only symptom would be an acceptance rate
     /// quietly falling to zero.
-    fn commit(&mut self, committed_tokens: usize) {
+    fn commit(&mut self, committed_tokens: usize) -> Result<()> {
         match self {
             Drafter::Model {
                 cache, committed, ..
@@ -3069,11 +4004,12 @@ impl Drafter<'_> {
             | Drafter::Mtp {
                 cache, committed, ..
             } if *committed > committed_tokens => {
-                cache.truncate(committed_tokens);
+                cache.truncate(committed_tokens)?;
                 *committed = committed_tokens;
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// The [`Drafter::Mtp`] half of [`Self::draft`].
@@ -3093,9 +4029,40 @@ impl Drafter<'_> {
             committed < history.len(),
             "the draft head's cache is ahead of the committed history"
         );
+        // A copy the context matches far enough back is drafted as prompt
+        // lookup drafts it, at its width. Through an echo the head's context
+        // waits for the next block it drafts: one catch-up over the whole
+        // copy reads the head's weights once, where one a step reads them
+        // every step.
+        if let Drafter::Mtp {
+            echo: Some(lookup), ..
+        } = self
+            && let Some((len, from)) = ngram_match(history, lookup.ngram)
+            && from < history.len()
+            && len >= copy_context()
+        {
+            let ngram = lookup.ngram;
+            if len < ECHO_CONTEXT || history.len() - committed > DEFERRED_CONTEXT {
+                self.catch_up(&history[committed..], committed)?;
+            }
+            return Ok(ngram_draft(history, ngram, room));
+        }
         let Some(step) = self.catch_up(&history[committed..], committed)? else {
             return Ok(drafted);
         };
+        // A block head drafts the whole run in one pass of its own, from
+        // the context the catch-up just cached.
+        if let Drafter::Mtp {
+            head,
+            cache,
+            first_pos,
+            ..
+        } = self
+            && head.block_size().is_some()
+        {
+            let pos = history.len() - 1;
+            return head.draft_block(cache, history[pos], pos, want, first_pos.unwrap_or(0));
+        }
         let mut logits = step.logits;
         let mut state = step.state;
         for i in 0..want {
@@ -3116,6 +4083,43 @@ impl Drafter<'_> {
         Ok(drafted)
     }
 
+    /// The [`Drafter::Assistant`] half of [`Self::draft`]: from the token
+    /// the served model is about to read and its state behind it, each step
+    /// guesses the next token and hands its own state to the step after,
+    /// all at that token's position over the rows `served` committed.
+    /// Empty while the state behind it is missing — the first step after a
+    /// prompt, whose verify then exports one.
+    fn draft_from_served(
+        &self,
+        history: &[u32],
+        room: usize,
+        served: &KvCache,
+    ) -> Result<Vec<u32>> {
+        let Drafter::Assistant { head, tokens, .. } = self else {
+            unreachable!("only reached from the Assistant arm")
+        };
+        let want = (*tokens).min(room);
+        let mut drafted = Vec::with_capacity(want);
+        let Some(&last) = history.last() else {
+            return Ok(drafted);
+        };
+        let pos = history.len() - 1;
+        let Some(PrevState::Row(state)) = self.previous_state(pos) else {
+            return Ok(drafted);
+        };
+        let (mut token, mut state) = (last, state.to_vec());
+        while drafted.len() < want {
+            let Some(step) = head.forward_served(served, token, &state, pos)? else {
+                break;
+            };
+            // Plain argmax, for the reason every drafter here uses one.
+            token = crate::engine::sampling::argmax(&step.logits);
+            drafted.push(token);
+            state = step.state;
+        }
+        Ok(drafted)
+    }
+
     /// How many positions the MTP head's cache holds, or `0` for a drafter
     /// that keeps no state of the served model's.
     fn mtp_committed(&self) -> usize {
@@ -3131,6 +4135,82 @@ impl Drafter<'_> {
         matches!(self, Drafter::Mtp { .. })
     }
 
+    /// Whether every verify has to export the served model's states — a
+    /// head's next draft starts from one of them. Such a drafter verifies on
+    /// every step, an empty draft included: a step taken any other way
+    /// leaves the head nothing to start from.
+    /// The most tokens one draft holds — a verify writes that many rows
+    /// past the token it starts from.
+    fn max_tokens(&self) -> usize {
+        match self {
+            Drafter::PromptLookup {
+                max_draft,
+                echo_draft,
+                ..
+            } => (*max_draft).max(*echo_draft),
+            Drafter::Mtp {
+                tokens,
+                echo: Some(lookup),
+                ..
+            } => (*tokens).max(lookup.max_draft).max(lookup.echo_draft),
+            Drafter::Mtp { tokens, .. }
+            | Drafter::Assistant { tokens, .. }
+            | Drafter::Model { tokens, .. } => *tokens,
+        }
+    }
+
+    fn verifies_with_states(&self) -> bool {
+        matches!(self, Drafter::Mtp { .. } | Drafter::Assistant { .. })
+    }
+
+    /// Whether the next draft copies a passage the reply is echoing: prompt
+    /// lookup's match reaches [`ECHO_CONTEXT`] tokens back. Such a draft is
+    /// verified even while verifying has not been paying
+    /// (`engine::draft_control`): that verdict is an average over the
+    /// request so far, and an echo that starts after prose would otherwise
+    /// wait out the average.
+    /// How many tokens this step's draft may hold: the echo length for an
+    /// echo that `wide` says to verify wide, the drafter's own otherwise —
+    /// on a block head's echo, prompt lookup's own.
+    fn draft_len(&self, wide: bool) -> usize {
+        if let Drafter::Mtp {
+            echo: Some(lookup), ..
+        } = self
+        {
+            return if wide {
+                lookup.max_draft.max(lookup.echo_draft)
+            } else {
+                lookup.max_draft
+            };
+        }
+        match self {
+            Drafter::PromptLookup {
+                max_draft,
+                echo_draft,
+                ..
+            } if wide => (*max_draft).max(*echo_draft),
+            Drafter::PromptLookup { max_draft, .. } => *max_draft,
+            Drafter::Mtp { tokens, .. } => *tokens,
+            _ => self.max_draft(),
+        }
+    }
+
+    /// Whether this drafter has a wider draft for echoes than its own.
+    fn has_echo_draft(&self) -> bool {
+        matches!(self, Drafter::PromptLookup { max_draft, echo_draft, .. } if echo_draft > max_draft)
+            || matches!(self, Drafter::Mtp { echo: Some(lookup), .. } if lookup.echo_draft > lookup.max_draft)
+    }
+
+    fn echoes(&self, history: &[u32]) -> bool {
+        match self {
+            Drafter::PromptLookup { ngram, .. } => echoing(history, *ngram),
+            Drafter::Mtp {
+                echo: Some(lookup), ..
+            } => echoing(history, lookup.ngram),
+            _ => false,
+        }
+    }
+
     /// Takes the served model's per-position state rows for the batch it has
     /// just forwarded. Row 0 is position `start_pos`.
     ///
@@ -3143,8 +4223,42 @@ impl Drafter<'_> {
     /// wholesale loses exactly the one the seam needs — and the head then
     /// gains a hole at every chunk boundary of a long prompt, which the
     /// rest of this refuses to paper over.
+    ///
+    /// A block head that copies an echo caches its context later, in one
+    /// batch ([`Self::draft_from_head`]), so it keeps every row from the
+    /// first its next catch-up reads — the rows a verify rewrote dropped,
+    /// for this batch's in their place.
     fn observe_states(&mut self, start_pos: usize, rows: &[f32]) {
         if let Drafter::Mtp {
+            states,
+            states_start,
+            width,
+            committed,
+            echo: Some(_),
+            ..
+        } = self
+        {
+            let end = *states_start + states.len() / *width;
+            let keep_from = committed.saturating_sub(1).max(*states_start);
+            if !states.is_empty() && (*states_start..=end).contains(&start_pos) {
+                states.truncate((start_pos - *states_start) * *width);
+                let stale = keep_from.min(start_pos) - *states_start;
+                states.drain(..stale * *width);
+                *states_start += stale;
+            } else {
+                states.clear();
+                *states_start = start_pos;
+            }
+            states.extend_from_slice(rows);
+            return;
+        }
+        if let Drafter::Mtp {
+            states,
+            states_start,
+            width,
+            ..
+        }
+        | Drafter::Assistant {
             states,
             states_start,
             width,
@@ -3175,12 +4289,18 @@ impl Drafter<'_> {
     /// look alike and are opposite, so they are different answers here
     /// rather than one zero row standing for both.
     fn previous_state(&self, pos: usize) -> Option<PrevState<'_>> {
-        let Drafter::Mtp {
+        let (Drafter::Mtp {
             states,
             states_start,
             width,
             ..
-        } = self
+        }
+        | Drafter::Assistant {
+            states,
+            states_start,
+            width,
+            ..
+        }) = self
         else {
             return None;
         };
@@ -3285,12 +4405,25 @@ impl Drafter<'_> {
         Ok(step)
     }
 
+    /// The most tokens [`Self::draft`] returns.
+    fn max_draft(&self) -> usize {
+        match self {
+            Drafter::PromptLookup {
+                max_draft,
+                echo_draft,
+                ..
+            } => (*max_draft).max(*echo_draft),
+            Drafter::Mtp { .. } => self.max_tokens(),
+            Drafter::Assistant { tokens, .. } | Drafter::Model { tokens, .. } => *tokens,
+        }
+    }
+
     /// What the acceptance log calls this drafter.
     fn label(&self) -> &'static str {
         match self {
             Drafter::PromptLookup { .. } => "prompt-lookup",
             Drafter::Model { .. } => "draft model",
-            Drafter::Mtp { .. } => "mtp head",
+            Drafter::Mtp { .. } | Drafter::Assistant { .. } => "mtp head",
         }
     }
 }
@@ -3306,18 +4439,18 @@ enum PrevState<'s> {
 
 /// Runs the draft model forward and returns the last position's logits.
 ///
-/// **`forward_all_logits`, never `forward`, and that is the whole point of
-/// this function existing.** A single-token `forward` takes the GPU-fused
-/// decode path on the backends that have one, and that path writes the key and
-/// value straight into the GPU mirror without populating the host-side rows —
-/// `KvCache::advance_gpu_only` says so, and warns in as many words that a
-/// cache treated this way cannot later be read by a CPU attention pass.
-///
-/// A draft cache is read that way constantly: every step rolls it back to what
-/// the target accepted and then runs a multi-position pass over it. Mixing the
-/// two produced exactly the two failures the warning predicts — a read one row
-/// past the end of the host buffer, and, where the buffer happened to be long
-/// enough, an acceptance rate of zero from a model drafting for *itself*.
+/// **The target's own calls, in the target's own order**: the prompt through
+/// `forward`, as prefill runs it, and every step after it through
+/// [`ModelForward::forward_verify`] — one token or a catch-up alike.
+/// A draft cache is rolled back to what the target accepted and run again on
+/// every step, which is the verifier's cache's life too, so it must be kept by
+/// the same path the verifier keeps its own. A single-token `forward` alone is
+/// not that path: on a backend with a fused decode step it writes the key and
+/// value into the device mirror only (`KvCache::advance_gpu_only`), and an
+/// architecture whose `forward_verify` is the host's `forward_all_logits`
+/// would then read rows that were never written — one row past the end of
+/// the host buffer, or, where the buffer was long enough, zeros and an
+/// acceptance rate of zero from a model drafting for *itself*.
 ///
 /// Chunked for the same reason [`prefill`] is: the first call carries the
 /// whole prompt, and one large submission is what resets the device.
@@ -3326,56 +4459,108 @@ fn draft_forward(
     cache: &mut KvCache,
     tokens: &[u32],
     start_pos: usize,
+    draft_tokens: usize,
     slot_id: usize,
 ) -> Result<Vec<f32>> {
-    // The draft model runs the same forward passes over the same prompt, so it
-    // wants the same width for the same reasons — it just never adapted.
-    let batch = Chunking::for_prompt(tokens.len()).width;
-    let chunk = if batch == 0 { tokens.len() } else { batch };
     let mut last = Vec::new();
-    for (i, part) in tokens.chunks(chunk.max(1)).enumerate() {
-        let logits = model.forward_all_logits(cache, part, start_pos + i * chunk, slot_id)?;
-        last = logits
-            .into_iter()
-            .next_back()
+    if start_pos == 0 {
+        // The draft model runs the same forward passes over the same prompt,
+        // so it wants the same width for the same reasons.
+        let batch = Chunking::for_prompt(tokens.len()).width;
+        let chunk = if batch == 0 { tokens.len() } else { batch }.max(1);
+        for (i, part) in tokens.chunks(chunk).enumerate() {
+            last = model.forward(cache, part, i * chunk, slot_id)?;
+        }
+        return Ok(last);
+    }
+    // A catch-up longer than a verify (decoding went on undrafted for a
+    // while) is verified a draft's width at a time.
+    let chunk = draft_tokens + 1;
+    for (i, part) in tokens.chunks(chunk).enumerate() {
+        last = model
+            .forward_verify(cache, part, start_pos + i * chunk, slot_id)?
+            .pop()
             .ok_or_else(|| anyhow::anyhow!("the draft model returned no logits"))?;
     }
     Ok(last)
 }
 
-/// Prompt-lookup draft: find the most recent earlier occurrence of the last
-/// `ngram` tokens of `history`, and return up to `max_draft` tokens that
-/// followed it there — a zero-cost (no model call) guess at what comes next,
-/// which pays off whenever the output echoes the context (code, quotations,
-/// structured/repetitive text). Empty when there's no match.
-fn ngram_draft(history: &[u32], ngram: usize, max_draft: usize) -> Vec<u32> {
-    if history.len() <= ngram {
-        return Vec::new();
+/// The longest trailing context prompt lookup compares.
+const NGRAM_LONGEST: usize = 64;
+
+/// Prompt-lookup draft: the continuation of the earlier occurrence of
+/// `history`'s trailing context that matches it furthest back, at least
+/// `shortest` tokens and at most [`NGRAM_LONGEST`], the most recent of equal
+/// ones — a zero-cost (no model call) guess at what comes next, which pays
+/// off whenever the output echoes the context (code, quotations,
+/// structured/repetitive text). A longer matching context is the better
+/// predictor: in a copied list every item ends the same way, and only the
+/// context back to the item before tells the place being copied from the
+/// copy just written. Empty when there's no match.
+fn ngram_draft(history: &[u32], shortest: usize, max_draft: usize) -> Vec<u32> {
+    ngram_match(history, shortest)
+        .map(|(_, from)| history[from..(from + max_draft).min(history.len())].to_vec())
+        .unwrap_or_default()
+}
+
+/// The trailing context matched at least this far back makes a draft an
+/// echo in progress ([`Drafter::echoes`]): prose repeats a phrase of a few
+/// tokens, a copy runs on for dozens.
+const ECHO_CONTEXT: usize = 16;
+
+/// Whether `history` is copying an earlier passage: its trailing context
+/// matches [`ECHO_CONTEXT`] tokens back, with something left to copy.
+fn echoing(history: &[u32], ngram: usize) -> bool {
+    ngram_match(history, ngram)
+        .is_some_and(|(len, from)| len >= ECHO_CONTEXT && from < history.len())
+}
+
+/// [`ngram_draft`]'s match: how many tokens of context it matched, and
+/// where in `history` the continuation it copies starts.
+fn ngram_match(history: &[u32], shortest: usize) -> Option<(usize, usize)> {
+    let shortest = shortest.max(1);
+    if history.len() <= shortest {
+        return None;
     }
-    let suffix = &history[history.len() - ngram..];
-    // Scan match-start positions newest-first; the most recent occurrence is
-    // the best predictor of what follows now.
-    for start in (0..history.len() - ngram).rev() {
-        if &history[start..start + ngram] == suffix {
-            let from = start + ngram;
-            let to = (from + max_draft).min(history.len());
-            return history[from..to].to_vec();
+    let end = history.len();
+    let suffix = &history[end - shortest..];
+    // `(context length, start of the continuation)`.
+    let mut best: Option<(usize, usize)> = None;
+    for start in (0..end - shortest).rev() {
+        if &history[start..start + shortest] != suffix {
+            continue;
+        }
+        let from = start + shortest;
+        let longest = NGRAM_LONGEST.min(from);
+        let mut len = shortest;
+        while len < longest && history[from - len - 1] == history[end - len - 1] {
+            len += 1;
+        }
+        if best.is_none_or(|(l, _)| len > l) {
+            best = Some((len, from));
+            if len == longest {
+                break;
+            }
         }
     }
-    Vec::new()
+    best
 }
 
 /// One speculative step. Takes a draft from `drafter`, verifies the whole of
-/// it in a single multi-position forward, keeps the longest prefix the model
+/// it in a single multi-position forward (as rows of the batched step, with
+/// `batch`), keeps the longest prefix the model
 /// would itself have produced greedily, and rolls the rejected tail off both
 /// KV caches. Returns the model's own next token (identical to what plain
-/// greedy decoding produces here) and pushes any further accepted tokens onto
-/// `spec_buf` for the loop to emit before its next forward.
+/// greedy decoding produces here) with the number of tokens the step
+/// yielded, and pushes any further accepted tokens onto `spec_buf` for the
+/// loop to emit before its next forward; `None` when there was no draft to
+/// verify, and the loop decodes the token instead.
 /// `accepted`/`steps` accumulate acceptance stats for the final log.
 ///
-/// Only sound for greedy sampling: a draft token is accepted only when it
-/// equals the sampler's own pick at that position, so the emitted sequence is
-/// byte-for-byte what non-speculative greedy decoding would emit.
+/// A draft token is accepted only when it equals the sampler's own pick at
+/// that position, and that pick depends on the position alone
+/// (`sampling::position_draw`), so the emitted sequence is what decoding
+/// without a draft would emit, greedy or sampled.
 #[allow(clippy::too_many_arguments)]
 fn speculative_next(
     model: &dyn ModelForward,
@@ -3387,16 +4572,33 @@ fn speculative_next(
     capacity: usize,
     drafter: &mut Drafter<'_>,
     slot_id: usize,
+    draft_len: usize,
     spec_buf: &mut VecDeque<u32>,
     accepted: &mut usize,
     steps: &mut usize,
-) -> Result<u32> {
-    // `current` takes the first of the remaining rows; the draft gets the rest.
-    let room = capacity.saturating_sub(start_pos + 1);
-    let draft = drafter.draft(history, room, slot_id)?;
+    batch: Option<(
+        &super::decode_batch::DecodeBatcher,
+        &super::decode_batch::Registration<'_>,
+    )>,
+) -> Result<Option<(u32, usize)>> {
+    // `current` takes the first of the remaining rows; the draft gets the
+    // rest, up to the step's `draft_len`.
+    let room = capacity.saturating_sub(start_pos + 1).min(draft_len);
+    let draft = drafter.draft(history, room, cache, slot_id)?;
+    // Nothing to verify: the plain decode step is the cheaper way to the
+    // same token. A head-based drafter still needs this pass's states.
+    if draft.is_empty() && !drafter.verifies_with_states() {
+        return Ok(None);
+    }
     let mut input = Vec::with_capacity(1 + draft.len());
     input.push(current);
     input.extend_from_slice(&draft);
+    // A recurrent state takes in every token the verify runs, so it is saved
+    // here, at the anchor, for a rejected draft to return to.
+    let checkpoint = cache
+        .has_recurrent()
+        .then(|| cache.rollback_point(start_pos))
+        .transpose()?;
 
     // Per-position logits for `current` and every drafted token, from one
     // forward that appends all of them to the cache. A head-based drafter
@@ -3404,25 +4606,55 @@ fn speculative_next(
     // the same pass — the next draft reads the state behind whichever token
     // the verification below goes on to accept last, and only this forward
     // ever computes it.
-    let logits = if drafter.wants_states() {
+    let logits = if drafter.verifies_with_states() {
         let (logits, states) =
             model.forward_all_logits_with_states(cache, &input, start_pos, slot_id)?;
         drafter.observe_states(start_pos, &states);
         logits
     } else {
-        model.forward_all_logits(cache, &input, start_pos, slot_id)?
+        // Every non-empty draft verified at the step's full width (one of
+        // two: the drafter's own and its echo width): a device keeps
+        // resources per pass width, and a draft cut short near the end of
+        // the history would otherwise add a width — and its share of device
+        // memory — for each length it happened to have. The padding rows are computed, never read, and rolled off
+        // with the rejected tail below.
+        // Not for a recurrent cache: a padding row would step its state too,
+        // and every verify that padded would have to be run again.
+        let real = input.len();
+        let width = 1 + room;
+        if real > 1 && real < width && checkpoint.is_none() {
+            input.resize(width, current);
+        }
+        // A slot in the batch verifies as rows of the batched step, so the
+        // other slots step with it rather than wait for it.
+        let mut logits = match batch {
+            Some((batcher, registration)) => {
+                batcher.verify(Some(registration), model, cache, &input, start_pos, slot_id)?
+            }
+            None => model.forward_verify(cache, &input, start_pos, slot_id)?,
+        };
+        logits.truncate(real);
+        input.truncate(real);
+        logits
     };
 
-    // Verify greedily. `recent` mirrors what `history` would be as accepted
-    // tokens are committed, so the repeat penalty (if any) sees exactly the
-    // context plain decoding would — keeping the output identical.
+    // Verify with the request's own sampler, row by row. `recent` mirrors
+    // what `history` would be as accepted tokens are committed, so the repeat
+    // penalty (if any) sees exactly the context plain decoding would, and
+    // row `m` is sampled for the position it fills — `start_pos + 1 + m` —
+    // whose draw depends on nothing else (`sampling::position_draw`). A
+    // constraint advances once per pick, so at row `m` it has seen exactly
+    // the tokens committed before it. So the token chosen at every position
+    // is the one plain decoding would choose there, sampled, greedy or
+    // constrained, and a draft is accepted exactly as far as it agrees with
+    // it.
     let rl = sampler.repeat_last_n();
     let mut recent: Vec<u32> = history[history.len().saturating_sub(rl)..].to_vec();
-    let mut chosen = vec![sampler.sample(&logits[0], &recent)];
+    let mut chosen = vec![sampler.sample(&logits[0], &recent, start_pos + 1)];
     recent.push(chosen[0]);
     let mut matched = 0usize;
     while matched < draft.len() && draft[matched] == chosen[matched] {
-        let next = sampler.sample(&logits[matched + 1], &recent);
+        let next = sampler.sample(&logits[matched + 1], &recent, start_pos + 2 + matched);
         recent.push(next);
         chosen.push(next);
         matched += 1;
@@ -3433,17 +4665,32 @@ fn speculative_next(
     // prefix — its key/value is not committed (it was never an accepted input),
     // so it becomes the next frontier the loop forwards.
     let committed_tokens = start_pos + chosen.len();
-    cache.truncate(committed_tokens);
+    match &checkpoint {
+        // The state has taken in the rejected tokens too: back to the one
+        // the verify left behind its last accepted token where the device
+        // kept it, otherwise back to the anchor and the accepted ones again
+        // — either way it holds exactly what plain decoding would have
+        // given it. Their logits are not needed.
+        Some(checkpoint) if chosen.len() < input.len() => {
+            if !cache.keep_verified(checkpoint, chosen.len()) {
+                cache.rollback(checkpoint)?;
+                model.forward(cache, &input[..chosen.len()], start_pos, slot_id)?;
+            }
+        }
+        // Every token verified was accepted: the state is already right.
+        Some(_) => {}
+        None => cache.truncate(committed_tokens)?,
+    }
     // The draft's cache follows the target's exactly, which is what keeps the
     // two models looking at the same context. A drafter with no cache of its
     // own ignores this.
-    drafter.commit(committed_tokens);
+    drafter.commit(committed_tokens)?;
     *accepted += matched;
     *steps += 1;
     for &t in &chosen[1..] {
         spec_buf.push_back(t);
     }
-    Ok(chosen[0])
+    Ok(Some((chosen[0], chosen.len())))
 }
 
 #[cfg(test)]
@@ -3970,6 +5217,14 @@ mod tests {
         /// reduces: a verification forward is one call carrying the whole
         /// draft, where plain decoding would have made one call per token.
         forward_calls: AtomicUsize,
+        /// Carry one recurrent layer beside the attention layer, the shape of
+        /// a hybrid model: every token is added into its state, and the
+        /// state weighs into the winner. A cache whose state saw other tokens
+        /// than its attention rows then answers differently.
+        recurrent: bool,
+        /// How long each forward takes, so requests run side by side
+        /// overlap.
+        pause: Duration,
     }
 
     impl DeterministicModel {
@@ -3993,6 +5248,25 @@ mod tests {
                 disagree_every: 0,
                 calls: AtomicUsize::new(0),
                 forward_calls: AtomicUsize::new(0),
+                recurrent: false,
+                pause: Duration::ZERO,
+            }
+        }
+
+        /// The same model with a recurrent layer — see `recurrent`.
+        fn hybrid(n_vocab: usize) -> Self {
+            Self {
+                recurrent: true,
+                ..Self::new(n_vocab)
+            }
+        }
+
+        /// Pushes `token` at `pos` into every layer this model has.
+        fn absorb(&self, cache: &mut KvCache, token: u32, pos: usize) {
+            let val = token as f32 * 1000.0 + pos as f32;
+            cache.layers[0].push(&[val], &[val]);
+            if self.recurrent {
+                cache.recurrent[0].delta_states_mut().0[0] += token as f32 + 1.0;
             }
         }
 
@@ -4007,10 +5281,14 @@ mod tests {
 
         /// The winner this model's rule picks for a cache in its current
         /// state, with the deliberate disagreement applied.
-        fn winner(&self, layer: &crate::engine::kv_cache::LayerCache) -> usize {
+        fn winner(&self, cache: &mut KvCache) -> usize {
+            let layer = &cache.layers[0];
             let mut acc = 0f32;
             for p in 0..layer.len {
                 acc += layer.key_at(p, 0, 1)[0];
+            }
+            if self.recurrent {
+                acc += 7.0 * cache.recurrent[0].delta_states_mut().0[0];
             }
             let base = (acc.abs() as u64 as usize) % self.config.n_vocab;
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
@@ -4022,8 +5300,10 @@ mod tests {
         }
 
         fn logits_for(&self, winner: usize) -> Vec<f32> {
+            // Soft enough that a sampled request does not always take the
+            // winner — about two in three at temperature 0.8.
             let mut logits = vec![0f32; self.config.n_vocab];
-            logits[winner] = 10.0;
+            logits[winner] = 2.0;
             logits
         }
     }
@@ -4034,7 +5314,17 @@ mod tests {
         }
 
         fn new_kv_cache(&self, capacity: usize) -> KvCache {
-            KvCache::new(1, capacity, 1)
+            if self.recurrent {
+                KvCache::new_mixed(
+                    capacity,
+                    &[1],
+                    &[crate::engine::kv_cache::RecurrentSpec::delta_net(
+                        0, 0, 1, 1,
+                    )],
+                )
+            } else {
+                KvCache::new(1, capacity, 1)
+            }
         }
 
         fn forward(
@@ -4047,12 +5337,11 @@ mod tests {
             self.forwarded_tokens
                 .fetch_add(tokens.len(), Ordering::Relaxed);
             self.forward_calls.fetch_add(1, Ordering::Relaxed);
-            let layer = &mut cache.layers[0];
+            std::thread::sleep(self.pause);
             for (i, &t) in tokens.iter().enumerate() {
-                let val = t as f32 * 1000.0 + (start_pos + i) as f32;
-                layer.push(&[val], &[val]);
+                self.absorb(cache, t, start_pos + i);
             }
-            let winner = self.winner(layer);
+            let winner = self.winner(cache);
             Ok(self.logits_for(winner))
         }
 
@@ -4070,12 +5359,10 @@ mod tests {
             self.forwarded_tokens
                 .fetch_add(tokens.len(), Ordering::Relaxed);
             self.forward_calls.fetch_add(1, Ordering::Relaxed);
-            let layer = &mut cache.layers[0];
             let mut out = Vec::with_capacity(tokens.len());
             for (i, &t) in tokens.iter().enumerate() {
-                let val = t as f32 * 1000.0 + (start_pos + i) as f32;
-                layer.push(&[val], &[val]);
-                let winner = self.winner(layer);
+                self.absorb(cache, t, start_pos + i);
+                let winner = self.winner(cache);
                 out.push(self.logits_for(winner));
             }
             Ok(out)
@@ -4217,6 +5504,8 @@ mod tests {
             id_slot: None,
             timings_per_token: false,
             role: None,
+            cache_point: None,
+            background: false,
         };
         let draft = DraftModel {
             model: draft,
@@ -4240,6 +5529,8 @@ mod tests {
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),
             tx,
+            None,
+            None,
         )
         .unwrap();
         drain(rx)
@@ -4268,6 +5559,8 @@ mod tests {
             id_slot: None,
             timings_per_token: false,
             role: None,
+            cache_point: None,
+            background: false,
         };
         run(
             model,
@@ -4286,9 +5579,489 @@ mod tests {
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),
             tx,
+            None,
+            None,
         )
         .unwrap();
         drain(rx)
+    }
+
+    /// `run_request` through a paged pool and its index, as a server with the
+    /// paged cache on serves every request.
+    fn run_request_paged(
+        model: &DeterministicModel,
+        tokenizer: &Tokenizer,
+        paged: &(
+            Arc<crate::engine::kv_pool::KvPool>,
+            Arc<crate::engine::prefix_index::PrefixIndex>,
+        ),
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+    ) -> (String, bool) {
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        run_on_slot(
+            model,
+            tokenizer,
+            paged,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
+            &guard,
+            prompt_tokens,
+            max_tokens,
+        )
+    }
+
+    /// [`run_request_paged`] on a given slot and decode batch, admitted to
+    /// the pool as a request is.
+    fn run_on_slot(
+        model: &DeterministicModel,
+        tokenizer: &Tokenizer,
+        paged: &(
+            Arc<crate::engine::kv_pool::KvPool>,
+            Arc<crate::engine::prefix_index::PrefixIndex>,
+        ),
+        batcher: &crate::engine::decode_batch::DecodeBatcher,
+        guard: &crate::engine::scheduler::SlotGuard,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+    ) -> (String, bool) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let prompt_pages = wait_for_prompt_pages(&paged.0, prompt_tokens.len(), None, || false);
+        let req = GenerateRequest {
+            json_output: false,
+            prompt_tokens,
+            sampling: greedy_params(),
+            max_tokens,
+            stop_token_ids: vec![],
+            cache_prompt: true,
+            id_slot: None,
+            timings_per_token: false,
+            role: None,
+            cache_point: None,
+            background: false,
+        };
+        run(
+            model,
+            tokenizer,
+            None,
+            None,
+            None,
+            None,
+            Some(paged),
+            batcher,
+            guard,
+            req,
+            crate::config::Role::default(),
+            crate::config::Role::default(),
+            false,
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+            None,
+            prompt_pages,
+        )
+        .unwrap();
+        drain(rx)
+    }
+
+    /// Two requests whose answers together outgrow the pool both start at
+    /// once — each promised its prompt, not its answer cap — and when the
+    /// pool runs short the younger gives its pages back, waits for the
+    /// older to finish, rebuilds and goes on: both answer exactly as each
+    /// does alone, and every page and promise comes back. On a hybrid too,
+    /// whose state the rebuild has to recompute rather than adopt.
+    #[test]
+    fn requests_that_outgrow_the_pool_together_take_turns_and_answer_as_alone() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        let tokenizer = letter_tokenizer(8);
+        let prompts: [Vec<u32>; 2] = [
+            vec![1, 2, 3, 4, 5, 6, 7, 1, 2],
+            vec![7, 6, 5, 4, 3, 2, 1, 7, 6],
+        ];
+        const ANSWER: usize = 20;
+        for hybrid in [false, true] {
+            let make = || {
+                let mut model = if hybrid {
+                    DeterministicModel::hybrid(8)
+                } else {
+                    DeterministicModel::new(8)
+                };
+                model.pause = Duration::from_millis(2);
+                model
+            };
+            let alone: Vec<(String, bool)> = prompts
+                .iter()
+                .map(|p| run_request(&make(), &tokenizer, None, p.clone(), ANSWER))
+                .collect();
+
+            let model = make();
+            // Ten pages of four tokens: one request of 29 positions needs
+            // eight, two together sixteen.
+            const PAGE: usize = 4;
+            let geom = LayerGeometry::of(&model.new_kv_cache(1));
+            let pool = Arc::new(KvPool::with_policy(10, PAGE, geom, Policy::Lru));
+            let paged = (
+                pool.clone(),
+                Arc::new(crate::engine::prefix_index::PrefixIndex::new(PAGE)),
+            );
+            let slots = SlotPool::new(2);
+            let batcher = crate::engine::decode_batch::DecodeBatcher::new();
+            let together: Vec<(String, bool)> = std::thread::scope(|scope| {
+                let runs: Vec<_> = prompts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, prompt)| {
+                        let (model, tokenizer, paged, batcher, slots) =
+                            (&model, &tokenizer, &paged, &batcher, &slots);
+                        scope.spawn(move || {
+                            std::thread::sleep(Duration::from_millis(5 * i as u64));
+                            let guard = pollster::block_on(slots.acquire());
+                            run_on_slot(
+                                model,
+                                tokenizer,
+                                paged,
+                                batcher,
+                                &guard,
+                                prompt.clone(),
+                                ANSWER,
+                            )
+                        })
+                    })
+                    .collect();
+                runs.into_iter().map(|r| r.join().unwrap()).collect()
+            });
+            assert_eq!(together, alone, "an answer changed (hybrid={hybrid})");
+            assert!(
+                pool.yields() >= 1,
+                "nobody gave pages back, so the test proves nothing (hybrid={hybrid})"
+            );
+            assert_eq!(
+                pool.available(),
+                10,
+                "a page or promise leaked (hybrid={hybrid})"
+            );
+            assert_eq!(pool.stats().live_pages, 0);
+        }
+    }
+
+    /// A pool and index sized for `model`'s own cache geometry.
+    fn paged_pool_for(
+        model: &DeterministicModel,
+    ) -> (
+        Arc<crate::engine::kv_pool::KvPool>,
+        Arc<crate::engine::prefix_index::PrefixIndex>,
+    ) {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        const PAGE: usize = 4;
+        let geom = LayerGeometry::of(&model.new_kv_cache(1));
+        (
+            Arc::new(KvPool::with_policy(64, PAGE, geom, Policy::Lru)),
+            Arc::new(crate::engine::prefix_index::PrefixIndex::new(PAGE)),
+        )
+    }
+
+    /// The second turn of a conversation answers the same whether its prefix
+    /// came from the pool or was prefilled cold — and on a model without
+    /// recurrent layers the pool really did skip the prefix, so the property
+    /// is tested on a path that shares.
+    #[test]
+    fn a_shared_page_prefix_answers_as_a_cold_prefill() {
+        let tokenizer = letter_tokenizer(8);
+        let first: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 1, 2];
+        let second: Vec<u32> = first.iter().copied().chain([3, 5, 7]).collect();
+        for hybrid in [false, true] {
+            let make = || {
+                if hybrid {
+                    DeterministicModel::hybrid(8)
+                } else {
+                    DeterministicModel::new(8)
+                }
+            };
+            let cold_model = make();
+            let cold = run_request(&cold_model, &tokenizer, None, second.clone(), 12);
+            let cold_tokens = cold_model.forwarded_tokens.load(Ordering::Relaxed);
+
+            let model = make();
+            let paged = paged_pool_for(&model);
+            run_request_paged(&model, &tokenizer, &paged, first.clone(), 4);
+            let before = model.forwarded_tokens.load(Ordering::Relaxed);
+            let warm = run_request_paged(&model, &tokenizer, &paged, second.clone(), 12);
+            let warm_tokens = model.forwarded_tokens.load(Ordering::Relaxed) - before;
+
+            assert_eq!(
+                warm, cold,
+                "a shared prefix changed the answer (hybrid={hybrid})"
+            );
+            if hybrid {
+                assert_eq!(
+                    warm_tokens, cold_tokens,
+                    "a recurrent cache adopted pages its state does not match"
+                );
+            } else {
+                assert!(
+                    warm_tokens < cold_tokens,
+                    "the pool shared nothing, so the test proves nothing: \
+                     {warm_tokens} vs {cold_tokens}"
+                );
+            }
+        }
+    }
+
+    /// The next turn of a conversation — the first turn's prompt, its reply,
+    /// and a new message — finds the reply's pages, not only the prompt's,
+    /// and answers as a cold prefill of the same tokens does.
+    #[test]
+    fn the_next_turn_shares_the_reply_pages_too() {
+        let tokenizer = letter_tokenizer(8);
+        // Nine prompt tokens: two whole pages and one the reply finishes.
+        let first: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 1, 2];
+        let model = DeterministicModel::new(8);
+        let paged = paged_pool_for(&model);
+        let (reply, _) = run_request_paged(&model, &tokenizer, &paged, first.clone(), 12);
+        let reply: Vec<u32> = reply.chars().map(|c| c as u32 - 'a' as u32).collect();
+        assert_eq!(reply.len(), 12);
+        let second: Vec<u32> = first
+            .iter()
+            .chain(&reply)
+            .copied()
+            .chain([3, 5, 7])
+            .collect();
+
+        let cold_model = DeterministicModel::new(8);
+        let cold = run_request(&cold_model, &tokenizer, None, second.clone(), 6);
+
+        let before = model.forwarded_tokens.load(Ordering::Relaxed);
+        let warm = run_request_paged(&model, &tokenizer, &paged, second.clone(), 6);
+        let forwarded = model.forwarded_tokens.load(Ordering::Relaxed) - before;
+        assert_eq!(warm, cold);
+        // 24 tokens of the 21 the first turn committed (its last reply token
+        // was never forwarded) make five whole pages; only the remainder of
+        // the prompt and the answer should be computed.
+        let prompt_pages_only = second.len() - 8;
+        assert!(
+            forwarded < prompt_pages_only,
+            "the reply's pages were not shared: forwarded {forwarded} tokens"
+        );
+    }
+
+    /// Speculation on a hybrid model emits exactly what plain decoding does:
+    /// a rejected draft returns the recurrent state to the verify's anchor
+    /// and runs the accepted tokens again, at every acceptance rate.
+    #[test]
+    fn a_hybrid_model_speculates_and_decodes_as_without_a_draft() {
+        let tokenizer = letter_tokenizer(8);
+        let prompt = vec![1u32, 2, 3, 4, 1, 2];
+        let plain = {
+            let model = DeterministicModel::hybrid(8);
+            run_request(&model, &tokenizer, None, prompt.clone(), 40)
+        };
+        for disagree_every in [1usize, 2, 3] {
+            let model = DeterministicModel::hybrid(8);
+            let draft = Arc::new(DeterministicModel::drafting(8, disagree_every));
+            let drafted =
+                run_request_drafted(&model, draft.clone(), &tokenizer, prompt.clone(), 40, 4);
+            assert_eq!(drafted, plain, "disagree_every={disagree_every}");
+            assert!(
+                draft.forwarded_tokens.load(Ordering::Relaxed) > 0,
+                "no draft ran against the recurrent target"
+            );
+        }
+    }
+
+    /// A teacher-forced run sees the same distributions however many
+    /// positions a pass covers, and one forward call per pass.
+    #[test]
+    fn teacher_forcing_is_the_same_by_decode_steps_or_verify_passes() {
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 1, 2, 3];
+        let decoded = {
+            let model = DeterministicModel::new(8);
+            let out = crate::engine::teacher::teacher_forced(&model, &tokens, 1, 4, 0).unwrap();
+            assert_eq!(model.forward_calls.load(Ordering::Relaxed), tokens.len());
+            out
+        };
+        let model = DeterministicModel::new(8);
+        let verified = crate::engine::teacher::teacher_forced(&model, &tokens, 4, 4, 0).unwrap();
+        assert_eq!(model.forward_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(verified.len(), tokens.len());
+        assert_eq!(verified, decoded);
+    }
+
+    /// A prompt makes way for decode steps only while *another* thread
+    /// decodes: the decoding thread's own passes (a batched step, a verify)
+    /// keep their groups.
+    #[test]
+    fn a_prompt_yields_between_layers_only_to_another_threads_decode() {
+        let (entered, decoding) = std::sync::mpsc::channel();
+        let (release, done) = std::sync::mpsc::channel::<()>();
+        let decoder = std::thread::spawn(move || {
+            let _decoding = Decoding::enter();
+            entered
+                .send((
+                    prompt_yields_to_decode(),
+                    crate::engine::arch::gemma::prefill_group_layers(4),
+                ))
+                .unwrap();
+            done.recv().unwrap();
+        });
+        let (decoder_yields, decoder_group) = decoding.recv().unwrap();
+        assert!(
+            !decoder_yields,
+            "the decoding thread's own passes do not yield"
+        );
+        assert_eq!(decoder_group, 4);
+        assert!(prompt_yields_to_decode(), "another thread decodes");
+        assert_eq!(crate::engine::arch::gemma::prefill_group_layers(4), 1);
+        release.send(()).unwrap();
+        decoder.join().unwrap();
+    }
+
+    /// While a request decodes, a timed prefill is sized to the yield budget
+    /// from its wall time; an untimed or flat one is left alone.
+    #[test]
+    fn a_decoding_request_narrows_a_timed_prefill_to_the_yield_budget() {
+        let _decoding = Decoding::enter();
+        assert_eq!(
+            yield_width_at(150, None, ChunkPolicy::Adaptive, 4096),
+            usize::MAX,
+            "nothing timed yet caps nothing"
+        );
+        // 10 ms a token of wall time: 150 ms is under the sizer's floor.
+        let wall = Some((100, Duration::from_millis(1000)));
+        let capped = yield_width_at(150, wall, ChunkPolicy::Adaptive, 4096);
+        assert!(capped <= 16, "capped at {capped}");
+        assert_eq!(
+            yield_width_at(0, wall, ChunkPolicy::Adaptive, 4096),
+            usize::MAX,
+            "0 is off"
+        );
+        assert_eq!(
+            yield_width_at(150, wall, ChunkPolicy::Flat, 4096),
+            usize::MAX
+        );
+    }
+
+    /// `run_request` with a slot store and a cache point, as a chat request
+    /// to a hybrid model arrives.
+    fn run_request_with_slots(
+        model: &DeterministicModel,
+        tokenizer: &Tokenizer,
+        store: &crate::engine::slot_store::SlotStore,
+        prompt_tokens: Vec<u32>,
+        cache_point: Option<usize>,
+        max_tokens: usize,
+    ) -> (String, bool) {
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let req = GenerateRequest {
+            prompt_tokens,
+            sampling: greedy_params(),
+            max_tokens,
+            cache_point,
+            background: false,
+            ..Default::default()
+        };
+        run(
+            model,
+            tokenizer,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
+            &guard,
+            req,
+            crate::config::Role::default(),
+            crate::config::Role::default(),
+            false,
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+            None,
+            None,
+        )
+        .unwrap();
+        drain(rx)
+    }
+
+    /// A hybrid model's next turn repeats this one only up to the end of the
+    /// last user message — the reply comes back re-rendered — and must
+    /// reuse exactly that much, from the state checkpointed there, and
+    /// answer as a cold prefill of the same tokens does.
+    #[test]
+    fn a_hybrid_conversation_resumes_from_its_cache_point() {
+        let tokenizer = letter_tokenizer(8);
+        let dir = std::env::temp_dir().join(format!("orangu-m3-{}", std::process::id()));
+        let store = crate::engine::slot_store::SlotStore::at(dir.clone(), "test".into(), 1);
+        // Turn one: a "user message" of 6 tokens, then 3 of generation prompt.
+        let first: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 7, 7];
+        let model = DeterministicModel::hybrid(8);
+        run_request_with_slots(&model, &tokenizer, &store, first.clone(), Some(6), 5);
+        // Turn two: the same user message, then a reply rendered unlike the
+        // tokens generated, and a new message.
+        let second: Vec<u32> = first[..6].iter().copied().chain([2, 4, 6, 1, 3]).collect();
+        let before = model.forwarded_tokens.load(Ordering::Relaxed);
+        let warm = run_request_with_slots(&model, &tokenizer, &store, second.clone(), Some(9), 6);
+        let forwarded = model.forwarded_tokens.load(Ordering::Relaxed) - before;
+
+        let cold_model = DeterministicModel::hybrid(8);
+        let cold = run_request(&cold_model, &tokenizer, None, second.clone(), 6);
+        assert_eq!(warm, cold, "the checkpoint changed the answer");
+        // Six tokens came from the checkpoint; the five after them and the
+        // generated ones were computed.
+        assert_eq!(
+            forwarded,
+            cold_model.forwarded_tokens.load(Ordering::Relaxed) - 6,
+            "the checkpoint was not reused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rollback itself refuses a recurrent cache and leaves it as it was.
+    #[test]
+    fn truncating_a_recurrent_cache_is_an_error() {
+        let model = DeterministicModel::hybrid(8);
+        let mut cache = model.new_kv_cache(8);
+        for (pos, t) in [1u32, 2, 3].into_iter().enumerate() {
+            model.absorb(&mut cache, t, pos);
+        }
+        assert!(cache.truncate(1).is_err());
+        assert_eq!(cache.layers[0].len, 3);
+    }
+
+    /// A rollback returns a hybrid cache to its checkpoint whole: the
+    /// recurrent state as if the later tokens had never been pushed, and the
+    /// attention rows cut back with it.
+    #[test]
+    fn a_recurrent_cache_rolls_back_to_its_checkpoint() {
+        let model = DeterministicModel::hybrid(8);
+        let mut cache = model.new_kv_cache(8);
+        let mut reference = model.new_kv_cache(8);
+        for (pos, t) in [1u32, 2].into_iter().enumerate() {
+            model.absorb(&mut cache, t, pos);
+            model.absorb(&mut reference, t, pos);
+        }
+        let checkpoint = cache.rollback_point(2).unwrap();
+        for (pos, t) in [3u32, 4, 5].into_iter().enumerate() {
+            model.absorb(&mut cache, t, pos + 2);
+        }
+        assert_ne!(
+            cache.recurrent[0].host_snapshot().state,
+            reference.recurrent[0].host_snapshot().state
+        );
+        cache.rollback(&checkpoint).unwrap();
+        assert_eq!(cache.layers[0].len, 2);
+        for (c, r) in cache.recurrent.iter().zip(&reference.recurrent) {
+            assert_eq!(c.host_snapshot().state, r.host_snapshot().state);
+            assert_eq!(c.host_snapshot().conv, r.host_snapshot().conv);
+        }
+        model.absorb(&mut cache, 6, 2);
+        model.absorb(&mut reference, 6, 2);
+        assert_eq!(
+            cache.recurrent[0].host_snapshot().state,
+            reference.recurrent[0].host_snapshot().state
+        );
     }
 
     /// The correctness property prefix reuse must never break: a second,
@@ -4797,6 +6570,176 @@ mod tests {
         }
     }
 
+    /// A [`RecordingHead`] that drafts a block (`MtpHead::block_size`), and
+    /// records each block it is asked for: `(anchor, pos, n_draft,
+    /// first_pos)`.
+    struct BlockHead {
+        context: RecordingHead,
+        blocks: std::sync::Mutex<Vec<(u32, usize, usize, usize)>>,
+    }
+
+    impl MtpHead for BlockHead {
+        fn state_width(&self) -> usize {
+            STATE_WIDTH
+        }
+
+        fn new_kv_cache(&self, capacity: usize) -> KvCache {
+            self.context.new_kv_cache(capacity)
+        }
+
+        fn forward(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            states: &[f32],
+            start_pos: usize,
+            first_pos: usize,
+        ) -> Result<MtpStep> {
+            self.context
+                .forward(cache, tokens, states, start_pos, first_pos)
+        }
+
+        fn block_size(&self) -> Option<usize> {
+            Some(16)
+        }
+
+        fn draft_block(
+            &self,
+            _cache: &mut KvCache,
+            anchor: u32,
+            pos: usize,
+            n_draft: usize,
+            first_pos: usize,
+        ) -> Result<Vec<u32>> {
+            self.blocks
+                .lock()
+                .unwrap()
+                .push((anchor, pos, n_draft, first_pos));
+            Ok(vec![7; n_draft])
+        }
+    }
+
+    fn block_drafter<'a>(head: &'a BlockHead, echo: Option<EchoLookup>) -> Drafter<'a> {
+        Drafter::Mtp {
+            head,
+            tokens: 2,
+            cache: head.new_kv_cache(64),
+            committed: 0,
+            first_pos: None,
+            states: Vec::new(),
+            states_start: 0,
+            width: STATE_WIDTH,
+            echo,
+        }
+    }
+
+    /// A block head caches the committed context through the same catch-up
+    /// a chained head runs — each token with the state behind it — and then
+    /// drafts once, from the token the served model is about to read, at
+    /// that token's position. No chained steps follow it.
+    #[test]
+    fn a_block_head_drafts_once_from_the_token_about_to_be_read() {
+        let head = BlockHead {
+            context: RecordingHead::new(),
+            blocks: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut drafter = block_drafter(&head, None);
+        drafter.observe_states(0, &StatefulModel::states(&[0, 0, 0, 0], 0));
+        let history: Vec<u32> = vec![10, 11, 12, 13, 14];
+        let drafted = drafter
+            .draft(&history, 8, &KvCache::new_with_dims(1, &[]), 0)
+            .unwrap();
+        assert_eq!(drafted, vec![7, 7]);
+        let calls = head.context.calls();
+        assert_eq!(calls.len(), 1, "the catch-up alone: {calls:?}");
+        assert_eq!(calls[0].tokens, history);
+        assert_eq!(calls[0].states, vec![0.0, 100.0, 101.0, 102.0, 103.0]);
+        assert_eq!(*head.blocks.lock().unwrap(), vec![(14, 4, 2, 0)]);
+    }
+
+    /// While the reply copies an earlier passage, a block head's step copies
+    /// it too, at the width the step was given, and leaves its context for
+    /// later: the first block it drafts after the echo caches the whole
+    /// copy in one catch-up, every token with the state behind it.
+    #[test]
+    fn a_block_head_copies_an_echo_and_keeps_its_context() {
+        let head = BlockHead {
+            context: RecordingHead::new(),
+            blocks: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut drafter = block_drafter(
+            &head,
+            Some(EchoLookup {
+                ngram: 2,
+                max_draft: 4,
+                echo_draft: 0,
+            }),
+        );
+        let passage: Vec<u32> = (20..40).collect();
+        let mut history = passage.clone();
+        history.push(99);
+        history.extend_from_slice(&passage[..18]);
+        drafter.observe_states(0, &StatefulModel::states(&history[..history.len() - 1], 0));
+        assert!(drafter.echoes(&history));
+        // Prompt lookup's own widths: no echo width, so no wide step.
+        assert!(!drafter.has_echo_draft());
+        assert_eq!(drafter.draft_len(false), 4);
+        let drafted = drafter
+            .draft(&history, 4, &KvCache::new_with_dims(1, &[]), 0)
+            .unwrap();
+        // What follows the copied passage, four tokens of it.
+        assert_eq!(drafted, vec![38, 39, 99, 20]);
+        assert!(head.blocks.lock().unwrap().is_empty());
+        assert!(head.context.calls().is_empty(), "the context waits");
+
+        // The served model accepted none of it and read a token that ends
+        // the echo.
+        let pos = history.len() - 1;
+        drafter.observe_states(pos, &StatefulModel::states(&[history[pos]], pos));
+        history.push(98);
+        assert!(!drafter.echoes(&history));
+        drafter
+            .draft(&history, 4, &KvCache::new_with_dims(1, &[]), 0)
+            .unwrap();
+        let calls = head.context.calls();
+        assert_eq!(calls.len(), 1, "one catch-up: {calls:?}");
+        assert_eq!(calls[0].tokens, history);
+        let mut behind = vec![0.0];
+        behind.extend((0..history.len() - 1).map(|p| STATE_BASE + p as f32));
+        assert_eq!(calls[0].states, behind);
+        assert_eq!(head.blocks.lock().unwrap().len(), 1);
+    }
+
+    /// A shorter match than an echo's is copied too, with the context
+    /// cached on the step as a block's would be: the next step may well be
+    /// a block, and finds its context current.
+    #[test]
+    fn a_block_head_copies_a_short_match_with_its_context_current() {
+        let head = BlockHead {
+            context: RecordingHead::new(),
+            blocks: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut drafter = block_drafter(
+            &head,
+            Some(EchoLookup {
+                ngram: 2,
+                max_draft: 4,
+                echo_draft: 0,
+            }),
+        );
+        let history: Vec<u32> = vec![1, 2, 3, 9, 8, 1, 2];
+        drafter.observe_states(0, &StatefulModel::states(&history[..history.len() - 1], 0));
+        assert!(!drafter.echoes(&history));
+        let drafted = drafter
+            .draft(&history, 4, &KvCache::new_with_dims(1, &[]), 0)
+            .unwrap();
+        assert_eq!(drafted, vec![3, 9, 8, 1]);
+        assert!(head.blocks.lock().unwrap().is_empty());
+        let calls = head.context.calls();
+        assert_eq!(calls.len(), 1, "the context is cached: {calls:?}");
+        assert_eq!(calls[0].tokens, history);
+    }
+
     fn mtp_drafter<'a>(head: &'a RecordingHead, tokens: usize) -> Drafter<'a> {
         Drafter::Mtp {
             head,
@@ -4807,6 +6750,7 @@ mod tests {
             states: Vec::new(),
             states_start: 0,
             width: STATE_WIDTH,
+            echo: None,
         }
     }
 
@@ -4909,7 +6853,9 @@ mod tests {
         // history now ends with the token it is about to forward at 4.
         drafter.observe_states(0, &StatefulModel::states(&[0, 0, 0, 0], 0));
         let history: Vec<u32> = vec![10, 11, 12, 13, 14];
-        let drafted = drafter.draft(&history, 8, 0).unwrap();
+        let drafted = drafter
+            .draft(&history, 8, &KvCache::new_with_dims(1, &[]), 0)
+            .unwrap();
         assert_eq!(drafted.len(), 3);
 
         let calls = head.calls();
@@ -4942,7 +6888,9 @@ mod tests {
         let mut drafter = mtp_drafter(&head, 3);
         drafter.observe_states(0, &StatefulModel::states(&[0, 0, 0, 0], 0));
         let history: Vec<u32> = vec![10, 11, 12, 13, 14];
-        drafter.draft(&history, 8, 0).unwrap();
+        drafter
+            .draft(&history, 8, &KvCache::new_with_dims(1, &[]), 0)
+            .unwrap();
         assert_eq!(
             drafter.mtp_committed(),
             7,
@@ -4950,7 +6898,7 @@ mod tests {
         );
 
         // The served model accepted `current` and one drafted token.
-        drafter.commit(6);
+        drafter.commit(6).unwrap();
         assert_eq!(drafter.mtp_committed(), 6);
         let Drafter::Mtp { cache, .. } = &drafter else {
             unreachable!()
@@ -5345,16 +7293,24 @@ mod tests {
         cost.observe(122, Duration::from_millis(733));
 
         let fresh = cost
-            .opening_width(0, budget, 512)
+            .opening_width(0, 512, budget, 512)
             .expect("a priced machine must offer an opening width");
         assert!(fresh > 400, "opened only {fresh} tokens wide");
         assert_eq!(
-            cost.opening_width(100_000, budget, 512),
+            cost.opening_width(100_000, 600, budget, 512),
             None,
-            "a continuation must still open with the probe"
+            "a deep continuation must still open with the probe"
         );
+        // A turn's worth of tokens a little way in fits many times over and
+        // goes in one pass; a long one at the same depth still probes.
+        assert_eq!(cost.opening_width(2_048, 60, budget, 512), Some(60));
+        assert_eq!(cost.opening_width(2_048, 4_000, budget, 512), None);
         // And an unpriced one has nothing to offer, at any position.
-        assert_eq!(ChunkCost::new().opening_width(0, budget, 512), None);
+        assert_eq!(ChunkCost::new().opening_width(0, 512, budget, 512), None);
+        assert_eq!(
+            ChunkCost::new().opening_width(2_048, 120, budget, 512),
+            None
+        );
     }
 
     /// End to end through the chunk loop: a cold estimate opens with the probe
@@ -5444,7 +7400,7 @@ mod tests {
             let mut widths = Vec::new();
             let mut done = 0usize;
             let mut width = cost
-                .opening_width(0, budget, 512)
+                .opening_width(0, 512, budget, 512)
                 .unwrap_or(PREFILL_PROBE_TOKENS.min(512));
             while done < 1120 {
                 let n = width.min(1120 - done);
@@ -5702,6 +7658,8 @@ mod tests {
             model: Arc::new(PanickingModel::new()),
             tokenizer: Arc::new(letter_tokenizer(8)),
             chat_template_source: None,
+            chat_template: None,
+            recurrent: false,
             slots: SlotPool::new(1),
             prefix_cache: None,
             decode_batcher: Arc::new(crate::engine::decode_batch::DecodeBatcher::new()),
@@ -5724,6 +7682,8 @@ mod tests {
                 id_slot: None,
                 timings_per_token: false,
                 role: None,
+                cache_point: None,
+                background: false,
             })
             .await;
 
@@ -5811,6 +7771,8 @@ mod tests {
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),
             tx,
+            None,
+            None,
         )
         .unwrap();
 
@@ -5866,6 +7828,240 @@ mod tests {
                     "the draft model was never actually run"
                 );
             }
+        }
+    }
+
+    /// `run_request_drafted` under any sampling, with or without a draft.
+    fn run_request_sampling(
+        model: &DeterministicModel,
+        draft: Option<Arc<DeterministicModel>>,
+        tokenizer: &Tokenizer,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        sampling: SamplingParams,
+    ) -> (String, bool) {
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let req = GenerateRequest {
+            prompt_tokens,
+            sampling,
+            max_tokens,
+            ..Default::default()
+        };
+        let draft = draft.map(|model| DraftModel {
+            model,
+            tokens: 4,
+            label: "test-draft".to_string(),
+        });
+        run(
+            model,
+            tokenizer,
+            draft.as_ref(),
+            None,
+            None,
+            None,
+            None,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
+            &guard,
+            req,
+            crate::config::Role::default(),
+            crate::config::Role::default(),
+            false,
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+            None,
+            None,
+        )
+        .unwrap();
+        drain(rx)
+    }
+
+    /// Under sampling, too, a draft changes how many forwards a request costs
+    /// and nothing it emits: the verifier samples each drafted position as
+    /// plain decoding samples it.
+    #[test]
+    fn a_draft_never_changes_what_sampled_decoding_emits() {
+        let tokenizer = letter_tokenizer(8);
+        let prompt = vec![1u32, 2, 3, 4, 1, 2];
+        for seed in [1u64, 7, 42] {
+            let sampling = SamplingParams {
+                temperature: 0.8,
+                top_k: 0,
+                top_p: 1.0,
+                min_p: 0.0,
+                repeat_penalty: 1.0,
+                repeat_last_n: 0,
+                seed,
+            };
+            let plain = run_request_sampling(
+                &DeterministicModel::new(8),
+                None,
+                &tokenizer,
+                prompt.clone(),
+                40,
+                sampling.clone(),
+            );
+            for disagree_every in [0usize, 2, 1] {
+                let model = DeterministicModel::new(8);
+                let draft = Arc::new(DeterministicModel::drafting(8, disagree_every));
+                let drafted = run_request_sampling(
+                    &model,
+                    Some(draft.clone()),
+                    &tokenizer,
+                    prompt.clone(),
+                    40,
+                    sampling.clone(),
+                );
+                assert_eq!(
+                    drafted, plain,
+                    "seed {seed}, disagree_every {disagree_every}"
+                );
+                assert!(
+                    draft.forwarded_tokens.load(Ordering::Relaxed) > 0,
+                    "the draft never ran"
+                );
+            }
+        }
+    }
+
+    /// [`letter_tokenizer`] over single JSON characters, with `e` as the stop
+    /// token (id 7). Every grammar state has a legal token, and inside a
+    /// string every token but the stop is legal, so a draft is often accepted.
+    fn json_tokenizer() -> Tokenizer {
+        let tokens: Vec<GgufValue> = ["{", "\"", "a", "b", "c", ":", "}", "e", ","]
+            .iter()
+            .map(|t| GgufValue::String(t.to_string()))
+            .collect();
+        let gguf = GgufFile {
+            version: 3,
+            metadata: vec![
+                (
+                    "tokenizer.ggml.tokens".to_string(),
+                    GgufValue::Array(tokens),
+                ),
+                (
+                    "tokenizer.ggml.model".to_string(),
+                    GgufValue::String("llama".to_string()),
+                ),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        };
+        Tokenizer::from_gguf(&gguf).unwrap()
+    }
+
+    /// A JSON-constrained request, with or without a draft of `draft_tokens`.
+    fn run_request_json(
+        model: &DeterministicModel,
+        draft: Option<(Arc<DeterministicModel>, usize)>,
+        prompt_tokens: Vec<u32>,
+        sampling: SamplingParams,
+    ) -> (String, bool) {
+        let tokenizer = json_tokenizer();
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let req = GenerateRequest {
+            json_output: true,
+            prompt_tokens,
+            sampling,
+            max_tokens: 60,
+            stop_token_ids: vec![7],
+            ..Default::default()
+        };
+        let draft = draft.map(|(model, tokens)| DraftModel {
+            model,
+            tokens,
+            label: "test-draft".to_string(),
+        });
+        run(
+            model,
+            &tokenizer,
+            draft.as_ref(),
+            None,
+            None,
+            None,
+            None,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
+            &guard,
+            req,
+            crate::config::Role::default(),
+            crate::config::Role::default(),
+            false,
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+            None,
+            None,
+        )
+        .unwrap();
+        drain(rx)
+    }
+
+    /// Under a JSON constraint a draft still changes nothing that is emitted:
+    /// the draft model proposes unconstrained tokens, and verification picks
+    /// each position under the constraint as plain decoding does, so the
+    /// constrained answer is byte-identical, greedy or sampled.
+    #[test]
+    fn a_draft_never_changes_what_constrained_decoding_emits() {
+        let prompt = vec![1u32, 2, 3, 4, 1, 2];
+        let sampled = SamplingParams {
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_last_n: 0,
+            seed: 7,
+        };
+        for sampling in [greedy_params(), sampled] {
+            let baseline = DeterministicModel::new(9);
+            let plain = run_request_json(&baseline, None, prompt.clone(), sampling.clone());
+            let plain_calls = baseline.forward_calls.load(Ordering::Relaxed);
+            let mut fewest_calls = usize::MAX;
+            assert!(plain.1, "the baseline run must finish");
+            // A run may end at `max_tokens` inside the object, so what holds
+            // is that the output is a legal start of one.
+            assert!(
+                plain.0.starts_with('{')
+                    && crate::engine::constraint::JsonPrefix::object().allows(plain.0.as_bytes()),
+                "the constraint did not hold: {:?}",
+                plain.0
+            );
+            for disagree_every in [0usize, 1, 2, 3] {
+                for draft_tokens in [1usize, 2, 4] {
+                    let model = DeterministicModel::new(9);
+                    let draft = Arc::new(DeterministicModel::drafting(9, disagree_every));
+                    let drafted = run_request_json(
+                        &model,
+                        Some((draft.clone(), draft_tokens)),
+                        prompt.clone(),
+                        sampling.clone(),
+                    );
+                    assert_eq!(
+                        drafted, plain,
+                        "speculation changed the constrained output (temperature {}, \
+                         disagree_every {disagree_every}, draft_tokens {draft_tokens})",
+                        sampling.temperature
+                    );
+                    assert!(
+                        draft.forwarded_tokens.load(Ordering::Relaxed) > 0,
+                        "the draft never ran under a constraint"
+                    );
+                    fewest_calls = fewest_calls.min(model.forward_calls.load(Ordering::Relaxed));
+                }
+            }
+            // Some draft was accepted, or every run above compared a
+            // rejected draft with plain decoding and proved nothing.
+            assert!(
+                fewest_calls < plain_calls,
+                "no draft was ever accepted under the constraint ({fewest_calls} forward calls \
+                 against {plain_calls}; output {:?})",
+                plain.0
+            );
         }
     }
 
@@ -5940,8 +8136,11 @@ mod tests {
             let mut lookup = Drafter::PromptLookup {
                 ngram: 2,
                 max_draft: 8,
+                echo_draft: 16,
             };
-            let drafted = lookup.draft(&history, room, 0).expect("prompt lookup");
+            let drafted = lookup
+                .draft(&history, room, &KvCache::new_with_dims(1, &[]), 0)
+                .expect("prompt lookup");
             assert!(
                 drafted.len() <= room,
                 "prompt-lookup drafted {} with room for {room}",
@@ -5956,7 +8155,9 @@ mod tests {
                 cache,
                 committed: 0,
             };
-            let drafted = model.draft(&history, room, 0).expect("draft model");
+            let drafted = model
+                .draft(&history, room, &KvCache::new_with_dims(1, &[]), 0)
+                .expect("draft model");
             assert!(
                 drafted.len() <= room,
                 "the draft model drafted {} with room for {room}",
@@ -5988,7 +8189,7 @@ mod tests {
             cache,
             committed: 10,
         };
-        drafter.commit(8);
+        drafter.commit(8).unwrap();
         match &drafter {
             Drafter::Model {
                 cache, committed, ..
@@ -6004,7 +8205,7 @@ mod tests {
         // Committing further ahead than the cache reaches is the
         // all-accepted case, and must leave the cache alone for the next
         // step's catch-up to fill in rather than pretend it holds more.
-        drafter.commit(12);
+        drafter.commit(12).unwrap();
         match &drafter {
             Drafter::Model {
                 cache, committed, ..
@@ -6027,6 +8228,58 @@ mod tests {
     }
 
     #[test]
+    fn ngram_draft_prefers_the_longest_matching_context() {
+        // [1, 2] last recurs at index 6, followed by [7, 7]; but [5, 1, 2]
+        // recurs at index 0, followed by [8, 8], and the longer context wins.
+        let history = [5u32, 1, 2, 8, 8, 6, 1, 2, 7, 7, 5, 1, 2];
+        assert_eq!(ngram_draft(&history, 2, 2), vec![8, 8]);
+    }
+
+    #[test]
+    fn ngram_draft_copies_a_list_from_the_prompt_not_from_its_own_copy() {
+        // A prompt listing items `[n, 50, 51, 52, 53, 54]` for n = 1..=6,
+        // then the reply copying it, three items in. Every item ends the same
+        // five tokens, so the newest occurrence of the trailing context is
+        // the reply's own item 2, whose continuation is item 3 again. Matched
+        // back past item 3's number, the prompt's copy is the place being
+        // copied, and the draft runs on through items 4 and 5.
+        let item = |n: u32| [n, 50, 51, 52, 53, 54];
+        let mut history: Vec<u32> = vec![99];
+        for n in 1..=6 {
+            history.extend(item(n));
+        }
+        history.push(98);
+        for n in 1..=3 {
+            history.extend(item(n));
+        }
+        let mut want = Vec::new();
+        for n in 4..=5 {
+            want.extend(item(n));
+        }
+        assert_eq!(ngram_draft(&history, 2, 12), want);
+    }
+
+    #[test]
+    fn a_draft_echoes_only_on_a_long_matched_context() {
+        let lookup = Drafter::PromptLookup {
+            ngram: 2,
+            max_draft: 4,
+            echo_draft: 16,
+        };
+        // A passage of 20 distinct tokens, then the reply copying its first
+        // 17: matched 17 back, an echo.
+        let passage: Vec<u32> = (100..120).collect();
+        let mut history = passage.clone();
+        history.extend(&passage[..17]);
+        assert!(lookup.echoes(&history));
+        // The same copy only 4 tokens in: a phrase, not an echo.
+        let mut short = passage.clone();
+        short.extend(&passage[..4]);
+        assert!(!lookup.echoes(&short));
+        assert!(!ngram_draft(&short, 2, 4).is_empty());
+    }
+
+    #[test]
     fn ngram_draft_is_empty_without_a_match_or_enough_history() {
         assert!(ngram_draft(&[1, 2], 2, 4).is_empty()); // suffix is the whole history
         assert!(ngram_draft(&[1, 2, 3, 4, 5], 2, 4).is_empty()); // [4,5] never recurs
@@ -6045,9 +8298,104 @@ mod tests {
             }
         }
         assert_eq!(cache.layers[0].len, 6);
-        cache.truncate(4);
+        cache.truncate(4).unwrap();
         assert_eq!(cache.layers[0].len, 4);
-        cache.truncate(10); // no-op: never grows
+        cache.truncate(10).unwrap(); // no-op: never grows
         assert_eq!(cache.layers[0].len, 4);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::engine::kv_pool::{KvPool, LayerGeometry};
+
+    /// Eight pages of four tokens.
+    fn pool() -> Arc<KvPool> {
+        Arc::new(KvPool::new(
+            8,
+            4,
+            vec![LayerGeometry {
+                kv_dim: 8,
+                stride: 1,
+                ring: None,
+            }],
+        ))
+    }
+
+    /// A prompt the pool has room for is admitted at once and its pages
+    /// promised until the promise is dropped.
+    #[test]
+    fn a_prompt_with_room_is_admitted_and_its_pages_held() {
+        let pool = pool();
+        // 11 tokens and the one generated: three pages of four.
+        let held = wait_for_prompt_pages(&pool, 11, None, || false).expect("admitted");
+        assert_eq!(held.pages, 3);
+        assert_eq!(pool.available(), 5);
+        drop(held);
+        assert_eq!(pool.available(), 8);
+    }
+
+    /// A prompt arriving while others hold the pages it needs waits until
+    /// they are given back, then holds them itself; two arriving together
+    /// cannot both be admitted against the same free pages.
+    #[test]
+    fn a_prompt_waits_for_the_pages_others_hold() {
+        let pool = pool();
+        let first = wait_for_prompt_pages(&pool, 19, None, || false).expect("admitted");
+        assert_eq!(first.pages, 5);
+        let started = Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(first);
+        });
+        let second = wait_for_prompt_pages(&pool, 19, None, || false).expect("admitted after");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(90));
+        assert_eq!(pool.available(), 3);
+        releaser.join().unwrap();
+        drop(second);
+        assert_eq!(pool.available(), 8);
+    }
+
+    /// A slot's retained conversation holding the pages a prompt needs is
+    /// dropped for it: an idle cache never gives them back by itself, and a
+    /// prompt waiting on it would wait for the next request on that slot.
+    #[test]
+    fn a_prompt_does_not_wait_behind_an_idle_retained_cache() {
+        let pool = pool();
+        let mut idle =
+            KvCache::new_with_strided_dims(24, &crate::engine::kv_cache::strided_dims(&pool))
+                .try_into_paged(pool.clone(), 0)
+                .unwrap_or_else(|_| panic!("the pool has room"));
+        for r in 0..24 {
+            let row = vec![r as f32; 8];
+            idle.layers[0].push(&row, &row);
+        }
+        idle.commit_pages();
+        let store = crate::engine::slot_store::SlotStore::at(
+            std::env::temp_dir().join("orangu-admission-test"),
+            "test".into(),
+            1,
+        );
+        store.retain(0, (0..24).collect(), idle);
+        assert_eq!(pool.available(), 2, "the retained cache holds six pages");
+        let started = Instant::now();
+        let gave_up = || started.elapsed() > std::time::Duration::from_millis(300);
+        let held = wait_for_prompt_pages(&pool, 19, Some(&store), gave_up)
+            .expect("admitted once the idle cache is dropped");
+        assert_eq!(held.pages, 5);
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    }
+
+    /// Nothing to wait for: a prompt larger than the whole pool, or a
+    /// client that has gone, is not held back and takes no promise.
+    #[test]
+    fn a_prompt_that_cannot_be_helped_by_waiting_does_not_wait() {
+        let pool = pool();
+        assert!(wait_for_prompt_pages(&pool, 40, None, || false).is_none());
+        let _all = wait_for_prompt_pages(&pool, 31, None, || false).expect("admitted");
+        let started = Instant::now();
+        assert!(wait_for_prompt_pages(&pool, 3, None, || true).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 }

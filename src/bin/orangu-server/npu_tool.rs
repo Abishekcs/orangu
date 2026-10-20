@@ -137,9 +137,8 @@ pub fn widths_for(gguf: &GgufFile) -> Vec<usize> {
 /// | 1 | 7.30, 7.25 | 6.93, 6.71 |
 /// | 2 | 7.95, 7.94 | **11.24, 11.26** |
 ///
-/// The GPU column is why `Role::default_slots` returns 1: a second slot
-/// buys 9% because both slots stream the same weights through the same
-/// device. The NPU column is a different machine — 1.62x from the second
+/// In the GPU column a second slot buys 9%, because both slots stream the
+/// same weights through the same device one step at a time. The NPU column is a different machine — 1.62x from the second
 /// slot and **1.42x over the GPU** at two — because the two slots are no
 /// longer queueing for one device. That is the whole point of having an
 /// NPU, and it is invisible to any measurement that sends one request at a

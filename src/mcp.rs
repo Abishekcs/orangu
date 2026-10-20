@@ -232,7 +232,12 @@ async fn build_state(
             continue;
         }
         match connect_server(configuration).await {
-            Ok((server, tools)) => {
+            Ok((server, mut tools)) => {
+                // In name order, not the server's: the definitions are sorted
+                // below, but which of two colliding tools keeps its name is
+                // decided here, and a reconnect must not change the answer
+                // (or the prompt prefix the tools are rendered into).
+                tools.sort_by(|left, right| left.name.cmp(&right.name));
                 if !server.instructions.is_empty() {
                     instructions.push(format!(
                         "# MCP server instructions: {server_name}\n{}",

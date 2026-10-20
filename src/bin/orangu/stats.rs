@@ -124,6 +124,14 @@ impl UsageStats {
             std::process::id(),
         );
 
+        let (prompt, cached) = orangu::llm::prompt_cache_totals();
+        if prompt > 0 {
+            out.push_str(&format!(
+                "\n\nPrompt cache:\nPrompt tokens    : {prompt}\nServed from cache: {cached}\nCache rate       : {:.1}%",
+                cached as f64 * 100.0 / prompt as f64
+            ));
+        }
+
         if let Ok(cache) = tools.context_cache().lock() {
             let s = cache.stats();
             let saved_kb = s.bytes_saved as f64 / 1024.0;

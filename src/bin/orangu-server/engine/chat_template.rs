@@ -146,8 +146,14 @@ impl From<ChatMessageWire> for ChatMessage {
     }
 }
 
+/// A model's chat template, compiled once.
+///
+/// The environment — its helper functions, filters and the parsed template —
+/// is built when the template is, and every render reuses it. A template that
+/// fails to compile keeps its error, reported by each render as it would have
+/// been had it compiled there.
 pub struct ChatTemplate {
-    source: String,
+    env: std::result::Result<Environment<'static>, String>,
 }
 
 /// What a request wants from a reasoning model: whether it should think at
@@ -181,7 +187,29 @@ pub struct Reasoning<'a> {
 
 impl ChatTemplate {
     pub fn new(source: String) -> Self {
-        Self { source }
+        let mut env = Environment::new();
+        env.add_function("raise_exception", |msg: String| {
+            Err::<String, minijinja::Error>(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        });
+        env.add_function("strftime_now", |fmt: String| strftime_now(&fmt));
+        env.add_filter("tojson", tojson);
+        // Real chat templates (this project's own gemma-4-E2B-it test
+        // model's included) are written for Python's Jinja2 and lean on
+        // dict/list/str methods minijinja doesn't implement natively —
+        // `message.get('reasoning')`, `.strip()`, `.split()`, and so on.
+        // `minijinja_contrib::pycompat` fills that gap; without it, any
+        // template using `.get()` (a common pattern for optional
+        // tool-calling/reasoning fields) fails to render at all.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        let source = parenthesize_call_kwarg_conditionals(&source).into_owned();
+        let env = match env.add_template_owned("chat", source) {
+            Ok(()) => Ok(env),
+            Err(err) => Err(format!("invalid chat template: {err}")),
+        };
+        Self { env }
     }
 
     /// `enable_thinking`, when `Some`, is passed into the template as a
@@ -286,27 +314,8 @@ impl ChatTemplate {
         reasoning: Reasoning<'_>,
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
-        let mut env = Environment::new();
-        env.add_function("raise_exception", |msg: String| {
-            Err::<String, minijinja::Error>(minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                msg,
-            ))
-        });
-        env.add_function("strftime_now", |fmt: String| strftime_now(&fmt));
-        env.add_filter("tojson", tojson);
-        // Real chat templates (this project's own gemma-4-E2B-it test
-        // model's included) are written for Python's Jinja2 and lean on
-        // dict/list/str methods minijinja doesn't implement natively —
-        // `message.get('reasoning')`, `.strip()`, `.split()`, and so on.
-        // `minijinja_contrib::pycompat` fills that gap; without it, any
-        // template using `.get()` (a common pattern for optional
-        // tool-calling/reasoning fields) fails to render at all.
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        let source = parenthesize_call_kwarg_conditionals(&self.source);
-        env.add_template("chat", &source)
-            .map_err(|err| anyhow!("invalid chat template: {err}"))?;
-        let tmpl = env.get_template("chat").expect("just added");
+        let env = self.env.as_ref().map_err(|err| anyhow!("{err}"))?;
+        let tmpl = env.get_template("chat").expect("added at construction");
         // Built additively rather than as one `context!` per combination:
         // two optional variables that must each be *absent* (not null) when
         // unset would otherwise need four literals kept in step.
@@ -1220,10 +1229,7 @@ mod tests {
 
     /// Renders `{{ value | tojson(<args>) }}` and returns what came out.
     fn render_tojson(args: &str, value: serde_json::Value) -> Result<String> {
-        let tmpl = ChatTemplate::new(format!("{{{{ value | tojson({args}) }}}}"));
-        // The value rides in as a message field, since `render` builds its
-        // own context — `content` is passed through untouched.
-        let source = tmpl.source.replace("value", "messages[0].tool_calls");
+        let source = format!("{{{{ messages[0].tool_calls | tojson({args}) }}}}");
         let mut env = Environment::new();
         env.add_filter("tojson", tojson);
         env.add_template("t", &source)
@@ -1374,5 +1380,71 @@ mod real_model_tests {
             out.contains(r#""name":"get_weather""#),
             "tool declaration was: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod render_cost_tests {
+    use super::*;
+
+    /// What one chat request pays for its template: building the environment
+    /// and parsing the template, then rendering, against rendering alone on a
+    /// template compiled once. The conversation is orangu-bench's built-in
+    /// coding session at its deepest turn, tools included.
+    ///
+    /// Run with `ORANGU_TEST_TEMPLATES=a.jinja:b.jinja cargo test --release
+    /// --bin orangu-server render_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing report; needs ORANGU_TEST_TEMPLATES"]
+    fn render_cost() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../orangu-bench/fixtures/coding-session.json"
+        ))
+        .unwrap();
+        let tools = fixture["tools"].clone();
+        let mut messages = vec![ChatMessage::text(
+            "system",
+            fixture["system"].as_str().unwrap(),
+        )];
+        for turn in fixture["turns"].as_array().unwrap() {
+            messages.push(ChatMessage::text("user", turn.as_str().unwrap()));
+            messages.push(ChatMessage::text(
+                "assistant",
+                "Understood; here is the change.",
+            ));
+        }
+        messages.pop();
+        let paths = std::env::var("ORANGU_TEST_TEMPLATES").expect("set ORANGU_TEST_TEMPLATES");
+        const N: u32 = 200;
+        for path in paths.split(':') {
+            let source = std::fs::read_to_string(path).unwrap();
+            let render = |t: &ChatTemplate| {
+                t.render_with_tools(&messages, true, "", "", Reasoning::default(), Some(&tools))
+                    .unwrap()
+            };
+            let compiled = ChatTemplate::new(source.clone());
+            let bytes = render(&compiled).len();
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(render(&ChatTemplate::new(source.clone())));
+            }
+            let fresh = t0.elapsed() / N;
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(render(&compiled));
+            }
+            let reused = t0.elapsed() / N;
+            println!(
+                "{:<40} {:>7} B prompt  compile+render {:>9.1?}  render {:>9.1?}  saved {:>9.1?}",
+                std::path::Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy(),
+                bytes,
+                fresh,
+                reused,
+                fresh.saturating_sub(reused),
+            );
+        }
     }
 }

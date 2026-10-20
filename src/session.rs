@@ -759,6 +759,53 @@ mod tests {
         assert!(quiet >= 2, "only {quiet} of 4 follow-up turns were free");
     }
 
+    /// What the prefix cache depends on: each turn's prompt is the previous
+    /// turn's, extended — byte for byte — except on the turns compaction
+    /// rewrites, and those are rare and each reclaims at least half.
+    #[test]
+    fn every_turn_extends_the_last_except_where_compaction_rewrites_it() {
+        let fragment = ContextualFragment::new("world_state_changes", &"w".repeat(2_000));
+        let mut session = ChatSession::new("system");
+        let mut sent: Vec<crate::llm::ChatMessage> = Vec::new();
+        let mut rewrites = 0;
+        for turn in 0..40 {
+            // As `prompt` does: compact, then append this turn.
+            let before: usize = session.messages().iter().map(|m| m.content.len()).sum();
+            session.compact_transcript();
+            let after: usize = session.messages().iter().map(|m| m.content.len()).sum();
+            let extends = session.messages().len() >= sent.len()
+                && session.messages()[..sent.len()]
+                    .iter()
+                    .zip(&sent)
+                    .all(|(a, b)| a.role == b.role && a.content == b.content);
+            if !extends {
+                rewrites += 1;
+                assert!(
+                    after * 2 <= before,
+                    "turn {turn} rewrote the history to reclaim only {} of {before} bytes",
+                    before - after
+                );
+            }
+            session.push_user(&format!("{}\n\nquestion {turn}", fragment.render()));
+            let mut tool = crate::llm::ChatMessage::assistant("");
+            tool.role = "tool".into();
+            tool.content = format!("output {turn} ").repeat(400);
+            session.messages.push(tool);
+            session
+                .messages
+                .push(crate::llm::ChatMessage::assistant(&format!(
+                    "answer {turn}"
+                )));
+            sent = session.messages().to_vec();
+        }
+        // Every turn here adds a stale fragment and a large tool output, the
+        // most compactable session there is; it rewrites on 9 of 40 turns.
+        assert!(
+            rewrites >= 1 && rewrites * 3 < 40,
+            "{rewrites} of 40 turns rewrote the history"
+        );
+    }
+
     /// The system prompt belongs in the system message, mid-conversation or
     /// not. It used to arrive as a `user` message prefixed `[System Update]`,
     /// leaving the model with two contradicting sets of instructions — one of

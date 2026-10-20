@@ -56,15 +56,15 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--interference|--chat|--chat-fixture|--kl|--kl-rows|--kl-top|--kl-tokens|--kl-text|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --shared-prefix --shared-prefix-tokens \
-             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --per-rep \
+            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --kl --kl-rows --kl-top --kl-tokens --kl-text --shared-prefix --shared-prefix-tokens \
+             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png --flamegraph-keep-data \
@@ -97,8 +97,19 @@ _orangu_bench() {
         '--pg[Combined mode: prompt lengths prefilled and generated in one request]:list:' \
         '--decode-cpu[Report the server'"'"'s CPU time per generated token, with prefill excluded]' \
         '--streams[Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s]:list:' \
+        '--streams-echo[Concurrency mode: each stream copies a passage out of its prompt, which speculation drafts]' \
+        '--streams-warm[Concurrency mode: prefill the prompts before each run, so all streams decode at once]' \
+        '--interference[Interference mode: prompt lengths a second request prefills while one stream decodes]:list:' \
+        '--chat[Chat mode: replay this many turns of a coding session through /v1/chat/completions]:turns:' \
+        '--chat-fixture[The conversation --chat replays (JSON: system, tools, turns)]:file:_files' \
+        '--kl[Compare teacher-forced distributions with this reference]:file:_files' \
+        '--kl-rows[Positions per --kl pass]:n:' \
+        '--kl-top[Candidates --kl keeps per position]:n:' \
+        '--kl-tokens[Tokens --kl runs]:n:' \
+        '--kl-text[The text --kl runs]:file:_files' \
         '--shared-prefix[Shared-prefix mode: stream counts that all send the SAME long prefix]:list:' \
         '--shared-prefix-tokens[Length in tokens of the prefix --shared-prefix streams have in common]:n:' \
+        '--shared-prefix-cold[Shared-prefix mode: every round sends a prefix the server has not seen, so all streams arrive cold]' \
         '--prefix-scan[Scan-resistance mode: unique prompts to push through between two uses of one hot prefix]:list:' \
         '--pp-continue-base[Prompt length (tokens) to prime the prefix cache with for --pp-continue]:n:' \
         '--embed[Embedding mode: prompt lengths to sweep against /v1/embeddings]:list:' \
@@ -113,6 +124,7 @@ _orangu_bench() {
         '--reps[Repetitions per depth; the reported rate is the best run with mean±sd]:n:' \
         '--drop-model-cache[Evict the model from the page cache before every repetition]' \
         '--no-warmup[Skip the initial warmup run]' \
+        '--fail-on-regression[After a two-value --sweep, exit 2 if the second value is worse beyond the noise]' \
         '--per-rep[Also print every repetition'"'"'s rate, in order, after each row]' \
         '--timeout[Per-request timeout in seconds]:seconds:' \
         '--model[Model id to request]:id:' \
@@ -184,8 +196,19 @@ complete -c orangu-bench -l pp-continue            -x -d 'Continuation-prefill m
 complete -c orangu-bench -l pg                     -x -d 'Combined mode: prompt lengths prefilled and generated in one request'
 complete -c orangu-bench -l decode-cpu                -d 'Report the server\'s CPU time per generated token, with prefill excluded'
 complete -c orangu-bench -l streams                -x -d 'Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s'
+complete -c orangu-bench -l streams-echo              -d 'Concurrency mode: each stream copies a passage out of its prompt, which speculation drafts'
+complete -c orangu-bench -l streams-warm              -d 'Concurrency mode: prefill the prompts before each run, so all streams decode at once'
+complete -c orangu-bench -l interference           -x -d 'Interference mode: prompt lengths a second request prefills while one stream decodes'
+complete -c orangu-bench -l chat                   -x -d 'Chat mode: replay this many turns of a coding session through /v1/chat/completions'
+complete -c orangu-bench -l chat-fixture           -r -d 'The conversation --chat replays (JSON: system, tools, turns)'
+complete -c orangu-bench -l kl                     -r -d 'Compare teacher-forced distributions with this reference'
+complete -c orangu-bench -l kl-rows                -r -d 'Positions per --kl pass'
+complete -c orangu-bench -l kl-top                 -r -d 'Candidates --kl keeps per position'
+complete -c orangu-bench -l kl-tokens              -r -d 'Tokens --kl runs'
+complete -c orangu-bench -l kl-text                -r -d 'The text --kl runs'
 complete -c orangu-bench -l shared-prefix          -x -d 'Shared-prefix mode: stream counts that all send the SAME long prefix'
 complete -c orangu-bench -l shared-prefix-tokens   -x -d 'Length in tokens of the prefix --shared-prefix streams have in common'
+complete -c orangu-bench -l shared-prefix-cold        -d 'Shared-prefix mode: every round sends a prefix the server has not seen, so all streams arrive cold'
 complete -c orangu-bench -l prefix-scan            -x -d 'Scan-resistance mode: unique prompts to push through between two uses of one hot prefix'
 complete -c orangu-bench -l pp-continue-base       -x -d 'Prompt length (tokens) to prime the prefix cache with for --pp-continue'
 complete -c orangu-bench -l embed                  -x -d 'Embedding mode: prompt lengths to sweep against /v1/embeddings'
@@ -200,6 +223,7 @@ complete -c orangu-bench -l bucket                 -x -d 'Bucket width (in conte
 complete -c orangu-bench -l reps                   -x -d 'Repetitions per depth; the reported rate is the best run with mean±sd'
 complete -c orangu-bench -l drop-model-cache          -d 'Evict the model from the page cache before every repetition'
 complete -c orangu-bench -l no-warmup                 -d 'Skip the initial warmup run'
+complete -c orangu-bench -l fail-on-regression        -d 'After a two-value --sweep, exit 2 if the second value is worse beyond the noise'
 complete -c orangu-bench -l per-rep                   -d 'Also print every repetition\'s rate, in order, after each row'
 complete -c orangu-bench -l timeout                -x -d 'Per-request timeout in seconds'
 complete -c orangu-bench -l model                  -x -d 'Model id to request'
@@ -280,8 +304,19 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--pg', 'Combined mode: prompt lengths prefilled and generated in one request'),
         @('--decode-cpu', 'Report the server''s CPU time per generated token, with prefill excluded'),
         @('--streams', 'Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s'),
+        @('--streams-echo', 'Concurrency mode: each stream copies a passage out of its prompt, which speculation drafts'),
+        @('--streams-warm', 'Concurrency mode: prefill the prompts before each run, so all streams decode at once'),
+        @('--interference', 'Interference mode: prompt lengths a second request prefills while one stream decodes'),
+        @('--chat', 'Chat mode: replay this many turns of a coding session through /v1/chat/completions'),
+        @('--chat-fixture', 'The conversation --chat replays (JSON: system, tools, turns)'),
+        @('--kl', 'Compare teacher-forced distributions with this reference'),
+        @('--kl-rows', 'Positions per --kl pass'),
+        @('--kl-top', 'Candidates --kl keeps per position'),
+        @('--kl-tokens', 'Tokens --kl runs'),
+        @('--kl-text', 'The text --kl runs'),
         @('--shared-prefix', 'Shared-prefix mode: stream counts that all send the SAME long prefix'),
         @('--shared-prefix-tokens', 'Length in tokens of the prefix --shared-prefix streams have in common'),
+        @('--shared-prefix-cold', 'Shared-prefix mode: every round sends a prefix the server has not seen, so all streams arrive cold'),
         @('--prefix-scan', 'Scan-resistance mode: unique prompts to push through between two uses of one hot prefix'),
         @('--pp-continue-base', 'Prompt length (tokens) to prime the prefix cache with for --pp-continue'),
         @('--embed', 'Embedding mode: prompt lengths to sweep against /v1/embeddings'),
@@ -296,6 +331,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--reps', 'Repetitions per depth; the reported rate is the best run with mean+/-sd'),
         @('--drop-model-cache', 'Evict the model from the page cache before every repetition'),
         @('--no-warmup', 'Skip the initial warmup run'),
+        @('--fail-on-regression', 'After a two-value --sweep, exit 2 if the second value is worse beyond the noise'),
         @('--per-rep', 'Also print every repetition''s rate, in order, after each row'),
         @('--timeout', 'Per-request timeout in seconds'),
         @('--model', 'Model id to request'),
@@ -361,7 +397,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         { $_ -in '--history', '--chart', '--table', '--storage-file', '--download-dir', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--interference', '--chat', '--chat-fixture', '--kl', '--kl-rows', '--kl-top', '--kl-tokens', '--kl-text', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

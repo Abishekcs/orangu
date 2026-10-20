@@ -51,6 +51,7 @@ pub mod bailingmoe;
 pub mod deepseek4;
 pub mod dflash;
 pub mod gemma;
+pub mod gemma4_assistant;
 pub mod glm;
 pub mod glm5;
 pub mod granite;
@@ -3082,6 +3083,7 @@ pub fn read_reference_fixture(name: &str) -> Option<String> {
 /// `apply_repeat_penalty`, which does the same trim before applying the
 /// penalty) — the callee applies the penalty to exactly the slice it's
 /// given, nothing more.
+#[derive(Clone, Copy)]
 pub struct GreedySampleParams<'a> {
     pub recent_tokens: &'a [u32],
     pub repeat_penalty: f32,
@@ -3176,6 +3178,9 @@ pub(crate) struct ResidentLayer<'a> {
     pub q_bias: Option<&'a [f32]>,
     pub k_bias: Option<&'a [f32]>,
     pub v_bias: Option<&'a [f32]>,
+    /// Per-head RMSNorm weights over Q and K, before RoPE (qwen3).
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
     pub pairing: crate::engine::tensor::RopeLayout,
     pub yarn: crate::engine::backend::vulkan::RopeYarn,
     pub rope_dim: usize,
@@ -3283,12 +3288,12 @@ pub(crate) fn run_layers_resident<'a>(
             n_tokens,
             start_pos,
             wq: l.wq,
-            q_norm: None,
+            q_norm: l.q_norm,
             kv: Some(FusedAttnPrefillKv {
                 k_bias: l.k_bias,
                 v_bias: l.v_bias,
                 wk: l.wk,
-                k_norm: None,
+                k_norm: l.k_norm,
                 wv: Some(l.wv),
             }),
             n_head,
@@ -3344,7 +3349,7 @@ pub(crate) fn run_layers_resident<'a>(
         }
         bufs.swap(0, 1);
         group_layers += 1;
-        if group_layers >= layers_per_submit.max(1) {
+        if group_layers >= gemma::prefill_group_layers(layers_per_submit) {
             vulkan.end_prefill_group();
             vulkan.begin_prefill_group();
             group_layers = 0;
@@ -3366,6 +3371,225 @@ pub(crate) fn run_layers_resident<'a>(
     }
     vulkan.finish_op_span(start_pos);
     Ok(Some(x))
+}
+
+/// One decode step of several sequences on the device-resident stream:
+/// `tokens[i]` at `rows[i].pos` into `rows[i].cache`, with `x` their scaled
+/// embeddings (`[rows, n_embd]`). Every layer's projections and feed-forward
+/// run once over all the rows, on the narrow-pass kernels, and its attention
+/// per sequence exactly as that sequence's own decode step would
+/// (`VulkanBackend::fused_attention_decode_batch`), so each cache advances as
+/// its solo step would have. `slot_offset` maps a row's slot to the
+/// `batch_slot` the architecture's solo decode uses for it. Returns the
+/// device buffer the residual leaving the last layer is in, `[rows, n_embd]`
+/// from its start, with every layer submitted; the caller reads it back or
+/// records the head over it, then ends the op span
+/// (`VulkanBackend::finish_op_span`).
+///
+/// `widths[i]` is how many tokens row `i` brings, from `rows[i].pos`: one
+/// for a decode step, more for a speculative verify, whose tokens take
+/// consecutive rows of `x`. The one-token rows come first. A verifying
+/// row's attention is its own prefill chain over its tokens (causal, its
+/// K/V rows brought home before this returns), as its solo verify's would
+/// be; the post-attention chain still runs once over every row. Empty
+/// `widths` means one token a row.
+///
+/// `None`, with nothing written, when the first layer cannot be served this
+/// way; the caller steps the sequences one by one. A layer after the first
+/// that cannot is an error: the caches already hold this step's rows for the
+/// layers before it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_layers_resident_batch<'a>(
+    vulkan: &crate::engine::backend::VulkanBackend,
+    rows: &mut [DecodeRow<'_>],
+    widths: &[usize],
+    x: &[f32],
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    eps: f32,
+    slot_offset: usize,
+    layers: std::ops::Range<usize>,
+    layer: impl Fn(usize) -> ResidentLayer<'a>,
+) -> Result<Option<wgpu::Buffer>> {
+    use crate::engine::backend::vulkan::{AttnOutSrc, FusedAttnPrefillInput, FusedAttnPrefillKv};
+    let ones;
+    let widths = if widths.is_empty() {
+        ones = vec![1; rows.len()];
+        &ones[..]
+    } else {
+        widths
+    };
+    anyhow::ensure!(widths.len() == rows.len(), "one width per row");
+    let n_rows: usize = widths.iter().sum();
+    let n_embd = x.len() / n_rows.max(1);
+    let n_dec = widths.iter().take_while(|&&w| w == 1).count();
+    anyhow::ensure!(
+        widths[n_dec..].iter().all(|&w| w > 1),
+        "the one-token rows of a batch come first"
+    );
+    let q_dim = n_head * head_dim;
+    let kv_dim = n_head_kv * head_dim;
+    // A stage per verifying row for its K/V rows, as its solo verify has.
+    let mut stages = Vec::with_capacity(rows.len() - n_dec);
+    for &w in &widths[n_dec..] {
+        let Some(stage) = (!gemma::prefill_kv_wait())
+            .then(|| vulkan.kv_readback_stage((layers.len() * w * kv_dim * 2 * 4) as u64))
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        stages.push(stage);
+    }
+    let mut pending_kv: Vec<Vec<(usize, Vec<crate::engine::backend::vulkan::PendingKvRows>)>> =
+        (n_dec..rows.len()).map(|_| Vec::new()).collect();
+    for row in &mut rows[n_dec..] {
+        row.cache.discard_pending_rows();
+    }
+    let first = layers.start;
+    let device_rows = crate::engine::backend::vulkan::prefill_rows_capacity(n_rows);
+    let mut bufs: [wgpu::Buffer; 2] =
+        std::array::from_fn(|_| vulkan.prefill_rows_buffer(device_rows * n_embd));
+    vulkan.upload_rows(&bufs[0], x);
+    vulkan.begin_op_span();
+    let layers_per_submit = gemma::prefill_layers_per_submit();
+    let mut group_layers = 0usize;
+    vulkan.begin_prefill_group();
+    for il in layers {
+        let _scratch_lease = vulkan.scratch_lease();
+        let l = layer(il);
+        let attn_input = FusedAttnPrefillInput {
+            x_gpu: Some((&bufs[0], 0)),
+            attn_norm: Some(l.attn_norm),
+            q_bias: l.q_bias,
+            pairing: l.pairing,
+            yarn: l.yarn,
+            normalize_v: false,
+            attn_gate: None,
+            normed: &[],
+            n_tokens: n_rows,
+            start_pos: 0,
+            wq: l.wq,
+            q_norm: l.q_norm,
+            kv: Some(FusedAttnPrefillKv {
+                k_bias: l.k_bias,
+                v_bias: l.v_bias,
+                wk: l.wk,
+                k_norm: l.k_norm,
+                wv: Some(l.wv),
+            }),
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim: l.rope_dim,
+            rope_freq_base: l.rope_freq_base,
+            freq_factors: l.freq_factors,
+            eps,
+            n_swa: l.n_swa,
+            causal: true,
+            scale: l.scale,
+            want_attn_out_host: false,
+        };
+        let (dec_rows, verify_rows) = rows.split_at_mut(n_dec);
+        let decoded = (n_dec > 0)
+            .then(|| {
+                let input = FusedAttnPrefillInput {
+                    n_tokens: n_dec,
+                    ..attn_input
+                };
+                vulkan.fused_attention_decode_batch(&input, l.attn_norm, dec_rows, il, slot_offset)
+            })
+            .flatten();
+        if n_dec > 0 && decoded.is_none() {
+            vulkan.end_prefill_group();
+            if il == first {
+                return Ok(None);
+            }
+            anyhow::bail!("layer {il} cannot take a batched decode step");
+        }
+        let attn_out = if verify_rows.is_empty() {
+            decoded.expect("a batch of one-token rows decoded above")
+        } else {
+            // Every row's attention output gathered for the post-attention
+            // chain, each copied as soon as it is recorded.
+            let all = vulkan.prefill_rows_buffer(device_rows * q_dim);
+            if let Some(decoded) = &decoded {
+                vulkan.copy_rows(decoded, 0, &all, 0, n_dec * q_dim);
+            }
+            let mut at = n_dec;
+            for (j, row) in verify_rows.iter_mut().enumerate() {
+                let w = widths[n_dec + j];
+                let input = FusedAttnPrefillInput {
+                    x_gpu: Some((&bufs[0], (at * n_embd * 4) as u64)),
+                    n_tokens: w,
+                    start_pos: row.pos,
+                    ..attn_input
+                };
+                let Some((attn, pending)) = vulkan.fused_attention_prefill_deferred(
+                    input,
+                    &mut row.cache.layers[il],
+                    &mut stages[j],
+                ) else {
+                    vulkan.end_prefill_group();
+                    anyhow::bail!("layer {il} cannot verify a draft in a batched step");
+                };
+                if !pending.is_empty() {
+                    pending_kv[j].push((il, pending));
+                }
+                vulkan.copy_rows(&attn.attn_out_buf, 0, &all, at * q_dim, w * q_dim);
+                at += w;
+            }
+            all
+        };
+        if let Some(pair) = ffn_gate_up_pair(l.ffn_gate, l.ffn_up) {
+            vulkan.place_weight(&pair);
+        }
+        let out = vulkan.fused_post_attention_prefill_rows(
+            AttnOutSrc::Gpu(&attn_out, 0, n_rows),
+            AttnOutSrc::Gpu(&bufs[0], 0, n_rows),
+            n_rows,
+            l.wo,
+            None,
+            l.ffn_norm,
+            l.ffn_gate,
+            l.ffn_up,
+            l.ffn_down,
+            None,
+            eps,
+            l.activation,
+            Some((&bufs[1], 0)),
+            None,
+            None,
+        );
+        if out.is_none() {
+            vulkan.end_prefill_group();
+            anyhow::bail!("layer {il}'s feed-forward cannot take a batched decode step");
+        }
+        bufs.swap(0, 1);
+        group_layers += 1;
+        // The first layer goes on its own: the device waits for the first
+        // submission, and every layer after it records while it runs.
+        if group_layers >= layers_per_submit.max(1) || il == first {
+            vulkan.end_prefill_group();
+            vulkan.begin_prefill_group();
+            group_layers = 0;
+        }
+    }
+    vulkan.end_prefill_group();
+    for ((row, stage), pending) in rows[n_dec..].iter_mut().zip(stages).zip(pending_kv) {
+        vulkan.fill_deferred_kv_rows(row.cache);
+        vulkan.fill_kv_rows(stage, pending, row.cache);
+    }
+    let [x, _] = bufs;
+    Ok(Some(x))
+}
+
+/// `ORANGU_BATCH_VERIFY=0`: a speculative verify runs on its own, outside
+/// the batched step, instead of as rows of it
+/// (`ModelForward::forward_decode_batch_verify`) — the control arm.
+pub(crate) fn batch_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_BATCH_VERIFY"))
 }
 
 /// The slot a range's decode chain caches its GPU resources under
@@ -3401,6 +3625,52 @@ pub trait ModelForward: Send + Sync {
         tokens: &[u32],
     ) -> Result<Option<Vec<Vec<f32>>>> {
         let _ = (rows, tokens);
+        Ok(None)
+    }
+
+    /// [`Self::forward_decode_batch`], with each row's sampling handed in
+    /// as its solo step's [`Self::forward_maybe_sampling`] takes it: a row
+    /// with `Some` may come back as its token or its candidates, picked on
+    /// the device in the batch's own submission. A row with `None` comes
+    /// back as logits. The default samples nothing and returns every row's
+    /// logits.
+    fn forward_decode_batch_sampling(
+        &self,
+        rows: &mut [DecodeRow<'_>],
+        tokens: &[u32],
+        samples: &[Option<GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<ForwardOutcome>>> {
+        let _ = samples;
+        Ok(self
+            .forward_decode_batch(rows, tokens)?
+            .map(|logits| logits.into_iter().map(ForwardOutcome::Logits).collect()))
+    }
+
+    /// Whether [`Self::forward_decode_batch_verify`] takes a verify into a
+    /// batched step. A verify offered to a batch whose model declines it
+    /// would make every row of that step run on its own, so a caller asks
+    /// first.
+    fn batches_verify(&self) -> bool {
+        false
+    }
+
+    /// One batched step in which some rows verify a speculative draft:
+    /// `tokens[i]` (one token, or the token and its draft) at
+    /// `rows[i].pos` onwards into `rows[i].cache`, the one-token rows
+    /// first. Returns each row's outcomes, one per token: a one-token row's
+    /// is as [`Self::forward_decode_batch_sampling`] gives it, a verifying
+    /// row's are its logits at every position, as
+    /// [`Self::forward_verify`] gives them, with its cache holding all of
+    /// its tokens for the caller to roll back. `Ok(None)`, with nothing
+    /// written, where the architecture does not batch a verify, and the
+    /// caller runs every row on its own.
+    fn forward_decode_batch_verify(
+        &self,
+        rows: &mut [DecodeRow<'_>],
+        tokens: &[&[u32]],
+        samples: &[Option<GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<Vec<ForwardOutcome>>>> {
+        let _ = (rows, tokens, samples);
         Ok(None)
     }
 
@@ -3610,6 +3880,24 @@ pub trait ModelForward: Send + Sync {
         anyhow::bail!("this architecture does not support multi-position (speculative) decoding")
     }
 
+    /// [`Self::forward_all_logits`] for a speculative pair's passes after
+    /// the prompt — the served model's verify and a draft model's steps:
+    /// every position's logits, the tokens appended to `cache`, rolled back
+    /// past the accepted prefix with [`KvCache::truncate`]. Neither cache is
+    /// read back on the host, so an architecture may run this on its device
+    /// stream — the path a prompt chunk takes, rows left where the device
+    /// wrote them — and one token as a decode step. The default is
+    /// `forward_all_logits`.
+    fn forward_verify(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.forward_all_logits(cache, tokens, start_pos, slot_id)
+    }
+
     /// Every token's final hidden state (`[n_tokens, n_embd]`, before the
     /// output projection to vocab logits) — what an embeddings request
     /// pools over. A one-shot call: no KV cache reuse across calls.
@@ -3689,6 +3977,15 @@ pub trait ModelForward: Send + Sync {
         anyhow::bail!("this architecture has no multi-token-prediction state to export")
     }
 
+    /// Whether a model with recurrent layers verifies a draft on its device,
+    /// reading the weights once for every row and keeping the state behind
+    /// each — the case where speculating pays for it. `false` here: such a
+    /// model's verify is its host prompt loop, the rows run again after a
+    /// partly rejected draft.
+    fn verifies_recurrent_on_device(&self) -> bool {
+        false
+    }
+
     /// [`Self::forward_all_logits`], additionally returning every position's
     /// hidden state — the verification half of the same pairing
     /// [`Self::forward_with_states`] covers for prefill.
@@ -3761,6 +4058,59 @@ pub trait MtpHead: Send + Sync {
         start_pos: usize,
         first_pos: usize,
     ) -> Result<MtpStep>;
+
+    /// Whether this head attends over the *served model's* cache instead of
+    /// one of its own — a head with query projections only, which reads the
+    /// keys and values the served model's last layers wrote. Such a head is
+    /// driven through [`Self::forward_served`] and never through
+    /// [`Self::forward`]: it has no rows of its own to catch up, and every
+    /// one of its draft steps sits at the same position.
+    fn reads_served_cache(&self) -> bool {
+        false
+    }
+
+    /// One draft step of a head that [`Self::reads_served_cache`]: `token`
+    /// at `pos`, paired with `state` — the served model's state at the
+    /// position before it, or this head's own from its previous step — and
+    /// attending over every row `served` holds below `pos`.
+    ///
+    /// `None` when `served` does not hold those rows where this head can
+    /// read them (rows the device wrote and the host never received); the
+    /// caller then drafts nothing rather than guess from a hole.
+    fn forward_served(
+        &self,
+        served: &KvCache,
+        token: u32,
+        state: &[f32],
+        pos: usize,
+    ) -> Result<Option<MtpStep>> {
+        let _ = (served, token, state, pos);
+        anyhow::bail!("this draft head keeps a cache of its own")
+    }
+
+    /// The most positions this head drafts over in one pass, anchor
+    /// included, or `None` for a head that drafts a token a step. Such a
+    /// head's [`Self::forward`] only caches the context its states describe;
+    /// the draft itself is [`Self::draft_block`].
+    fn block_size(&self) -> Option<usize> {
+        None
+    }
+
+    /// One draft of up to `n_draft` tokens after `anchor`, the token the
+    /// served model is about to read at `pos`, from one pass over the
+    /// context `cache` holds below `pos`. `first_pos` is as in
+    /// [`Self::forward`]. Empty when the context stops short of `pos`.
+    fn draft_block(
+        &self,
+        cache: &mut KvCache,
+        anchor: u32,
+        pos: usize,
+        n_draft: usize,
+        first_pos: usize,
+    ) -> Result<Vec<u32>> {
+        let _ = (cache, anchor, pos, n_draft, first_pos);
+        anyhow::bail!("this draft head drafts a token a step")
+    }
 }
 
 /// What one [`MtpHead::forward`] produced.

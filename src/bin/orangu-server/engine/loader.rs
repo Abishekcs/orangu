@@ -1599,6 +1599,15 @@ pub(crate) fn block_index(name: &str) -> Option<usize> {
     name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
 }
 
+/// What [`LoadedModel::open_shards_as`] is opening, which decides how much
+/// of the header it reads as a model's configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opened {
+    Model,
+    Projector,
+    Head,
+}
+
 impl LoadedModel {
     /// Every tensor's name, `ggml_type` and shape, sorted by name — the
     /// file's layout, independent of the order its directory lists them in
@@ -1949,7 +1958,16 @@ impl LoadedModel {
     /// architecture family serves, so no configuration is read beyond its
     /// width — `engine::image::qwen3vl` reads the rest itself.
     pub fn open_projector(path: &Path) -> Result<Self> {
-        Self::open_shards_as(&shard_sources(path)?, true)
+        Self::open_shards_as(&shard_sources(path)?, Opened::Projector)
+    }
+
+    /// Opens a draft head that ships beside its model (`MTP/*.gguf`) for its
+    /// tensors and plain hyperparameters. A head's architecture string names
+    /// the head (`gemma4-assistant`), not a model any family serves on its
+    /// own, so it is not resolved here: the served model's own
+    /// `ModelForward::load_mtp_head` decides whether it can drive it.
+    pub fn open_head(path: &Path) -> Result<Self> {
+        Self::open_shards_as(&shard_sources(path)?, Opened::Head)
     }
 
     /// Loads a model whose shards are byte ranges inside one file that is
@@ -1973,10 +1991,10 @@ impl LoadedModel {
     }
 
     fn open_shards(shards: &[ShardSource]) -> Result<Self> {
-        Self::open_shards_as(shards, false)
+        Self::open_shards_as(shards, Opened::Model)
     }
 
-    fn open_shards_as(shards: &[ShardSource], projector: bool) -> Result<Self> {
+    fn open_shards_as(shards: &[ShardSource], opened: Opened) -> Result<Self> {
         let first = shards
             .first()
             .ok_or_else(|| anyhow!("a model needs at least one shard"))?;
@@ -1985,7 +2003,7 @@ impl LoadedModel {
         // `orangu::model_spec::architecture_from_tensors`.
         let architecture = orangu::model_spec::architecture_of(&gguf)
             .ok_or_else(|| anyhow!("GGUF file is missing general.architecture"))?;
-        let config = if projector {
+        let config = if opened == Opened::Projector {
             anyhow::ensure!(
                 architecture == "clip",
                 "{} is a {architecture} model, not a multimodal projector",
@@ -2006,6 +2024,8 @@ impl LoadedModel {
                 rms_eps: 1e-6,
                 pooling_type: PoolingType::Mean,
             }
+        } else if opened == Opened::Head {
+            read_model_config(&gguf, &architecture)?
         } else if resolve_arch_family(&architecture)? == ArchFamily::QwenImage {
             read_image_model_config(&gguf, &architecture)?
         } else {
