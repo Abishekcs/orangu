@@ -63,6 +63,19 @@ const PAD_L: f64 = 64.0;
 const PAD_R: f64 = 108.0; // room for the direct labels at each line's right end
 const PAD_T: f64 = 34.0;
 const PAD_B: f64 = 48.0;
+/// One grid panel's width; a grid is this times its columns wide.
+const GRID_PANEL_W: f64 = 480.0;
+/// An overlay's one panel is this tall.
+const OVERLAY_H: f64 = 560.0;
+/// Shades an overlay tells a group's series apart by: how far each is mixed
+/// towards the surface, the last series at full strength. Never cycled: past
+/// the last a series is dropped, as with colours.
+const SHADES: [&[f64]; 4] = [
+    &[0.0],
+    &[0.5, 0.0],
+    &[0.6, 0.3, 0.0],
+    &[0.65, 0.45, 0.25, 0.0],
+];
 
 /// One engine's curve on one chart: its rate at each context length, on one
 /// measurement date.
@@ -72,6 +85,19 @@ struct Line {
     date: String,
     /// `(context length, tok/s)`, ascending by context.
     points: Vec<(u32, f64)>,
+    /// The series' shade of its colour on an overlay, an index into
+    /// [`SHADES`].
+    shade: Option<usize>,
+}
+
+impl Line {
+    /// The suffix of the `s`/`f` classes that colour it.
+    fn class(&self) -> String {
+        match self.shade {
+            Some(k) => format!("{}t{k}", self.color_idx),
+            None => self.color_idx.to_string(),
+        }
+    }
 }
 
 /// One of the two charts.
@@ -111,6 +137,14 @@ pub struct Labels {
     /// report — expert re-reads, bytes per token — and a document comparing
     /// the two wants the panels both engines appear in.
     pub panels: Vec<String>,
+    /// One panel per label group and mode, every panel on the same axes. A
+    /// label's group is its text before the first ` · ` and its series the
+    /// rest, so `--sweep` rows labelled `<model>` draw one panel per model
+    /// with one line per arm. Each mode is a column.
+    pub grid: bool,
+    /// Every group and mode on one panel: a hue per group and mode, a shade
+    /// of it per series.
+    pub overlay: bool,
 }
 
 impl Default for Labels {
@@ -119,6 +153,8 @@ impl Default for Labels {
             y: "tok/s (log)".to_string(),
             x: None,
             panels: Vec::new(),
+            grid: false,
+            overlay: false,
         }
     }
 }
@@ -150,19 +186,79 @@ pub fn render_labelled(
     // Only when they actually differ (`devices_differ` ignores rows that name
     // no device), so a one-card machine's chart is unchanged and a file of
     // older rows does not get relabelled by the arrival of a newer one.
-    if crate::history::devices_differ(&records) {
+    // A grid or an overlay names the device in the group instead (see
+    // `place`), so one series keeps one colour or one style throughout.
+    let grouped = axes.grid || axes.overlay;
+    let devices_differ = crate::history::devices_differ(&records);
+    if devices_differ && !grouped {
         for r in &mut records {
             r.label = r.series(true);
         }
     }
     let records = &records[..];
+    // A group measured on more than one device is two groups, told apart by
+    // the device; one measured on one device keeps its plain name.
+    let split = |r: &Record| -> (String, String) {
+        let (group, series) = r.label.split_once(" · ").unwrap_or((&r.label, &r.label));
+        (group.to_string(), series.to_string())
+    };
+    let mut group_devices: BTreeMap<String, Vec<Option<&str>>> = BTreeMap::new();
+    if grouped {
+        for r in records {
+            let on = group_devices.entry(split(r).0).or_default();
+            if !on.contains(&r.device.as_deref()) {
+                on.push(r.device.as_deref());
+            }
+        }
+    }
+    // The panel a row is drawn on and the line it is drawn as.
+    let place = |r: &Record| -> (String, String) {
+        if grouped {
+            let (group, series) = split(r);
+            let group = if group_devices.get(&group).is_some_and(|d| d.len() > 1) {
+                format!("{group} · {}", r.device.as_deref().unwrap_or("?"))
+            } else {
+                group
+            };
+            (group, series)
+        } else {
+            (String::new(), r.label.clone())
+        }
+    };
+    // What a line's colour names, and on an overlay what its shade names.
     let mut labels: Vec<String> = Vec::new();
+    let mut styles: Vec<String> = Vec::new();
     for r in records {
-        if !labels.iter().any(|l| l == &r.label) {
-            labels.push(r.label.clone());
+        let (group, series) = place(r);
+        let (colour, style) = if axes.overlay {
+            (group, series)
+        } else {
+            (series, String::new())
+        };
+        if !labels.contains(&colour) {
+            labels.push(colour);
+        }
+        if axes.overlay && !styles.contains(&style) {
+            styles.push(style);
         }
     }
     labels.truncate(SERIES_COLORS.len());
+    styles.truncate(SHADES.len());
+    // Every (hue, shade) an overlay draws, in the order the legend lists them.
+    let mut shaded: Vec<(usize, usize)> = Vec::new();
+    if axes.overlay {
+        for r in records {
+            let (group, series) = place(r);
+            if let (Some(ci), Some(k)) = (
+                labels.iter().position(|l| *l == group),
+                styles.iter().position(|l| *l == series),
+            ) && !shaded.contains(&(ci, k))
+            {
+                shaded.push((ci, k));
+            }
+        }
+        shaded.sort_unstable();
+    }
 
     // The storage panels describe the streaming regime — a model larger than
     // the page cache, read from disk on every token. When no row read a byte
@@ -177,7 +273,7 @@ pub fn render_labelled(
         .peekable();
     let nothing_read = io_rows.peek().is_some() && io_rows.all(|r| r.best == 0.0);
 
-    let mut charts = Vec::new();
+    let mut columns: Vec<(&str, Vec<Chart>)> = Vec::new();
     for (mode, title, x_title) in [
         (
             "pp",
@@ -304,14 +400,38 @@ pub fn render_labelled(
         if !axes.panels.is_empty() && !axes.panels.iter().any(|p| p == mode) {
             continue;
         }
-        // `(label, date) -> context -> best`.
-        let mut by_series: BTreeMap<(usize, &str, &str), BTreeMap<u32, f64>> = BTreeMap::new();
+        // `group -> (series, date) -> context -> best`, groups in first-seen order.
+        type Series = BTreeMap<(usize, Option<usize>, String, String), BTreeMap<u32, f64>>;
+        let mut groups: Vec<(String, Series)> = Vec::new();
         for r in records.iter().filter(|r| r.mode == mode) {
-            let Some(ci) = labels.iter().position(|l| l == &r.label) else {
+            let (group, series) = place(r);
+            let colour = if axes.overlay { &group } else { &series };
+            let Some(ci) = labels.iter().position(|l| l == colour) else {
                 continue;
             };
-            let at = by_series
-                .entry((ci, r.label.as_str(), r.date.as_str()))
+            let shade = if axes.overlay {
+                let Some(k) = styles.iter().position(|l| *l == series) else {
+                    continue;
+                };
+                Some(k)
+            } else {
+                None
+            };
+            let series = if axes.overlay {
+                format!("{group} · {series}")
+            } else {
+                series
+            };
+            let gi = match groups.iter().position(|(g, _)| *g == group) {
+                Some(gi) => gi,
+                None => {
+                    groups.push((group, BTreeMap::new()));
+                    groups.len() - 1
+                }
+            };
+            let at = groups[gi]
+                .1
+                .entry((ci, shade, series, r.date.clone()))
                 .or_default()
                 .entry(r.n)
                 .or_insert(r.best);
@@ -319,24 +439,85 @@ pub fn render_labelled(
                 *at = r.best;
             }
         }
-        if by_series.is_empty() {
+        if groups.is_empty() {
             continue;
         }
-        let lines = by_series
+        let panels = groups
             .into_iter()
-            .map(|((ci, label, date), pts)| Line {
-                color_idx: ci,
-                label: label.to_string(),
-                date: date.to_string(),
-                points: pts.into_iter().collect(),
+            .map(|(group, by_series)| Chart {
+                title: if axes.grid { group } else { title.to_string() },
+                x_title: x_title.to_string(),
+                lines: by_series
+                    .into_iter()
+                    .map(|((ci, shade, label, date), pts)| Line {
+                        color_idx: ci,
+                        label,
+                        date,
+                        points: pts.into_iter().collect(),
+                        shade,
+                    })
+                    .collect(),
             })
             .collect();
-        charts.push(Chart {
-            title: title.to_string(),
-            x_title: x_title.to_string(),
-            lines,
-        });
+        columns.push((title, panels));
     }
+
+    // Stacked, every panel is a row of the one column; in a grid each mode is
+    // a column of its own; an overlay is one panel holding every line.
+    let columns: Vec<(&str, Vec<Chart>)> = if axes.grid {
+        columns
+    } else if axes.overlay {
+        let title = columns
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let x_title = columns
+            .first()
+            .and_then(|(_, c)| c.first())
+            .map(|c| c.x_title.clone())
+            .unwrap_or_default();
+        let lines = columns
+            .into_iter()
+            .flat_map(|(_, c)| c)
+            .flat_map(|c| c.lines)
+            .collect();
+        vec![(
+            "",
+            vec![Chart {
+                title,
+                x_title,
+                lines,
+            }],
+        )]
+    } else {
+        vec![("", columns.into_iter().flat_map(|(_, c)| c).collect())]
+    };
+    let width = if axes.grid {
+        GRID_PANEL_W * columns.len().max(1) as f64
+    } else {
+        WIDTH
+    };
+    let panel_h = if axes.overlay { OVERLAY_H } else { PANEL_H };
+    // A grid's panels share one extent, so a height or a position means the
+    // same in every panel. The floor drops a step below the slowest point, so
+    // its line does not run along the bottom.
+    let shared = grouped.then(|| {
+        let e = Extent::of(
+            columns
+                .iter()
+                .flat_map(|(_, c)| c)
+                .flat_map(|c| &c.lines)
+                .flat_map(|l| l.points.iter().copied()),
+        );
+        Extent {
+            v_min: e.v_min * 0.9,
+            ..e
+        }
+    });
+    let panel_w = width / columns.len().max(1) as f64;
+    let rows = columns.iter().map(|(_, c)| c.len()).max().unwrap_or(0);
+    let column_head_h = if axes.grid { 22.0 } else { 0.0 };
 
     let head_h = 56.0;
     // Where each legend entry sits, worked out *before* the document is sized
@@ -349,16 +530,35 @@ pub fn render_labelled(
     // reached x=1501 on a 900-wide canvas: one entry visible, three off the
     // edge, on a chart whose whole purpose was comparing the four.
     const LEGEND_ROW_H: f64 = 16.0;
-    let entry_w = |label: &String| 22.0 + 6.6 * label.chars().count() as f64;
+    // `(class suffix, text)`: a colour per series, or on an overlay one per
+    // line it draws.
+    let entries: Vec<(String, String)> = if axes.overlay {
+        shaded
+            .iter()
+            .map(|&(ci, k)| {
+                (
+                    format!("{ci}t{k}"),
+                    format!("{} · {}", labels[ci], styles[k]),
+                )
+            })
+            .collect()
+    } else {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (i.to_string(), l.clone()))
+            .collect()
+    };
+    let entry_w = |(_, label): &(String, String)| 22.0 + 6.6 * label.chars().count() as f64;
     let legend_at: Vec<(f64, usize)> = {
-        let mut out = Vec::with_capacity(labels.len());
+        let mut out = Vec::with_capacity(entries.len());
         let (mut x, mut row) = (16.0, 0usize);
-        for label in &labels {
-            let w = entry_w(label);
+        for entry in &entries {
+            let w = entry_w(entry);
             // Never wrap a row that has nothing on it yet: an entry wider than
             // the whole canvas overflows its own row, which is still readable
             // from the left, where starting off-screen is not readable at all.
-            if x > 16.0 && x + w > WIDTH - 16.0 {
+            if x > 16.0 && x + w > width - 16.0 {
                 row += 1;
                 x = 16.0;
             }
@@ -371,12 +571,20 @@ pub fn render_labelled(
     // One row is 30.0 — exactly what this was before it could wrap, so a
     // one-row chart is unchanged down to the pixel.
     let legend_h = 14.0 + legend_rows as f64 * LEGEND_ROW_H;
-    let height = head_h + legend_h + PANEL_H * charts.len() as f64 + 10.0;
+    let height = head_h + legend_h + column_head_h + panel_h * rows as f64 + 10.0;
+    // A grid's or an overlay's legend goes under its panels, where the eye
+    // ends up after reading them; a stacked chart's sits above.
+    let panels_top = if grouped { head_h } else { head_h + legend_h };
+    let legend_top = if grouped {
+        head_h + column_head_h + panel_h * rows as f64
+    } else {
+        head_h
+    };
 
     let mut s = String::new();
     let _ = write!(
         s,
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {WIDTH:.0} {height:.0}" width="{WIDTH:.0}" height="{height:.0}" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.0} {height:.0}" width="{width:.0}" height="{height:.0}" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
 <style>
   :root {{ color-scheme: light dark; }}
   .surface {{ fill: #fcfcfb; }}
@@ -397,6 +605,13 @@ pub fn render_labelled(
     for (i, color) in SERIES_COLORS.iter().enumerate().take(labels.len()) {
         let _ = writeln!(s, "  .f{i} {{ fill: {}; }}", color.0);
     }
+    for &(ci, k) in &shaded {
+        let c = tint(SERIES_COLORS[ci].0, "#fcfcfb", SHADES[styles.len() - 1][k]);
+        let _ = writeln!(
+            s,
+            "  .s{ci}t{k} {{ stroke: {c}; }}\n  .f{ci}t{k} {{ fill: {c}; }}"
+        );
+    }
     // Last, so the later rule wins and an overlapping marker keeps its
     // surface-coloured separating ring.
     let _ = writeln!(s, "  .mark-ring {{ stroke: #fcfcfb; stroke-width: 2; }}");
@@ -415,6 +630,13 @@ pub fn render_labelled(
             color.1, color.1
         );
     }
+    for &(ci, k) in &shaded {
+        let c = tint(SERIES_COLORS[ci].1, "#1a1a19", SHADES[styles.len() - 1][k]);
+        let _ = writeln!(
+            dark,
+            "    .s{ci}t{k} {{ stroke: {c}; }}\n    .f{ci}t{k} {{ fill: {c}; }}"
+        );
+    }
     let _ = writeln!(
         dark,
         "    .mark-ring {{ stroke: #1a1a19; stroke-width: 2; }}"
@@ -426,7 +648,7 @@ pub fn render_labelled(
 
     let _ = write!(
         s,
-        r#"<rect class="surface" x="0" y="0" width="{WIDTH:.0}" height="{height:.0}"/>
+        r#"<rect class="surface" x="0" y="0" width="{width:.0}" height="{height:.0}"/>
 <text class="ink" x="16" y="26" font-size="16" font-weight="600">orangu throughput vs context</text>
 <text class="ink-2" x="16" y="44" font-size="11">{} · showing {} ({} of {} rows)</text>
 "#,
@@ -438,11 +660,11 @@ pub fn render_labelled(
 
     // Identity is never colour alone: every series is named here and each
     // line's right-hand end is direct-labelled in the chart below.
-    for ((i, label), &(lx, row)) in labels.iter().enumerate().zip(&legend_at) {
-        let ly = head_h + row as f64 * LEGEND_ROW_H;
+    for ((class, label), &(lx, row)) in entries.iter().zip(&legend_at) {
+        let ly = legend_top + row as f64 * LEGEND_ROW_H;
         let _ = write!(
             s,
-            r#"<circle class="f{i}" cx="{:.1}" cy="{:.1}" r="4"/><text class="ink" x="{:.1}" y="{:.1}" font-size="11">{}</text>"#,
+            r#"<circle class="f{class}" cx="{:.1}" cy="{:.1}" r="4"/><text class="ink" x="{:.1}" y="{:.1}" font-size="11">{}</text>"#,
             lx + 4.0,
             ly + 6.0,
             lx + 14.0,
@@ -452,24 +674,74 @@ pub fn render_labelled(
         s.push('\n');
     }
 
-    for (idx, chart) in charts.iter().enumerate() {
-        render_chart(
-            &mut s,
-            chart,
-            head_h + legend_h + idx as f64 * PANEL_H,
-            scale,
-            &axes.y,
-        );
+    let top = panels_top;
+    for (col, (title, panels)) in columns.iter().enumerate() {
+        let ox = col as f64 * panel_w;
+        if axes.grid {
+            let _ = writeln!(
+                s,
+                r#"<text class="ink" x="{:.1}" y="{:.1}" font-size="14" font-weight="600">{}</text>"#,
+                ox + PAD_L,
+                top + 12.0,
+                esc(title)
+            );
+        }
+        for (row, chart) in panels.iter().enumerate() {
+            render_chart(
+                &mut s,
+                chart,
+                (ox, top + column_head_h + row as f64 * panel_h),
+                (panel_w, panel_h),
+                scale,
+                &axes.y,
+                shared,
+            );
+        }
     }
 
     s.push_str("</svg>\n");
     s
 }
 
-fn render_chart(s: &mut String, chart: &Chart, oy: f64, scale: Option<(f64, f64)>, y_label: &str) {
-    let plot_w = WIDTH - PAD_L - PAD_R;
-    let plot_h = PANEL_H - PAD_T - PAD_B;
-    let x0 = PAD_L;
+/// The context and rate range a panel's axes cover.
+#[derive(Clone, Copy)]
+struct Extent {
+    x_max: f64,
+    v_min: f64,
+    v_max: f64,
+}
+
+impl Extent {
+    fn of(points: impl Iterator<Item = (u32, f64)>) -> Extent {
+        points.fold(
+            Extent {
+                x_max: 1.0,
+                v_min: f64::INFINITY,
+                v_max: 0.0,
+            },
+            |e, (n, v)| Extent {
+                x_max: e.x_max.max(n as f64),
+                v_min: e.v_min.min(v),
+                v_max: e.v_max.max(v),
+            },
+        )
+    }
+}
+
+/// Draw one `w` × `h` panel with its top-left corner at `(ox, oy)`. `shared`
+/// is the extent every panel of a grid takes; `None` fits the panel's own.
+fn render_chart(
+    s: &mut String,
+    chart: &Chart,
+    (ox, oy): (f64, f64),
+    (w, h): (f64, f64),
+    scale: Option<(f64, f64)>,
+    y_label: &str,
+    shared: Option<Extent>,
+) {
+    let plot_w = w - PAD_L - PAD_R;
+    let plot_h = h - PAD_T - PAD_B;
+    let x0 = ox + PAD_L;
     let y0 = oy + PAD_T;
 
     let all: Vec<(u32, f64)> = chart
@@ -477,9 +749,11 @@ fn render_chart(s: &mut String, chart: &Chart, oy: f64, scale: Option<(f64, f64)
         .iter()
         .flat_map(|l| l.points.iter().copied())
         .collect();
-    let x_max = all.iter().map(|(n, _)| *n).max().unwrap_or(1).max(1) as f64;
-    let v_min = all.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
-    let v_max = all.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
+    let Extent {
+        x_max,
+        v_min,
+        v_max,
+    } = shared.unwrap_or_else(|| Extent::of(all.iter().copied()));
     // Decade-aligned bounds, so every gridline is a round number and the ratio
     // between two curves can be read off the axis.
     let (lo, hi) = match scale {
@@ -587,7 +861,6 @@ fn render_chart(s: &mut String, chart: &Chart, oy: f64, scale: Option<(f64, f64)
         if line.points.len() < 2 {
             continue;
         }
-        let ci = line.color_idx;
         let d: Vec<String> = line
             .points
             .iter()
@@ -595,14 +868,15 @@ fn render_chart(s: &mut String, chart: &Chart, oy: f64, scale: Option<(f64, f64)
             .collect();
         let _ = write!(
             s,
-            r#"<polyline class="s{ci}" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="{}"/>"#,
+            r#"<polyline class="s{}" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="{}"/>"#,
+            line.class(),
             d.join(" ")
         );
         s.push('\n');
     }
 
     for line in &order {
-        let ci = line.color_idx;
+        let ci = line.class();
         for (n, v) in &line.points {
             let _ = write!(
                 s,
@@ -616,26 +890,52 @@ fn render_chart(s: &mut String, chart: &Chart, oy: f64, scale: Option<(f64, f64)
         }
     }
 
-    // Direct-label each line's right-hand end — the number a reader wants
-    // without matching a colour to the legend. Nudged vertically off any label
-    // already placed, since two engines can end close together.
-    let mut placed: Vec<f64> = Vec::new();
-    for line in &order {
+    // Direct-label each line's right-hand end, in the line's colour — the
+    // number a reader wants without matching a colour to the legend. Nudged
+    // vertically off any label already placed, since two engines can end
+    // close together.
+    // Highest end first, so a nudged label moves down and keeps the lines'
+    // order.
+    let mut by_end = order.clone();
+    by_end.sort_by(|a, b| {
+        let end = |l: &Line| l.points.last().map_or(0.0, |p| p.1);
+        end(b).total_cmp(&end(a))
+    });
+    // Only labels that start at the same x can collide.
+    let mut placed: Vec<(f64, f64)> = Vec::new();
+    for line in &by_end {
         if let Some((n, v)) = line.points.last() {
+            let x = px(*n) + 9.0;
             let mut y = py(*v) + 3.5;
-            while placed.iter().any(|oy| (oy - y).abs() < 11.0) {
+            while placed
+                .iter()
+                .any(|(ox, oy)| (ox - x).abs() < 1.0 && (oy - y).abs() < 11.0)
+            {
                 y += 11.0;
             }
-            placed.push(y);
+            placed.push((x, y));
             let _ = write!(
                 s,
-                r#"<text class="ink" x="{:.1}" y="{y:.1}" font-size="10" font-weight="600">{}</text>"#,
-                px(*n) + 9.0,
+                r#"<text class="f{}" x="{x:.1}" y="{y:.1}" font-size="10" font-weight="600">{}</text>"#,
+                line.class(),
                 fmt_num(*v)
             );
             s.push('\n');
         }
     }
+}
+
+/// `#rrggbb` `color` mixed a fraction `t` of the way towards `surface`.
+fn tint(color: &str, surface: &str, t: f64) -> String {
+    let rgb = |hex: &str| -> [f64; 3] {
+        std::array::from_fn(|i| {
+            u8::from_str_radix(hex.get(1 + 2 * i..3 + 2 * i).unwrap_or("00"), 16).unwrap_or(0)
+                as f64
+        })
+    };
+    let (c, b) = (rgb(color), rgb(surface));
+    let mix = |i: usize| (c[i] + (b[i] - c[i]) * t).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", mix(0), mix(1), mix(2))
 }
 
 /// Largest `1/2/5 × 10^k` at or below `v` — a whole decade of headroom below
@@ -772,6 +1072,159 @@ mod tests {
         let svg = render_labelled(&streamed, "test", None, Labels::default());
         assert!(svg.contains("MiB read from disk"), "{svg}");
         assert!(svg.contains("major faults per repetition"), "{svg}");
+    }
+
+    /// `--chart-grid` draws a panel per label group and mode, each a line per
+    /// series, with the two series coloured the same in every panel.
+    #[test]
+    fn a_grid_draws_one_panel_per_group_and_mode() {
+        let mut recs = Vec::new();
+        for model in ["model-a", "model-b", "model-c"] {
+            for arm in ["ARM=old", "ARM=new"] {
+                for (mode, n) in [("pp", 512), ("pp", 2048), ("tg", 0), ("tg", 4096)] {
+                    recs.push(rec(
+                        "2026-10-26",
+                        &format!("{model} · {arm}"),
+                        mode,
+                        n,
+                        50.0,
+                    ));
+                }
+            }
+        }
+        let svg = render_labelled(
+            &recs,
+            "test",
+            None,
+            Labels {
+                grid: true,
+                ..Labels::default()
+            },
+        );
+        for model in ["model-a", "model-b", "model-c"] {
+            assert_eq!(svg.matches(&format!(">{model}<")).count(), 2, "{model}");
+        }
+        assert!(svg.contains(">Prefill — prompt processing<"), "{svg}");
+        assert!(svg.contains(">Decode — token generation<"), "{svg}");
+        // Six panels of two lines; the legend names each series once.
+        assert_eq!(svg.matches("<polyline").count(), 12);
+        assert_eq!(svg.matches(">ARM=old<").count(), 1);
+        assert!(svg.contains(r#"width="960""#), "two columns wide");
+
+        // A model measured on two devices keeps its series' colours and
+        // names the device in its panels' titles; one measured on one device
+        // keeps its plain name.
+        let mut split = recs.clone();
+        for r in &mut split {
+            r.device = Some("card".into());
+        }
+        let other: Vec<Record> = split
+            .iter()
+            .filter(|r| r.label.starts_with("model-c"))
+            .map(|r| Record {
+                device: Some("card (split 2)".into()),
+                ..r.clone()
+            })
+            .collect();
+        split.extend(other);
+        let svg = render_labelled(
+            &split,
+            "t",
+            None,
+            Labels {
+                grid: true,
+                ..Labels::default()
+            },
+        );
+        assert_eq!(
+            svg.matches(">ARM=old<").count(),
+            1,
+            "one legend entry per series"
+        );
+        assert!(svg.contains(">model-c · card (split 2)<"), "{svg}");
+        assert!(svg.contains(">model-c · card<"), "{svg}");
+        assert!(svg.contains(">model-a<"), "{svg}");
+    }
+
+    /// `--chart-overlay` draws every group and mode on one panel: a hue per
+    /// group, a lighter shade of it for the earlier series, one legend entry
+    /// per line, no dashes.
+    #[test]
+    fn an_overlay_draws_every_line_on_one_panel_in_shades() {
+        let mut recs = Vec::new();
+        for model in ["prompt-a", "prompt-b"] {
+            for arm in ["ARM=old", "ARM=new"] {
+                for (n, v) in [(512, 900.0), (2048, 800.0)] {
+                    recs.push(rec("2026-10-26", &format!("{model} · {arm}"), "pp", n, v));
+                }
+            }
+        }
+        for arm in ["ARM=old", "ARM=new"] {
+            for (n, v) in [(0, 6.0), (4096, 5.0)] {
+                recs.push(rec("2026-10-26", &format!("decode-a · {arm}"), "tg", n, v));
+            }
+        }
+        let svg = render_labelled(
+            &recs,
+            "t",
+            None,
+            Labels {
+                overlay: true,
+                ..Labels::default()
+            },
+        );
+        assert_eq!(svg.matches("<polyline").count(), 6, "one panel, every line");
+        assert_eq!(
+            svg.matches(">Prefill — prompt processing · Decode — token generation<")
+                .count(),
+            1
+        );
+        assert!(!svg.contains("dasharray"), "{svg}");
+        assert!(
+            svg.contains(">decode-a · ARM=old<") && svg.contains(">prompt-b · ARM=new<"),
+            "{svg}"
+        );
+        // The newer series is the hue itself, the older a lighter shade of it.
+        assert!(
+            svg.contains(&format!(".s0t1 {{ stroke: {}; }}", SERIES_COLORS[0].0)),
+            "{svg}"
+        );
+        let older = tint(SERIES_COLORS[0].0, "#fcfcfb", 0.5);
+        assert!(
+            svg.contains(&format!(".s0t0 {{ stroke: {older}; }}")),
+            "{svg}"
+        );
+        assert_ne!(older, SERIES_COLORS[0].0);
+    }
+
+    /// Every panel of a grid takes the same axes: model-c's 5 tok/s and the
+    /// others' 500 share one log range, and a prefill at 2048 sits halfway
+    /// along the decode panels' 4096.
+    #[test]
+    fn a_grid_shares_its_axes_and_puts_the_legend_below() {
+        let mut recs = Vec::new();
+        for (model, v) in [("model-a", 500.0), ("model-c", 5.0)] {
+            for (mode, n) in [("pp", 512), ("pp", 2048), ("tg", 0), ("tg", 4096)] {
+                recs.push(rec("2026-10-26", &format!("{model} · ARM=new"), mode, n, v));
+            }
+        }
+        let svg = render_labelled(
+            &recs,
+            "t",
+            None,
+            Labels {
+                grid: true,
+                ..Labels::default()
+            },
+        );
+        assert_eq!(svg.matches(r#"text-anchor="end">2.0<"#).count(), 4, "{svg}");
+        assert_eq!(svg.matches(r#"text-anchor="end">500<"#).count(), 4, "{svg}");
+        let half = PAD_L + (GRID_PANEL_W - PAD_L - PAD_R) / 2.0;
+        assert!(svg.contains(&format!(r#"cx="{half:.1}""#)), "{svg}");
+        // The legend's swatch sits below the last panel.
+        let swatch = svg.find(r#"<circle class="f0" cx="#).unwrap();
+        let cy: f64 = svg[swatch..].split('"').nth(5).unwrap().parse().unwrap();
+        assert!(cy > PANEL_H * 2.0, "legend at y={cy}");
     }
 
     /// `--chart-panels pp,tg` keeps exactly those panels, whatever else the

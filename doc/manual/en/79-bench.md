@@ -1036,6 +1036,40 @@ rows are already in it, so nothing has to be re-measured to redraw. Each series
 comes out as `llama-1b · Vulkan/Radeon RX 5500M`, and the four combinations sit
 on one pair of axes.
 
+With many models, one pair of axes crowds. `--chart-grid` draws a panel for
+each model and mode instead, with one line per swept value:
+
+```sh
+orangu-bench --chart-only --history matrix.tsv --chart matrix.svg \
+  --chart-grid --chart-panels pp,tg --chart-png
+```
+
+- **Panels.** A label's text before the first ` · ` is its group: the
+  `--label` given to the loop. Each group gets a panel per mode, and each mode
+  is a column, prefill on the left and decode on the right, the groups in the
+  order the file first holds them.
+- **Lines.** The rest of the label, the swept value, is the series. A series
+  keeps its colour in every panel, so the legend names it once.
+- **Devices.** A group measured on more than one device gets a panel per
+  device, its title naming the device.
+- **Axes.** Every panel takes the same axes, so a height or a position means
+  the same in each: the context runs from zero to the longest measured, and
+  tokens per second on a log axis from below the slowest point to above the
+  fastest. `--chart-scale` pins that range.
+- **Legend.** Below the panels.
+- **Points.** Each point is the best repetition, as on every chart.
+
+`--chart-overlay` takes the same labels and draws every line on one panel:
+
+- **Colours.** Each group and mode has a hue of its own. Its series are
+  shades of that hue: the last series in the file at full strength, earlier
+  ones lighter.
+- **Legend.** Below the panel, one entry per line, `<group> · <series>`.
+- **Axes.** One x-axis and one log tokens-per-second axis, as on a grid. The
+  x-axis is the prompt length for prefill and the context depth for decode.
+- **Limits.** Six hues and four shades; a group or series past them is left
+  out.
+
 Two practical notes for a matrix that takes hours. Give each model its own
 `--sweep-cmd` port only if you are running loops concurrently — otherwise let
 them share one, since each sweep frees the port before it returns. And check
@@ -1268,6 +1302,8 @@ Options:
       --chart-y-label <TEXT>           Label for the chart's y-axis [default: "tok/s (log)"]
       --chart-x-label <TEXT>           Label for the chart's x-axis
       --chart-panels <LIST>            Draw only these modes' panels (e.g. `pp,tg`); default: every mode in the file
+      --chart-grid                     Draw one panel per label group (text before ` · `) and mode, on shared axes
+      --chart-overlay                  Draw every label group and mode on one panel: hue per group, shade per series
       --flamegraph <PATH>              Record a CPU flamegraph of the server over the measured window
       --flamegraph-pid <PID>           Process to profile (default: the server's own, else the URL port's owner)
       --flamegraph-freq <HZ>           Sampling frequency in Hz for `--flamegraph` [default: 999]

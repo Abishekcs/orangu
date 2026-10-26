@@ -365,6 +365,14 @@ struct Args {
     #[arg(long, value_delimiter = ',', value_name = "LIST")]
     chart_panels: Vec<String>,
 
+    /// Draw one panel per label group (text before ` · `) and mode, on shared axes.
+    #[arg(long, default_value_t = false)]
+    chart_grid: bool,
+
+    /// Draw every label group and mode on one panel: hue per group, shade per series.
+    #[arg(long, default_value_t = false)]
+    chart_overlay: bool,
+
     /// Record a CPU flamegraph of the server over the measured window.
     #[arg(long, value_name = "PATH")]
     flamegraph: Option<String>,
@@ -3714,6 +3722,8 @@ fn write_chart(args: &Args, extra: &[history::Record]) -> anyhow::Result<()> {
                 y: args.chart_y_label.clone(),
                 x: args.chart_x_label.clone(),
                 panels: args.chart_panels.clone(),
+                grid: args.chart_grid,
+                overlay: args.chart_overlay,
             },
         ),
     )?;
