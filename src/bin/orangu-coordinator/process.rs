@@ -2303,12 +2303,32 @@ mod tests {
     }
 
     /// Ports nothing listens on, for profiles of their own.
+    ///
+    /// Taken below every system's ephemeral range rather than from port 0:
+    /// the health checks' own outgoing connections draw from that range, and
+    /// where it is handed out in order (macOS) the checks on one profile's
+    /// port took the ports the next profiles were about to bind. Each call
+    /// moves on from where the last stopped, so tests running at once never
+    /// share one.
     #[cfg(unix)]
     fn free_ports<const N: usize>() -> [u16; N] {
-        let listeners: Vec<std::net::TcpListener> = (0..N)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        std::array::from_fn(|i| listeners[i].local_addr().unwrap().port())
+        use std::sync::atomic::{AtomicU16, Ordering};
+        const LOW: u16 = 20_000;
+        const SPAN: u16 = 10_000;
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        let start = (std::process::id() % u32::from(SPAN)) as u16;
+        let mut ports = [0; N];
+        let mut found = 0;
+        while found < N {
+            let step = NEXT.fetch_add(1, Ordering::Relaxed);
+            assert!(step < SPAN, "no free port in {LOW}..{}", LOW + SPAN);
+            let port = LOW + (start + step) % SPAN;
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                ports[found] = port;
+                found += 1;
+            }
+        }
+        ports
     }
 
     /// The running profiles, most recently used first, with their pids.
