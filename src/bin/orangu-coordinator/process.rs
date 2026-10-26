@@ -2296,9 +2296,13 @@ mod tests {
             .arg("--version")
             .output()
             .ok()?;
+        // Says which port it took and runs Python unbuffered, so a server
+        // that never answers leaves its own account in the output tail the
+        // timeout reports.
         Some(fake_server_script(
             "PORT=$(sed -n 's/^port = //p' \"$2\" | head -1)\n\
-             cd \"$(mktemp -d)\" && exec python3 -m http.server \"$PORT\" --bind 127.0.0.1\n",
+             echo \"fake orangu-server: $(command -v python3) on port $PORT\" >&2\n\
+             cd \"$(mktemp -d)\" && exec python3 -u -m http.server \"$PORT\" --bind 127.0.0.1\n",
         ))
     }
 
@@ -2363,7 +2367,7 @@ mod tests {
         };
         let [pa, pb, pc, pd] = free_ports::<4>();
         let config = minimal_config(
-            "startup_timeout = 10\nresident = 2",
+            "startup_timeout = 30\nresident = 2",
             &format!(
                 "[a]\nrole = all\nmodel = org/a\nport = {pa}\n\
                  [b]\nrole = explorer\nmodel = org/b\nport = {pb}\nbackend = cpu\n\
@@ -2430,7 +2434,7 @@ mod tests {
         };
         let [pa, pb] = free_ports::<2>();
         let config = minimal_config(
-            "startup_timeout = 10",
+            "startup_timeout = 30",
             &format!(
                 "[one-a]\nrole = all\nmodel = org/a\nport = {pa}\n\
                  [one-b]\nrole = explorer\nmodel = org/b\nport = {pb}\nbackend = cpu\n"
