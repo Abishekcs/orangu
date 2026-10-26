@@ -2303,6 +2303,7 @@ mod tests {
     }
 
     /// Ports nothing listens on, for profiles of their own.
+    #[cfg(unix)]
     fn free_ports<const N: usize>() -> [u16; N] {
         let listeners: Vec<std::net::TcpListener> = (0..N)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -2311,6 +2312,7 @@ mod tests {
     }
 
     /// The running profiles, most recently used first, with their pids.
+    #[cfg(unix)]
     async fn residents(coordinator: &Coordinator) -> Vec<(String, u32)> {
         coordinator
             .active

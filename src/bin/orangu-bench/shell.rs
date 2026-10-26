@@ -56,17 +56,17 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--interference|--chat|--chat-fixture|--kl|--kl-rows|--kl-top|--kl-tokens|--kl-text|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--kl|--kl-rows|--kl-top|--kl-tokens|--kl-text|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --kl --kl-rows --kl-top --kl-tokens --kl-text --shared-prefix --shared-prefix-tokens \
+            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --kl --kl-rows --kl-top --kl-tokens --kl-text --shared-prefix --shared-prefix-tokens \
              --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
-             --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
+             --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels --chart-grid --chart-overlay \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png --flamegraph-keep-data \
              --flamegraph-layers --flamegraph-duration --flamegraph-watch \
              --compare-profiles --bundle --read-bundle --sweep --sweep-cmd --sweep-env --sweep-start-timeout \
@@ -97,6 +97,7 @@ _orangu_bench() {
         '--pg[Combined mode: prompt lengths prefilled and generated in one request]:list:' \
         '--decode-cpu[Report the server'"'"'s CPU time per generated token, with prefill excluded]' \
         '--streams[Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s]:list:' \
+        '--streams-depth[Concurrency mode: tokens of context in front of each stream'"'"'s instruction; 0 is none]:n:' \
         '--streams-echo[Concurrency mode: each stream copies a passage out of its prompt, which speculation drafts]' \
         '--streams-warm[Concurrency mode: prefill the prompts before each run, so all streams decode at once]' \
         '--interference[Interference mode: prompt lengths a second request prefills while one stream decodes]:list:' \
@@ -148,6 +149,8 @@ _orangu_bench() {
         '--chart-y-label[Label for the chart'"'"'s y-axis]:text:' \
         '--chart-x-label[Label for the chart'"'"'s x-axis]:text:' \
         '--chart-panels[Draw only these modes'"'"' panels (e.g. pp,tg); default: every mode in the file]:list:' \
+        '--chart-grid[Draw one panel per label group and mode, on shared axes]' \
+        '--chart-overlay[Draw every label group and mode on one panel: hue per group, shade per series]' \
         '--flamegraph[Record a CPU flamegraph of the server over the measured window]:path:_files' \
         '--flamegraph-pid[Process to profile (default: the server'"'"'s own, else the URL port'"'"'s owner)]:pid:' \
         '--flamegraph-freq[Sampling frequency in Hz for --flamegraph]:hz:' \
@@ -196,6 +199,7 @@ complete -c orangu-bench -l pp-continue            -x -d 'Continuation-prefill m
 complete -c orangu-bench -l pg                     -x -d 'Combined mode: prompt lengths prefilled and generated in one request'
 complete -c orangu-bench -l decode-cpu                -d 'Report the server\'s CPU time per generated token, with prefill excluded'
 complete -c orangu-bench -l streams                -x -d 'Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s'
+complete -c orangu-bench -l streams-depth          -x -d 'Concurrency mode: tokens of context in front of each stream\'s instruction; 0 is none'
 complete -c orangu-bench -l streams-echo              -d 'Concurrency mode: each stream copies a passage out of its prompt, which speculation drafts'
 complete -c orangu-bench -l streams-warm              -d 'Concurrency mode: prefill the prompts before each run, so all streams decode at once'
 complete -c orangu-bench -l interference           -x -d 'Interference mode: prompt lengths a second request prefills while one stream decodes'
@@ -247,6 +251,8 @@ complete -c orangu-bench -l chart-scale            -x -d 'Pin the chart\'s tok/s
 complete -c orangu-bench -l chart-y-label          -x -d 'Label for the chart\'s y-axis'
 complete -c orangu-bench -l chart-x-label          -x -d 'Label for the chart\'s x-axis'
 complete -c orangu-bench -l chart-panels           -x -d 'Draw only these modes\' panels (e.g. pp,tg); default: every mode in the file'
+complete -c orangu-bench -l chart-grid                 -d 'Draw one panel per label group and mode, on shared axes'
+complete -c orangu-bench -l chart-overlay              -d 'Draw every label group and mode on one panel: hue per group, shade per series'
 complete -c orangu-bench -l flamegraph             -r -d 'Record a CPU flamegraph of the server over the measured window'
 complete -c orangu-bench -l flamegraph-pid         -x -d 'Process to profile (default: the server\'s own, else the URL port\'s owner)'
 complete -c orangu-bench -l flamegraph-freq        -x -d 'Sampling frequency in Hz for --flamegraph'
@@ -304,6 +310,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--pg', 'Combined mode: prompt lengths prefilled and generated in one request'),
         @('--decode-cpu', 'Report the server''s CPU time per generated token, with prefill excluded'),
         @('--streams', 'Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s'),
+        @('--streams-depth', 'Concurrency mode: tokens of context in front of each stream''s instruction; 0 is none'),
         @('--streams-echo', 'Concurrency mode: each stream copies a passage out of its prompt, which speculation drafts'),
         @('--streams-warm', 'Concurrency mode: prefill the prompts before each run, so all streams decode at once'),
         @('--interference', 'Interference mode: prompt lengths a second request prefills while one stream decodes'),
@@ -355,6 +362,8 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--chart-y-label', 'Label for the chart''s y-axis'),
         @('--chart-x-label', 'Label for the chart''s x-axis'),
         @('--chart-panels', 'Draw only these modes'' panels (e.g. pp,tg); default: every mode in the file'),
+        @('--chart-grid', 'Draw one panel per label group and mode, on shared axes'),
+        @('--chart-overlay', 'Draw every label group and mode on one panel: hue per group, shade per series'),
         @('--flamegraph', 'Record a CPU flamegraph of the server over the measured window'),
         @('--flamegraph-pid', 'Process to profile (default: the server''s own, else the URL port''s owner)'),
         @('--flamegraph-freq', 'Sampling frequency in Hz for --flamegraph'),
@@ -397,7 +406,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         { $_ -in '--history', '--chart', '--table', '--storage-file', '--download-dir', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--interference', '--chat', '--chat-fixture', '--kl', '--kl-rows', '--kl-top', '--kl-tokens', '--kl-text', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--kl', '--kl-rows', '--kl-top', '--kl-tokens', '--kl-text', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {
