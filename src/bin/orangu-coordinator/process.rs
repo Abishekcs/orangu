@@ -1953,7 +1953,7 @@ mod tests {
         // listens on the configured port, so the health check keeps
         // failing (not timing out) until `shutdown` intervenes.
         let config = minimal_config(
-            "startup_timeout = 30",
+            "startup_timeout = 10",
             "[main]\nrole = all\nmodel = org/gemma\nport = 65535\n",
         );
         let fake_bin = fake_server_script("sleep 30");
@@ -2296,13 +2296,27 @@ mod tests {
             .arg("--version")
             .output()
             .ok()?;
-        // Says which port it took and runs Python unbuffered, so a server
-        // that never answers leaves its own account in the output tail the
-        // timeout reports.
+        // A bare socket rather than `python3 -m http.server`: that one looks
+        // up its own address's name before it listens, and on macOS the
+        // lookup stalled past every startup timeout. This answers any request
+        // with an empty JSON object and says which port it took, so a server
+        // that never answers leaves its own account in the output tail.
         Some(fake_server_script(
-            "PORT=$(sed -n 's/^port = //p' \"$2\" | head -1)\n\
-             echo \"fake orangu-server: $(command -v python3) on port $PORT\" >&2\n\
-             cd \"$(mktemp -d)\" && exec python3 -u -m http.server \"$PORT\" --bind 127.0.0.1\n",
+            r#"PORT=$(sed -n 's/^port = //p' "$2" | head -1)
+exec python3 -u -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(16)
+print("fake orangu-server: listening on port", sys.argv[1])
+while True:
+    c, _ = s.accept()
+    c.recv(65536)
+    c.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+    c.close()
+' "$PORT"
+"#,
         ))
     }
 
@@ -2367,7 +2381,7 @@ mod tests {
         };
         let [pa, pb, pc, pd] = free_ports::<4>();
         let config = minimal_config(
-            "startup_timeout = 30\nresident = 2",
+            "startup_timeout = 10\nresident = 2",
             &format!(
                 "[a]\nrole = all\nmodel = org/a\nport = {pa}\n\
                  [b]\nrole = explorer\nmodel = org/b\nport = {pb}\nbackend = cpu\n\
@@ -2434,7 +2448,7 @@ mod tests {
         };
         let [pa, pb] = free_ports::<2>();
         let config = minimal_config(
-            "startup_timeout = 30",
+            "startup_timeout = 10",
             &format!(
                 "[one-a]\nrole = all\nmodel = org/a\nport = {pa}\n\
                  [one-b]\nrole = explorer\nmodel = org/b\nport = {pb}\nbackend = cpu\n"
