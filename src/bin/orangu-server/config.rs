@@ -498,6 +498,9 @@ pub fn bundled_configuration(
         image: crate::engine::image::ImageDefaults::default(),
         image_steps_set: false,
         image_cfg_scale_set: false,
+        audio_vae: None,
+        upscaler: None,
+        video: crate::engine::video::VideoDefaults::default(),
         // A bundle carries no certificate; TLS is a per-deployment decision.
         tls: None,
         // A key baked into a distributed executable is a key everyone who has
@@ -560,6 +563,9 @@ pub enum Role {
     /// model comes up in it without being asked (see
     /// [`Role::fixed_by_model`]) and a text model cannot take it.
     Image,
+    /// Video generation — the role of an `ltxv` model, fixed by the model
+    /// exactly as [`Role::Image`] is.
+    Video,
 }
 
 impl Role {
@@ -571,8 +577,10 @@ impl Role {
             "explorer" => Ok(Role::Explorer),
             "embedding" => Ok(Role::Embedding),
             "image" => Ok(Role::Image),
+            "video" => Ok(Role::Video),
             other => Err(anyhow!(
-                "invalid role '{other}' (expected all, code, review, explorer, embedding, or image)"
+                "invalid role '{other}' (expected all, code, review, explorer, embedding, image, or \
+                 video)"
             )),
         }
     }
@@ -585,25 +593,32 @@ impl Role {
             Role::Explorer => "explorer",
             Role::Embedding => "embedding",
             Role::Image => "image",
+            Role::Video => "video",
         }
     }
 
     /// Whether this is the role a model's architecture decides — [`Role::
-    /// Image`], which a `qwen_image` model always has and nothing else can
-    /// have — as opposed to the five an operator picks between for a
+    /// Image`] or [`Role::Video`], which a picture or video generator always
+    /// has and nothing else can have — as opposed to the five an operator picks between for a
     /// language model. A fixed role is never prompted for and never
     /// narrowed by an `x-orangu-role` header.
     pub fn fixed_by_model(&self) -> bool {
-        matches!(self, Role::Image)
+        matches!(self, Role::Image | Role::Video)
     }
 
     /// The role a model must be served in, from its `general.architecture`
-    /// — `Some(Role::Image)` for a picture generator, `None` for a language
-    /// model, whose role is the operator's choice.
+    /// — `Some(Role::Image)` for a picture generator, `Some(Role::Video)` for
+    /// a video generator, `None` for a language model, whose role is the
+    /// operator's choice.
     pub fn required_by(architecture: Option<&str>) -> Option<Role> {
-        architecture
-            .is_some_and(orangu::model_spec::is_image_architecture)
-            .then_some(Role::Image)
+        let architecture = architecture?;
+        if orangu::model_spec::is_image_architecture(architecture) {
+            Some(Role::Image)
+        } else if orangu::model_spec::is_video_architecture(architecture) {
+            Some(Role::Video)
+        } else {
+            None
+        }
     }
 
     /// Default request-queue depth per slot before a new request is
@@ -625,11 +640,12 @@ impl Role {
             // way for the others' decode steps between its layers. A slot
             // costs a single stream nothing: the KV pool is shared, not split.
             //
-            // A review is one request at a time, and an image model draws one
-            // picture at a time (`engine::image::Pipeline` holds a single busy
-            // lock), so a second slot there would only queue.
+            // A review is one request at a time, and an image or video model
+            // draws one picture or clip at a time (`engine::image::Pipeline`
+            // and `engine::video::Pipeline` each hold a single busy lock), so
+            // a second slot there would only queue.
             Role::All | Role::Code | Role::Explorer => 4,
-            Role::Review | Role::Image => 1,
+            Role::Review | Role::Image | Role::Video => 1,
         }
     }
 
@@ -1060,7 +1076,10 @@ pub struct ServerConfiguration {
     /// `[orangu-server].text_encoder`: the `qwen2vl` GGUF a `qwen_image`
     /// model encodes prompts with — a model spec or path, the same shape as
     /// [`model`](Self::model). `None` (the default) finds the largest such
-    /// file in the models directory. Ignored for every other architecture.
+    /// file in the models directory. For an `ltxv` model it is LTX's Gemma 4
+    /// with its projection heads instead: a GGUF, or the published
+    /// `.safetensors`, which is converted to a GGUF once. Ignored for every other
+    /// architecture.
     pub text_encoder: Option<String>,
     /// `[orangu-server].vision`: the text encoder's vision projector (an
     /// `mmproj-*.gguf`) a `qwen_image_2_1` model reads a reference picture
@@ -1068,7 +1087,8 @@ pub struct ServerConfiguration {
     /// `none` to draw attached pictures over instead of editing them.
     /// `None` finds one beside the text encoder, or under `models`.
     pub vision: Option<String>,
-    /// `[orangu-server].vae`: the Qwen-Image VAE (`.safetensors`) a
+    /// `[orangu-server].vae`: for an `ltxv` model, LTX's convolutional video
+    /// VAE; otherwise the Qwen-Image VAE (`.safetensors`) a
     /// `qwen_image` model decodes pictures with, absolute or relative to
     /// the models directory. `None` finds it by its tensors.
     pub vae: Option<String>,
@@ -1130,6 +1150,20 @@ pub struct ServerConfiguration {
     /// [`ServerConfiguration::image_defaults_under`].
     pub image_steps_set: bool,
     pub image_cfg_scale_set: bool,
+    /// `[orangu-server].audio_vae`: LTX-2's audio VAE and vocoder
+    /// (`.safetensors`) an `ltxv` model voices its clips with — a path, absolute
+    /// or relative to the models directory, or `none` for silent clips. `None`
+    /// finds it by its tensors.
+    pub audio_vae: Option<String>,
+    /// `[orangu-server].upscaler`: the ×2 latent upscaler (`.safetensors`) the
+    /// distilled two-stage recipe refines with — a path, or `none` to draw
+    /// every clip in one stage at its full size. `None` finds it by its
+    /// tensors.
+    pub upscaler: Option<String>,
+    /// `[orangu-server].video_*`: what a clip gets when the request does not
+    /// say — size, length, frame rate, sound, the two stages, the encoder's
+    /// quality.
+    pub video: crate::engine::video::VideoDefaults,
     /// `[orangu-server].draft_tokens`: how many tokens the draft model
     /// proposes per verification (default 4).
     ///
@@ -1764,6 +1798,15 @@ pub fn load_server_configuration(
         })?,
     };
     let image = parse_image_defaults(&section)?;
+    let audio_vae = section
+        .get("audio_vae")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let upscaler = section
+        .get("upscaler")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let video = parse_video_defaults(&section)?;
 
     let kv_cache = match section.get("kv_cache") {
         Some(value) => KvCache::parse(value).ok_or_else(|| {
@@ -1950,6 +1993,9 @@ pub fn load_server_configuration(
         image,
         image_steps_set,
         image_cfg_scale_set,
+        audio_vae,
+        upscaler,
+        video,
         api_key,
         tls,
         device,
@@ -2115,6 +2161,90 @@ pub fn parse_image_size(value: &str) -> Option<(usize, usize)> {
         }
     };
     (w >= 16 && h >= 16 && w.is_multiple_of(16) && h.is_multiple_of(16)).then_some((w, h))
+}
+
+/// `WIDTHxHEIGHT` (or `WIDTH` alone for a square), both multiples of 32 —
+/// a video's latent pixel. The two-stage recipe draws at half the size
+/// first and needs multiples of 64, which the pipeline checks against
+/// whether it has the upscaler.
+pub fn parse_video_size(value: &str) -> Option<(usize, usize)> {
+    let (w, h) = parse_image_size(value)?;
+    (w >= 32 && h >= 32 && w.is_multiple_of(32) && h.is_multiple_of(32)).then_some((w, h))
+}
+
+fn parse_video_defaults(
+    section: &HashMap<String, String>,
+) -> Result<crate::engine::video::VideoDefaults> {
+    let mut video = crate::engine::video::VideoDefaults::default();
+    let number = |key: &str, what: &str| -> Result<Option<f64>> {
+        section
+            .get(key)
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "invalid value for [{SERVER_SECTION}].{key}: '{}' (expected {what})",
+                            value.trim()
+                        )
+                    })
+            })
+            .transpose()
+    };
+    if let Some(value) = section.get("video_size") {
+        let (width, height) = parse_video_size(value).ok_or_else(|| {
+            anyhow!(
+                "invalid value for [{SERVER_SECTION}].video_size: '{}' (expected WIDTHxHEIGHT, \
+                 both multiples of 32)",
+                value.trim()
+            )
+        })?;
+        video.width = width;
+        video.height = height;
+    }
+    if let Some(fps) = number("video_fps", "frames per second, 1 to 60")? {
+        anyhow::ensure!(
+            fps.fract() == 0.0 && fps <= 60.0,
+            "invalid value for [{SERVER_SECTION}].video_fps: {fps} (expected a whole number of \
+             frames per second, 1 to 60)"
+        );
+        video.fps = fps as u32;
+    }
+    if let Some(frames) = number("video_frames", "a positive frame count")? {
+        video.frames = crate::engine::video::snap_frames(frames as usize);
+    }
+    if let Some(seconds) = number("video_seconds", "a positive number of seconds")? {
+        anyhow::ensure!(
+            !section.contains_key("video_frames"),
+            "[{SERVER_SECTION}] sets both video_frames and video_seconds; keep one"
+        );
+        video.frames =
+            crate::engine::video::snap_frames((seconds * video.fps as f64).round() as usize);
+    }
+    if let Some(value) = section.get("video_audio") {
+        video.audio = parse_bool(SERVER_SECTION, "video_audio", value)?;
+    }
+    if let Some(value) = section.get("video_two_stage") {
+        video.two_stage = parse_bool(SERVER_SECTION, "video_two_stage", value)?;
+    }
+    if let Some(value) = section.get("video_quality") {
+        video.quality = value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|q| *q <= 255)
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].video_quality: '{}' (expected the AV1 \
+                     quantizer, 0 best to 255 smallest)",
+                    value.trim()
+                )
+            })?;
+    }
+    Ok(video)
 }
 
 /// The `approval_mode` values an MCP section may carry — orangu's own

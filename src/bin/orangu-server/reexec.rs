@@ -457,6 +457,7 @@ fn role_flag(role: Role) -> &'static str {
         Role::Explorer => "--explorer",
         Role::Embedding => "--embedding",
         Role::Image => "--image",
+        Role::Video => "--video",
     }
 }
 

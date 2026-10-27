@@ -336,11 +336,43 @@ impl CpuBackend {
         in_dim: usize,
         out_dim: usize,
     ) {
+        Self::matmul_rows_tiles_into(
+            out,
+            n_tokens,
+            out_dim,
+            acts.n_tiles(),
+            vecdot::KRow::new,
+            |o, slot| {
+                vecdot::unpack_k_row(
+                    ggml_type,
+                    &raw[o * row_bytes..(o + 1) * row_bytes],
+                    in_dim,
+                    slot,
+                )
+            },
+            |rows, tiles, outs| vecdot::dot_k_rows_tiles(rows, acts, tiles, outs),
+        );
+    }
+
+    /// The tile GEMMs' task loop, for any row form `R` and tile kernel:
+    /// `unpack(o, row)` fills output row `o`'s weights, `dot(rows, tiles,
+    /// outs)` multiplies [`vecdot::ROW_QUAD`]-aligned rows against a range
+    /// of [`vecdot::MM_TILE`]-token tiles.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_rows_tiles_into<R: Send>(
+        out: &mut Vec<f32>,
+        n_tokens: usize,
+        out_dim: usize,
+        n_tiles: usize,
+        new_row: impl Fn() -> R + Sync + Send,
+        unpack: impl Fn(usize, &mut R) + Sync + Send,
+        dot: impl Fn(&[&R], std::ops::Range<usize>, &mut [&mut [f32]]) + Sync + Send,
+    ) {
         {
             // `k_rows_per_task` rows per task for the tile kernel
-            // (`vecdot::dot_k_rows_tiles`), unpacked once each, over a block
-            // of token tiles — two dimensions, so a matmul of few rows
-            // against many tokens (a VAE convolution: 96 rows, 65,536
+            // (`vecdot::dot_k_rows_tiles`, `vecdot::dot_flat_rows_tiles`),
+            // unpacked once each, over a block of token tiles — two
+            // dimensions, so a matmul of few rows against many tokens (a VAE convolution: 96 rows, 65,536
             // pixels) is not six tasks on twelve cores. A short trailing
             // row group is padded up to a whole quad with the last row
             // repeated, its extra outputs going to scratch — the kernel's
@@ -358,7 +390,6 @@ impl CpuBackend {
             let per_task = vecdot::k_rows_per_task();
             let quad = vecdot::ROW_QUAD;
             let n_groups = out_dim.div_ceil(per_task);
-            let n_tiles = acts.n_tiles();
             // Token blocks only when the rows alone cannot occupy the pool:
             // the transformer's 3072-row linears are 192 groups already,
             // and every block re-reads the group's unpacked rows.
@@ -374,9 +405,7 @@ impl CpuBackend {
             (0..n_groups * n_blocks).into_par_iter().for_each_init(
                 || {
                     (
-                        (0..per_task)
-                            .map(|_| vecdot::KRow::new())
-                            .collect::<Vec<_>>(),
+                        (0..per_task).map(|_| new_row()).collect::<Vec<_>>(),
                         vec![0f32; n_tokens * per_task],
                         vec![0f32; n_tokens * (quad - 1)],
                     )
@@ -386,20 +415,18 @@ impl CpuBackend {
                     let (g, b) = (task / n_blocks, task % n_blocks);
                     let o0 = g * per_task;
                     let n_rows = per_task.min(out_dim - o0);
-                    let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
                     for (i, slot) in rows.iter_mut().enumerate().take(n_rows) {
-                        vecdot::unpack_k_row(ggml_type, row(o0 + i), in_dim, slot);
+                        unpack(o0 + i, slot);
                     }
                     let padded = n_rows.div_ceil(quad) * quad;
-                    let refs: Vec<&vecdot::KRow> =
-                        (0..padded).map(|i| &rows[i.min(n_rows - 1)]).collect();
+                    let refs: Vec<&R> = (0..padded).map(|i| &rows[i.min(n_rows - 1)]).collect();
                     let mut outs: Vec<&mut [f32]> =
                         yt[..n_tokens * n_rows].chunks_mut(n_tokens).collect();
                     outs.extend(scratch.chunks_mut(n_tokens).take(padded - n_rows));
                     let tiles = b * tiles_per_block..((b + 1) * tiles_per_block).min(n_tiles);
                     let t0 = tiles.start * vecdot::MM_TILE;
                     let t1 = (tiles.end * vecdot::MM_TILE).min(n_tokens);
-                    vecdot::dot_k_rows_tiles(&refs, acts, tiles, &mut outs);
+                    dot(&refs, tiles, &mut outs);
                     // Safety: task `task` alone writes columns
                     // `o0..o0 + n_rows` of token rows `t0..t1` of a buffer
                     // sized `n_tokens * out_dim` above; the rectangles of
@@ -417,9 +444,9 @@ impl CpuBackend {
         }
     }
 
-    /// The `Q8_0`/`Q5_0`/`IQ4_NL` prefill GEMM, over [`vecdot::ActQ8Flat`].
-    /// Identical in shape to [`Self::matmul_k_gemm`]; they differ only in the
-    /// activation type and the kernel called.
+    /// The `Q8_0`/`Q5_0`/`IQ4_NL` prefill GEMM: on a core with `i8mm` the
+    /// flat tile (`vecdot::dot_flat_rows_tiles`) on the K-quants' task loop,
+    /// elsewhere row pairs over [`vecdot::ActQ8Flat`] (`vecdot::dot_flat_pair`).
     #[allow(clippy::too_many_arguments)]
     fn matmul_flat_gemm_into(
         out: &mut Vec<f32>,
@@ -431,6 +458,27 @@ impl CpuBackend {
         in_dim: usize,
         out_dim: usize,
     ) {
+        // The `i8mm` tile where there is one, on the K-quants' task loop.
+        if vecdot::have_flat_rows_tile() {
+            let acts = vecdot::ActQ8MmFlat::quantize(x, in_dim, n_tokens);
+            Self::matmul_rows_tiles_into(
+                out,
+                n_tokens,
+                out_dim,
+                acts.n_tiles(),
+                vecdot::UnpackedRow::new,
+                |o, slot| {
+                    vecdot::unpack_row(
+                        ggml_type,
+                        &raw[o * row_bytes..(o + 1) * row_bytes],
+                        in_dim,
+                        slot,
+                    )
+                },
+                |rows, tiles, outs| vecdot::dot_flat_rows_tiles(rows, &acts, tiles, outs),
+            );
+            return;
+        }
         let acts = vecdot::ActQ8Flat::quantize(x, in_dim, n_tokens);
         let mut yt = vec![0f32; out_dim * n_tokens];
         yt.par_chunks_mut(n_tokens * 2).enumerate().for_each_init(

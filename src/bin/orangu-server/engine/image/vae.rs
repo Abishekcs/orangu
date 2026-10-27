@@ -708,7 +708,7 @@ impl VaePrecision {
 /// `None` under `F32`, on a CPU without an `int8` tile
 /// (`vecdot::have_rowi8_tile`), or with `ORANGU_IMAGE_ROWI8_CONV=off` (an
 /// A/B against `Q6_K`).
-pub(super) fn row_matrix(
+pub(crate) fn row_matrix(
     rows: &[f32],
     cols: usize,
     cout: usize,
@@ -732,7 +732,7 @@ pub(super) fn row_matrix(
 /// The matrix a convolution runs as: `rows` is `[cout][cols]` in `f32`.
 /// `Int8` pads each row to a multiple of 256 with zeros and encodes it as
 /// `Q6_K` with the library's own GGUF encoder.
-pub(super) fn conv_matrix(
+pub(crate) fn conv_matrix(
     rows: Vec<f32>,
     cols: usize,
     cout: usize,

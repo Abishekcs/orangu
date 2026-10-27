@@ -118,7 +118,7 @@ _orangu_server() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "-c --config -w --workspace --host -p --port --web --device --device-split --context --threads --metrics -i --init -s --shell-completions -d --daemon \
-             --all --code --review --explorer --embedding --image -o --output --binary --deep --sort -y --yes -h --help -V --version" -- "$cur") )
+             --all --code --review --explorer --embedding --image --video -o --output --binary --deep --sort -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
 
@@ -192,12 +192,13 @@ _orangu_server() {
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu-server.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-d --daemon)'{-d,--daemon}'[Run in the background, detached from the terminal]' \
-        '(--all --code --review --explorer --embedding --image)--all[General-purpose role (default)]' \
-        '(--all --code --review --explorer --embedding --image)--code[Coding role]' \
-        '(--all --code --review --explorer --embedding --image)--review[Code review role]' \
-        '(--all --code --review --explorer --embedding --image)--explorer[Exploration role]' \
-        '(--all --code --review --explorer --embedding --image)--embedding[Embeddings-only role]' \
-        '(--all --code --review --explorer --embedding --image)--image[Image generation role (qwen_image, qwen_image_2_1 models)]' \
+        '(--all --code --review --explorer --embedding --image --video)--all[General-purpose role (default)]' \
+        '(--all --code --review --explorer --embedding --image --video)--code[Coding role]' \
+        '(--all --code --review --explorer --embedding --image --video)--review[Code review role]' \
+        '(--all --code --review --explorer --embedding --image --video)--explorer[Exploration role]' \
+        '(--all --code --review --explorer --embedding --image --video)--embedding[Embeddings-only role]' \
+        '(--all --code --review --explorer --embedding --image --video)--image[Image generation role (qwen_image, qwen_image_2_1 models)]' \
+        '(--all --code --review --explorer --embedding --image --video)--video[Video generation role (ltxv models)]' \
         '(-o --output)'{-o,--output}'[Where bundle writes the bundled executable]:output:_files' \
         '--binary[The executable bundle embeds the model into]:binary:_files' \
         '--deep[Also verify plan'"'"'s shards and architecture]' \
@@ -292,6 +293,7 @@ complete -c orangu-server      -l review                  -d 'Code review role'
 complete -c orangu-server      -l explorer                -d 'Exploration role'
 complete -c orangu-server      -l embedding               -d 'Embeddings-only role'
 complete -c orangu-server      -l image                   -d 'Image generation role (qwen_image, qwen_image_2_1 models)'
+complete -c orangu-server      -l video                   -d 'Video generation role (ltxv models)'
 complete -c orangu-server -s o -l output              -r -d 'Where bundle writes the bundled executable'
 complete -c orangu-server      -l binary              -r -d 'The executable bundle embeds the model into'
 complete -c orangu-server -l deep                         -d 'Also verify plan\'s shards and architecture'
@@ -341,6 +343,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
         @('--explorer', 'Exploration role'),
         @('--embedding', 'Embeddings-only role'),
         @('--image', 'Image generation role (qwen_image, qwen_image_2_1 models)'),
+        @('--video', 'Video generation role (ltxv models)'),
         @('-o', '--output', 'Where bundle writes the bundled executable'),
         @('--binary', 'The executable bundle embeds the model into'),
         @('--deep', 'Also verify plan''s shards and architecture'),

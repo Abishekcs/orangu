@@ -153,6 +153,9 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `POST /v1/completions` | legacy completion, no chat template needed; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled and L2-normalized; carries OpenAI's `usage` |
 | `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image` or `qwen_image_2_1` model; `501` on a language model |
+| `POST /v1/videos`, `GET /v1/videos` | OpenAI's Videos API, on an `ltxv` model: start a clip as a job, or list the jobs; `501` on any other model |
+| `GET /v1/videos/{id}`, `DELETE /v1/videos/{id}` | one job's status and progress; cancel or drop it |
+| `GET /v1/videos/{id}/content` | the finished clip as `video/mp4`, with `Range` |
 | `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
 | `GET /ready` | readiness: would a request sent now be served |
 | `GET /v1/workers` | this node's place in its `[workers]` tree: role, layers, plan, workers |
@@ -540,6 +543,121 @@ client that wants the bytes. Streamed, the chunks carry an empty `delta` and
 an `image_progress` object (`step`, `steps`, `eta_seconds`) until the final
 chunk delivers the content with `finish_reason: "stop"`.
 
+#### `POST /v1/videos`
+
+Only on a server whose model is an `ltxv` video model (see the *Video
+generation* section of the server chapter); any other model answers
+`501`. A clip is minutes of work, so this is a job: the request answers
+at once with the job, and the clip is fetched when it is done.
+
+```sh
+curl -s localhost:8100/v1/videos -H 'Content-Type: application/json' \
+  -d '{"prompt": "A paper boat drifts down a rain-filled gutter", "seconds": 3, "size": "512x320"}'
+```
+
+| field | default | |
+| :-- | :-- | :-- |
+| `prompt` | *required* | what to film, the sound included |
+| `seconds` | `video_seconds` | the length, a number or a string (`"4"`) as OpenAI sends it; more than 0 and at most 60. Snapped to 8k + 1 frames at `fps` |
+| `frames` | `video_frames` | the length in frames instead, snapped the same way. Give `seconds` or `frames`, not both |
+| `size` | `video_size` | `WIDTHxHEIGHT`, both multiples of 32, and of 64 when the clip is drawn in two stages; `auto` is the default |
+| `fps` | `video_fps` | frames per second, 1 to 60 |
+| `seed` | drawn | reproduces a clip on the same build; the job reports the one used |
+| `audio` | `video_audio` | whether the sound goes into the file; without the audio VAE a clip is silent either way |
+| `two_stage` | `video_two_stage` | the distilled two-stage recipe; without the upscaler a clip is drawn in one stage either way |
+| `quality` | `video_quality` | the AV1 quantizer, `0` (best) to `255` (smallest file) |
+| `stream` | `false` | server-sent events until the clip is done, instead of answering at once |
+
+A bad field — an empty prompt, a size that is not a multiple of the unit,
+both `seconds` and `frames`, a value out of range — is a `400` with the
+reason as plain text, before any work.
+
+The answer is the job, a `video` object:
+
+```json
+{"id":"video_3f1c9a0d5e7b2468","object":"video","model":"unsloth/LTX-2.5-GGUF:Q4_K_M",
+ "status":"queued","progress":0,"phase":null,"eta_seconds":null,
+ "created_at":1760000000,"completed_at":null,
+ "prompt":"A paper boat drifts down a rain-filled gutter","size":"512x320",
+ "seconds":"3.04","frames":73,"fps":24,"seed":null,"audio":null,
+ "bytes":null,"generation_ms":null,"timings":null,"error":null}
+```
+
+| field | |
+| :-- | :-- |
+| `id` | `video_` and sixteen hex digits |
+| `status` | `queued` until the work starts (one clip runs at a time, so a second job waits), `in_progress`, then `completed` or `failed` |
+| `progress` | `0` to `100`: the transformer steps done across both stages; `100` only when `completed` |
+| `phase` | what is running: `encoding` (the prompt), `stage 1`, `upscaling`, `stage 2`, `decoding`, `sound`, `encoding the file` |
+| `eta_seconds` | this server's estimate of the seconds still ahead, from its measured rate |
+| `created_at`, `completed_at` | Unix seconds; `completed_at` is set on `completed` and on `failed` |
+| `prompt`, `size`, `fps` | as asked, with the defaults filled in |
+| `seconds` | the length as a string, OpenAI's way, from the frames actually drawn |
+| `frames` | the frames actually drawn, 8k + 1 |
+| `seed` | the one used, once the clip is done; the one asked for before that |
+| `audio` | once done: whether the file has a sound track |
+| `bytes` | once done: the MP4's size |
+| `generation_ms` | once done: the whole run |
+| `timings` | once done: where the time went — `encode_ms`, `stage_1_ms`, `upscale_ms`, `stage_2_ms`, `decode_ms`, `audio_ms`, `mux_ms` |
+| `error` | on `failed`: `{"message": …}` |
+
+Jobs live in memory: the last sixteen are kept (the oldest finished one
+is dropped first), and a restart forgets them all.
+
+**Streamed** (`stream: true`), the connection stays open and each event
+is a JSON object with a `type`:
+
+- `video.created` — `{"type", "video"}`, the job as above, first.
+- `video.progress` — `{"type", "id", "step", "steps", "phase",
+  "eta_seconds"}`, at every phase and every step. The first has `step`
+  **0**: the announcement before any work, its `eta_seconds` the estimate
+  of the whole clip.
+- `video.completed` — `{"type", "video"}`, the finished job, then
+  `[DONE]`.
+- `video.failed` — `{"type", "id", "error": {"message"}}`.
+
+Leaving the stream does not stop the job: it stays in the table, and
+`DELETE /v1/videos/{id}` is how a client cancels it.
+
+#### `GET /v1/videos` and `GET /v1/videos/{id}`
+
+`GET /v1/videos` lists the jobs kept, newest first, as
+`{"object": "list", "data": [ … ]}`. `GET /v1/videos/{id}` is one job, the
+object above; poll it for `progress`, `phase` and `eta_seconds`. An
+unknown id is a `404` with `{"error": {"message": "no video '…'"}}`.
+
+#### `GET /v1/videos/{id}/content`
+
+The finished clip: an MP4 of AV1 video and a FLAC sound track, as
+`video/mp4`. Its index comes before the media, so a player starts before
+the whole file has arrived, and a single `Range: bytes=a-b` (or `a-`, or
+`-n`) is answered with `206` and that part, so a `<video>` element can
+seek. A job that is not `completed` answers `409` with
+`{"error": {"message": "video '…' is in_progress"}}`; an unknown id `404`.
+
+```sh
+curl -s -o boat.mp4 localhost:8100/v1/videos/video_3f1c9a0d5e7b2468/content
+```
+
+#### `DELETE /v1/videos/{id}`
+
+Cancels a running job, which stops at its next transformer block, or
+drops a finished one, and answers
+`{"id", "object": "video.deleted", "deleted": true}`. An unknown id is a
+`404`.
+
+`POST /v1/chat/completions` on a video server films the last user
+message: its text is the prompt, and every knob is the server's `video_*`
+default except `seed`. It runs as a `/v1/videos` job, so the clip is also
+at `/v1/videos/{id}`. The assistant's `content` is a markdown link to the
+clip, `[prompt](/v1/videos/{id}/content)`, which a chat client can
+follow, and `message.videos` carries the job object. Without `stream`
+the reply comes when the clip is done. Streamed, the chunks carry an
+empty `delta` and a `video_progress` object (`id`, `step`, `steps`,
+`phase`, `eta_seconds`) until the final chunk delivers the content with
+`finish_reason: "stop"`. A failed clip is a `500` with the reason, or an
+`{"error"}` event when streamed.
+
 ### What a request cost
 
 Every generation endpoint reports what the request cost, so a client never has
@@ -664,6 +782,7 @@ Model and server metadata — the closest thing the server exposes over HTTP to
 | `workspace` | the root the file-lifecycle endpoints resolve against |
 | `uptime_seconds`, `pid` | which process answered, and for how long it has been up |
 | `image` | `null` for a language model; on a `qwen_image` model, the picture pipeline — see below |
+| `video` | `null` but on an `ltxv` model: the video pipeline — see below |
 
 `version` dates the release; `commit` is the only field that tells two builds
 of one version apart, which during performance work is every pair of builds
@@ -692,6 +811,20 @@ picture will come out, and how long it will take, before asking for one:
 | `token_passes_per_second`, `estimated_default_seconds` | the last measured rate at the defaults' size, and what a picture at the defaults costs at it — `null` before anything was measured |
 | `rate` | the model behind both: `encode` (seconds per picture), `linear_per_token_pass` and `attention_per_token_pass` (seconds per latent-token pass, attention's measured at `attention_tokens` tokens and growing with the count), `decode_per_pixel`, `edit_encode_per_token` (an edit's encode per reference latent token, `null` until an edit ran), and `step_share` (the share of steps that run the transformer — the step cache, `image_cache`, reuses the rest; `1` with it off). Seconds for any settings = `encode + steps × step_share × n × passes × (linear + attention × n / attention_tokens) + decode_per_pixel × pixels`, `n` the latent tokens (`width/16 × height/16`) and `passes` 2 under guidance, 1 without; an edit attends over `n + r` keys in place of `n`, `r` the reference's tokens. `null` before anything was measured |
 
+On a video model, `video` is the same for a clip:
+
+| `video.` | |
+| :-- | :-- |
+| `architecture` | `ltxv` |
+| `size_unit` | the pixels each side of a clip must be a multiple of: `64` when the defaults draw in two stages, `32` otherwise |
+| `text_encoder`, `vae` | the text encoder and the video VAE the pipeline was loaded with |
+| `audio_vae`, `upscaler` | the audio VAE and the latent upscaler, or `null` — clips are then silent, or drawn in one stage |
+| `n_layer`, `dim`, `head_dim`, `audio_dim`, `audio_head_dim` | the transformer's shape: its blocks, and each stream's width and head width |
+| `defaults` | what a request gets when it does not say: `size`, `frames`, `fps`, `seconds`, `audio`, `two_stage`, `quality` — as they stand now |
+| `configured` | the same, as the server came up, from the configuration |
+| `estimated_default_seconds` | what a clip at the defaults costs at the current rate |
+| `rate` | the model behind it, seeded by the startup calibration and replaced by each finished clip's measurements: `encode` (seconds for the prompt), `per_step`, `per_token` and `per_token_sq` (a step's seconds), `decode_per_pixel` and `other_per_pixel` (per output pixel per frame: the video VAE; the upscaler and the file), `audio_per_second`. Seconds for any settings = `encode + Σ steps × (per_step + per_token × n + per_token_sq × n²) + pixels × frames × (decode_per_pixel + other_per_pixel) + audio_per_second × seconds of sound`, summed over the stages' steps (eight, then three), `n` the stage's video tokens: latent frames × `height/32` × `width/32`, a quarter of that in stage 1 of two |
+
 #### `POST /props`
 
 Changes the picture defaults — the ones every request that does not say
@@ -714,6 +847,21 @@ not in multiples of 16, zero steps, a guidance below 0, a strength outside
 **Settings › Image** pane is this endpoint, on the console's own port as
 `/api/props`; the change holds until the server restarts, when the
 configuration's values are back.
+
+On a video model the body is `{"video": {…}}` with any of `size`
+(`WIDTHxHEIGHT`, multiples of 32, or of 64 in two stages), `seconds` or
+`frames` (not both), `fps` (1–60), `audio`, `two_stage` and `quality`
+(0–255), and `"reset": true` as above:
+
+```sh
+curl -s -X POST localhost:8100/props -H 'Content-Type: application/json' \
+  -d '{"video": {"size": "512x320", "seconds": 3}}'
+```
+
+The checks are the ones `POST /v1/videos` makes, and a value that fails
+one is a `400` that changes nothing; `{"video": …}` on any other model is
+a `501`. The console's **Settings › Video** pane is this endpoint, and the
+change holds until the server restarts.
 
 A top-level `[workers]` node also takes `{"workers": {"enabled": false}}`:
 it serves alone — its model's own paths, with the prefix pool, paged KV
@@ -1519,7 +1667,7 @@ Chat sessions:
 | `GET /api/sessions` | lists every non-empty session, newest-updated first |
 | `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
 | `POST /api/sessions/{id}/messages` | sends one chat turn against that session; SSE reply |
-| `GET /api/sessions/{id}/files/{name}` | a picture kept beside the session: one attached to a message (PNG, JPEG, GIF, WebP, SVG), or one a `qwen_image` model made |
+| `GET /api/sessions/{id}/files/{name}` | a file kept beside the session: a picture attached to a message (PNG, JPEG, GIF, WebP, SVG), one a `qwen_image` model made, or a clip an `ltxv` model made (`video/mp4`, with `Range`) |
 | `DELETE /api/sessions/{id}` | deletes one chat session, directory and all — History's per-row cross |
 | `DELETE /api/sessions` | deletes every chat session — History's **Clear all** footer |
 
@@ -1543,6 +1691,19 @@ picture is what it starts from — and the events are `progress` (`step`,
 `steps`, `eta_seconds`) once per step, then the same `done` event as a text
 reply, whose `html` holds the picture and whose `content` is a markdown
 image over the session file's URL.
+
+On an `ltxv` server the turn is a clip request — the text is the prompt,
+and every knob is the server's `video_*` default — and the events are
+`progress` (`step`, `steps`, `phase`, `eta_seconds`) at every phase and
+step, then the same `done` event with `"video": true`. The clip is kept
+beside the session as an `.mp4`; `content` is a markdown image over its
+URL followed by a caption line (size, frames, frame rate, length, sound,
+seed), and `html` renders that link as a `<video>` player with a save
+control. The file route answers an `.mp4` as `video/mp4` with
+`Accept-Ranges: bytes`, and a single `Range` with `206` and that part, so
+the player can seek. Closing the stream stops the clip at its next
+transformer block. A clip made here is not a `/v1/videos` job and is not
+listed there.
 
 The model manager, on the same port:
 

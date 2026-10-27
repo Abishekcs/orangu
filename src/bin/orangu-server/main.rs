@@ -148,7 +148,7 @@ impl Drop for TerminalTitleGuard {
     }
 }
 
-/// The six mutually exclusive role flags, as one reusable block.
+/// The seven mutually exclusive role flags, as one reusable block.
 ///
 /// Shared rather than written twice because `bundle` needs exactly the same
 /// set: the role a bundle is built with is the role its server comes up in,
@@ -176,6 +176,10 @@ struct RoleFlags {
     /// serves and the only role such a model is served in.
     #[arg(long)]
     image: bool,
+    /// Video generation — an ltxv model (LTX-2.5), the only kind this role serves and the only
+    /// role such a model is served in.
+    #[arg(long)]
+    video: bool,
 }
 
 impl RoleFlags {
@@ -195,6 +199,8 @@ impl RoleFlags {
             Some(config::Role::Embedding)
         } else if self.image {
             Some(config::Role::Image)
+        } else if self.video {
+            Some(config::Role::Video)
         } else {
             None
         }
@@ -1104,7 +1110,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                 // also set explicitly in the config — the same scoping
                 // `--code`/`--review`/etc. already have when combined with
                 // an interactively-prompted model.
-                if cli_role.is_none() && !selected.image {
+                if cli_role.is_none() && !selected.generator {
                     // Pre-selected from `[orangu-server].role` when the
                     // config names one, so a configuration that already says
                     // how this server is meant to run is one Enter away
@@ -1217,14 +1223,70 @@ fn prepare(args: Args) -> Result<Prepared> {
         }
         None => None,
     };
-    // What the language-model engine loads: the text encoder for an image
-    // model, the model itself otherwise.
-    let weights_source = match (&source, &image_companions) {
-        (_, Some(companions)) => ModelSource::File(companions.text_encoder.clone()),
+    // An `ltxv` file is a video diffusion transformer: like a picture model
+    // it is served through its text encoder (LTX's Gemma 4, a `gemma4`
+    // GGUF), with the transformer, the VAEs and the upscaler loaded into
+    // `engine::video::Pipeline` further down.
+    let video_companions = if architecture_key
+        .as_deref()
+        .is_some_and(orangu::model_spec::is_video_architecture)
+    {
+        if let ModelSource::Embedded(_) = &source {
+            bail!(
+                "an ltxv model cannot be bundled: it needs its text encoder and VAEs beside \
+                 it, and a bundle carries one file"
+            );
+        }
+        let companions = engine::video::Companions::locate(
+            &conf.models,
+            conf.text_encoder.as_deref(),
+            conf.vae.as_deref(),
+            conf.audio_vae.as_deref(),
+            conf.upscaler.as_deref(),
+        )?;
+        log::info!(
+            "orangu-server: ltxv text encoder {}",
+            companions.text_encoder.display()
+        );
+        log::info!(
+            "orangu-server: ltxv video VAE {} ({})",
+            companions.vae.display(),
+            conf.vae_precision.label()
+        );
+        match &companions.audio_vae {
+            Some(path) => log::info!("orangu-server: ltxv audio VAE {}", path.display()),
+            None => log::info!(
+                "orangu-server: ltxv has no audio VAE — clips are silent; `orangu-server \
+                 download {}:{}` fetches it",
+                orangu::model_download::LTX_COMPANION_REPO,
+                orangu::model_download::LTX_AUDIO_VAE_FILE,
+            ),
+        }
+        match &companions.upscaler {
+            Some(path) => log::info!("orangu-server: ltxv latent upscaler {}", path.display()),
+            None => log::info!(
+                "orangu-server: ltxv has no latent upscaler — clips are drawn in one stage at \
+                 their full size; `orangu-server download {}:{}` fetches it",
+                orangu::model_download::LTX_COMPANION_REPO,
+                orangu::model_download::LTX_UPSCALER_FILE,
+            ),
+        }
+        Some(companions)
+    } else {
+        None
+    };
+    // What the language-model engine loads: the text encoder for a picture
+    // or video model, the model itself otherwise.
+    let encoder_path = image_companions
+        .as_ref()
+        .map(|c| c.text_encoder.clone())
+        .or_else(|| video_companions.as_ref().map(|c| c.text_encoder.clone()));
+    let weights_source = match (&source, &encoder_path) {
+        (_, Some(encoder)) => ModelSource::File(encoder.clone()),
         (ModelSource::Embedded(bundle), None) => ModelSource::Embedded(bundle),
         (ModelSource::File(path), None) => ModelSource::File(path.clone()),
     };
-    let weights_gguf = match &image_companions {
+    let weights_gguf = match &encoder_path {
         Some(_) => weights_source.gguf()?,
         None => gguf,
     };
@@ -1258,9 +1320,16 @@ fn prepare(args: Args) -> Result<Prepared> {
     // a model fetched in ranges, where reading it is a download.
     let partial = conf.workers.is_some();
     let ranged = conf.workers.as_ref().is_some_and(|w| w.download_range);
-    let npu_precompile = conf.npu_precompile && !partial;
+    // A video model's text encoder reads one prompt a clip, so the NPU has
+    // nothing to win there; and whether it is used at all was decided by a
+    // race against whatever else had the cores at startup, while every
+    // hidden state of the encoder conditions the clip and the NPU's
+    // reduced-precision blocks are not exact.
+    let npu_precompile = conf.npu_precompile && !partial && video_companions.is_none();
     let npu_line = npu_inventory(if npu_precompile {
         "— preparing feed-forward blocks"
+    } else if video_companions.is_some() {
+        "— not used (a video model: the encoder runs once a clip)"
     } else {
         "— not used (npu_precompile = off)"
     });
@@ -1296,6 +1365,17 @@ fn prepare(args: Args) -> Result<Prepared> {
         conf.backend,
         &requested_device(device_flag.as_deref(), &conf.device),
     )?;
+    // A video model's encoder reads the prompt once a clip, and the
+    // transformer, which runs every step, is on the CPU and needs the
+    // memory: under `backend = auto` the encoder stays on the CPU too, rather
+    // than taking a share of RAM an integrated device would hold it in.
+    if video_companions.is_some()
+        && matches!(conf.backend, config::BackendPreference::Auto)
+        && backend.as_wgpu().is_some()
+    {
+        backend = Arc::new(engine::backend::CpuBackend);
+        backend_label = "CPU (a video model: the encoder runs once a clip)".to_string();
+    }
     // A picture pipeline under `backend = auto` is committed to a GPU only
     // when the GPU actually beats the CPU at prefill-shaped work — measured
     // on one of the transformer's own linears, now, before the encoder is
@@ -1675,6 +1755,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     }
     let architecture = match image_variant {
         Some(variant) => variant.architecture().to_string(),
+        None if video_companions.is_some() => orangu::model_spec::LTXV_ARCHITECTURE.to_string(),
         None => loaded.config.architecture.clone(),
     };
     // The device's weight arena cuts its chunks to what is coming.
@@ -1712,6 +1793,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         && matches!(conf.backend, config::BackendPreference::Auto)
         && backend.as_wgpu().is_some()
         && image_variant.is_none()
+        && video_companions.is_none()
         && role.allows_generation()
         && !engine::loader::ternary_repack::on()
         && engine::decode_backend::enabled();
@@ -1876,6 +1958,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         && !partial
         && !decode_on_cpu
         && image_variant.is_none()
+        && video_companions.is_none()
         && role.allows_generation()
         && engine::cpu_pools::available()
     {
@@ -1942,7 +2025,16 @@ fn prepare(args: Args) -> Result<Prepared> {
     // A `[workers]` node copies only the layers a plan gives it, by its tree's
     // top-level decision (`workers::node`).
     if conf.workers.is_none() {
-        engine::prompt_weights::prepare(&loaded, conf.prompt_weights);
+        // A video model's encoder is one prompt a clip: copies of its
+        // weights would save seconds a clip and cost the transformer the
+        // memory it runs in, so `auto` keeps the file's.
+        let prompt_weights = match (conf.prompt_weights, video_companions.is_some()) {
+            (engine::prompt_weights::PromptWeights::Auto, true) => {
+                engine::prompt_weights::PromptWeights::File
+            }
+            (chosen, _) => chosen,
+        };
+        engine::prompt_weights::prepare(&loaded, prompt_weights);
     }
     // Prompts on the cores: the pool they run faster in, timed on the
     // model's widest FFN GEMM at a prompt chunk's width, through the same
@@ -1989,6 +2081,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // picture), a model on the CPU, a split's host layers. Those are read
     // ahead once the server is ready — see `page_cache::prefetch_registered`.
     let reads_through_mappings = image_companions.is_some()
+        || video_companions.is_some()
         || split.as_ref().is_some_and(|s| s.plan.runs_on_host())
         || (split.is_none() && backend.as_wgpu().is_none());
     let image = match &image_companions {
@@ -2182,6 +2275,67 @@ fn prepare(args: Args) -> Result<Prepared> {
                 image_defaults.height,
                 image_defaults.steps,
                 image_defaults.cfg_scale,
+            );
+            Some(Arc::new(pipeline))
+        }
+        None => None,
+    };
+    let video = match &video_companions {
+        Some(companions) => {
+            let transformer =
+                LoadedModel::open(&path).context("loading the video model's weights")?;
+            // The video pipeline runs on the CPU: its transformer is 13 GiB
+            // and more at the quantizations that keep it watchable, past
+            // what a card holds beside the encoder, and its convolutions
+            // and attention are the CPU kernels' anyway. The encoder keeps
+            // the device it was placed on.
+            let video_backend: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
+            let pipeline = engine::video::Pipeline::load(
+                &transformer,
+                companions.clone(),
+                model.clone(),
+                tokenizer.clone(),
+                video_backend,
+                conf.video.clone(),
+                conf.vae_precision,
+            )?;
+            let d = pipeline.defaults();
+            let request = engine::video::VideoRequest::from_defaults("", &d);
+            // Defaults no request could be built from (a size that fits one
+            // stage while two are configured, a clip over the limit) are
+            // refused now rather than by every request.
+            let plan = engine::video::Plan::new(&request, pipeline.has_upscaler())
+                .context("the video_* defaults in the configuration")?;
+            if let Ok(seconds) = pipeline.estimate(&request) {
+                log::info!(
+                    "orangu-server: [video] a clip at the defaults ({}x{}, {} frames at {} fps, \
+                     {}, {}) takes about {} here",
+                    d.width,
+                    d.height,
+                    plan.frames,
+                    d.fps,
+                    if plan.two_stage {
+                        "two stages"
+                    } else {
+                        "one stage"
+                    },
+                    if d.audio && pipeline.has_audio() {
+                        "with sound"
+                    } else {
+                        "silent"
+                    },
+                    orangu::format::format_duration_rough(seconds),
+                );
+            }
+            let tc = pipeline.transformer_config();
+            log::info!(
+                "orangu-server: ltxv transformer: {} blocks, video {} wide ({} heads), audio {} \
+                 wide ({} heads); runs on the CPU",
+                tc.n_layer,
+                tc.dim,
+                tc.heads,
+                tc.audio_dim,
+                tc.audio_heads,
             );
             Some(Arc::new(pipeline))
         }
@@ -2784,15 +2938,15 @@ fn prepare(args: Args) -> Result<Prepared> {
                     slots.total(),
                     conf.prompt_weights,
                     &backend_label,
-                    // A picture model's text encoder is not split: such a node
-                    // serves only as a worker.
-                    image.is_none(),
+                    // A picture or video model's text encoder is not split:
+                    // such a node serves only as a worker.
+                    image.is_none() && video.is_none(),
                 )?;
                 workers::node::set_global(node.clone());
                 match node.delegating_model() {
-                    // Generation and embeddings both; a picture model's text
-                    // encoder is not split.
-                    Some(delegating) if image.is_none() => {
+                    // Generation and embeddings both; a picture or video
+                    // model's text encoder is not split.
+                    Some(delegating) if image.is_none() && video.is_none() => {
                         // A draft model runs here, beside the embedding and the
                         // head, and its guesses are checked in one multi-position
                         // forward through the tree, rolled back where they miss —
@@ -2897,6 +3051,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // the console has `/dev/null` for a stdout.
         live_stats: conf.log.is_console() && !args.daemon,
         image,
+        video,
         switch,
     });
 
@@ -3775,6 +3930,11 @@ fn build_model(
             "{architecture} is a diffusion transformer, not a language model; it is served as \
              the model, with its text encoder and VAE beside it, and cannot stand in as a draft"
         ),
+        ArchFamily::Ltxv => bail!(
+            "{architecture} is a video diffusion transformer, not a language model; it is \
+             served as the model, with its text encoder and VAEs beside it, and cannot stand in \
+             as a draft"
+        ),
     };
     Ok(model)
 }
@@ -4444,12 +4604,13 @@ pub(crate) fn model_support(
             let supported = architecture
                 .as_deref()
                 .is_some_and(|arch| engine::loader::resolve_arch_family(arch).is_ok());
-            let image = config::Role::required_by(architecture.as_deref()).is_some();
+            let required = config::Role::required_by(architecture.as_deref());
             orangu::model_spec::ModelSupport {
                 architecture,
                 supported,
                 unsupported_quant,
-                image,
+                image: required == Some(config::Role::Image),
+                video: required == Some(config::Role::Video),
             }
         })
         .collect()
@@ -5132,26 +5293,28 @@ pub(crate) fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String 
 /// the `--init` wizard's own `model` prompt) skips the `NR` prompt entirely
 /// and goes straight on to the caller's role prompt.
 /// What the startup picker settled on: the file to serve, the label to
-/// call it by, and whether it is a picture generator — known from the
+/// call it by, and whether it is a picture or video generator — known from the
 /// table's own `SUPPORTED` column, so the caller can skip the role prompt
 /// for a model whose role is not a choice (`Role::fixed_by_model`).
 struct SelectedModel {
     path: PathBuf,
     label: String,
-    image: bool,
+    /// Whether the model fixes its own role — a picture or video generator,
+    /// whose role is never prompted for.
+    generator: bool,
 }
 
 /// The role a model has to be served in, reconciled with the one asked
 /// for.
 ///
-/// `image` is the model's own role rather than the operator's choice: a
-/// `qwen_image` file (`Role::required_by`) comes up in it whatever `role`
+/// `image` and `video` are the model's own role rather than the operator's
+/// choice: a `qwen_image` (or `ltxv`) file (`Role::required_by`) comes up in it whatever `role`
 /// was resolved to so far, and refuses any *explicit* other role — the
 /// CLI flag (`cli_role`), or under `--daemon` the config file's `role` key
 /// (`config_role`), which is the flag's stand-in when there is no terminal
-/// to pass one on. The other way round, `--image` (or `role = image`) on a
-/// language model is refused too: there is no picture pipeline to run it
-/// in. A language model with no explicit role keeps whatever `role` the
+/// to pass one on. The other way round, `--image` or `--video` (or `role =
+/// image`/`video`) on a language model is refused too: there is no picture
+/// or video pipeline to run it in. A language model with no explicit role keeps whatever `role` the
 /// prompt or the default gave it.
 fn fix_role_for_model(
     role: config::Role,
@@ -5182,9 +5345,16 @@ fn fix_role_for_model(
                 Some(_) => format!("--{}", role.label()),
                 None => format!("[{}].role = {}", config::SERVER_SECTION, role.label()),
             };
+            let (serves, kind) = match role {
+                config::Role::Video => ("video generators (ltxv)", "a video"),
+                _ => (
+                    "picture generators (qwen_image, qwen_image_2_1)",
+                    "an image",
+                ),
+            };
             bail!(
-                "{how} serves picture generators (qwen_image, qwen_image_2_1) only, and {model_label} is a {} \
-                 model; pick an image model or another role",
+                "{how} serves {serves} only, and {model_label} is a {} model; pick {kind} model \
+                 or another role",
                 architecture.unwrap_or("language")
             )
         }
@@ -5208,11 +5378,12 @@ fn select_model_interactively(
     }
 
     // Which rows the flag that was given can serve: `--image` the picture
-    // generators, any other flag the language models, and no flag at all
+    // generators, `--video` the video generators, any other flag the language models, and no flag at all
     // everything this build loads — the role is settled by the pick then,
     // fixed for an image model and prompted for otherwise.
     let mode = match role {
         Some(config::Role::Image) => orangu::model_spec::Dimming::ImageModels,
+        Some(config::Role::Video) => orangu::model_spec::Dimming::VideoModels,
         Some(_) => orangu::model_spec::Dimming::TextModels,
         None => orangu::model_spec::Dimming::Unsupported,
     };
@@ -5235,23 +5406,29 @@ fn select_model_interactively(
     let check = |index: usize, group: &orangu::model_spec::ModelGroup| -> Result<bool> {
         let support = &support[index];
         if support.loadable() && !support.selectable(mode) {
+            let asked = role.unwrap_or_default();
+            let (kind, why) = if support.image {
+                (
+                    "an image",
+                    "an image model is only served in the image role (--image, or no role flag)",
+                )
+            } else if support.video {
+                (
+                    "a video",
+                    "a video model is only served in the video role (--video, or no role flag)",
+                )
+            } else if asked == config::Role::Video {
+                ("a language", "--video serves video models only")
+            } else {
+                ("a language", "--image serves image models only")
+            };
             bail!(
-                "{} is {} model, which --{} does not serve; {}",
+                "{} is {kind} model, which --{} does not serve; {why}",
                 group.label,
-                if support.image {
-                    "an image"
-                } else {
-                    "a language"
-                },
-                role.unwrap_or_default().label(),
-                if support.image {
-                    "an image model is only served in the image role (--image, or no role flag)"
-                } else {
-                    "--image serves image models only"
-                }
+                asked.label(),
             );
         }
-        Ok(support.image)
+        Ok(support.image || support.video)
     };
 
     // A single listed model is not a choice — take it and move straight on
@@ -5261,12 +5438,12 @@ fn select_model_interactively(
     // `key: value` shape as the `role [all]: ` prompt that follows, matching
     // how `--init` echoes the same decision.
     if let Some(only) = init::sole_model(&groups) {
-        let image = check(0, only)?;
+        let generator = check(0, only)?;
         println!("\nmodel: {}", only.label);
         return Ok(SelectedModel {
             path: only.representative_path.clone(),
             label: only.label.clone(),
-            image,
+            generator,
         });
     }
 
@@ -5310,23 +5487,27 @@ fn select_model_interactively(
             .filter(|index| *index < groups.len())
             .ok_or_else(|| anyhow!("no model with NR {nr} ({} model(s) listed)", groups.len()))?;
         let group = &groups[index];
-        let image = check(index, group)?;
+        let generator = check(index, group)?;
         return Ok(SelectedModel {
             path: group.representative_path.clone(),
             label: group.label.clone(),
-            image,
+            generator,
         });
     }
     let (path, label) = orangu::model_spec::resolve_load_target(models_dir, &answer)
         .with_context(|| format!("resolving model '{answer}'"))?;
     // Not a row, so not in `support`: judged from its own header, the same
     // way `prepare` judges a model named on the command line.
-    let image = GgufFile::open_summary(&path)
+    let generator = GgufFile::open_summary(&path)
         .ok()
         .and_then(|gguf| orangu::model_spec::architecture_of(&gguf))
         .and_then(|arch| config::Role::required_by(Some(&arch)))
         .is_some();
-    Ok(SelectedModel { path, label, image })
+    Ok(SelectedModel {
+        path,
+        label,
+        generator,
+    })
 }
 
 /// Ctrl+C (`tokio::signal::ctrl_c`) already covers `SIGINT` on Unix in

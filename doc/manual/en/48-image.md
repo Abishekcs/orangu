@@ -12,7 +12,7 @@ has the reference for every key, and the *HTTP endpoints* chapter the
 API; the *Inference server internals* chapter says how the pipeline is
 built.
 
-orangu serves text and images. There is no audio or video path.
+For clips with sound, see the *Video generation* chapter.
 
 ![A 512 × 512 picture from the prompt "Create an image of a cat", eight
 steps on a twelve-core ARM board](images/orangu-image-cat.png)

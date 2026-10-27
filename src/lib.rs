@@ -28,6 +28,7 @@ pub mod files;
 pub mod files_http;
 pub mod format;
 pub mod gguf;
+pub mod gguf_write;
 pub mod git_index;
 pub mod graph;
 pub mod hardware;

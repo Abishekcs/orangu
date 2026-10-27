@@ -422,6 +422,146 @@ pub fn is_turbo(spec: &str) -> bool {
     spec.to_ascii_lowercase().contains("turbo")
 }
 
+/// `general.architecture` of an LTX-2 audio-video diffusion transformer
+/// (`unsloth/LTX-2.5-GGUF`), which its GGUFs do carry.
+pub const LTXV_ARCHITECTURE: &str = "ltxv";
+
+/// The architectures that are video generators: served in the `video` role
+/// only, and through `engine::video`.
+pub const VIDEO_ARCHITECTURES: &[&str] = &[LTXV_ARCHITECTURE];
+
+/// Whether `architecture` is one of [`VIDEO_ARCHITECTURES`].
+pub fn is_video_architecture(architecture: &str) -> bool {
+    VIDEO_ARCHITECTURES.contains(&architecture)
+}
+
+/// Whether `architecture` is served by a generation pipeline rather than
+/// as a language model — a picture or a video generator.
+pub fn is_generator_architecture(architecture: &str) -> bool {
+    is_image_architecture(architecture) || is_video_architecture(architecture)
+}
+
+/// Whether `path` is the text encoder an `ltxv` model needs: a `gemma4`
+/// GGUF that carries LTX's two projection heads beside the language model
+/// (`text_embedding_projection.video_aggregate_embed` and its audio twin) —
+/// `elix3r/gemma4-12b-with-proj-ltx-2.5-GGUF`. A plain Gemma 4 has no
+/// heads, and the transformer cannot read its hidden states without them.
+pub fn is_ltx_text_encoder(path: &Path) -> bool {
+    let Ok(gguf) = GgufFile::open_summary(path) else {
+        return false;
+    };
+    architecture_of(&gguf).as_deref() == Some("gemma4")
+        && gguf
+            .tensors
+            .iter()
+            .any(|t| t.name.ends_with("video_aggregate_embed.weight"))
+        && gguf
+            .tensors
+            .iter()
+            .any(|t| t.name.ends_with("audio_aggregate_embed.weight"))
+}
+
+/// Every LTX text encoder under `dir` (see [`is_ltx_text_encoder`]),
+/// largest file first.
+pub fn find_ltx_text_encoder(dir: &Path) -> Option<PathBuf> {
+    largest_gguf(dir, is_ltx_text_encoder)
+}
+
+/// Whether `path` is LTX's text encoder as published in `safetensors`
+/// (`text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`): the
+/// model's `gemma_config` in the header's metadata, its tokenizer embedded,
+/// and the video projection head. The server converts it to a GGUF (which
+/// [`is_ltx_text_encoder`] then recognises) at its first start.
+pub fn is_ltx_text_encoder_safetensors(path: &Path) -> bool {
+    let Some(header) = safetensors_header(path) else {
+        return false;
+    };
+    header
+        .get("__metadata__")
+        .and_then(|m| m.get("gemma_config"))
+        .is_some()
+        && header.get("tokenizer_json").is_some()
+        && header
+            .get("text_embedding_projection.video_aggregate_embed.weight")
+            .is_some()
+}
+
+/// The first such file under `dir`, in path order.
+pub fn find_ltx_text_encoder_safetensors(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_ltx_text_encoder_safetensors)
+}
+
+/// A `safetensors` header's tensor, under its own name or with one of the
+/// prefixes LTX's checkpoints put before a component (`vae.`,
+/// `audio_vae.`).
+fn ltx_shape(header: &serde_json::Value, prefixes: &[&str], name: &str) -> Option<Vec<u64>> {
+    prefixes
+        .iter()
+        .find_map(|prefix| shape_of(header, &format!("{prefix}{name}")))
+}
+
+/// Whether `path` is LTX-2's convolutional video VAE
+/// (`ltx-2.5-video-vae-conv-bf16.safetensors`): a decoder whose first
+/// convolution is a 3-D kernel over the 128 latent channels
+/// (`decoder.conv_in.conv.weight`, `[C, 128, 3, 3, 3]`) and the latent
+/// statistics beside it. The diffusion decoder (`ltx-2.5-video-vae`) has
+/// neither and is not served.
+pub fn is_ltx_video_vae(path: &Path) -> bool {
+    let Some(header) = safetensors_header(path) else {
+        return false;
+    };
+    let prefixes = ["", "vae."];
+    ltx_shape(&header, &prefixes, "decoder.conv_in.conv.weight")
+        .is_some_and(|s| s.len() == 5 && s[1] == 128)
+        && ltx_shape(&header, &prefixes, "per_channel_statistics.mean-of-means").is_some()
+}
+
+/// The first LTX video VAE under `dir`, in path order.
+pub fn find_ltx_video_vae(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_ltx_video_vae)
+}
+
+/// Whether `path` is LTX-2's audio VAE and vocoder
+/// (`ltx-2.5-audio-vae-bf16.safetensors`): the spectrogram decoder
+/// (`audio_vae.decoder.conv_in`) and the vocoder that turns its
+/// spectrogram into sound, in one file.
+pub fn is_ltx_audio_vae(path: &Path) -> bool {
+    let Some(header) = safetensors_header(path) else {
+        return false;
+    };
+    let Some(map) = header.as_object() else {
+        return false;
+    };
+    map.keys()
+        .any(|k| k.starts_with("audio_vae.decoder.conv_in"))
+        && map.keys().any(|k| k.starts_with("vocoder."))
+}
+
+/// The first LTX audio VAE under `dir`, in path order.
+pub fn find_ltx_audio_vae(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_ltx_audio_vae)
+}
+
+/// Whether `path` is an LTX-2 latent upscaler that doubles the latent's
+/// width and height
+/// (`ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`) — the second
+/// stage of the distilled recipe. Its temporal twin has the same blocks and
+/// a `Conv3d` upsampler (`upsampler.0.weight` of rank 5), and is not used.
+pub fn is_ltx_spatial_upscaler(path: &Path) -> bool {
+    let Some(header) = safetensors_header(path) else {
+        return false;
+    };
+    shape_of(&header, "initial_conv.weight").is_some_and(|s| s.len() == 5 && s[1] == 128)
+        && shape_of(&header, "final_conv.weight").is_some()
+        && (shape_of(&header, "upsampler.0.weight").is_some_and(|s| s.len() == 4)
+            || shape_of(&header, "upsampler.conv.weight").is_some())
+}
+
+/// The first LTX spatial upscaler under `dir`, in path order.
+pub fn find_ltx_spatial_upscaler(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_ltx_spatial_upscaler)
+}
+
 /// Whether `path` names a multi-token-prediction draft head, by the filename
 /// rule `download` selected it with — and the one the server attaches it by.
 fn is_mtp_head_path(path: &Path) -> bool {
@@ -1438,6 +1578,10 @@ pub struct ModelSupport {
     /// rather than a language model — the rows `orangu-server --image`
     /// offers, and the ones every other role flag greys out.
     pub image: bool,
+    /// Whether the architecture is a video generator (`ltxv`) — the rows
+    /// `orangu-server --video` offers, and the ones every other role flag
+    /// greys out.
+    pub video: bool,
 }
 
 impl ModelSupport {
@@ -1454,7 +1598,8 @@ impl ModelSupport {
             && match dim {
                 Dimming::Off | Dimming::Unsupported | Dimming::UpToDate => true,
                 Dimming::ImageModels => self.image,
-                Dimming::TextModels => !self.image,
+                Dimming::VideoModels => self.video,
+                Dimming::TextModels => !self.image && !self.video,
             }
     }
 
@@ -1484,6 +1629,7 @@ mod support_cell_tests {
             supported,
             unsupported_quant: quant.map(str::to_string),
             image: arch == "qwen_image",
+            video: arch == "ltxv",
         }
     }
 
@@ -1519,6 +1665,12 @@ mod support_cell_tests {
         assert!(text.selectable(Dimming::TextModels));
         assert!(!image.selectable(Dimming::TextModels));
         assert!(!broken.selectable(Dimming::ImageModels));
+        let video = support("ltxv", true, None);
+        assert!(video.selectable(Dimming::VideoModels));
+        assert!(!video.selectable(Dimming::ImageModels));
+        assert!(!video.selectable(Dimming::TextModels));
+        assert!(!image.selectable(Dimming::VideoModels));
+        assert!(!text.selectable(Dimming::VideoModels));
     }
 
     /// `loadable()` is what greys the row and gates the pickers, so it has
@@ -1560,10 +1712,15 @@ pub enum Dimming {
     /// picture generator ([`ModelSupport::image`]), so only the models that
     /// role can serve stand out. Needs a non-empty `support` slice.
     ImageModels,
+    /// `orangu-server --video`: grey every row that is not a loadable video
+    /// generator ([`ModelSupport::video`]). Needs a non-empty `support`
+    /// slice.
+    VideoModels,
     /// `orangu-server --all`/`--code`/`--review`/`--explorer`/
-    /// `--embedding`: grey the picture generators along with the unloadable
-    /// rows — an image model is only ever served in the `image` role, so
-    /// under any other flag it is not on offer. Needs a non-empty `support`
+    /// `--embedding`: grey the picture and video generators along with the
+    /// unloadable rows — an image model is only ever served in the `image`
+    /// role and a video model in the `video` role, so under any other flag
+    /// neither is on offer. Needs a non-empty `support`
     /// slice.
     TextModels,
 }
@@ -1764,9 +1921,10 @@ pub fn format_groups_with_last_used_in_order(
         };
         let dimmed = match dim {
             Dimming::Off => false,
-            Dimming::Unsupported | Dimming::ImageModels | Dimming::TextModels => {
-                show_support && !support[index].selectable(dim)
-            }
+            Dimming::Unsupported
+            | Dimming::ImageModels
+            | Dimming::VideoModels
+            | Dimming::TextModels => show_support && !support[index].selectable(dim),
             Dimming::UpToDate => !refresh,
         };
         if dimmed {
@@ -1878,6 +2036,71 @@ mod tests {
         assert_eq!(find_qwen_image_vae(dir.path()), Some(vae));
         assert!(find_qwen_image_text_encoder(dir.path()).is_none());
         assert!(find_qwen_image_lightning(dir.path()).is_none());
+    }
+
+    /// LTX-2's three `safetensors` companions are told apart by their
+    /// tensors — the video VAE's 3-D `conv_in` over 128 latent channels,
+    /// the audio VAE's decoder beside a vocoder, the upscaler's 2-D
+    /// upsampler — and none of them is mistaken for another, or for a
+    /// Qwen-Image VAE.
+    #[test]
+    fn the_ltx_companions_are_recognised_by_their_tensors() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, header: &str| {
+            let path = dir.path().join(name);
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let t = |name: &str, shape: &str| {
+            format!(r#""{name}":{{"dtype":"BF16","shape":{shape},"data_offsets":[0,0]}}"#)
+        };
+        let video = write(
+            "a.safetensors",
+            &format!(
+                "{{{},{}}}",
+                t("decoder.conv_in.conv.weight", "[1024,128,3,3,3]"),
+                t("per_channel_statistics.mean-of-means", "[128]")
+            ),
+        );
+        let audio = write(
+            "b.safetensors",
+            &format!(
+                "{{{},{}}}",
+                t("audio_vae.decoder.conv_in.conv.weight", "[512,8,3,3]"),
+                t("vocoder.vocoder.conv_pre.weight", "[1536,128,7]")
+            ),
+        );
+        let upscaler = write(
+            "c.safetensors",
+            &format!(
+                "{{{},{},{}}}",
+                t("initial_conv.weight", "[512,128,3,3,3]"),
+                t("upsampler.0.weight", "[2048,512,3,3]"),
+                t("final_conv.weight", "[128,512,3,3,3]")
+            ),
+        );
+        let temporal = write(
+            "d.safetensors",
+            &format!(
+                "{{{},{},{}}}",
+                t("initial_conv.weight", "[512,128,3,3,3]"),
+                t("upsampler.0.weight", "[1024,512,3,3,3]"),
+                t("final_conv.weight", "[128,512,3,3,3]")
+            ),
+        );
+        assert!(is_ltx_video_vae(&video) && !is_ltx_audio_vae(&video));
+        assert!(is_ltx_audio_vae(&audio) && !is_ltx_video_vae(&audio));
+        assert!(is_ltx_spatial_upscaler(&upscaler) && !is_ltx_video_vae(&upscaler));
+        assert!(!is_ltx_spatial_upscaler(&temporal));
+        assert!(!is_qwen_image21_vae(&video) && !is_qwen_image_vae(&video));
+        assert_eq!(find_ltx_video_vae(dir.path()), Some(video));
+        assert_eq!(find_ltx_audio_vae(dir.path()), Some(audio));
+        assert_eq!(find_ltx_spatial_upscaler(dir.path()), Some(upscaler));
+        assert!(find_ltx_text_encoder(dir.path()).is_none());
+        assert!(is_video_architecture("ltxv") && !is_image_architecture("ltxv"));
+        assert!(is_generator_architecture("ltxv") && is_generator_architecture("qwen_image"));
     }
 
     /// The adapter is found by its name, the most steps first when the
@@ -2596,6 +2819,7 @@ mod tests {
             supported: true,
             unsupported_quant: None,
             image: false,
+            video: false,
         }];
         let output = format_groups_with_last_used(
             &groups,

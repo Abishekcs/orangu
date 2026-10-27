@@ -761,6 +761,16 @@ button:disabled {
   border-radius: 8px;
 }
 
+/* A clip an ltxv model made: the browser's own player, scaled like a
+   picture, on black while its first frame loads. */
+.answer-image video {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  background: #000;
+}
+
 .answer-image .diagram-dl {
   display: inline-flex;
   margin-top: 0.3em;
@@ -1329,23 +1339,27 @@ button:disabled {
 /* ---------------------------------------------------------------- image --
    The picture settings pane: a label column and a control column, the
    estimate under them, the two actions last. */
-#image-header {
+#image-header,
+#video-header {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
-#image-header h2 {
+#image-header h2,
+#video-header h2 {
   margin: 0;
   font-size: 1.1em;
 }
 
-#image-model {
+#image-model,
+#video-model {
   flex: 1;
   min-width: 0;
 }
 
-#image-form {
+#image-form,
+#video-form {
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -1394,23 +1408,27 @@ button:disabled {
   color: var(--text-dim);
 }
 
-#image-estimate {
+#image-estimate,
+#video-estimate {
   min-height: 1.2em;
 }
 
-#image-actions {
+#image-actions,
+#video-actions {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
-#image-reset-btn {
+#image-reset-btn,
+#video-reset-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
 
-#image-reset-btn svg {
+#image-reset-btn svg,
+#video-reset-btn svg {
   width: 16px;
   height: 16px;
 }

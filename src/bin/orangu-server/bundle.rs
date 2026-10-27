@@ -577,8 +577,8 @@ pub fn run(request: Request) -> Result<()> {
     // catching now, not after a multi-gigabyte copy.
     crate::reexec::precheck(&model_path)
         .with_context(|| format!("{} cannot be served by this build", model_path.display()))?;
-    // A picture generator is three files (transformer, text encoder, VAE)
-    // and a bundle carries one, so neither the model nor its role can be
+    // A picture or video generator is several files (transformer, text
+    // encoder, VAEs) and a bundle carries one, so neither the model nor its role can be
     // bundled — said here, before the copy, rather than at the bundle's
     // first start.
     let architecture = orangu::model_spec::architecture_of(&gguf);
@@ -591,8 +591,12 @@ pub fn run(request: Request) -> Result<()> {
         );
     }
     if role.fixed_by_model() {
+        let serves = match role {
+            Role::Video => "video generators (ltxv)",
+            _ => "picture generators (qwen_image, qwen_image_2_1)",
+        };
         bail!(
-            "--{} serves picture generators (qwen_image, qwen_image_2_1) only, and {label} is a {} model",
+            "--{} serves {serves} only, and {label} is a {} model",
             role.label(),
             architecture.as_deref().unwrap_or("language")
         );

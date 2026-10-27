@@ -46,6 +46,9 @@ pub struct SafeTensors {
     map: Mmap,
     data_start: usize,
     tensors: HashMap<String, TensorInfo>,
+    /// The header's `__metadata__`: string keys to string values (LTX-2's
+    /// components keep their `config` JSON there).
+    metadata: HashMap<String, String>,
 }
 
 impl SafeTensors {
@@ -73,8 +76,16 @@ impl SafeTensors {
             serde_json::from_slice(&map[8..data_start]).context("parsing safetensors header")?;
         let data_len = map.len() - data_start;
         let mut tensors = HashMap::with_capacity(header.len());
+        let mut metadata = HashMap::new();
         for (name, entry) in header {
             if name == "__metadata__" {
+                if let Some(map) = entry.as_object() {
+                    for (k, v) in map {
+                        if let Some(s) = v.as_str() {
+                            metadata.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
                 continue;
             }
             let dtype = entry["dtype"]
@@ -104,6 +115,9 @@ impl SafeTensors {
             let width = match dtype.as_str() {
                 "F32" => 4,
                 "F16" | "BF16" => 2,
+                // Raw bytes: a checkpoint's embedded files (LTX-2's text
+                // encoder carries its tokenizer this way), read with `bytes`.
+                "U8" => 1,
                 other => {
                     bail!("tensor '{name}' is stored as {other}, which this reader does not read")
                 }
@@ -129,7 +143,30 @@ impl SafeTensors {
             map,
             data_start,
             tensors,
+            metadata,
         })
+    }
+
+    /// A tensor's raw bytes, whatever its type — for a `U8` tensor that
+    /// is an embedded file.
+    pub fn bytes(&self, name: &str) -> Result<&[u8]> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("safetensors file is missing tensor '{name}'"))?;
+        Ok(&self.map[self.data_start + info.begin..self.data_start + info.end])
+    }
+
+    /// A tensor's shape and type, without reading it.
+    pub fn info(&self, name: &str) -> Option<(&[usize], &str)> {
+        self.tensors
+            .get(name)
+            .map(|t| (t.shape.as_slice(), t.dtype.as_str()))
+    }
+
+    /// A `__metadata__` value.
+    pub fn metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
     }
 
     pub fn has(&self, name: &str) -> bool {

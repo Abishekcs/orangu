@@ -796,6 +796,9 @@ impl Renderer<'_> {
 /// closed early by the browser's parser and land outside its paragraph.
 fn render_image(url: &str, alt: &str) -> String {
     let extension = image_extension(url);
+    if extension == "mp4" {
+        return render_video(url, alt);
+    }
     format!(
         "<span class=\"answer-image\"><img src=\"{url}\" alt=\"{alt}\" loading=\"lazy\">\
          <a class=\"diagram-dl\" href=\"{url}\" download=\"orangu-image.{extension}\" \
@@ -803,6 +806,20 @@ fn render_image(url: &str, alt: &str) -> String {
         url = escape_attr(url),
         alt = escape_attr(alt),
         upper = extension.to_ascii_uppercase(),
+    )
+}
+
+/// A clip in an answer — an `ltxv` model's MP4, kept beside the session —
+/// as a player with the same save control a picture gets. `preload=
+/// "metadata"` reads the index and the first frame, not the clip.
+fn render_video(url: &str, alt: &str) -> String {
+    format!(
+        "<span class=\"answer-image answer-video\"><video src=\"{url}\" controls \
+         preload=\"metadata\" playsinline title=\"{alt}\"></video>\
+         <a class=\"diagram-dl\" href=\"{url}\" download=\"orangu-video.mp4\" \
+         title=\"Download MP4\" aria-label=\"Download video as MP4\">{SAVE_ICON}</a></span>",
+        url = escape_attr(url),
+        alt = escape_attr(alt),
     )
 }
 

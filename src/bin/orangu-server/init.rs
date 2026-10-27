@@ -68,6 +68,7 @@ pub fn run_init() -> Result<()> {
     let support =
         nr_of(&groups, &model).and_then(|nr| crate::model_support(&groups).into_iter().nth(nr - 1));
     let image_model = support.as_ref().is_some_and(|support| support.image);
+    let video_model = support.as_ref().is_some_and(|support| support.video);
     let image_variant = support
         .and_then(|support| support.architecture)
         .and_then(|arch| crate::engine::image::Variant::from_architecture(&arch))
@@ -75,6 +76,9 @@ pub fn run_init() -> Result<()> {
     let role = if image_model {
         println!("role: {}", Role::Image.label());
         Role::Image
+    } else if video_model {
+        println!("role: {}", Role::Video.label());
+        Role::Video
     } else {
         prompt_role(
             &format!("role [{}]: ", Role::default().label()),
@@ -90,6 +94,11 @@ pub fn run_init() -> Result<()> {
         let turbo = image_variant == crate::engine::image::Variant::QwenImage21
             && orangu::model_spec::is_turbo(&model);
         Some(prompt_image_keys(Path::new(&models), image_variant, turbo)?)
+    } else {
+        None
+    };
+    let video = if role == Role::Video {
+        Some(prompt_video_keys()?)
     } else {
         None
     };
@@ -203,6 +212,9 @@ pub fn run_init() -> Result<()> {
     }
     if let Some(image) = &image {
         contents.push_str(&image.render());
+    }
+    if let Some(video) = &video {
+        contents.push_str(&video.render());
     }
     contents.push_str(&format!("host = {host}\nport = {port}\n"));
     if !api_key.trim().is_empty() {
@@ -1183,6 +1195,140 @@ impl ImageKeys {
     }
 }
 
+/// The `[orangu-server]` keys a video model's pipeline reads, as the wizard
+/// collected them: `None` wherever the answer was the default, so
+/// [`VideoKeys::render`] leaves that line out.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct VideoKeys {
+    /// `text_encoder`: LTX's Gemma 4 GGUF, when not the one found under
+    /// `models`.
+    pub text_encoder: Option<String>,
+    /// `vae`, `audio_vae`, `upscaler`: the `.safetensors` files, or `none`
+    /// for the two that may be left out, when not the ones found.
+    pub vae: Option<String>,
+    pub audio_vae: Option<String>,
+    pub upscaler: Option<String>,
+    /// `video_size`, as typed.
+    pub size: Option<String>,
+    pub seconds: Option<f64>,
+    pub fps: Option<u32>,
+    pub audio: Option<bool>,
+    pub two_stage: Option<bool>,
+    pub quality: Option<usize>,
+}
+
+impl VideoKeys {
+    /// One line per key answered with something other than its default.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        let yes_no = |b: bool| if b { "yes" } else { "no" };
+        for (key, value) in [
+            ("text_encoder", &self.text_encoder),
+            ("vae", &self.vae),
+            ("audio_vae", &self.audio_vae),
+            ("upscaler", &self.upscaler),
+            ("video_size", &self.size),
+        ] {
+            if let Some(value) = value {
+                out.push_str(&format!("{key} = {value}\n"));
+            }
+        }
+        if let Some(seconds) = self.seconds {
+            out.push_str(&format!("video_seconds = {seconds}\n"));
+        }
+        if let Some(fps) = self.fps {
+            out.push_str(&format!("video_fps = {fps}\n"));
+        }
+        if let Some(audio) = self.audio {
+            out.push_str(&format!("video_audio = {}\n", yes_no(audio)));
+        }
+        if let Some(two) = self.two_stage {
+            out.push_str(&format!("video_two_stage = {}\n", yes_no(two)));
+        }
+        if let Some(quality) = self.quality {
+            out.push_str(&format!("video_quality = {quality}\n"));
+        }
+        out
+    }
+}
+
+/// Asks for every `[orangu-server]` key the video pipeline reads, each
+/// defaulting to what the server does without it
+/// (`engine::video::VideoDefaults`, and the companions found under
+/// `models` by their contents). A value that would not load is re-asked.
+fn prompt_video_keys() -> Result<VideoKeys> {
+    let d = crate::engine::video::VideoDefaults::default();
+    let optional = |value: String| (!value.trim().is_empty()).then(|| value.trim().to_string());
+    let text_encoder = optional(prompt_line(
+        "text_encoder (blank = LTX's Gemma 4 GGUF found under models)",
+        "",
+    )?);
+    let vae = optional(prompt_line(
+        "vae (blank = the LTX video VAE found under models)",
+        "",
+    )?);
+    let audio_vae = optional(prompt_line(
+        "audio_vae (blank = the one found under models; none = silent clips)",
+        "",
+    )?);
+    let upscaler = optional(prompt_line(
+        "upscaler (blank = the one found under models; none = one stage)",
+        "",
+    )?);
+    let default_size = format!("{}x{}", d.width, d.height);
+    let size = loop {
+        let value = prompt_line("video_size", &default_size)?;
+        if crate::config::parse_video_size(&value).is_some() {
+            break (value != default_size).then_some(value);
+        }
+        println!("Please give WIDTHxHEIGHT, both multiples of 32 (64 for the two-stage recipe).");
+    };
+    let default_seconds = d.frames as f64 / d.fps as f64;
+    let seconds = loop {
+        let value = prompt_line("video_seconds", &format!("{default_seconds:.2}"))?;
+        match value.parse::<f64>() {
+            Ok(s) if s > 0.0 && s <= 60.0 => {
+                break ((s - default_seconds).abs() > 0.01).then_some(s);
+            }
+            _ => println!("Please give a number of seconds, more than 0 and at most 60."),
+        }
+    };
+    let fps = loop {
+        let value = prompt_line("video_fps", &d.fps.to_string())?;
+        match value.parse::<u32>() {
+            Ok(f) if (1..=60).contains(&f) => break (f != d.fps).then_some(f),
+            _ => println!("Please give whole frames per second, 1 to 60."),
+        }
+    };
+    let audio = prompt_bool("video_audio — the clip's sound", d.audio)?;
+    let two_stage = prompt_bool(
+        "video_two_stage — the distilled two-stage recipe",
+        d.two_stage,
+    )?;
+    let quality = loop {
+        let value = prompt_line(
+            "video_quality (AV1 quantizer, 0 best to 255)",
+            &d.quality.to_string(),
+        )?;
+        match value.parse::<usize>() {
+            Ok(q) if q <= 255 => break (q != d.quality).then_some(q),
+            _ => println!("Please give a number from 0 to 255."),
+        }
+    };
+    Ok(VideoKeys {
+        text_encoder,
+        vae,
+        audio_vae,
+        upscaler,
+        size,
+        seconds,
+        fps,
+        audio: (audio != d.audio).then_some(audio),
+        two_stage: (two_stage != d.two_stage).then_some(two_stage),
+        quality,
+    })
+}
+
 /// Asks for every `[orangu-server]` key the picture pipeline reads, each
 /// defaulting to what the server uses when the key is absent
 /// (`engine::image::ImageDefaults`, and auto-detection under `models` for
@@ -1449,7 +1595,7 @@ fn changed(value: String, default: &str) -> Option<String> {
 /// applies when it is absent. A picture model is asked only the keys that
 /// apply to it; its own keys come from [`prompt_image_keys`].
 fn prompt_serving_keys(role: Role) -> Result<ServingKeys> {
-    let text = role != Role::Image;
+    let text = !role.fixed_by_model();
     let tls_cert = prompt_line("tls_cert (blank = plain HTTP)", "")?;
     let tls_key = if tls_cert.is_empty() {
         String::new()

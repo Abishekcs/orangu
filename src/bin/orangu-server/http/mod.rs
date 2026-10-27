@@ -20,6 +20,7 @@
 pub mod images;
 pub mod native;
 pub mod openai;
+pub mod videos;
 
 use crate::engine::backend::Backend;
 use crate::engine::generate::Engine;
@@ -319,6 +320,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(openai::completions))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/images/generations", post(images::generations))
+        .route("/v1/videos", post(videos::create).get(videos::list))
+        .route(
+            "/v1/videos/{id}",
+            get(videos::retrieve).delete(videos::delete),
+        )
+        .route("/v1/videos/{id}/content", get(videos::content))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/workers", get(native::workers))
         // The file-lifecycle API, mounted from the shared router

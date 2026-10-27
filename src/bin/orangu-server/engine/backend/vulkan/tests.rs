@@ -1543,7 +1543,9 @@ fn _scratch_measure_prefill_gemm() {
     // compute-bound and the kernel is what matters; if it barely moves,
     // the per-call data movement dominates and the kernel is not the
     // thing to tune.
-    for k in if std::env::var("ORANGU_SCRATCH_BONSAI").is_ok() {
+    for k in if std::env::var("ORANGU_SCRATCH_BONSAI").is_ok()
+        || std::env::var("ORANGU_SCRATCH_LTX").is_ok()
+    {
         vec![]
     } else {
         vec![1536usize, 768, 384]
@@ -1558,8 +1560,18 @@ fn _scratch_measure_prefill_gemm() {
     // types instead, through `matmul` — whichever GEMM the batch path
     // picks (the integer-dot one where the type has it).
     let bonsai = std::env::var("ORANGU_SCRATCH_BONSAI").is_ok();
+    // `ORANGU_SCRATCH_LTX=1`: LTX-2.5's video block instead — its feed-forward
+    // and an attention projection at the default clip's first-stage token
+    // count, in the types its `Q4_K_M` and `Q8_0` files hold.
+    let ltx = std::env::var("ORANGU_SCRATCH_LTX").is_ok();
     let shapes: Vec<(&str, usize, usize)> = if bonsai {
         vec![("gate", 5120, 17408), ("down", 17408, 5120)]
+    } else if ltx {
+        vec![
+            ("ff_up", 4096, 16384),
+            ("ff_down", 16384, 4096),
+            ("to_q", 4096, 4096),
+        ]
     } else {
         vec![
             ("gate_up", 1536, 12288),
@@ -1574,14 +1586,23 @@ fn _scratch_measure_prefill_gemm() {
             ("q4_k", GGML_TYPE_Q4_K),
             ("q8_0", GGML_TYPE_Q8_0),
         ]
+    } else if ltx {
+        vec![("q4_k", GGML_TYPE_Q4_K), ("q8_0", GGML_TYPE_Q8_0)]
     } else {
         vec![("q4_k", GGML_TYPE_Q4_K), ("f16", GGML_TYPE_F16)]
     };
     for (label, in_dim, out_dim) in shapes {
-        for n_tokens in [64usize, 128] {
+        let counts: &[usize] = if ltx { &[1344] } else { &[64, 128] };
+        for &n_tokens in counts {
             for &(type_label, ggml_type) in &types {
-                let (ms, gflops) =
-                    measure_matmul_gflops(vulkan, ggml_type, in_dim, out_dim, n_tokens, 10);
+                let (ms, gflops) = measure_matmul_gflops(
+                    vulkan,
+                    ggml_type,
+                    in_dim,
+                    out_dim,
+                    n_tokens,
+                    if ltx { 3 } else { 10 },
+                );
                 eprintln!(
                     "orangu-server: [scratch] {label} {type_label} {in_dim}x{out_dim} \
                          n_tokens={n_tokens}: min={ms:.2}ms ({gflops:.1} GFLOP/s)"

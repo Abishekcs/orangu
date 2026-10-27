@@ -204,6 +204,14 @@ pub enum ArchFamily {
     /// `engine::image::transformer21` and `engine::image::vae21`. Its GGUFs
     /// carry no metadata at all; the architecture is read off the tensors.
     QwenImage,
+    /// LTX-2 (`ltxv`, e.g. `unsloth/LTX-2.5-GGUF`) — like [`ArchFamily::QwenImage`]
+    /// not a language model: the audio-video diffusion transformer that turns
+    /// a prompt into a clip with its sound. It is served through
+    /// `engine::video`, with a Gemma 4 text encoder (an ordinary
+    /// [`ArchFamily::Gemma`] load, whose every layer conditions the clip),
+    /// the video VAE and the audio VAE beside it. See
+    /// `engine::video::transformer` for the graph.
+    Ltxv,
 }
 
 /// GGUF `general.architecture` values that map to [`ArchFamily::LlamaStyle`]
@@ -353,6 +361,9 @@ const BAILINGMOE3_ARCHITECTURES: &[&str] = &["bailingmoe3"];
 /// `unsloth/Qwen-Image-Edit-2511-GGUF`) — see [`ArchFamily::QwenImage`] and
 /// `engine::image`. The only family here that is not a language model.
 const QWEN_IMAGE_ARCHITECTURES: &[&str] = orangu::model_spec::IMAGE_ARCHITECTURES;
+/// `ltxv` (`unsloth/LTX-2.5-GGUF`) — see [`ArchFamily::Ltxv`] and
+/// `engine::video`.
+const LTXV_ARCHITECTURES: &[&str] = orangu::model_spec::VIDEO_ARCHITECTURES;
 
 /// Architectures this engine recognises by name and deliberately does **not**
 /// serve, with the reason.
@@ -468,6 +479,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if QWEN_IMAGE_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::QwenImage);
     }
+    if LTXV_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Ltxv);
+    }
     // A recognised near miss gets its own reason. The alternative — dropping
     // the reader into the whole accepted-name list, which looks like it
     // *should* contain theirs — is what makes an out-of-tree alias mechanism
@@ -523,6 +537,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(NEMOTRON_ARCHITECTURES)
         .chain(BAILINGMOE3_ARCHITECTURES)
         .chain(QWEN_IMAGE_ARCHITECTURES)
+        .chain(LTXV_ARCHITECTURES)
         .cloned()
         .collect()
 }
@@ -2028,6 +2043,8 @@ impl LoadedModel {
             read_model_config(&gguf, &architecture)?
         } else if resolve_arch_family(&architecture)? == ArchFamily::QwenImage {
             read_image_model_config(&gguf, &architecture)?
+        } else if resolve_arch_family(&architecture)? == ArchFamily::Ltxv {
+            read_video_model_config(&gguf, &architecture)?
         } else {
             read_model_config(&gguf, &architecture)?
         };
@@ -2547,6 +2564,68 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
     })
 }
 
+/// [`ModelConfig`] for an `ltxv` file: the video stream's width off
+/// `patchify_proj` (`[128, dim]`), its head width from the `config` JSON
+/// the file carries (`transformer.attention_head_dim`), and the block count
+/// off the tensor names. As for [`read_image_model_config`], the fields a
+/// diffusion transformer has no use for keep generic consumers
+/// well-defined, and `engine::video::transformer` reads its own real
+/// dimensions.
+fn read_video_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig> {
+    let patchify = gguf
+        .tensors
+        .iter()
+        .find(|t| t.name == "patchify_proj.weight")
+        .map(|t| t.dims.as_slice())
+        .ok_or_else(|| anyhow!("{architecture}: model is missing tensor 'patchify_proj.weight'"))?;
+    anyhow::ensure!(
+        patchify.len() == 2,
+        "{architecture}: patchify_proj.weight has an unexpected shape"
+    );
+    let n_embd = patchify[1] as usize;
+    let head_dim = gguf
+        .metadata
+        .iter()
+        .find_map(|(k, v)| match v {
+            orangu::gguf::GgufValue::String(s) if k == "config" => Some(s.as_str()),
+            _ => None,
+        })
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|c| c["transformer"]["attention_head_dim"].as_u64())
+        .unwrap_or(128) as usize;
+    if head_dim == 0 || !n_embd.is_multiple_of(head_dim) {
+        bail!("{architecture}: stream width {n_embd} is not a multiple of head width {head_dim}");
+    }
+    let n_layer = gguf
+        .tensors
+        .iter()
+        .filter_map(|t| {
+            t.name
+                .strip_prefix("transformer_blocks.")?
+                .split('.')
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .map(|last| last + 1)
+        .ok_or_else(|| anyhow!("{architecture}: no transformer_blocks.N tensors"))?;
+    Ok(ModelConfig {
+        architecture: architecture.to_string(),
+        n_vocab: 0,
+        n_embd,
+        n_layer,
+        n_head: n_embd / head_dim,
+        n_head_kv: n_embd / head_dim,
+        head_dim,
+        n_ctx_train: 0,
+        rope_dim: head_dim,
+        rope_freq_base: 10000.0,
+        rms_eps: 1e-6,
+        pooling_type: PoolingType::Mean,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     /// Rows come out in the order the runs name them, each run whole —
@@ -2801,6 +2880,7 @@ mod tests {
             (ArchFamily::NemotronHMoe, "nemotron_h_moe"),
             (ArchFamily::BailingMoe3, "bailingmoe3"),
             (ArchFamily::QwenImage, "qwen_image"),
+            (ArchFamily::Ltxv, "ltxv"),
         ];
         for &(family, name) in representatives {
             // The exhaustiveness guard: this match has no wildcard, so a new
@@ -2825,6 +2905,7 @@ mod tests {
                 ArchFamily::NemotronHMoe => "NemotronHMoe",
                 ArchFamily::BailingMoe3 => "BailingMoe3",
                 ArchFamily::QwenImage => "QwenImage",
+                ArchFamily::Ltxv => "Ltxv",
             };
             assert!(
                 listing.contains(&name),

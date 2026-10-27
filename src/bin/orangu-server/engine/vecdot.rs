@@ -5516,6 +5516,277 @@ pub fn supports_flat(ggml_type: u32, in_dim: usize) -> bool {
     ) && in_dim.is_multiple_of(ACT_BLOCK)
 }
 
+// ------------------------------------------------ The flat `i8mm` tile
+//
+// [`dot_flat_pair`] takes two weight rows at a time against every token on
+// `sdot`: per 32-element block, each row pair and token is four `sdot` into
+// one accumulator and a horizontal reduction. On a core with `i8mm` that
+// leaves the K-quants' tile shape on the table — the same `Q8_0` linear
+// measured 2.8-3.3x slower than a `Q4_K` one of its size on the twelve-core
+// Cortex-A720 board, where the K GEMM runs on `smmla`.
+//
+// This is that tile for the flat types: [`ROW_QUAD`] rows by [`MM_TILE`]
+// tokens, two row pairs by four token pairs of `smmla` accumulators, the
+// activations laid out as [`ActQ8Mm`] lays them. What it cannot borrow from
+// the K tile is the integer accumulation across a super-block: a flat
+// type's scale is a float per 32, so every block's `i32` sums go to `f32`
+// at once, `acc += (d_w * d_a) * isum` per lane — the order
+// [`dot_flat_rows_portable`] spells out and the `smmla` kernel keeps, to the
+// bit. The activations keep their scale per 32 too, the precision
+// [`ActQ8Flat`] gives them.
+
+/// Activations for [`dot_flat_rows_tiles`]: quantized per 32-element block
+/// as [`ActQ8Flat`]'s are, laid out in [`MM_TILE`]-token tiles as
+/// [`ActQ8Mm`]'s are, so the 16 bytes an `smmla` takes (two tokens' same 8
+/// elements) are one load.
+pub struct ActQ8MmFlat {
+    n_tokens: usize,
+    n_block: usize,
+    n_tile: usize,
+    /// `[tile][block][pair][chunk][2][8]`
+    q: Vec<i8>,
+    /// `[tile][block][pair][4]`: `[d(2p), d(2p + 1), d(2p), d(2p + 1)]`, a
+    /// token pair's two scales in an `smmla` accumulator's lane order.
+    d: Vec<f32>,
+}
+
+impl ActQ8MmFlat {
+    /// `x` is `[n_tokens][in_dim]`, token-major; `in_dim` a multiple of
+    /// [`ACT_BLOCK`]. The padding tokens of the last tile stay zero, scale
+    /// included, and contribute nothing; their outputs are never read.
+    pub fn quantize(x: &[f32], in_dim: usize, n_tokens: usize) -> Self {
+        debug_assert_eq!(in_dim % ACT_BLOCK, 0);
+        debug_assert_eq!(x.len(), n_tokens * in_dim);
+        let n_block = in_dim / ACT_BLOCK;
+        let n_tile = n_tokens.div_ceil(MM_TILE);
+        let pairs = MM_TILE / 2;
+        let mut q = vec![0i8; n_tile * n_block * MM_TILE * ACT_BLOCK];
+        let mut d = vec![0f32; n_tile * n_block * pairs * 4];
+        // A task per tile, as `ActQ8Mm::build` does: each tile owns a
+        // contiguous run of both arrays.
+        q.par_chunks_mut(n_block * MM_TILE * ACT_BLOCK)
+            .zip(d.par_chunks_mut(n_block * pairs * 4))
+            .enumerate()
+            .for_each(|(tl, (q, d))| {
+                let mut block = [0i8; ACT_BLOCK];
+                let mut no_sums = Vec::new();
+                for k in 0..MM_TILE {
+                    let t = tl * MM_TILE + k;
+                    if t >= n_tokens {
+                        break;
+                    }
+                    let (tp, half) = (k / 2, k % 2);
+                    let row = &x[t * in_dim..(t + 1) * in_dim];
+                    for b in 0..n_block {
+                        let scale = quantize_block::<false>(
+                            &row[b * ACT_BLOCK..(b + 1) * ACT_BLOCK],
+                            &mut block,
+                            &mut no_sums,
+                        );
+                        let dst = &mut q[b * MM_TILE * ACT_BLOCK..][..MM_TILE * ACT_BLOCK];
+                        for (c, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
+                            dst[((tp * 4 + c) * 2 + half) * 8..][..8].copy_from_slice(chunk);
+                        }
+                        let lanes = &mut d[(b * pairs + tp) * 4..][..4];
+                        lanes[half] = scale;
+                        lanes[2 + half] = scale;
+                    }
+                }
+            });
+        Self {
+            n_tokens,
+            n_block,
+            n_tile,
+            q,
+            d,
+        }
+    }
+
+    /// The number of [`MM_TILE`]-token tiles — for a caller splitting
+    /// [`dot_flat_rows_tiles`] over tokens.
+    pub fn n_tiles(&self) -> usize {
+        self.n_tile
+    }
+}
+
+/// Whether [`dot_flat_rows_tiles`] has its `smmla` kernel here. Where it
+/// does not, the flat GEMM stays on [`dot_flat_pair`], which has `sdot`,
+/// `AVX2` and `VNNI` forms of its own.
+pub fn have_flat_rows_tile() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        have_i8mm()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Every row of `rows` against every token of `tiles`, into `out[row]`
+/// (`a.n_tokens` long each, written at the tiles' tokens only). The rows
+/// are [`ROW_QUAD`] at a time, unpacked by [`unpack_row`] from a type
+/// [`supports_flat`] covers: a scale per 32 and no min term.
+pub fn dot_flat_rows_tiles(
+    rows: &[&UnpackedRow],
+    a: &ActQ8MmFlat,
+    tiles: std::ops::Range<usize>,
+    out: &mut [&mut [f32]],
+) {
+    debug_assert!(!rows.is_empty() && rows.len().is_multiple_of(ROW_QUAD));
+    debug_assert_eq!(rows.len(), out.len());
+    debug_assert!(rows.iter().all(|r| r.per32 && !r.has_min));
+    debug_assert!(out.iter().all(|o| o.len() == a.n_tokens));
+    debug_assert!(tiles.end <= a.n_tile);
+    #[cfg(target_arch = "aarch64")]
+    if have_i8mm() {
+        // Safety: `have_i8mm` verified the instruction.
+        unsafe { gemm_flat_rows_mmla(rows, a, tiles, out) };
+        return;
+    }
+    dot_flat_rows_portable(rows, a, tiles, out)
+}
+
+/// The flat tile in portable Rust, and the definition the `smmla` kernel
+/// reproduces bit for bit: per row, token and block the `i32` dot, then
+/// `acc += (d_w * d_a) * isum` in `f32`, block by block.
+pub fn dot_flat_rows_portable(
+    rows: &[&UnpackedRow],
+    a: &ActQ8MmFlat,
+    tiles: std::ops::Range<usize>,
+    out: &mut [&mut [f32]],
+) {
+    let pairs = MM_TILE / 2;
+    for tl in tiles {
+        let qtile = &a.q[tl * a.n_block * MM_TILE * ACT_BLOCK..][..a.n_block * MM_TILE * ACT_BLOCK];
+        let dtile = &a.d[tl * a.n_block * pairs * 4..][..a.n_block * pairs * 4];
+        for k in 0..MM_TILE {
+            let t = tl * MM_TILE + k;
+            if t >= a.n_tokens {
+                break;
+            }
+            let (tp, half) = (k / 2, k % 2);
+            for (row, o) in rows.iter().zip(out.iter_mut()) {
+                let mut acc = 0f32;
+                for b in 0..a.n_block {
+                    let x = &qtile[b * MM_TILE * ACT_BLOCK..];
+                    let wq = &row.q[b * ACT_BLOCK..(b + 1) * ACT_BLOCK];
+                    let isum: i32 = wq
+                        .iter()
+                        .enumerate()
+                        .map(|(e, &w)| {
+                            w as i32 * x[((tp * 4 + e / 8) * 2 + half) * 8 + e % 8] as i32
+                        })
+                        .sum();
+                    let ad = dtile[(b * pairs + tp) * 4 + half];
+                    acc += (row.scale[b] * ad) * isum as f32;
+                }
+                o[t] = acc;
+            }
+        }
+    }
+}
+
+/// [`dot_flat_rows_portable`] on `smmla`. Per block and row quad: two
+/// weight vectors and four activation vectors a chunk, eight `smmla` into
+/// eight 2x2 `i32` tiles; then per tile one convert and the scale product
+/// into its `f32` accumulator.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn gemm_flat_rows_mmla(
+    rows: &[&UnpackedRow],
+    a: &ActQ8MmFlat,
+    tiles: std::ops::Range<usize>,
+    out: &mut [&mut [f32]],
+) {
+    use std::arch::aarch64::*;
+    let n_block = a.n_block;
+    let pairs = MM_TILE / 2;
+    let n_pair = rows.len() / 2;
+    // The rows re-laid once for every tile, as `PairedRows` does: per row
+    // pair and block, each 8-byte chunk of the two rows side by side, and
+    // the pair's scales as `[d0, d0, d1, d1]`.
+    let mut wq = vec![0i8; n_pair * n_block * 64];
+    let mut wd = vec![[0f32; 4]; n_pair * n_block];
+    for (p, [r0, r1]) in rows.as_chunks::<2>().0.iter().enumerate() {
+        debug_assert!(r0.q.len() >= n_block * 32 && r1.q.len() >= n_block * 32);
+        // Safety: NEON is baseline on aarch64; block `b` reads
+        // `r*.q[32b..32b + 32]` and writes `wq[p][64b..64b + 64]`.
+        unsafe {
+            let dst = wq.as_mut_ptr().add(p * n_block * 64);
+            for b in 0..n_block {
+                let (x, y) = (r0.q.as_ptr().add(b * 32), r1.q.as_ptr().add(b * 32));
+                let o = dst.add(b * 64);
+                for h in 0..2 {
+                    let x0 = vreinterpretq_u64_s8(vld1q_s8(x.add(h * 16)));
+                    let x1 = vreinterpretq_u64_s8(vld1q_s8(y.add(h * 16)));
+                    vst1q_s8(o.add(h * 32), vreinterpretq_s8_u64(vzip1q_u64(x0, x1)));
+                    vst1q_s8(o.add(h * 32 + 16), vreinterpretq_s8_u64(vzip2q_u64(x0, x1)));
+                }
+            }
+        }
+        for b in 0..n_block {
+            wd[p * n_block + b] = [r0.scale[b], r0.scale[b], r1.scale[b], r1.scale[b]];
+        }
+    }
+    // Safety: the caller verified `i8mm`; every load is 16 bytes inside
+    // `wq`, `wd`, or the tile's run of `a.q`/`a.d`.
+    unsafe {
+        for tl in tiles {
+            let qtile = a.q.as_ptr().add(tl * n_block * MM_TILE * ACT_BLOCK);
+            let dtile = a.d.as_ptr().add(tl * n_block * pairs * 4);
+            for quad in 0..rows.len() / ROW_QUAD {
+                let pair0 = quad * 2;
+                let w0 = wq.as_ptr().add(pair0 * n_block * 64);
+                let w1 = wq.as_ptr().add((pair0 + 1) * n_block * 64);
+                let d0 = wd.as_ptr().add(pair0 * n_block);
+                let d1 = wd.as_ptr().add((pair0 + 1) * n_block);
+                let mut facc = [[vdupq_n_f32(0.0); 4]; 2];
+                for b in 0..n_block {
+                    let x = qtile.add(b * MM_TILE * ACT_BLOCK);
+                    let mut part = [[vdupq_n_s32(0); 4]; 2];
+                    for c in 0..4 {
+                        let wv0 = vld1q_s8(w0.add(b * 64 + c * 16));
+                        let wv1 = vld1q_s8(w1.add(b * 64 + c * 16));
+                        let [p0, p1] = &mut part;
+                        for (tp, (a0, a1)) in p0.iter_mut().zip(p1.iter_mut()).enumerate() {
+                            let xv = vld1q_s8(x.add(tp * 64 + c * 16));
+                            *a0 = mmla_2x8(*a0, wv0, xv);
+                            *a1 = mmla_2x8(*a1, wv1, xv);
+                        }
+                    }
+                    let dv = [
+                        vld1q_f32((*d0.add(b)).as_ptr()),
+                        vld1q_f32((*d1.add(b)).as_ptr()),
+                    ];
+                    for tp in 0..4 {
+                        let adv = vld1q_f32(dtile.add((b * pairs + tp) * 4));
+                        for rp in 0..2 {
+                            let s = vmulq_f32(dv[rp], adv);
+                            let f = vcvtq_f32_s32(part[rp][tp]);
+                            facc[rp][tp] = vaddq_f32(facc[rp][tp], vmulq_f32(s, f));
+                        }
+                    }
+                }
+                // Back to `[row][token]` and out, dropping the padded tail.
+                let base = tl * MM_TILE;
+                for (rp, row) in facc.iter().enumerate() {
+                    for (tp, &v4) in row.iter().enumerate() {
+                        let mut lanes = [0f32; 4];
+                        vst1q_f32(lanes.as_mut_ptr(), v4);
+                        for (i, &v) in lanes.iter().enumerate() {
+                            let (r, t) = (quad * ROW_QUAD + rp * 2 + i / 2, base + tp * 2 + i % 2);
+                            if let Some(slot) = out[r].get_mut(t) {
+                                *slot = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Activations for [`dot_flat_pair`], laid out so a token tile is contiguous.
 ///
 /// Same idea as [`ActQ8K`] but with the scale granularity the symmetric
@@ -10502,6 +10773,140 @@ mod tests {
         }
     }
 
+    /// The flat tile over `out_dim` rows padded up to a whole quad, as the
+    /// CPU backend's task loop pads them: `[out][token]`, the padded rows'
+    /// outputs dropped. `portable` picks the reference over the dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn flat_tile_gemm(
+        ggml_type: u32,
+        raw: &[u8],
+        row_bytes: usize,
+        in_dim: usize,
+        out_dim: usize,
+        x: &[f32],
+        n_tokens: usize,
+        portable: bool,
+    ) -> Vec<f32> {
+        let acts = ActQ8MmFlat::quantize(x, in_dim, n_tokens);
+        let rows: Vec<UnpackedRow> = (0..out_dim)
+            .map(|o| {
+                let mut r = UnpackedRow::new();
+                unpack_row(
+                    ggml_type,
+                    &raw[o * row_bytes..(o + 1) * row_bytes],
+                    in_dim,
+                    &mut r,
+                );
+                r
+            })
+            .collect();
+        let padded = out_dim.div_ceil(ROW_QUAD) * ROW_QUAD;
+        let refs: Vec<&UnpackedRow> = (0..padded).map(|i| &rows[i.min(out_dim - 1)]).collect();
+        let mut yt = vec![0f32; padded * n_tokens];
+        let mut outs: Vec<&mut [f32]> = yt.chunks_mut(n_tokens).collect();
+        let tiles = 0..acts.n_tiles();
+        if portable {
+            dot_flat_rows_portable(&refs, &acts, tiles, &mut outs);
+        } else {
+            dot_flat_rows_tiles(&refs, &acts, tiles, &mut outs);
+        }
+        yt.truncate(out_dim * n_tokens);
+        yt
+    }
+
+    /// The `smmla` tile is its portable definition to the bit, at whole and
+    /// partial token tiles and a row count that pads its last quad.
+    #[test]
+    fn flat_tile_is_its_portable_definition_bit_for_bit() {
+        if !have_flat_rows_tile() {
+            return;
+        }
+        for (ggml_type, in_dim) in [
+            (GGML_TYPE_Q8_0, 896usize),
+            (GGML_TYPE_Q5_0, 896),
+            (GGML_TYPE_IQ4_NL, 896),
+            (GGML_TYPE_PQ2_0, 5120),
+            (GGML_TYPE_PTQ1_0, 128),
+        ] {
+            for n_tokens in [1usize, 7, 8, 13, 17] {
+                let out_dim = 6;
+                let (raw, x, row_bytes) = flat_fixture(ggml_type, in_dim, out_dim, n_tokens, 2718);
+                let args = (
+                    ggml_type,
+                    &raw[..],
+                    row_bytes,
+                    in_dim,
+                    out_dim,
+                    &x[..],
+                    n_tokens,
+                );
+                let fast = flat_tile_gemm(
+                    args.0, args.1, args.2, args.3, args.4, args.5, args.6, false,
+                );
+                let reference =
+                    flat_tile_gemm(args.0, args.1, args.2, args.3, args.4, args.5, args.6, true);
+                assert_eq!(fast, reference, "type {ggml_type} n_tokens {n_tokens}");
+            }
+        }
+    }
+
+    /// The tile and the row-pair GEMM it replaces quantize the activations
+    /// alike and differ only in the order the blocks' `f32` terms are taken
+    /// in — the budget `flat_gemm_is_bit_identical_to_the_generic_gemm`
+    /// allows.
+    #[test]
+    fn flat_tile_matches_the_pair_gemm() {
+        for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL] {
+            for in_dim in [32usize, 896, 4864] {
+                for n_tokens in [2usize, 7, 8, 19] {
+                    let out_dim = 5;
+                    let (raw, x, row_bytes) =
+                        flat_fixture(ggml_type, in_dim, out_dim, n_tokens, 1618);
+                    let tile = flat_tile_gemm(
+                        ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens, false,
+                    );
+                    let pair = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+                    for (i, (t, p)) in tile.iter().zip(&pair).enumerate() {
+                        assert!(
+                            (t - p).abs() <= 1e-4 * p.abs().max(1.0),
+                            "type {ggml_type} in_dim {in_dim} n_tokens {n_tokens} at {i}: \
+                             {t} vs {p}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A partial tile's zero tokens leak into no real token: a batch of
+    /// 2, 5, 9 or 15 gives exactly what a batch of 16 gives those tokens.
+    #[test]
+    fn flat_tile_result_is_independent_of_the_batch_size() {
+        let (ggml_type, in_dim, out_dim) = (GGML_TYPE_Q8_0, 896usize, 4usize);
+        let (raw, x, row_bytes) = flat_fixture(ggml_type, in_dim, out_dim, 16, 1414);
+        let full = flat_tile_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, 16, false);
+        for n in [2usize, 5, 9, 15] {
+            let got = flat_tile_gemm(
+                ggml_type,
+                &raw,
+                row_bytes,
+                in_dim,
+                out_dim,
+                &x[..n * in_dim],
+                n,
+                false,
+            );
+            for o in 0..out_dim {
+                for t in 0..n {
+                    assert_eq!(
+                        got[o * n + t],
+                        full[o * 16 + t],
+                        "n_tokens {n} row {o} token {t}"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn supports_flat_covers_only_the_symmetric_per32_types() {
         assert!(supports_flat(GGML_TYPE_Q8_0, 896));

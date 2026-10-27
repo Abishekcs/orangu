@@ -1,9 +1,9 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries seventeen architecture modules across seventeen servable
-architecture families — sixteen language models and one diffusion
-transformer, which has a module of its own outside `engine::arch` — and six
-device backends.
+`orangu-server` carries seventeen architecture modules across nineteen servable
+architecture families — seventeen language models and two diffusion
+transformers, one for pictures and one for video, each with a module of its
+own outside `engine::arch` — and six device backends.
 Each one documents itself well; what has been missing is the thing you need
 *first* — where they sit, which of them you have to touch, and which rules are
 not visible from the module you happen to be reading.
@@ -237,10 +237,10 @@ Architectures, by what they are rather than by name:
 
 Twenty-one modules above, seventeen architecture modules: `qwen_hybrid`, `kda`,
 `hyper` and `indexer` are shared parts, not architectures of their own.
-Eighteen `ArchFamily` variants, seventeen *servable* families: `dflash` is a
+Twenty `ArchFamily` variants, nineteen *servable* families: `dflash` is a
 module and a variant but resolves to the model it drafts for rather than
-serving itself, and `QwenImage` is a variant whose module lives outside
-`engine::arch` altogether (below). Those are the two
+serving itself, and `QwenImage` and `Ltxv` are variants whose modules live
+outside `engine::arch` altogether (below). Those are the two
 conventions every count in the documentation uses — check them against this
 table and `ArchFamily` rather than against another prose count, which is how
 they drifted apart before.
@@ -283,6 +283,23 @@ bidirectional block inside the causal prompt. Its GGUFs carry no metadata, so
 `orangu::model_spec::architecture_of` names the file from its tensors, and
 the loader strips the `model.diffusion_model.` prefix they are written
 under. `image::Variant` is what the pipeline switches on.
+
+`ltxv`, LTX-2.5's audio-video diffusion transformer, is the other family
+outside the table, in `engine::video`. It draws a clip's frames and its
+sound together: two token streams, video and audio, through 48 blocks that
+attend to the prompt and to each other. The pipeline
+(`engine::video::Pipeline`) again reuses the language-model engine for the
+text encoder — LTX's Gemma 4 12B, an ordinary `gemma4` load, every layer's
+hidden state read (`video::text::all_hidden_states`) and projected by the
+two heads its GGUF carries — and adds the transformer
+(`video::transformer`, over the shared pieces in `video::ops`), the latent
+upscaler of the two-stage recipe (`video::upscaler`), the convolutional
+video VAE (`video::vae`, reusing `image::vae`'s convolution machinery), the
+audio VAE and vocoder (`video::audio`), and an AV1-and-FLAC MP4 writer
+(`video::mp4`, `video::flac`; AV1 through `rav1e`, no system codec). Unlike
+the picture pipeline it runs on `CpuBackend` whatever the encoder was
+placed on. `prepare` hangs it on `Engine::video`; `build_model` refuses the
+family.
 
 Backends, and they are not six of a kind:
 

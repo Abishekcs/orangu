@@ -413,9 +413,9 @@ pub(crate) const ROLE_HEADER: &str = "x-orangu-role";
 /// being reported — a request must not fail because a proxy in front of it
 /// labelled it in a spelling this build does not know.
 pub(crate) fn request_role(state: &AppState, headers: &HeaderMap) -> crate::config::Role {
-    // An embedding server has no generation to tune, and an image server's
-    // role is the model's own (`Role::fixed_by_model`): neither is a choice
-    // a header can make.
+    // An embedding server has no generation to tune, and a picture or video
+    // server's role is the model's own (`Role::fixed_by_model`): neither is
+    // a choice a header can make.
     if !state.engine.role.allows_generation() || state.engine.role.fixed_by_model() {
         return state.engine.role;
     }
@@ -446,6 +446,10 @@ pub async fn chat_completions(
     // An image model answers a chat turn with a picture — see `image_chat`.
     if state.engine.image.is_some() {
         return image_chat(state, req).await;
+    }
+    // A video model answers with a clip — see `video_chat`.
+    if state.engine.video.is_some() {
+        return video_chat(state, req).await;
     }
     let Some(template) = state.engine.chat_template.clone() else {
         return (
@@ -898,6 +902,105 @@ async fn image_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
                     break;
                 }
                 ImageEvent::Error(err) => {
+                    yield Ok(axum::response::sse::Event::default().data(json!({"error": err}).to_string()));
+                    break;
+                }
+            }
+        }
+    };
+    axum::response::sse::Sse::new(stream).into_response()
+}
+
+/// A chat turn on a video model: the last user message is the prompt, and
+/// the answer is the clip — run as a `/v1/videos` job, so the answer links
+/// to `/v1/videos/{id}/content` (markdown a chat client can follow) and
+/// carries the job as `videos`. Streaming sends `video_progress` chunks
+/// with an empty delta while it runs.
+async fn video_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::response::Response {
+    let pipeline = match super::videos::pipeline_or_reject(&state) {
+        Ok(pipeline) => pipeline,
+        Err(response) => return *response,
+    };
+    let Some(turn) = req.messages.iter().rev().find(|m| m.role == "user") else {
+        return (StatusCode::BAD_REQUEST, "no user message to film").into_response();
+    };
+    let request = match super::videos::build_request(
+        &pipeline.defaults(),
+        super::videos::VideoParams {
+            prompt: &turn.content,
+            seed: req.seed,
+            ..Default::default()
+        },
+    ) {
+        Ok(request) => request,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let prompt = request.prompt.replace(['[', ']', '\n'], " ");
+    let created = unix_now();
+    let model = state.model_label.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let id = super::videos::start_job(&pipeline, &model, request, Some(tx));
+    let content = format!("[{prompt}](/v1/videos/{id}/content)");
+    let zero_usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+    let job = |id: &str| -> serde_json::Value { super::videos::job_json(id).unwrap_or_default() };
+
+    if !req.stream {
+        loop {
+            match rx.recv().await {
+                Some(crate::engine::video::VideoEvent::Progress(_)) => {}
+                Some(crate::engine::video::VideoEvent::Done(_)) => break,
+                Some(crate::engine::video::VideoEvent::Error(err)) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+                }
+                None => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "generation ended early")
+                        .into_response();
+                }
+            }
+        }
+        return Json(json!({
+            "id": format!("chatcmpl-{created}"),
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content, "videos": [job(&id)]},
+                "finish_reason": "stop",
+            }],
+            "usage": zero_usage,
+        }))
+        .into_response();
+    }
+
+    let stream = async_stream::stream! {
+        let chat_id = format!("chatcmpl-{created}");
+        while let Some(event) = rx.recv().await {
+            match event {
+                crate::engine::video::VideoEvent::Progress(p) => {
+                    let chunk = json!({
+                        "id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+                        "video_progress": {
+                            "id": id, "step": p.step, "steps": p.steps, "phase": p.phase,
+                            "eta_seconds": p.eta_seconds,
+                        },
+                    });
+                    yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
+                }
+                crate::engine::video::VideoEvent::Done(_) => {
+                    let chunk = json!({
+                        "id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {
+                            "role": "assistant", "content": content, "videos": [job(&id)],
+                        }, "finish_reason": "stop"}],
+                        "usage": zero_usage,
+                    });
+                    yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                    yield Ok(axum::response::sse::Event::default().data("[DONE]"));
+                    break;
+                }
+                crate::engine::video::VideoEvent::Error(err) => {
                     yield Ok(axum::response::sse::Event::default().data(json!({"error": err}).to_string()));
                     break;
                 }

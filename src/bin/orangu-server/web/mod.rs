@@ -407,7 +407,7 @@ async fn workers() -> impl IntoResponse {
     Json(crate::workers::node::status_json())
 }
 
-/// `POST /api/props` — the picture defaults every chat turn on this
+/// `POST /api/props` — the picture or clip defaults every chat turn on this
 /// server then gets; the same body and checks as the API's `POST /props`.
 async fn set_props(
     State(state): State<Arc<WebState>>,
@@ -436,6 +436,29 @@ async fn set_props(
             d.cfg_scale,
         );
     }
+    let video: Option<crate::http::videos::VideoSettings> = match update.get("video") {
+        Some(video) => match serde_json::from_value(video.clone()) {
+            Ok(settings) => Some(settings),
+            Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        },
+        None => None,
+    };
+    if let Some(settings) = &video {
+        let Some(pipeline) = state.engine.video.as_deref() else {
+            return (StatusCode::NOT_IMPLEMENTED, "not a video model").into_response();
+        };
+        if let Err(err) = crate::http::videos::apply_settings(pipeline, settings) {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+        let d = pipeline.defaults();
+        log::info!(
+            "orangu-server: [video] defaults set to {}x{}, {} frames at {} fps (web console)",
+            d.width,
+            d.height,
+            d.frames,
+            d.fps,
+        );
+    }
     Json(props_view(&state)).into_response()
 }
 
@@ -444,6 +467,7 @@ fn props_view(state: &WebState) -> serde_json::Value {
         "model": state.model_display,
         "architecture": state.architecture,
         "image": state.engine.image.as_deref().map(crate::http::images::props_json),
+        "video": state.engine.video.as_deref().map(crate::http::videos::props_json),
     })
 }
 
@@ -836,6 +860,9 @@ async fn send_message(
     if state.engine.image.is_some() {
         return send_image_message(state, session, req.content, extracted, init_picture).await;
     }
+    if state.engine.video.is_some() {
+        return send_video_message(state, session, req.content, extracted).await;
+    }
 
     let Some(template) = state.engine.chat_template.clone() else {
         return (
@@ -1076,10 +1103,108 @@ async fn send_image_message(
     axum::response::sse::Sse::new(stream).into_response()
 }
 
+/// A console turn on a video model: the message is the prompt, the reply is
+/// the clip, kept beside the transcript as an MP4 and shown as a player with
+/// a caption. Progress is the image turn's (`step`, `steps`, `eta_seconds`)
+/// plus the `phase` running — encoding the prompt, either stage, decoding,
+/// the sound, the file.
+async fn send_video_message(
+    state: Arc<WebState>,
+    mut session: Session,
+    user_message: String,
+    user_attachments: Vec<Attachment>,
+) -> axum::response::Response {
+    let Some(pipeline) = state.engine.video.clone() else {
+        return (StatusCode::NOT_IMPLEMENTED, "not a video model").into_response();
+    };
+    let request = match crate::http::videos::build_request(
+        &pipeline.defaults(),
+        crate::http::videos::VideoParams {
+            prompt: &user_message,
+            ..Default::default()
+        },
+    ) {
+        Ok(request) => request,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    if let Err(err) = crate::engine::video::Plan::new(&request, pipeline.has_upscaler()) {
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+    }
+    let attachment_views: Vec<AttachmentView> = user_attachments
+        .iter()
+        .cloned()
+        .map(|a| attachment_view(&session.id, a))
+        .collect();
+    let (mut rx, cancel) = pipeline.spawn(request);
+    let stream = async_stream::stream! {
+        // Held for the stream's life: Stop closes the connection, and that
+        // stops the clip at its next block.
+        let _cancel = cancel;
+        if !attachment_views.is_empty() {
+            yield Ok::<_, Infallible>(
+                axum::response::sse::Event::default()
+                    .data(json!({"type": "attachments", "attachments": attachment_views}).to_string()),
+            );
+        }
+        loop {
+            let Some(event) = rx.recv().await else { break };
+            match event {
+                crate::engine::video::VideoEvent::Progress(p) => {
+                    yield Ok(axum::response::sse::Event::default().data(
+                        json!({"type": "progress", "step": p.step, "steps": p.steps, "phase": p.phase, "eta_seconds": p.eta_seconds}).to_string(),
+                    ));
+                }
+                crate::engine::video::VideoEvent::Done(video) => {
+                    let name = match sessions::store_file(&session.id, "mp4", &video.bytes) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            yield Ok(axum::response::sse::Event::default()
+                                .data(json!({"type": "error", "message": format!("{err:#}")}).to_string()));
+                            break;
+                        }
+                    };
+                    let alt = user_message.replace(['[', ']', '\n'], " ");
+                    let content = format!(
+                        "![{alt}]({})\n\n*{}x{}, {} frames at {} fps ({:.1} s), {}, seed {}*",
+                        sessions::file_url(&session.id, &name),
+                        video.width,
+                        video.height,
+                        video.frames,
+                        video.fps,
+                        video.seconds(),
+                        if video.has_audio { "with sound" } else { "silent" },
+                        video.seed
+                    );
+                    let html = render::render_markdown_to_html(&content, state.project_licence.as_ref());
+                    let generation_ms = video.elapsed.as_millis() as u64;
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms)) {
+                        yield Ok(axum::response::sse::Event::default()
+                            .data(json!({"type": "error", "message": err.to_string()}).to_string()));
+                        break;
+                    }
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "video": true}).to_string()));
+                    break;
+                }
+                crate::engine::video::VideoEvent::Error(err) => {
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(json!({"type": "error", "message": err}).to_string()));
+                    break;
+                }
+            }
+        }
+    };
+    axum::response::sse::Sse::new(stream).into_response()
+}
+
 /// Serves a file kept beside a session's transcript — an attached or a
-/// generated picture. The name is checked by [`sessions::file_path`], which
-/// only ever produces a path inside that session's own `files/` directory.
-async fn session_file(Path((id, name)): Path<(String, String)>) -> impl IntoResponse {
+/// generated picture, or a generated clip (with `Range`, so the player can
+/// seek). The name is checked by [`sessions::file_path`], which only ever
+/// produces a path inside that session's own `files/` directory.
+async fn session_file(
+    Path((id, name)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     let path = match sessions::file_path(&id, &name) {
         Ok(path) => path,
         Err(err) => return (StatusCode::NOT_FOUND, err.to_string()).into_response(),
@@ -1087,6 +1212,9 @@ async fn session_file(Path((id, name)): Path<(String, String)>) -> impl IntoResp
     let Ok(bytes) = tokio::fs::read(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if path.extension().and_then(|e| e.to_str()) == Some("mp4") {
+        return crate::http::videos::mp4_response(&bytes, &headers);
+    }
     let content_type = match path.extension().and_then(|e| e.to_str()) {
         Some("svg") => "image/svg+xml",
         Some(ext) => crate::engine::image::ImageFormat::from_extension(ext)

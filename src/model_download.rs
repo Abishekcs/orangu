@@ -307,7 +307,13 @@ pub fn download_model_reporting(
         && let Some(architecture) = crate::model_spec::architecture_of(&gguf)
         && crate::model_spec::is_image_architecture(&architecture)
     {
-        download_image_companions(models_dir, &architecture, progress)?;
+        download_image_companions(models_dir, &architecture, progress.clone())?;
+    }
+    if let Ok(gguf) = GgufFile::open_summary(&path)
+        && let Some(architecture) = crate::model_spec::architecture_of(&gguf)
+        && crate::model_spec::is_video_architecture(&architecture)
+    {
+        download_video_companions(models_dir, &architecture, progress)?;
     }
     Ok(path)
 }
@@ -439,6 +445,68 @@ pub fn download_image_companions(
             progress,
         )
         .context("downloading the qwen_image Lightning adapter")?;
+    }
+    Ok(())
+}
+
+/// Where `orangu-server download` fetches an `ltxv` model's companions:
+/// the model's own repository, which publishes them beside the GGUFs,
+/// without a gate.
+pub const LTX_COMPANION_REPO: &str = "unsloth/LTX-2.5-GGUF";
+/// LTX-2.5's own Gemma 4 12B, with the two heads that project its hidden
+/// states for the transformer — `bf16`, which the server converts to a
+/// GGUF at its first start.
+pub const LTX_TEXT_ENCODER_FILE: &str =
+    "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors";
+/// The convolutional video VAE — the lighter of the two LTX-2.5 publishes,
+/// and the one this engine runs.
+pub const LTX_VIDEO_VAE_FILE: &str = "vae/ltx-2.5-video-vae-conv-bf16.safetensors";
+/// The audio VAE and its vocoder, in one file.
+pub const LTX_AUDIO_VAE_FILE: &str = "vae/ltx-2.5-audio-vae-bf16.safetensors";
+/// The ×2 latent upscaler the distilled two-stage recipe refines with.
+pub const LTX_UPSCALER_FILE: &str =
+    "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors";
+
+/// Fetches what a video model (`ltxv`) needs beside it: LTX's Gemma 4 text
+/// encoder, the video VAE, the audio VAE and the latent upscaler — each
+/// skipped when the models directory already holds one (an encoder as a
+/// GGUF, or as the published `safetensors`).
+pub fn download_video_companions(
+    models_dir: &Path,
+    architecture: &str,
+    progress: Option<Arc<DownloadProgress>>,
+) -> Result<()> {
+    let have_encoder = |dir: &Path| {
+        crate::model_spec::find_ltx_text_encoder(dir)
+            .or_else(|| crate::model_spec::find_ltx_text_encoder_safetensors(dir))
+    };
+    type Find<'a> = &'a dyn Fn(&Path) -> Option<PathBuf>;
+    let files: [(&str, Find, &str); 4] = [
+        (LTX_TEXT_ENCODER_FILE, &have_encoder, "text encoder"),
+        (
+            LTX_VIDEO_VAE_FILE,
+            &crate::model_spec::find_ltx_video_vae,
+            "video VAE",
+        ),
+        (
+            LTX_AUDIO_VAE_FILE,
+            &crate::model_spec::find_ltx_audio_vae,
+            "audio VAE",
+        ),
+        (
+            LTX_UPSCALER_FILE,
+            &crate::model_spec::find_ltx_spatial_upscaler,
+            "latent upscaler",
+        ),
+    ];
+    for (file, find, what) in files {
+        if find(models_dir).is_none() {
+            eprintln!(
+                "Fetching the {what} a {architecture} model needs ({LTX_COMPANION_REPO}:{file})"
+            );
+            download_repo_file(models_dir, LTX_COMPANION_REPO, file, progress.clone())
+                .with_context(|| format!("downloading the {architecture} {what}"))?;
+        }
     }
     Ok(())
 }

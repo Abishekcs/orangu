@@ -1010,6 +1010,7 @@
       box.timer = setInterval(() => renderImageProgress(box), 1000);
     }
     box.step = Number(payload.step) || 0;
+    box.phase = payload.phase || null;
     box.steps = Number(payload.steps) || 0;
     const eta = Number(payload.eta_seconds);
     // Step 0 is the server's announcement before the first step — its
@@ -1021,8 +1022,11 @@
   }
 
   function renderImageProgress(box) {
-    const { step, steps, deadline } = box;
+    const { step, steps, deadline, phase } = box;
     let text = steps > 0 && step > 0 ? `Step ${step}/${steps}` : "Starting";
+    // A video model names what is running — the prompt, a stage, the
+    // decoders, the file — since a clip spends minutes outside the steps.
+    if (phase) text = `${phase.charAt(0).toUpperCase()}${phase.slice(1)}` + (steps > 0 && step > 0 ? ` · step ${step}/${steps}` : "");
     if (deadline !== null) {
       const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
       text += left > 0 ? ` · ${formatCountdown(left)}` : " · any moment now";
@@ -1370,6 +1374,7 @@
     models: document.getElementById("models-panel"),
     monitor: document.getElementById("monitor-panel"),
     image: document.getElementById("image-panel"),
+    video: document.getElementById("video-panel"),
     workers: document.getElementById("workers-panel"),
   };
   const modelsOverlay = settingsOverlay;
@@ -2550,6 +2555,185 @@
     imageStatus.textContent = "Reset to the configuration — Save to apply.";
   });
 
+  // ---------------------------------------------------------- video --
+  // The clip settings: the defaults every chat turn on a video model gets,
+  // as `POST /api/props` takes them. Like the Image pane: a form filled
+  // from the server's answer, an estimate from its rate model, Reset to the
+  // configuration, and the dialog's Save.
+  const videoForm = document.getElementById("video-form");
+  const videoNone = document.getElementById("video-none");
+  const videoModelEl = document.getElementById("video-model");
+  const videoSize = document.getElementById("video-size");
+  const videoSizeCustom = document.getElementById("video-size-custom");
+  const videoSeconds = document.getElementById("video-seconds");
+  const videoSecondsCustom = document.getElementById("video-seconds-custom");
+  const videoFps = document.getElementById("video-fps");
+  const videoAudio = document.getElementById("video-audio");
+  const videoTwoStage = document.getElementById("video-two-stage");
+  const videoQuality = document.getElementById("video-quality");
+  const videoQualityCustom = document.getElementById("video-quality-custom");
+  const videoEstimate = document.getElementById("video-estimate");
+  const videoStatus = document.getElementById("video-status");
+  const videoResetBtn = document.getElementById("video-reset-btn");
+  const videoTab = settingsTabs.find((tab) => tab.dataset.pane === "video");
+  // The last `/api/props` answer's `video` object, or `null` for any
+  // other model.
+  let videoProps = null;
+
+  for (const [select, custom] of [
+    [videoSize, videoSizeCustom],
+    [videoSeconds, videoSecondsCustom],
+    [videoQuality, videoQualityCustom],
+  ]) {
+    select.addEventListener("change", () => {
+      custom.hidden = select.value !== "custom";
+      if (!custom.hidden) custom.focus();
+      renderVideoEstimate();
+    });
+    custom.addEventListener("input", renderVideoEstimate);
+  }
+  for (const el of [videoFps, videoAudio, videoTwoStage]) {
+    el.addEventListener("change", renderVideoEstimate);
+  }
+
+  // The frame count the model draws: `8 k + 1`, nearest.
+  function snapFrames(frames) {
+    const k = Math.floor((Math.max(1, frames) - 1 + 4) / 8);
+    return k * 8 + 1;
+  }
+
+  function fillVideoForm(d) {
+    selectWithCustom(videoSize, videoSizeCustom, d.size);
+    const seconds = Math.round(Number(d.seconds) * 10) / 10;
+    selectWithCustom(videoSeconds, videoSecondsCustom, Number.isInteger(seconds) ? seconds : seconds.toFixed(1));
+    videoFps.value = String(d.fps);
+    if (videoFps.value !== String(d.fps)) {
+      const option = document.createElement("option");
+      option.value = String(d.fps);
+      option.textContent = `${d.fps} fps`;
+      videoFps.appendChild(option);
+      videoFps.value = String(d.fps);
+    }
+    videoAudio.checked = !!d.audio;
+    videoTwoStage.checked = !!d.two_stage;
+    selectWithCustom(videoQuality, videoQualityCustom, d.quality);
+    renderVideoEstimate();
+  }
+
+  // What the form says now, as `POST /api/props`' `video` object.
+  function videoFormSettings() {
+    return {
+      size: customValue(videoSize, videoSizeCustom),
+      seconds: Number(customValue(videoSeconds, videoSecondsCustom)),
+      fps: Number(videoFps.value),
+      audio: videoAudio.checked,
+      two_stage: videoTwoStage.checked,
+      quality: Number(customValue(videoQuality, videoQualityCustom)),
+    };
+  }
+
+  // The server's rate model (see `/props`' `video.rate`) over the form:
+  // encode, then each stage's steps at its tokens (a quarter of them in
+  // stage 1 of two), then the decoders per pixel and per second of sound.
+  function renderVideoEstimate() {
+    if (!videoProps) return;
+    const rate = videoProps.rate;
+    const s = videoFormSettings();
+    const match = /^(\d+)x(\d+)$/.exec(s.size);
+    if (!match || !rate || !(s.seconds > 0) || !(s.fps > 0)) {
+      videoEstimate.textContent = "";
+      return;
+    }
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    const two = s.two_stage && !!videoProps.upscaler;
+    const unit = two ? 64 : 32;
+    if (width % unit !== 0 || height % unit !== 0) {
+      videoEstimate.textContent = `Width and height must be multiples of ${unit}${two ? " for two stages" : ""}.`;
+      return;
+    }
+    const frames = snapFrames(Math.round(s.seconds * s.fps));
+    const latentFrames = (frames - 1) / 8 + 1;
+    const scale = two ? 2 : 1;
+    const t1 = latentFrames * (height / 32 / scale) * (width / 32 / scale);
+    const step = (n) => rate.per_step + rate.per_token * n + rate.per_token_sq * n * n;
+    let seconds = rate.encode + 8 * step(t1);
+    if (two) seconds += 3 * step(t1 * 4);
+    seconds += width * height * frames * (rate.decode_per_pixel + rate.other_per_pixel);
+    if (s.audio && videoProps.audio_vae) seconds += rate.audio_per_second * frames / 24;
+    videoEstimate.textContent =
+      `${frames} frames (${(frames / s.fps).toFixed(1)} s). About ${formatCountdown(Math.round(seconds))} a clip at these settings on this server.`;
+  }
+
+  async function loadVideoProps() {
+    const res = await fetch("/api/props", { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const props = await res.json();
+    videoProps = props.video;
+    renderVideoProps(props);
+  }
+
+  function renderVideoProps(props) {
+    const video = props.video;
+    videoTab.classList.toggle("unavailable", !video);
+    videoTab.title = video ? "" : "Not a video model";
+    videoNone.hidden = !!video;
+    videoForm.hidden = !video;
+    if (!video) {
+      videoModelEl.textContent = props.model || "";
+      return;
+    }
+    videoAudio.disabled = !video.audio_vae;
+    videoTwoStage.disabled = !video.upscaler;
+    const parts = [props.model];
+    parts.push(video.audio_vae ? "with sound" : "silent (no audio VAE)");
+    parts.push(video.upscaler ? "two stages" : "one stage (no upscaler)");
+    videoModelEl.textContent = parts.join(" · ");
+    fillVideoForm(video.defaults);
+  }
+
+  function videoFormDirty() {
+    if (!videoProps) return false;
+    const d = videoProps.defaults;
+    const f = videoFormSettings();
+    return (
+      f.size !== d.size ||
+      snapFrames(Math.round(f.seconds * f.fps)) !== d.frames ||
+      f.fps !== d.fps ||
+      f.audio !== d.audio ||
+      f.two_stage !== d.two_stage ||
+      f.quality !== d.quality
+    );
+  }
+
+  async function postVideoProps(settings) {
+    videoStatus.textContent = "Saving…";
+    const res = await fetch("/api/props", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video: settings }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const props = await res.json();
+    videoProps = props.video;
+    renderVideoProps(props);
+    const d = props.video.defaults;
+    const eta = props.video.estimated_default_seconds;
+    videoStatus.textContent = `Set: ${d.size}, ${d.frames} frames at ${d.fps} fps${
+      Number.isFinite(eta) ? ` — about ${formatCountdown(Math.round(eta))} a clip` : ""
+    }.`;
+  }
+
+  videoForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveSettings();
+  });
+  videoResetBtn.addEventListener("click", () => {
+    if (!videoProps) return;
+    fillVideoForm(videoProps.configured);
+    videoStatus.textContent = "Reset to the configuration — Save to apply.";
+  });
+
   // ------------------------monitor -----------------------------------
   // live CPU / GPU / NPU inventory. Polled from /api/monitor
   // only while the pane is shown same pattern as the model manager's
@@ -2776,6 +2960,10 @@
       imageStatus.textContent = "";
       loadImageProps().catch((err) => { imageStatus.textContent = err.message; });
     }
+    if (name === "video" && !keepForm) {
+      videoStatus.textContent = "";
+      loadVideoProps().catch((err) => { videoStatus.textContent = err.message; });
+    }
     if (name === "workers") {
       openWorkers().catch((err) => { workersSummary.textContent = err.message; });
     }
@@ -2801,6 +2989,7 @@
     // `/api/props`, asked once the dialog is open so the other panes never
     // wait on it.
     loadImageProps().catch((err) => console.error(err));
+    loadVideoProps().catch((err) => console.error(err));
   }
 
   function closeSettings() {
@@ -2828,6 +3017,15 @@
       } catch (err) {
         showSettingsPane("image", true);
         imageStatus.textContent = err.message;
+        return;
+      }
+    }
+    if (videoFormDirty()) {
+      try {
+        await postVideoProps(videoFormSettings());
+      } catch (err) {
+        showSettingsPane("video", true);
+        videoStatus.textContent = err.message;
         return;
       }
     }

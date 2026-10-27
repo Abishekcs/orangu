@@ -139,6 +139,8 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 pub struct PropsUpdate {
     #[serde(default)]
     image: Option<super::images::ImageSettings>,
+    #[serde(default)]
+    video: Option<super::videos::VideoSettings>,
     /// `{"enabled": false}` serves a `[workers]` tree's model alone, `true`
     /// through the tree again.
     #[serde(default)]
@@ -180,6 +182,31 @@ pub async fn set_props(
                     orangu::format::format_duration_rough(s)
                 ))
                 .unwrap_or_default()
+        );
+    }
+    if let Some(settings) = &update.video {
+        let Some(pipeline) = state.engine.video.as_deref() else {
+            return (StatusCode::NOT_IMPLEMENTED, "not a video model").into_response();
+        };
+        if let Err(err) = super::videos::apply_settings(pipeline, settings) {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+        let d = pipeline.defaults();
+        let estimate = pipeline
+            .estimate(&crate::engine::video::VideoRequest::from_defaults("", &d))
+            .map(|s| {
+                format!(
+                    " — about {} a clip",
+                    orangu::format::format_duration_rough(s)
+                )
+            })
+            .unwrap_or_default();
+        log::info!(
+            "orangu-server: [video] defaults set to {}x{}, {} frames at {} fps{estimate}",
+            d.width,
+            d.height,
+            d.frames,
+            d.fps,
         );
     }
     Json(props_json(&state)).into_response()
@@ -271,6 +298,9 @@ fn props_json(state: &AppState) -> serde_json::Value {
         // request defaults a chat turn gets and the measured rate — see
         // `images::props_json`; `POST /props` changes the defaults.
         "image": state.engine.image.as_deref().map(super::images::props_json),
+        // `null` but for an `ltxv` model: its companions, defaults and rate
+        // — see `videos::props_json`.
+        "video": state.engine.video.as_deref().map(super::videos::props_json),
         // Which of `--all`/`--code`/`--review`/`--explorer`/`--embedding`
         // this process came up as — the same thing the startup banner's
         // `Mode` row reports, where a client can read it. A coordinator uses

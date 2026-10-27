@@ -46,9 +46,9 @@ it isn't already cached there. No separate download step is needed.
 
 Leave it off entirely and `orangu-server` lists every `.gguf` model under
 the configured `models` directory and prompts for one by `NR`, then —
-unless `--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`
-was passed, and unless the model is a picture generator, whose role is
-`image` without asking — prompts for a role too (see below), TAB-completing
+unless `--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`/`--video`
+was passed, and unless the model is a picture or video generator, whose
+role is `image` or `video` without asking — prompts for a role too (see below), TAB-completing
 over the five names a language model can take (dropdown-style: an empty
 `TAB` press lists all five) and defaulting to `all` on an empty entry:
 
@@ -1802,9 +1802,9 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   runs them on the one pool). Setting it pins that one pool size. `--threads` and `ORANGU_THREADS`
   override it for one run.
 - `role` — `all` (the default), `code`, `review`, `explorer`,
-  `embedding`, or `image`. See **Roles** below. Resolved in this order: an
+  `embedding`, `image` or `video`. See **Roles** below. Resolved in this order: an
   explicit CLI flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`/
-  `--image`) wins everywhere and skips the prompt entirely; failing that,
+  `--image`/`--video`) wins everywhere and skips the prompt entirely; failing that,
   `--daemon` takes this key directly, having no terminal to prompt on; and
   an attached run with no flag uses it to **pre-select the interactive
   `role` prompt** — ghosted on the empty line, TAB-completing over the
@@ -1814,7 +1814,8 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   `image` is the exception to all of that: it is the role of a `qwen_image`
   model, which comes up in it whatever this key says is missing, and
   which refuses any _other_ value here (under `--daemon`) or on the CLI —
-  see **Image generation** below.
+  see **Image generation** below. `video` is the same for an `ltxv` model —
+  see **Video generation**.
 - `log_type` / `log_path` — where the server's output goes. `console` (the
   default) is exactly what it has always printed: the startup banner, a
   progress line rewritten once a second while a request runs, each request's
@@ -1857,8 +1858,8 @@ shown.
 | `model`                 | —                                          | model to serve when none is given on the command line (required for `--daemon`)                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `host`                  | `all`                                      | bind address; `all` (or `*`) means every interface, a literal address narrows it                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `port`                  | `8100`                                     | HTTP API port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `role`                  | `all`                                      | `all`, `code`, `review`, `explorer`, `embedding`, `image`; read under `--daemon`, an image model is always `image`                                                                                                                                                                                                                                                                                                                                                                                   |
-| `slots`                 | `4`; `1` for `review`/image, `8` embedding | concurrent requests, each with its own KV cache                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `role`                  | `all`                                      | `all`, `code`, `review`, `explorer`, `embedding`, `image`, `video`; read under `--daemon`, an image model is always `image`, a video model always `video`                                                                                                                                                                                                                                                                                                                                            |
+| `slots`                 | `4`; `1` review/image/video, `8` embedding | concurrent requests, each with its own KV cache                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `queue_limit`           | `16`                                       | requests allowed to wait for a slot before `503`; `0` is unbounded                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `context`               | —                                          | tokens one request must fit on the device; set, layers move to the host until the card has room for that much KV cache                                                                                                                                                                                                                                                                                                                                                                               |
 | `api_key`               | —                                          | bearer token every request must carry; unset leaves the server open                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -1874,17 +1875,17 @@ shown.
 | `kv_cache`              | `f16`                                      | GPU KV mirror storage: `f16`, `q8_0`, or `f32`                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `read_size`             | `8192`                                     | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `prefill_backend`       | `auto`                                     | where prompt passes run: `auto` (whichever backend a prompt-shaped GEMM timed at load favours), `device`, or `cpu`                                                                                                                                                                                                                                                                                                                                                                                   |
-| `prompt_weights`        | `auto`                                     | how the weights a prompt multiplies on the CPU are held: `auto` (copies for the cores' matrix instructions, kept when they measure at least 10% faster and fit in half the free memory), `copy` (unmeasured), or `file` (no copy)                                                                                                                                                                                                                                                                    |
+| `prompt_weights`        | `auto`                                     | how the weights a prompt multiplies on the CPU are held: `auto` (copies for the cores' matrix instructions, kept when they measure at least 10% faster and fit in half the free memory), `copy` (unmeasured), or `file` (no copy). For a video model `auto` means `file`: its encoder reads one prompt a clip                                                                                                                                                                                        |
 | `mlp_unroll`            | decided at startup                         | force the GPU's block-unroll decode kernels on or off; unset, each quantized type is checked against the CPU and dropped if wrong                                                                                                                                                                                                                                                                                                                                                                    |
 | `npu_precompile`        | `yes`                                      | whether this model may use the NPU at all; `no` neither compiles nor loads blocks                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `npu_cache_gb`          | a quarter of memory, 1–16                  | GiB of compiled NPU blocks one model may use; `0` stops compiling but still loads cached blocks                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, or Qwen-Image 2.1's own                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`, LTX's Gemma 4 with its projection heads for `ltxv` (a GGUF, or the published `.safetensors`, converted once)                                                                                                                                                                                                                                                                                                      |
+| `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, Qwen-Image 2.1's own, or LTX's convolutional video VAE for `ltxv`                                                                                                                                                                                                                                                                                                                                                                                    |
 | `vision`                | found beside the text encoder              | the vision projector (`mmproj-*.gguf`) a `qwen_image_2_1` model edits attached pictures with; `none` draws over them instead                                                                                                                                                                                                                                                                                                                                                                         |
 | `image_lora`            | `auto`                                     | the adapter applied to the picture transformer: `auto` the Lightning file under `models` (fetched with the model; a picture in 8 unguided steps), `none` the base model, or a `.safetensors` (or 4-step variant, rougher)                                                                                                                                                                                                                                                                            |
 | `image_lora_merge`      | `yes`                                      | fold the adapter into the weights at startup (a few minutes once, then no cost per pass); `no` applies it in `f32` every pass                                                                                                                                                                                                                                                                                                                                                                        |
 | `image_weights`         | `auto`                                     | how a `qwen_image_2_1` transformer's linears are held: `auto` per-row `int8` on the 8 × 8 `int8` tile (`i8mm`, `dotprod` or `AVX2`) when the transformer runs on the CPU and total memory is at least three times the 7 GB copy, `int8` whenever it runs on the CPU, `file` the file's K-quants (no copy); a transformer on a GPU keeps the file's; ~1.4–1.9× a step                                                                                                                                 |
-| `vae_precision`         | `int8`                                     | the VAE's convolutions as `Q6_K` on the `int8` kernel (3–4× faster decode), or `f32` as stored (exact)                                                                                                                                                                                                                                                                                                                                                                                               |
+| `vae_precision`         | `int8`                                     | the VAE's convolutions as `Q6_K` on the `int8` kernel (3–4× faster decode), or `f32` as stored (exact); an `ltxv` model's video VAE follows it too                                                                                                                                                                                                                                                                                                                                                   |
 | `image_cache`           | `easy`                                     | whether a step may reuse the last transformer pass rather than run one (EasyCache): `easy` (the default, threshold 0.08) or `easy:<threshold>` a step whose predicted change since the last pass stays under the threshold takes the last two passes' residual extrapolated to it, and `off` runs every step; at 0.08 about 2.4× a 40-step 1024² picture and 3.6× a 512² edit, the picture close to the uncached one but not identical; 0.05 is closer at 2×, 0.1 and above start to ghost lettering |
 | `image_reference_size`  | `source`                                   | the area an edit reads its reference at: `source` the picture's area but never more than the attached picture's own (upsampling adds nothing but tokens), `output` the picture's area (diffusers reads 1024²), or `WIDTHxHEIGHT` a cap; a 256² picture edited at 1024² encodes in 6 s rather than 84 and steps in 50 s rather than 79                                                                                                                                                                |
 | `image_size`            | `1024x1024`                                | a picture's size when the request does not say; multiples of 16                                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -1893,6 +1894,15 @@ shown.
 | `image_negative_prompt` | a space                                    | what a picture is pushed away from                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `image_strength`        | `0.6`                                      | how much of the schedule an attached picture goes through                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `image_format`          | `png`                                      | the format a picture comes back in: `png`, `jpeg`, `gif`, `webp` or `svg`                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `audio_vae`             | first found                                | LTX's audio VAE and vocoder (`.safetensors`) an `ltxv` model voices its clips with; `none` makes every clip silent                                                                                                                                                                                                                                                                                                                                                                                   |
+| `upscaler`              | first found                                | LTX's ×2 latent upscaler (`.safetensors`) the two-stage recipe refines with; `none` draws every clip in one stage at its full size                                                                                                                                                                                                                                                                                                                                                                   |
+| `video_size`            | `768x448`                                  | a clip's size when the request does not say; multiples of 32, 64 in two stages                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `video_seconds`         | `5` (121 frames)                           | a clip's length; snapped to 8k + 1 frames. Or `video_frames`, not both                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `video_frames`          | `121`                                      | a clip's length in frames; snapped to 8k + 1                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `video_fps`             | `24`                                       | frames per second, 1 to 60                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `video_audio`           | `yes`                                      | put the sound in the file, when the audio VAE is there                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `video_two_stage`       | `yes`                                      | the distilled two-stage recipe (half size, upscale, refine), when the upscaler is there                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `video_quality`         | `80`                                       | the AV1 encoder's quantizer: `0` (best) to `255` (smallest file)                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `log_type`              | `console`                                  | where the server's output goes: `console`, or `file` to append it — stamped, and without the once-a-second progress line — to `log_path`; what a `--daemon` needs, since detached it otherwise logs nothing                                                                                                                                                                                                                                                                                          |
 | `log_path`              | `orangu-server.log` in the start directory | the file `log_type = file` writes to; `~` is expanded, a missing directory created                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `web`                   | `0`                                        | the pre-section spelling of `[web].port`, still honored when the file has no `[web]` section and ignored when it does                                                                                                                                                                                                                                                                                                                                                                                |
@@ -2571,7 +2581,9 @@ prompts for `role` (TAB-completing over the five names a language model
 can take, defaulting to `all`), right after `model`, and only writes the
 `role =` line when a non-default value was chosen; an image model answers
 `image` on its own and is then asked the picture pipeline's keys, each
-written only when it differs from the default (see **Image generation**). It then
+written only when it differs from the default (see **Image generation**), and
+a video model answers `video` and is asked the video pipeline's keys the
+same way (see **Video generation**). It then
 asks for every other `[orangu-server]` key with the default the server applies
 without it — `api_key`, `tls_cert` (and, with one, `tls_key`), `slots`,
 `queue_limit`, `context`, `kv_cache`, `draft_model` (and, with one,
@@ -2646,12 +2658,13 @@ and the features built on top of it later will do the same.
 
 ## Roles
 
-`--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`
+`--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`/`--video`
 (mutually exclusive; `--all` is the default) hint at which of
 `orangu-server`'s own features matter for a given deployment. Five of them
 are a choice made for a language model; `--image` is not a choice at all —
 it is the role of a `qwen_image` picture generator, which takes it on its
-own and cannot take another (see **Image generation**). These mirror `orangu`'s conventional
+own and cannot take another (see **Image generation**), and `--video` is
+the same for an `ltxv` video generator (see **Video generation**). These mirror `orangu`'s conventional
 deployment roles (`all`/`code`/`review`/`explorer`/`embeddings`), but a
 single `orangu-server` process serves whatever model it's given rather than
 picking one — so unlike a real `orangu-server` process per role, this only
@@ -2793,8 +2806,13 @@ differently.
 with the engine's default sampling and no reasoning to suppress. An
 `x-orangu-role` header cannot move a request off it, or onto it.
 
+`video` is what an `ltxv` model is served as: every chat turn and
+`/v1/videos` make a clip, one at a time (a single slot; a second request
+waits for the first), with no sampling to tune and no reasoning to
+suppress. The header cannot move a request off it or onto it either.
+
 The role in effect is, in order: the model's own, when it has one (a
-`qwen_image` file is always `image`, and an explicit flag or `--daemon`
+`qwen_image` file is always `image`, an `ltxv` file always `video`, and an explicit flag or `--daemon`
 config key saying otherwise is an error rather than overridden); or
 whichever CLI flag was passed; or, if none was and this is an attached run
 with no model given on the command line either, whatever's typed at the
@@ -3951,6 +3969,229 @@ last user message with the picture as a markdown image over a `data:` URL
 picture from an `image_url` content part. Both are documented field by
 field in the _HTTP endpoints_ chapter.
 
+## Video generation
+
+This section is the reference; the _Video generation_ chapter that
+follows _Image generation_ is the walk-through — what to download, how to
+start, what the console's settings do.
+
+`orangu-server` also serves **LTX-2.5**, Lightricks' audio-video diffusion
+transformer, from the same GGUF inventory: a file whose
+`general.architecture` is `ltxv` (`unsloth/LTX-2.5-GGUF`, `list`'s
+`Yes (ltxv)`). Point the server at it exactly as at a language model —
+`orangu-server --video`, or `model = unsloth/LTX-2.5-GGUF:Q4_K_M` — and
+every chat turn is answered with a clip instead of text: an MP4 of AV1
+video with a FLAC sound track, made without an external encoder. The
+picture and the sound are drawn together by the same transformer.
+
+An `ltxv` file carries the transformer and its two text connectors. The
+rest are its four companions, found beside it in the models directory:
+
+- **The text encoder** — LTX's own Gemma 4 12B with the two heads that
+  project its hidden states for the transformer
+  (`text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`).
+  Every layer's hidden state is read, not only the last, and the heads
+  live in this file, so a plain Gemma 4 GGUF does not fit. The first start
+  that needs it converts it to a `gemma4` GGUF (`Q6_K`, norms in `f32`)
+  under `<models>/orangu-converted/` — llama.cpp's conversion for Gemma 4,
+  a few minutes once — and loads that as the server's language model
+  through the ordinary path; `list` shows it as `Yes (gemma4)`. A GGUF
+  of the encoder made elsewhere is used as it is.
+- **The video VAE** — `vae/ltx-2.5-video-vae-conv-bf16.safetensors`: the
+  convolutional decoder that turns the latents into frames. LTX-2.5's
+  diffusion decoder, which Lightricks also publishes, is not run.
+- **The audio VAE** — `vae/ltx-2.5-audio-vae-bf16.safetensors`: the
+  spectrogram decoder and the vocoder. Optional; without it every clip is
+  silent.
+- **The latent upscaler** —
+  `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`:
+  doubles the first stage's latent for the second. Optional; without it
+  every clip is drawn in one stage at its full size.
+
+`orangu-server download unsloth/LTX-2.5-GGUF:Q4_K_M` fetches all five,
+skipping a companion the directory already holds; the web console's model
+manager downloads the same way. The companions come from the same
+repository as the transformer, `unsloth/LTX-2.5-GGUF`, which is not
+gated.
+
+Each companion is recognised by its contents, not its name: the text
+encoder by its Gemma 4 architecture and its projection heads, the VAEs
+and the upscaler by their tensors. Four keys name them explicitly when
+they live elsewhere:
+
+```ini
+[orangu-server]
+model = unsloth/LTX-2.5-GGUF:Q4_K_M
+text_encoder = /srv/ltx/gemma4-12b-with-proj-ltx-2.5-Q4_K_M.gguf
+vae = /srv/ltx/ltx-2.5-video-vae-conv-bf16.safetensors
+audio_vae = /srv/ltx/ltx-2.5-audio-vae-bf16.safetensors
+upscaler = none
+```
+
+`text_encoder` takes the same kind of spec as `model`; `vae`,
+`audio_vae` and `upscaler` a path, absolute or relative to `models`.
+`audio_vae = none` makes every clip silent and `upscaler = none` draws
+every clip in one stage. A named `vae` that is not LTX's convolutional
+video VAE is refused at startup. Left out, the largest LTX text encoder
+under `models` is used, and the first of each of the others. All four are
+reported at startup and on `/props` under `video`:
+
+```
+ltxv text encoder …/gemma4-12b-with-proj-ltx-2.5-Q4_K_M.gguf
+ltxv video VAE …/vae/ltx-2.5-video-vae-conv-bf16.safetensors (int8)
+ltxv audio VAE …/vae/ltx-2.5-audio-vae-bf16.safetensors
+ltxv latent upscaler …/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors
+```
+
+A missing audio VAE or upscaler is not an error: the line says so and
+names the `download` that fetches it. A missing text encoder or video VAE
+is.
+
+**`vae_precision` applies to the video VAE too.** Its convolutions are
+requantized to `int8` by default, where the CPU has the tile for it;
+`vae_precision = f32` keeps them as the file has them. The startup line
+names the one in use.
+
+**The video pipeline runs on the CPU.** The transformer is 13 GiB and
+more at the quantizations worth serving, past what a card holds beside
+the text encoder, so the transformer, the VAEs, the upscaler and the file
+encoder run on the CPU whatever `backend` says. The text encoder, which
+reads one prompt a clip, stays on the CPU too under `backend = auto` (an
+explicit `backend` places it as asked), and under `prompt_weights = auto`
+it keeps the file's weights rather than building copies: on a board
+whose GPU shares the RAM, those two would take 20 GB of the memory the
+transformer runs in, to save seconds a clip.
+
+### Two stages
+
+The distilled checkpoint was made for a two-stage recipe, and the server
+runs it whenever the upscaler is there and `video_two_stage` is on:
+
+1. **Stage 1** draws the clip's latent at half its width and height, and
+   the sound's latent, from noise in eight steps on the fixed schedule
+   the model was distilled for, without guidance.
+2. **The upscaler** doubles the video latent's width and height.
+3. **Stage 2** noises both latents back part of the way and refines them
+   at the full size in three more steps.
+
+Width and height must then be multiples of 64, so that half of them is a
+multiple of the model's 32. Without the upscaler, or with
+`video_two_stage = no`, all eight steps run at the full size, and
+multiples of 32 are enough. The decoders then turn the latents into
+frames and a stereo waveform, and the two are written into one MP4.
+
+### The `video` role
+
+A video model is not served in a role you pick: it is always `video`, and
+`--video` is the flag that says so. The rules are the image role's:
+
+- `orangu-server` with a video model given (or a config `model =`) and no
+  role flag comes up in it, and the banner's `Mode` line says `video`.
+- `orangu-server` with no model prompts from the table as usual; picking
+  a video model settles the role, so the role prompt is skipped.
+- `orangu-server --video` greys every row of the table that is not a video
+  model and pre-selects the first one, so Enter is a video generator;
+  picking a greyed row is refused. Every other flag greys the video
+  models: `--image` or `--code` on an `ltxv` model is an error that says
+  so, and so is `--video` on a language model or an image model.
+- Under `--daemon`, the config's `role` key stands in for the flag, with
+  the same rules: `role = code` beside a video `model` is refused, and a
+  missing key is `video`.
+- `bundle` refuses a video model (five files do not fit one bundle) and
+  refuses `--video`.
+
+`--init` follows the same rule. Picking a video model at its `model`
+prompt answers `role: video` on its own, and then asks for every key of
+the video pipeline — `text_encoder`, `vae`, `audio_vae`, `upscaler`,
+`video_size`, `video_seconds`, `video_fps`, `video_audio`,
+`video_two_stage`, `video_quality` — each defaulting to what the server
+does without it. Enter on all of them writes none of them.
+
+### What a request gets
+
+Seven keys set what a clip gets when the request does not say:
+
+| `[orangu-server]` | default | |
+| :-- | :-- | :-- |
+| `video_size` | `768x448` | `WIDTHxHEIGHT` (or one number for a square), both multiples of 32 — a latent pixel — and of 64 when the clip is drawn in two stages. A size that does not fit the stages in use is refused when a clip is asked for |
+| `video_seconds` | `5` | the clip's length, turned into frames at `video_fps` and snapped to the nearest 8k + 1: five seconds at 24 fps is 120 frames, drawn as 121 |
+| `video_frames` | `121` | the length in frames instead, snapped the same way (100 is drawn as 97). Set `video_seconds` or `video_frames`, not both |
+| `video_fps` | `24` | frames per second, a whole number from 1 to 60. The model is trained at 24 |
+| `video_audio` | `yes` | whether the sound is decoded into the file. The model draws it either way; `no`, or no audio VAE, makes a silent clip |
+| `video_two_stage` | `yes` | the two-stage recipe above, when the upscaler is there; `no` draws all eight steps at the full size |
+| `video_quality` | `80` | the AV1 encoder's quantizer, `0` (best) to `255` (smallest file) |
+
+The model draws time in steps of eight frames, plus the first frame on
+its own, which is why a clip has 8k + 1 frames; the caption under a clip
+and the API's answer give the frames actually drawn. The web console
+sends none of these, so for it they _are_ the settings, and
+`/v1/videos` takes every one of them per request.
+
+**The wait is said up front.** At startup the server times one
+transformer block's feed-forward and seeds an estimate of the pipeline's rate from
+it, and the startup log says what a clip at the configured defaults costs
+at that rate:
+
+```
+[video] a clip at the defaults (768x448, 121 frames at 24 fps, two stages, with sound) takes about … here
+```
+
+The estimate counts the steps of each stage, which grow with the clip's
+tokens and, through attention, a little faster than in proportion, plus
+the prompt, the decoders and the file. Every finished clip replaces the
+startup figures with its own measurements, and every request is
+announced with the estimate and counted down as it runs.
+
+**One clip at a time**, and it can be stopped: the console's Stop button,
+a closed tab, `DELETE /v1/videos/{id}` or Ctrl+C on the server ends the
+work at the next transformer block.
+
+### In the web console
+
+Type a prompt and send it: the reply is the clip in the browser's own
+player, with a save control under it that downloads the MP4, and a
+caption with the size, frames, frame rate, length, whether it has sound,
+and the seed. It is kept beside the session at
+`~/.orangu/server/sessions/<uuid>/files/` and comes back on a later visit
+through **History**. While it is made the robot blinks beside the phase
+and a countdown — _Encoding_, _Stage 1 · step 3/11_, _Upscaling_,
+_Stage 2_, _Decoding_, _Sound_, _Encoding the file_ — the server's own
+estimate, corrected at every step.
+
+**Settings › Video** is where the clip's settings live: the size (512 ×
+320 up to 1280 × 704, or any `WIDTHxHEIGHT`), the length in seconds, the
+frame rate (24, 25, 30), sound on or off (greyed without the audio VAE),
+two stages on or off (greyed without the upscaler), and the AV1 quality
+— each with an (i) that explains it on hover, under a line that gives the
+frame count and what a clip at those settings costs on this server, from
+its measured rate. **Save** makes them the server's defaults until it
+restarts, and **Reset** puts the form back to the configuration file's
+values, as on the Image pane. On a model that is not a video model the
+pane holds only a note saying so. The same settings are `GET`/`POST /props` in the _HTTP
+endpoints_ chapter.
+
+The console's attach menu offers no picture to start a clip from: the
+server makes clips from text only.
+
+### Through the API
+
+`POST /v1/videos` is OpenAI's Videos API — `prompt`, `seconds` and
+`size` — plus the knobs above per request (`frames`, `fps`, `seed`,
+`audio`, `two_stage`, `quality`). A clip is minutes of work, so it is a
+job: the request answers at once with a `video` object
+(`status: "queued"`), `GET /v1/videos/{id}` reports its `progress`, its
+`phase` and this server's `eta_seconds`, and `GET /v1/videos/{id}/content`
+returns the MP4 once it is `completed`, with `Range` support so a player
+can seek. `DELETE /v1/videos/{id}` cancels a running clip or drops a
+finished one, and `GET /v1/videos` lists them. `stream: true` keeps the
+connection open and sends progress events until the clip is done. Jobs
+are kept in memory, the last sixteen, and a restart forgets them.
+
+`POST /v1/chat/completions` on a video server takes the last user message
+as the prompt, runs it as a `/v1/videos` job and answers with a markdown
+link to the clip's content, the job itself under `videos`. Both are
+documented field by field in the _HTTP endpoints_ chapter.
+
 ## Model management
 
 **Settings › Models** (the gear in the topbar) is a panel showing the
@@ -4140,7 +4381,7 @@ that apply to all of them.
 ## Scope
 
 Text-in/text-out GGUF chat, completion, and embedding models — and one
-text-to-image model — for seventeen
+text-to-image model and one text-to-video model — for nineteen
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
 _text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way; and

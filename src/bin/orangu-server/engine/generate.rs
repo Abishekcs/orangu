@@ -350,6 +350,11 @@ pub struct Engine {
     /// generation endpoints answer with pictures rather than tokens. `None`
     /// for every language model, which is every other architecture.
     pub image: Option<Arc<super::image::Pipeline>>,
+    /// The LTX-2.5 pipeline, when the served model is an `ltxv` video
+    /// diffusion transformer. Then [`Self::model`] and [`Self::tokenizer`]
+    /// are its text encoder (LTX's Gemma 4), and the generation endpoints
+    /// answer with clips. `None` for every other architecture.
+    pub video: Option<Arc<super::video::Pipeline>>,
     /// A `[workers]` top-level node's two ways of serving: through
     /// its tree, or alone on the model's own paths, switched by `POST
     /// /props`. [`Self::model`], [`Self::mtp`], [`Self::prefix_cache`] and
@@ -7668,6 +7673,7 @@ mod tests {
             reasoning_effort: None,
             live_stats: false,
             image: None,
+            video: None,
             switch: None,
         };
 

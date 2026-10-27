@@ -62,6 +62,7 @@ pub mod tensor;
 pub mod tokenizer;
 pub mod tool_calls;
 pub mod vecdot;
+pub mod video;
 pub mod warm_prefixes;
 
 /// The NPU feed-forward service, if this machine has one holding blocks for

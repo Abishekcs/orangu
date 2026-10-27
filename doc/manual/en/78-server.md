@@ -1299,7 +1299,22 @@ which calls them directly wherever `dotprod` exists, so an `i8mm` core
 checks them too). `have_k_rows_tile`, `have_rowi8_tile` and `have_i8_scores`
 answer yes on such a core; the `Q8_0`-type prompt kernel
 (`dot_flat_pair_sdot`) keeps its sums in four `f32` lanes per row and token
-on every core with `dotprod`, as the `AVX2` one keeps eight.
+on a core with `dotprod` but no `i8mm`, as the `AVX2` one keeps eight.
+
+**The flat types take the tile too.** `Q8_0`, `Q5_0`, `Q4_0`, `IQ4_NL` and
+the Prism ternary types — what `vecdot::supports_flat` covers — run their
+prompts on `smmla` where the core has `i8mm` (`vecdot::dot_flat_rows_tiles`),
+on the K tile's task loop (`CpuBackend::matmul_rows_tiles_into`). The
+activations keep their scale per 32 elements (`vecdot::ActQ8MmFlat`, laid out
+as `ActQ8Mm` is); what this tile cannot borrow is the K tile's `i32`
+accumulation across a super-block, since a flat type's scale is a float per
+32, so each block's 2 × 2 sums go to `f32` at once, `acc += (d_w · d_a) ·
+isum`. It is its portable definition to the bit
+(`flat_tile_is_its_portable_definition_bit_for_bit`). At LTX-2.5's linears
+over 1 344 tokens on the Cortex-A720 board a `Q8_0` matmul went 427 → 175 ms
+(4096 → 16384), 627 → 213 ms (16384 → 4096) and 118 → 45 ms (4096 →
+4096), within 15% of `Q4_K`'s; a 55-token text-encoder prompt's 4096 →
+12288, 15.5 → 8.3 ms. `ORANGU_EXPERT_I8MM=0` turns it off with the K tile.
 
 **A picture's attention scores run on `smmla` too.** Attention is the part
 of a denoising step that grows with the square of the picture: profiled
@@ -2143,9 +2158,10 @@ it as never prompted for and never narrowed by an `x-orangu-role` header,
 and `main::fix_role_for_model` reconciles it at every start with whatever
 was asked — the CLI flag, or under `--daemon` the config's `role` key —
 refusing a conflict in either direction. The startup picker
-(`select_model_interactively`) draws the table in one of three
-`model_spec::Dimming` modes — `ImageModels` under `--image`, `TextModels`
-under any other flag, `Unsupported` with none — from `ModelSupport::image`,
+(`select_model_interactively`) draws the table in one of four
+`model_spec::Dimming` modes — `ImageModels` under `--image`, `VideoModels`
+under `--video`, `TextModels` under any other flag, `Unsupported` with
+none — from `ModelSupport::image` and `ModelSupport::video`,
 and refuses a greyed row; `--init` reads the same column to answer its own
 `role` prompt and to ask the `image_*` keys plus `vae_precision` and
 `image_lora_merge` (`init::ImageKeys`, written only where an answer
@@ -2351,6 +2367,196 @@ convention in `doc/DEVELOPERS.md`): the machine this was written on cannot
 run PyTorch, so the transformer's output has been checked structurally and
 visually rather than to the fifth significant figure. It is the first thing
 to add.
+
+### Video generation (`engine::video`)
+
+An `ltxv` GGUF (LTX-2.5; `unsloth/LTX-2.5-GGUF`) is, like a `qwen_image`
+one, not a `ModelForward`. `loader::ArchFamily::Ltxv` recognises it,
+`read_video_model_config` sizes it, and it is never built as a language
+model (named as a `draft_model`, it is refused). The file holds Lightricks' audio-video diffusion
+transformer and its two text connectors; the rest of the model is four
+companions, which `engine::video::Companions::locate` takes from
+`[orangu-server].text_encoder`, `vae`, `audio_vae` and `upscaler` when
+they are set, and otherwise finds under `models` by their contents
+(`model_spec::find_ltx_text_encoder`, `find_ltx_video_vae`,
+`find_ltx_audio_vae`, `find_ltx_spatial_upscaler`): the encoder by its
+`gemma4` architecture and its `video_aggregate_embed` head, the VAEs and
+the upscaler by their tensor names and shapes. The audio VAE and the
+upscaler are optional (`none` turns them off); the encoder and the video
+VAE are not. `model_download::download_video_companions` fetches all four
+after the transformer, from the transformer's own repository
+(`unsloth/LTX-2.5-GGUF`, not gated). The encoder comes as `bf16`
+safetensors (`model_spec::find_ltx_text_encoder_safetensors`), and
+`Companions::locate` converts it once to a `gemma4` GGUF under
+`<models>/orangu-converted/` (`engine::video::convert`, below) when no GGUF
+of it is there yet.
+
+Its role is `config::Role::Video`, fixed by the model exactly as
+`Role::Image` is: `Role::required_by` names it for `ltxv`,
+`Role::fixed_by_model` covers both, `main::fix_role_for_model` refuses a
+conflict either way, the picker greys rows in `model_spec::
+Dimming::VideoModels` under `--video` (from `ModelSupport::video`), and
+`--init` asks the video keys (`init::VideoKeys`, `prompt_video_keys`).
+`bundle` refuses it before the copy.
+
+The text encoder is the served language model: `main.rs`'s `prepare`
+loads the Gemma 4 GGUF as the `Engine`'s `ModelForward` and tokenizer
+through the ordinary path, so backend selection, placement and the
+footprint report run on it. `engine::video::Pipeline::load` then loads
+everything else from the transformer's file and the companions, on
+`CpuBackend` whatever the encoder was placed on: the transformer is 13 GiB
+and more at the quantizations worth serving, and its convolutions and
+attention are the CPU kernels' anyway. The pipeline keeps its defaults in
+a `RwLock<VideoDefaults>` (`set_defaults` for `POST /props`,
+`configured` for `reset`), runs one clip at a time behind a `Mutex`, and
+keeps a `RateModel` for its estimates.
+
+The modules:
+
+- **`convert`** — the text encoder as published (Hugging Face's
+  `Gemma4UnifiedForConditionalGeneration` in `bf16` safetensors, its
+  `config.json` in the header as `gemma_config` and its `tokenizer.json`
+  embedded as a `U8` tensor) to a GGUF the engine's Gemma 4 loads. It is
+  llama.cpp's own conversion for Gemma 4 (`Gemma4Model` in
+  `convert_hf_to_gguf`): the language model's tensors renamed one for one
+  (`input_layernorm` → `attn_norm`, `pre_feedforward_layernorm` →
+  `ffn_norm`, `layer_scalar` → `layer_output_scale`, …), the vision tower
+  and the multimodal projectors dropped, the projection heads kept under
+  their own names, no shift on the norms (Gemma 4's converter has none),
+  the `gemma4.*` hyperparameters from `text_config`, and a `rope_freqs` of
+  1 for the rotated quarter of a global head's frequency pairs and 1e30
+  for the rest (the global layers' `proportional` rotation with
+  `partial_rotary_factor = 0.25`). The vocabulary's tokens and merges come
+  straight from `tokenizer.json`, every score is −1000, and the types are
+  `LlamaHfVocab`'s: control for an added special token, user-defined for
+  an added ordinary one and for the seven tokens Gemma 4's chat parser
+  must see, byte for `<0x..>`, normal otherwise. Checked against an
+  upstream `gemma-4-12b-it` GGUF, the tokens and merges are identical.
+  Matrices are written `Q6_K` and everything else `f32`, through the
+  shared writer `orangu::gguf_write`, to a `.partial` file that is moved
+  into place only when whole.
+- **`ops`** — the pieces the transformer and the text connectors share: a
+  linear with an optional bias, the parameter-free norms, the gated
+  multi-head attention every block is built from, and LTX's *split*
+  rotary embedding. Activations are row-major `[tokens, width]` `f32`,
+  and the linears go through `Backend::matmul_batch`.
+- **`text`** — how a prompt becomes what the transformer attends to.
+  Gemma 4 reads `<bos>` and the prompt, and *every* layer's hidden state is
+  kept (`all_hidden_states`: the embeddings, each layer's output, the
+  last after the final norm). The feature extractor RMS-normalizes each
+  token's state at each layer, lays a token's layers side by side, and
+  two linear heads from the encoder's file — one for video, one for audio
+  — project that to each stream's width. The connectors from the
+  transformer's file pad the prompt to 1024 tokens with learnable
+  registers, run eight bidirectional blocks with a 1-D rotary position
+  over them, and RMS-normalize the result: all 1024 rows are what the
+  transformer cross-attends to. Gemma runs over the real tokens alone,
+  which gives the same states as the reference's left-padded, masked run,
+  since the real tokens see only each other and rotary attention depends
+  on relative position alone.
+- **`transformer`** — the `ltxv` diffusion transformer: two streams side by
+  side through 48 identical blocks, **video** tokens (one per latent pixel
+  of every latent frame, 4096 wide, 32 heads of 128) and **audio** tokens
+  (one per latent audio frame, 2048 wide, 32 heads of 64). Each block, per
+  stream: self-attention, cross-attention to the prompt, then the two
+  streams meet (audio-to-video and video-to-audio attention, from the
+  streams as they stood before either was added), then a GELU
+  feed-forward, each behind its own AdaLN shift, scale and gate. Every
+  attention has a per-head gate, RMS-normed queries and keys, and the
+  split rotary embedding — video over time in seconds and height and
+  width in pixels, audio over time, the cross-modal attentions over time
+  alone, so a frame and the sound under it line up. The network predicts
+  a velocity; the pipeline turns it into the denoised latent as
+  `x − v · σ`.
+- **`upscaler`** — the latent spatial upscaler, the hinge of the
+  two-stage recipe: a latent at half the clip's width and height in, one
+  at the full size out. It works on un-normalized latents (the video
+  VAE's statistics taken off first and put back after): a 3-D convolution
+  to 512 channels, four residual blocks, a per-frame convolution and a
+  pixel shuffle that doubles rows and columns, four more residual blocks,
+  and a convolution back to 128 channels. Its weights stay `f32`.
+- **`vae`** — the convolutional video VAE decoder: 128 latent channels at
+  an eighth of the frame rate and a thirty-second of the width and height,
+  back to RGB frames. Its shape is read from the file's own metadata
+  (`config.vae.decoder_blocks`): residual stages with the decode
+  timestep's scale and shift, depth-to-space upsamplers that double time,
+  space or both, a final pixel norm and a convolution to 4 × 4 pixels of
+  RGB. Every convolution is 3 × 3 × 3, padded in time by repeating the
+  first and last frame and in space by reflection; the temporal
+  upsamplers drop the first frame they make, which is how `F'` latent
+  frames become `8 (F' − 1) + 1` pixel frames. Activations are
+  channel-last volumes, so a convolution is a matmul over unrolled
+  neighbourhoods as in `engine::image::vae`, and the weights follow
+  `vae_precision` (`conv_matrix`, `row_matrix`): per-row `int8` by
+  default where the CPU has the tile for it, `f32` as stored otherwise.
+- **`audio`** — the sound: the audio VAE's decoder, a 2-D convolutional
+  network over (time, mel bin), causal in time, that turns the audio
+  latent into a stereo mel spectrogram, and the vocoder, BigVGAN v2, that
+  turns the spectrogram into a waveform. From LTX-2.3 on the vocoder is
+  followed by a bandwidth extension: the waveform's own log-mel
+  spectrogram through a second, smaller BigVGAN, added as a residual to
+  the waveform resampled to the output rate. The vocoder runs in `f32`
+  throughout, as the reference does: in `bf16` its chained convolutions
+  lose most of the high end.
+- **`flac`** — a small FLAC encoder for the sound track: 16-bit PCM in
+  frames of 4096 samples, each channel predicted by the best of FLAC's
+  fixed predictors (orders 0 to 4) and its residual Rice-coded. Lossless.
+  Only what the MP4 needs is produced: the `STREAMINFO` block and the
+  frames, one MP4 sample each.
+- **`mp4`** — the file: the frames as **AV1** by `rav1e` (pure Rust, no
+  system codec; `video_quality` is its base quantizer), the sound as FLAC,
+  both in one **MP4** whose `moov` comes before the `mdat`, so a
+  `<video>` element starts playing before the whole file has arrived.
+  Frames are converted to 4:2:0 BT.709 limited-range YUV and tagged so,
+  in the AV1 sequence header and in a `colr` box.
+- **`mod`** — the pipeline, Lightricks' distilled two-stage recipe on the
+  engine's own kernels: the prompt through `text` once per clip; stage 1,
+  the video latent at half the width and height and the audio latent,
+  drawn from noise in eight transformer steps on the fixed distilled
+  schedule (`STAGE_1_SIGMAS`) with the ancestral Euler sampler LTX-2.5 is
+  made for; stage 2, when the upscaler is there, the video latent doubled,
+  both latents noised back to σ = 0.909375 and refined in three more steps
+  (`STAGE_2_SIGMAS`); the decoders; the file. `Plan` is a clip's shape at
+  both stages (frames snapped to 8k + 1 by `snap_frames`, sizes checked
+  against 32 or 64), and `Progress` is what a step reports: `step` of
+  `steps` across both stages, the `phase` running (`encoding`, `stage 1`,
+  `upscaling`, `stage 2`, `decoding`, `sound`, `encoding the file`) and
+  `eta_seconds`.
+
+`RateModel` is the pipeline's estimate of its own speed: a step's cost is
+a part that grows with the video tokens, a part that does not (the
+prompt's keys and values, recomputed every step since they are modulated
+by σ, and the sound), and attention, which grows with the square of the
+tokens; the decoders cost per output pixel and per second of sound. At
+startup it is seeded by timing one block's feed-forward over 256 random
+tokens, and every finished clip replaces the parts it measured. The
+startup log's `[video] a clip at the defaults …` line and every request's
+announcement come from it.
+
+`Pipeline::spawn` runs a clip on a blocking thread and reports
+`VideoEvent`s — progress at every phase and step, then exactly one of the
+clip or an error — over a channel whose reader holds a `CancelOnDrop`;
+the work checks the flag, and the server's shutdown flag, at every
+transformer block. `http::videos` is `/v1/videos`: jobs in memory (the
+last sixteen), each started with `start_job`, and `mp4_response`, which
+serves the bytes with a single `Range`. `http::openai::video_chat` runs a
+chat turn as such a job, and the web console's `send_video_message` runs
+the pipeline directly and keeps the clip as an `.mp4` under the session's
+`files/`, which `web::render` shows as a `<video>` player. All three build
+the request through `http::videos::build_request`, against
+`Pipeline::defaults()`; `http::videos::props_json` is the `video` object
+of `/props` and `/api/props`.
+
+**What is verified, and what is not.** The unit tests pin the pieces to
+the reference's arithmetic: frame snapping, the token positions in
+seconds and pixels, the ancestral step, the plan's size checks, the split
+rotary embedding and the timestep embedding, the feature extractor's
+layer order, the VAE's depth-to-space and unpatchify, the upscaler's pixel
+shuffle, the vocoder's resampling filters, the colour conversion, and the
+FLAC and MP4 writers. An ignored test (`ORANGU_LTXV` naming the transformer)
+runs both connectors and one stage-1 step over the real weights and
+compares its time with the rate model's estimate. As for the images,
+there is no captured-tensor fixture from the reference yet.
 
 ### Constrained decoding (`engine::constraint`, `engine::sampling::Constraint`)
 
@@ -3903,8 +4109,8 @@ already has, not a crashed server.
 ### The startup banner's `Mode` row
 
 `Mode` names which of `--all`/`--code`/`--review`/`--explorer`/`--embedding`/
-`--image` this process came up as (`image` whenever the model is a
-`qwen_image` file, flag or no flag) — the other half of "what will this server do with my
+`--image`/`--video` this process came up as (`image` whenever the model is a
+`qwen_image` file, `video` whenever it is an `ltxv` file, flag or no flag) — the other half of "what will this server do with my
 request", beside `Model`. It decides the sampling defaults, whether reasoning
 is suppressed, and whether the generation endpoints answer at all, and without
 it on the banner the only way to tell a `--review` server from an `--all` one
@@ -4658,9 +4864,10 @@ being watched.
 given: the workspace as an absolute path (a `--daemon` process has since
 moved to `/`) and the role as an explicit flag (it may have been answered at
 an interactive prompt). The flag is the *next* model's role, not this one's
-(`reexec::role_for_model`): a `qwen_image` file is always `--image`
-(`Role::required_by`, `Role::fixed_by_model`), which no language model can
-take — so a handover onto one says `--image` whatever this process is, and
+(`reexec::role_for_model`): a `qwen_image` file is always `--image` and an
+`ltxv` file always `--video` (`Role::required_by`, `Role::fixed_by_model`),
+which no language model can take — so a handover onto one says `--image`
+or `--video` whatever this process is, and
 one off it back onto a language model says `--all`, nobody being at a
 prompt to choose. `--config` is passed only if it was passed to this
 process, so a server that found its config by the default search makes the

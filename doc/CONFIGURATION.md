@@ -192,7 +192,7 @@ Only `models` is required.
 | `model` | No | Model to serve when none is given on the command line: a local path, an `NR`/`MODEL` label, or a `<user>/<model>[:quant]` Hugging Face repo. Required for `--daemon` |
 | `host` | No | Bind address for the API. Defaults to `all` (every interface; `*` is an alias); a literal address such as `127.0.0.1` restricts it |
 | `port` | No | HTTP API port. Defaults to `8100` |
-| `role` | No | Role the server is tuned for: `all`, `code`, `review`, `explorer`, `embedding`, or `image`. Read only under `--daemon`; otherwise the command-line flag (or `all`) decides. An image model is always served as `image` |
+| `role` | No | Role the server is tuned for: `all`, `code`, `review`, `explorer`, `embedding`, `image`, or `video`. Read only under `--daemon`; otherwise the command-line flag (or `all`) decides. An image model is always served as `image`, a video model as `video` |
 | `slots` | No | Concurrent requests, each with its own KV cache. Defaults to `8` for `embedding` and `1` for every other role; must be at least `1` |
 | `queue_limit` | No | Requests allowed to wait for a slot before the server answers `503`. Defaults to `0`, unbounded |
 | `context` | No | Context, in tokens, one request must be able to hold on the device. Unset, every layer goes to the card when it fits and the context is what is left; set, layers move to the host until the card has room for this much KV cache. Must be at least `1` |
@@ -245,6 +245,27 @@ its own.
 | `image_negative_prompt` | No | What a picture is pushed away from. Defaults to a single space |
 | `image_strength` | No | How much of the schedule an attached picture goes through, `0` to `1`. Defaults to `0.6` |
 | `image_format` | No | Format a picture is returned in: `png` (the default), `jpeg`, `gif`, `webp`, or `svg` |
+
+#### Video models
+
+These apply to an `ltxv` model (LTX-2.5). `text_encoder` and `vae` name its
+text encoder and video VAE, and `vae_precision` applies to that VAE too.
+The `video_*` keys are the defaults for a request that does not set its
+own.
+
+| Key | Required | Description |
+| :-- | :-- | :-- |
+| `text_encoder` | No | LTX's Gemma 4 text encoder with its projection heads (a `gemma4` GGUF). Defaults to the largest one found |
+| `vae` | No | LTX's convolutional video VAE (`.safetensors`). Defaults to the first one found |
+| `audio_vae` | No | LTX's audio VAE and vocoder (`.safetensors`). Defaults to the first one found; `none` makes every clip silent |
+| `upscaler` | No | LTX's ×2 latent upscaler (`.safetensors`) for the two-stage recipe. Defaults to the first one found; `none` draws every clip in one stage at its full size |
+| `video_size` | No | Clip size, `WIDTHxHEIGHT` (or one number for a square), both multiples of 32, and of 64 in two stages. Defaults to `768x448` |
+| `video_seconds` | No | Clip length in seconds, snapped to 8k + 1 frames. Defaults to `5` (121 frames at 24 fps). Not together with `video_frames` |
+| `video_frames` | No | Clip length in frames, snapped to 8k + 1. Defaults to `121` |
+| `video_fps` | No | Frames per second, a whole number from `1` to `60`. Defaults to `24` |
+| `video_audio` | No | Put the sound in the file, when the audio VAE is there. Defaults to `yes` |
+| `video_two_stage` | No | The two-stage recipe (half size, upscale, refine), when the upscaler is there. Defaults to `yes` |
+| `video_quality` | No | The AV1 encoder's quantizer, `0` (best) to `255` (smallest file). Defaults to `80` |
 
 #### Logging
 
