@@ -10852,8 +10852,9 @@ mod tests {
 
     /// The tile and the row-pair GEMM it replaces quantize the activations
     /// alike and differ only in the order the blocks' `f32` terms are taken
-    /// in — the budget `flat_gemm_is_bit_identical_to_the_generic_gemm`
-    /// allows.
+    /// in. That rounding is of the terms, not of their sum: where the terms
+    /// cancel it is a large share of a small output, so the budget is a
+    /// share of `sum |w_i * x_i|`.
     #[test]
     fn flat_tile_matches_the_pair_gemm() {
         for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL] {
@@ -10866,9 +10867,28 @@ mod tests {
                         ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens, false,
                     );
                     let pair = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+                    let mut row = UnpackedRow::new();
+                    let mut magnitude = Vec::with_capacity(out_dim * n_tokens);
+                    for o in 0..out_dim {
+                        unpack_row(
+                            ggml_type,
+                            &raw[o * row_bytes..(o + 1) * row_bytes],
+                            in_dim,
+                            &mut row,
+                        );
+                        for t in 0..n_tokens {
+                            let sum: f64 = (0..in_dim)
+                                .map(|e| {
+                                    let w = row.scale[e / ACT_BLOCK] * row.q[e] as f32;
+                                    (w * x[t * in_dim + e]).abs() as f64
+                                })
+                                .sum();
+                            magnitude.push(sum);
+                        }
+                    }
                     for (i, (t, p)) in tile.iter().zip(&pair).enumerate() {
                         assert!(
-                            (t - p).abs() <= 1e-4 * p.abs().max(1.0),
+                            ((t - p).abs() as f64) <= 1e-6 * magnitude[i].max(1.0),
                             "type {ggml_type} in_dim {in_dim} n_tokens {n_tokens} at {i}: \
                              {t} vs {p}"
                         );

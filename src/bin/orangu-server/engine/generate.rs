@@ -5263,6 +5263,12 @@ mod tests {
         /// How long each forward takes, so requests run side by side
         /// overlap.
         pause: Duration,
+        /// No forward past position 0 runs until this many forwards at
+        /// position 0 have: requests started together all hold their
+        /// prompts before any of them decodes, however the threads are
+        /// scheduled.
+        meet: usize,
+        started: AtomicUsize,
     }
 
     impl DeterministicModel {
@@ -5288,6 +5294,8 @@ mod tests {
                 forward_calls: AtomicUsize::new(0),
                 recurrent: false,
                 pause: Duration::ZERO,
+                meet: 0,
+                started: AtomicUsize::new(0),
             }
         }
 
@@ -5375,6 +5383,15 @@ mod tests {
             self.forwarded_tokens
                 .fetch_add(tokens.len(), Ordering::Relaxed);
             self.forward_calls.fetch_add(1, Ordering::Relaxed);
+            if start_pos == 0 {
+                self.started.fetch_add(1, Ordering::AcqRel);
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while self.started.load(Ordering::Acquire) < self.meet && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             std::thread::sleep(self.pause);
             for (i, &t) in tokens.iter().enumerate() {
                 self.absorb(cache, t, start_pos + i);
@@ -5732,7 +5749,10 @@ mod tests {
                 .map(|p| run_request(&make(), &tokenizer, None, p.clone(), ANSWER))
                 .collect();
 
-            let model = make();
+            // Both prompts are in before either decodes, so the two answers
+            // grow side by side however late the second thread starts.
+            let mut model = make();
+            model.meet = prompts.len();
             // Ten pages of four tokens: one request of 29 positions needs
             // eight, two together sixteen.
             const PAGE: usize = 4;
