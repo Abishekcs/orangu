@@ -52,6 +52,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use super::Seqs;
 use super::kda::{BAILINGMOE3_KDA_NAMES, KdaLayer, KdaShape, MlaLayer, MlaShape};
 use super::{
     ExpertGating, ExpertGroups, ExpertRouting, ModelForward, SwigluLimit, SwigluMoe,
@@ -354,12 +355,10 @@ impl BailingMoeModel {
         })
     }
 
-    fn run_layers(
-        &self,
-        cache: &mut KvCache,
-        tokens: &[u32],
-        start_pos: usize,
-    ) -> Result<Vec<f32>> {
+    /// Every layer over `tokens`, to the final norm: one sequence's run, or
+    /// one token for each of a batch's rows, every projection and expert read
+    /// once for all of them and each row's state and keys its own.
+    fn run_layers(&self, seqs: &mut Seqs<'_, '_>, tokens: &[u32]) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
 
@@ -370,7 +369,12 @@ impl BailingMoeModel {
         // for it and `perf/llamacpp/ops.sh` cannot see it at all. That gap
         // is why two rounds of measuring this model's decode could not
         // separate a kernel's time from the host's around it.
-        let _ops = super::OpSpan::open(self.backend.as_ref(), start_pos);
+        let decode = crate::engine::backend::DecodeKernels::for_batch(
+            self.backend.as_ref(),
+            seqs.is_batch(),
+        );
+        let backend: &dyn Backend = &decode;
+        let _ops = super::OpSpan::open(backend, seqs.pos(0));
 
         let mut x = vec![0f32; n_tokens * n_embd];
         {
@@ -410,23 +414,22 @@ impl BailingMoeModel {
             );
             match &layer.attn {
                 Attn::Kda(kda) => kda.forward_into(
-                    self.backend.as_ref(),
+                    backend,
                     &mut attn_out,
                     &mut kda_scratch,
                     &self.kda,
-                    cache,
+                    seqs,
                     &cur,
                     n_tokens,
                 ),
                 Attn::Mla(mla) => mla.forward_into(
-                    self.backend.as_ref(),
+                    backend,
                     &mut attn_out,
                     &mut mla_scratch,
                     &self.mla,
-                    cache,
+                    seqs,
                     &cur,
                     n_tokens,
-                    start_pos,
                 ),
             }
             tensor::add_inplace(&mut x, &attn_out);
@@ -448,7 +451,7 @@ impl BailingMoeModel {
                 Ffn::Dense { gate, up, down } => {
                     crate::engine::dump_ffn_input(il, n_tokens, &cur);
                     super::swiglu_ffn_into(
-                        self.backend.as_ref(),
+                        backend,
                         &mut ffn_out,
                         &mut ffn_scratch,
                         &cur,
@@ -460,7 +463,7 @@ impl BailingMoeModel {
                 }
                 Ffn::Moe(moe) => {
                     ffn_out = super::swiglu_moe_ffn(
-                        self.backend.as_ref(),
+                        backend,
                         &self.routing,
                         &cur,
                         n_tokens,
@@ -536,7 +539,7 @@ impl ModelForward for BailingMoeModel {
         // copy of 0.07: the cost is the device waking, not the kernel and
         // not the readback. See `super::hold_clock_for_step`.
         let _clock = super::hold_clock_for_step(self.backend.as_ref(), tokens.len());
-        let hidden = self.run_layers(cache, tokens, start_pos)?;
+        let hidden = self.run_layers(&mut Seqs::One { cache, start_pos }, tokens)?;
         let n_embd = self.config.n_embd;
         let last = &hidden[(tokens.len() - 1) * n_embd..];
         // **Where the vocabulary projection runs is measured, not inferred
@@ -572,7 +575,43 @@ impl ModelForward for BailingMoeModel {
             "forward_hidden_states called with no tokens"
         );
         let mut cache = self.new_kv_cache(tokens.len());
-        self.run_layers(&mut cache, tokens, 0)
+        self.run_layers(
+            &mut Seqs::One {
+                cache: &mut cache,
+                start_pos: 0,
+            },
+            tokens,
+        )
+    }
+
+    /// Every layer runs on the host's turn of the step, so a batch is the
+    /// same layer loop with each row's state and keys on its own cache.
+    fn batches_decode(&self) -> bool {
+        true
+    }
+
+    /// One decode step for several sequences: every projection and expert
+    /// read once for all the rows, each row's recurrence and attention on
+    /// its own cache, and one vocabulary projection for every row.
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let n_rows = rows.len();
+        if n_rows < 2 || tokens.len() != n_rows {
+            return Ok(None);
+        }
+        let _clock = super::hold_clock_for_step(self.backend.as_ref(), 1);
+        let hidden = self.run_layers(&mut Seqs::Rows(rows), tokens)?;
+        let backend = crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true);
+        crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::Head, || {
+            let flat = backend.matmul(&hidden, n_rows, &self.output_weight);
+            let n_vocab = flat.len() / n_rows;
+            Ok(Some(
+                flat.chunks_exact(n_vocab).map(<[f32]>::to_vec).collect(),
+            ))
+        })
     }
 }
 
@@ -1035,5 +1074,29 @@ mod real_model_tests {
 
         check(&model, &SHORT);
         check(&model, &LONG);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// A batch runs every projection and expert over all of its rows at once
+    /// and a solo step over one, and the recurrence carries the difference.
+    const TOLERANCE: f64 = 4e-2;
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_matches_each_rows_solo_step() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path = std::env::var("ORANGU_TEST_BAILINGMOE_MODEL")
+            .expect("set ORANGU_TEST_BAILINGMOE_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model =
+            BailingMoeModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        super::super::batch_checks::decode_batch_matches_each_rows_solo_step(&model, TOLERANCE);
     }
 }

@@ -2442,6 +2442,17 @@ fn prepare(args: Args) -> Result<Prepared> {
         }
         None => (None, None),
     };
+    // Prompt lookup verifies through the same multi-position forward, so a
+    // model without one drafts nothing rather than failing its first
+    // request that finds a match. A recurrent model is decided per request.
+    if draft.is_none()
+        && engine::generate::speculation_enabled()
+        && !model.new_kv_cache(1).has_recurrent()
+        && let Err(err) = supports_multi_position(model.as_ref(), &architecture)
+    {
+        log::info!("orangu-server: [speculative] prompt lookup off: {err:#}");
+        engine::generate::disable_prompt_lookup();
+    }
 
     let footprint = backend.as_wgpu().map(|wgpu| {
         let mut footprint = engine::footprint::DeviceFootprint::measure(
@@ -2489,6 +2500,35 @@ fn prepare(args: Args) -> Result<Prepared> {
         // report can say plainly what the numbers are.
     }
 
+    // The device's KV budget, before the slot count is settled: every slot
+    // holds its windowed layers' rings whatever its context, so a slot count
+    // whose rings take the whole budget leaves no request any context.
+    let kv_device_budget = kv_device_budget(
+        backend.as_wgpu(),
+        footprint.as_ref(),
+        draft_footprint.as_ref(),
+    );
+    let mut conf = conf;
+    let mut footprint = footprint;
+    let fitted = slots_that_fit(
+        conf.slots,
+        footprint.as_ref().map_or(0, |f| f.kv_fixed_bytes),
+        kv_device_budget,
+    );
+    if fitted < conf.slots {
+        log::warn!(
+            "orangu-server: [kv] {fitted} slot{} rather than {}: each slot's windowed-layer \
+             rings take {} of the device's {} KV budget",
+            if fitted == 1 { "" } else { "s" },
+            conf.slots,
+            orangu::format::format_bytes(footprint.as_ref().map_or(0, |f| f.kv_fixed_bytes)),
+            orangu::format::format_bytes(kv_device_budget.unwrap_or(0)),
+        );
+        conf.slots = fitted;
+        if let Some(footprint) = footprint.as_mut() {
+            footprint.slots = fitted;
+        }
+    }
     let slots = SlotPool::with_queue_limit(conf.slots, conf.queue_limit);
     // Cross-request KV-cache prefix reuse (`engine::prefix_cache`),
     // **off by default; opt in with `ORANGU_PREFIX_CACHE=1`**. Unlike
@@ -2588,48 +2628,7 @@ fn prepare(args: Args) -> Result<Prepared> {
             // host memory and decode unchanged; a pool past the budget has
             // part of the process moved into host memory, read across the
             // bus, and every kernel slows with it.
-            let device_budget = backend.as_wgpu().and_then(|wgpu| {
-                let footprint = footprint.as_ref()?;
-                // A draft model's weights sit on the same card, with the
-                // arena's padding, for the server's life.
-                let draft_weights = draft_footprint
-                    .as_ref()
-                    .map_or(0, |d| d.weights_device_bytes * 105 / 100);
-                let quarter = footprint
-                    .headroom_on(wgpu.device_in_use())
-                    .map(|h| h.saturating_sub(draft_weights) * kv_device_share_percent() / 100)?;
-                // `ORANGU_KV_DEVICE_BUDGET=0` keeps the quarter alone, the
-                // control arm of a sweep.
-                let budget_rule = engine::env::flag_on_unless_disabled("ORANGU_KV_DEVICE_BUDGET");
-                let Some((budget, usage)) = wgpu.device_local_budget().filter(|_| budget_rule)
-                else {
-                    return Some(quarter);
-                };
-                // The weights are placed on first use, so what is held now
-                // is not yet them; the plan, with the arena's padding, is.
-                let planned = footprint.weights_device_bytes * 105 / 100 + draft_weights;
-                let from_budget = kv_pages_from_budget(
-                    budget,
-                    usage,
-                    planned,
-                    footprint.reserved_device_bytes,
-                    kv_pool_scratch_reserve_bytes(),
-                );
-                if from_budget > quarter {
-                    log::info!(
-                        "orangu-server: [kv] device pages sized from the driver's budget: {} of {} \
-                         after {} of weights ({} held now) and {} of reserve",
-                        orangu::format::format_bytes(from_budget),
-                        orangu::format::format_bytes(budget),
-                        orangu::format::format_bytes(planned),
-                        orangu::format::format_bytes(usage),
-                        orangu::format::format_bytes(
-                            footprint.reserved_device_bytes + kv_pool_scratch_reserve_bytes()
-                        ),
-                    );
-                }
-                Some(from_budget.max(quarter))
-            });
+            let device_budget = kv_device_budget;
             // A draft model's cache follows every context the pages hold,
             // row for row, in a mirror of its own: the pages take the
             // served model's share of each token's bytes.
@@ -2707,7 +2706,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                 }
             }
             log::info!(
-                "orangu-server: [kv] paged cache — {} pages of {page_tokens} tokens                  ({} tokens total, {:.2} GiB host), policy {:?}",
+                "orangu-server: [kv] paged cache — {} pages of {page_tokens} tokens ({} tokens total, {:.2} GiB host), policy {:?}",
                 pool.num_pages(),
                 pool.token_capacity(),
                 pool.host_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -2784,7 +2783,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // asked for the pool and did not get one should learn it here, not
         // from a hit rate that never moves.
         log::warn!(
-            "orangu-server: [kv] ORANGU_PAGED_KV is set but the memory budget              does not hold one page; running with per-request caches"
+            "orangu-server: [kv] paged cache on but the memory budget does not hold one page; running with per-request caches"
         );
     }
 
@@ -6030,6 +6029,68 @@ fn download_catalogue_drafter(models: &std::path::Path, spec: &str) -> Result<()
     Ok(())
 }
 
+/// The device bytes a model's KV may take beside its weights: a quarter of
+/// the headroom (`ORANGU_KV_DEVICE_SHARE`), or what the driver's memory
+/// budget leaves after the planned weights, the reserved bytes and the
+/// prefill's scratch where that is more. `None` without a device or a
+/// footprint. See the paged pool's sizing in `serve` for why each part is
+/// there.
+fn kv_device_budget(
+    wgpu: Option<&engine::backend::VulkanBackend>,
+    footprint: Option<&engine::footprint::DeviceFootprint>,
+    draft_footprint: Option<&engine::footprint::DeviceFootprint>,
+) -> Option<u64> {
+    let wgpu = wgpu?;
+    let footprint = footprint?;
+    // A draft model's weights sit on the same card, with the
+    // arena's padding, for the server's life.
+    let draft_weights = draft_footprint.map_or(0, |d| d.weights_device_bytes * 105 / 100);
+    let quarter = footprint
+        .headroom_on(wgpu.device_in_use())
+        .map(|h| h.saturating_sub(draft_weights) * kv_device_share_percent() / 100)?;
+    // `ORANGU_KV_DEVICE_BUDGET=0` keeps the quarter alone, the
+    // control arm of a sweep.
+    let budget_rule = engine::env::flag_on_unless_disabled("ORANGU_KV_DEVICE_BUDGET");
+    let Some((budget, usage)) = wgpu.device_local_budget().filter(|_| budget_rule) else {
+        return Some(quarter);
+    };
+    // The weights are placed on first use, so what is held now
+    // is not yet them; the plan, with the arena's padding, is.
+    let planned = footprint.weights_device_bytes * 105 / 100 + draft_weights;
+    let from_budget = kv_pages_from_budget(
+        budget,
+        usage,
+        planned,
+        footprint.reserved_device_bytes,
+        kv_pool_scratch_reserve_bytes(),
+    );
+    if from_budget > quarter {
+        log::info!(
+            "orangu-server: [kv] device pages sized from the driver's budget: {} of {} \
+             after {} of weights ({} held now) and {} of reserve",
+            orangu::format::format_bytes(from_budget),
+            orangu::format::format_bytes(budget),
+            orangu::format::format_bytes(planned),
+            orangu::format::format_bytes(usage),
+            orangu::format::format_bytes(
+                footprint.reserved_device_bytes + kv_pool_scratch_reserve_bytes()
+            ),
+        );
+    }
+    Some(from_budget.max(quarter))
+}
+
+/// How many of `slots` fit a device whose KV may take `budget` bytes, when
+/// every slot holds `per_slot` bytes of its own whatever its context (the
+/// windowed layers' rings). Their rings may take half the budget, so the
+/// other half is left for context; never fewer than one slot.
+fn slots_that_fit(slots: usize, per_slot: u64, budget: Option<u64>) -> usize {
+    match budget {
+        Some(budget) if per_slot > 0 => slots.min((budget / 2 / per_slot) as usize).max(1),
+        _ => slots,
+    }
+}
+
 fn kv_device_share_percent() -> u64 {
     engine::backend::env_tuning_value(
         "ORANGU_KV_DEVICE_SHARE",
@@ -7097,7 +7158,9 @@ fn is_x86_feature_detected() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListSort, dominant_tensor_types, kv_pages_from_budget, list_order};
+    use super::{
+        ListSort, dominant_tensor_types, kv_pages_from_budget, list_order, slots_that_fit,
+    };
     use crate::engine::quant::{GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
     use clap::Parser;
     use orangu::model_spec::ModelGroup;
@@ -7119,6 +7182,20 @@ mod tests {
         // process's is on the card, and it is not the pages' to take.
         let more = kv_pages_from_budget(budget, 2600 * MIB, planned, reserved, scratch);
         assert_eq!(more, 1090 * MIB);
+    }
+
+    /// A 26B-A4B on a 4 GiB card: four slots' rings (~400 MiB each) were
+    /// more than the whole 649 MiB budget, leaving every request no context.
+    #[test]
+    fn slots_whose_rings_overrun_the_budget_are_cut_to_fit() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(slots_that_fit(4, 402 * MIB, Some(649 * MIB)), 1);
+        assert_eq!(slots_that_fit(4, 100 * MIB, Some(649 * MIB)), 3);
+        assert_eq!(slots_that_fit(4, 10 * MIB, Some(649 * MIB)), 4);
+        // Never none, and nothing to fit without rings or a device.
+        assert_eq!(slots_that_fit(4, 2000 * MIB, Some(649 * MIB)), 1);
+        assert_eq!(slots_that_fit(4, 0, Some(649 * MIB)), 4);
+        assert_eq!(slots_that_fit(4, 402 * MIB, None), 4);
     }
 
     fn listed_group(label: &str, size_bytes: u64) -> ModelGroup {

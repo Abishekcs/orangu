@@ -212,6 +212,137 @@ pub(crate) fn prefers_host_matmul(ops: &[MatmulOp<'_>]) -> bool {
     prefers_host_matmul_with(host_matmul_threshold_bytes(), ops)
 }
 
+/// [`prefers_host_matmul`] for a decode batch, whose rows are sequences:
+/// each sequence's own step would put these weights on the host, so its
+/// row goes there too, however many rows the batch has.
+pub(crate) fn prefers_host_matmul_rows(ops: &[MatmulOp<'_>]) -> bool {
+    let one: Vec<MatmulOp<'_>> = ops
+        .iter()
+        .map(|op| MatmulOp {
+            x: &[],
+            n_tokens: 1,
+            w: op.w,
+        })
+        .collect();
+    prefers_host_matmul(&one)
+}
+
+/// `ORANGU_BATCH_DECODE_KERNELS=1`: a decode batch on the host's layer loop
+/// takes every matmul in its decode form ([`DecodeKernels`]), so each row
+/// is computed as its sequence's own step computes it. Off unless `1`.
+pub(crate) fn batch_decode_kernels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_BATCH_DECODE_KERNELS"))
+}
+
+/// A backend whose every matmul takes its decode form
+/// ([`Backend::matmul_decode`]) when `decode` is set, and is `inner` itself
+/// otherwise: what a decode batch on the host's layer loop hands its layers,
+/// so the rows, one per sequence, take the kernels each sequence's own step
+/// takes. Everything but the matmuls is `inner`'s.
+#[derive(Clone, Copy)]
+pub(crate) struct DecodeKernels<'a> {
+    pub inner: &'a dyn Backend,
+    pub decode: bool,
+}
+
+impl<'a> DecodeKernels<'a> {
+    /// `inner` in its decode form for a decode batch under
+    /// [`batch_decode_kernels`], as it is otherwise.
+    pub(crate) fn for_batch(inner: &'a dyn Backend, batch: bool) -> Self {
+        Self {
+            inner,
+            decode: batch && batch_decode_kernels(),
+        }
+    }
+}
+
+impl Backend for DecodeKernels<'_> {
+    fn has_submission_timeout(&self) -> bool {
+        self.inner.has_submission_timeout()
+    }
+
+    fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        if self.decode {
+            self.inner.matmul_decode(x, n_tokens, w)
+        } else {
+            self.inner.matmul(x, n_tokens, w)
+        }
+    }
+
+    fn matmul_into(&self, out: &mut Vec<f32>, x: &[f32], n_tokens: usize, w: &QuantMatrix) {
+        if self.decode {
+            self.inner.matmul_decode_into(out, x, n_tokens, w)
+        } else {
+            self.inner.matmul_into(out, x, n_tokens, w)
+        }
+    }
+
+    fn matmul_decode_into(&self, out: &mut Vec<f32>, x: &[f32], n_tokens: usize, w: &QuantMatrix) {
+        self.inner.matmul_decode_into(out, x, n_tokens, w)
+    }
+
+    fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        if self.decode {
+            self.inner.matmul_batch_decode(ops)
+        } else {
+            self.inner.matmul_batch(ops)
+        }
+    }
+
+    fn matmul_decode(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        self.inner.matmul_decode(x, n_tokens, w)
+    }
+
+    fn matmul_batch_into(&self, outs: &mut Vec<Vec<f32>>, ops: &[MatmulOp<'_>]) {
+        if self.decode {
+            *outs = self.inner.matmul_batch_decode(ops);
+        } else {
+            self.inner.matmul_batch_into(outs, ops)
+        }
+    }
+
+    fn recycle(&self, buffer: Vec<f32>) {
+        self.inner.recycle(buffer)
+    }
+
+    fn split_device(&self, index: usize) -> Option<&dyn Backend> {
+        self.inner.split_device(index)
+    }
+
+    fn take_scratch(&self, len: usize) -> Vec<f32> {
+        self.inner.take_scratch(len)
+    }
+
+    fn matmul_batch_decode(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        self.inner.matmul_batch_decode(ops)
+    }
+
+    fn reduced_surface(&self) -> Option<&'static str> {
+        self.inner.reduced_surface()
+    }
+
+    fn is_host(&self) -> bool {
+        self.inner.is_host()
+    }
+
+    fn as_wgpu(&self) -> Option<&VulkanBackend> {
+        self.inner.as_wgpu()
+    }
+
+    fn is_cpu(&self) -> bool {
+        self.inner.is_cpu()
+    }
+
+    fn as_wgpu_on(&self, device: usize) -> Option<&VulkanBackend> {
+        self.inner.as_wgpu_on(device)
+    }
+
+    fn supports_type(&self, ggml_type: u32) -> bool {
+        self.inner.supports_type(ggml_type)
+    }
+}
+
 /// The fewest output rows a thread-pool task will take, from
 /// `ORANGU_MATMUL_MIN_ROWS`.
 ///
@@ -1185,6 +1316,57 @@ mod tests {
     /// would put a mixture-of-experts layer's branches on the same pool while
     /// the join still believed they were on different ones, which is the exact
     /// failure the join condition was rewritten to avoid.
+    /// A decode batch's rows through [`DecodeKernels`] come out as each
+    /// row's own one-token product, bit for bit, on the host — whatever the
+    /// multi-token kernel would have made of them — and with `decode` off
+    /// the wrapper is the plain product.
+    #[test]
+    fn decode_kernels_give_each_row_its_own_steps_product() {
+        // Wider than the host's narrow multi-token form, which already
+        // matches a one-token product, so the plain path takes the GEMM.
+        let (in_dim, out_dim, rows) = (512usize, 64usize, 40usize);
+        // Q4_K: per 256 values, f16 `d` and `dmin`, 12 packed scale bytes and
+        // 128 bytes of 4-bit values.
+        let mut bytes = Vec::new();
+        for r in 0..out_dim {
+            for b in 0..in_dim / 256 {
+                bytes
+                    .extend_from_slice(&half::f16::from_f32(0.02 + 0.001 * b as f32).to_le_bytes());
+                bytes.extend_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+                for k in 0..12 {
+                    bytes.push(((r * 5 + b * 11 + k * 7) % 63) as u8);
+                }
+                for k in 0..128 {
+                    bytes.push(((r * 31 + b * 17 + k * 13) % 256) as u8);
+                }
+            }
+        }
+        let w = crate::engine::loader::test_quant_matrix(
+            &bytes,
+            crate::engine::quant::GGML_TYPE_Q4_K,
+            in_dim,
+            out_dim,
+        );
+        let x: Vec<f32> = (0..rows * in_dim)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
+            .collect();
+        let cpu = CpuBackend;
+        let solo: Vec<f32> = x
+            .chunks_exact(in_dim)
+            .flat_map(|row| cpu.matmul(row, 1, &w))
+            .collect();
+        let decode = DecodeKernels {
+            inner: &cpu,
+            decode: true,
+        };
+        assert_eq!(decode.matmul(&x, rows, &w), solo);
+        let plain = DecodeKernels {
+            inner: &cpu,
+            decode: false,
+        };
+        assert_eq!(plain.matmul(&x, rows, &w), cpu.matmul(&x, rows, &w));
+    }
+
     #[test]
     fn the_two_host_matmul_predicates_agree() {
         let w = weight_of_bytes(4096);

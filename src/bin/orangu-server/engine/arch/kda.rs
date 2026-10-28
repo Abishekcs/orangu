@@ -54,8 +54,9 @@
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
+use super::Seqs;
 use crate::engine::backend::Backend;
-use crate::engine::kv_cache::{KvCache, RecurrentSpec};
+use crate::engine::kv_cache::RecurrentSpec;
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, QuantMatrix};
 use crate::engine::tensor::{self, RopeParams};
 
@@ -279,7 +280,7 @@ impl KdaLayer {
         out: &mut Vec<f32>,
         scratch: &mut KdaScratch,
         shape: &KdaShape,
-        cache: &mut KvCache,
+        seqs: &mut Seqs<'_, '_>,
         normed: &[f32],
         n_tokens: usize,
     ) {
@@ -331,7 +332,6 @@ impl KdaLayer {
         // The scan output, before the output projection. Every element is
         // written by the loop below, so `resize` without a `clear`.
         let mut scan = vec![0f32; n_tokens * d_inner];
-        let state = &mut cache.recurrent[self.cache_index];
         // The state update, timed apart from the projections either side of
         // it: it is scalar and sequential by construction, so its elapsed
         // time and its share of the machine are different numbers — which
@@ -340,6 +340,7 @@ impl KdaLayer {
             crate::engine::decode_stages::Stage::RecurrentDelta,
         );
         for t in 0..n_tokens {
+            let state = &mut seqs.cache(t).recurrent[self.cache_index];
             let mut qkv = Vec::with_capacity(3 * d_inner);
             qkv.extend_from_slice(&q[t * d_inner..(t + 1) * d_inner]);
             qkv.extend_from_slice(&k[t * d_inner..(t + 1) * d_inner]);
@@ -773,19 +774,16 @@ impl MlaLayer {
         out: &mut Vec<f32>,
         scratch: &mut MlaScratch,
         shape: &MlaShape,
-        cache: &mut KvCache,
+        seqs: &mut Seqs<'_, '_>,
         normed: &[f32],
         n_tokens: usize,
-        start_pos: usize,
     ) {
         crate::engine::decode_stages::scope(
             crate::engine::decode_stages::Stage::AttnProject,
             || self.project_query_into(backend, scratch, shape, normed, n_tokens),
         );
         crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::Attn, || {
-            self.attend_into(
-                backend, out, scratch, shape, cache, normed, n_tokens, start_pos, None,
-            )
+            self.attend_into(backend, out, scratch, shape, seqs, normed, n_tokens, None)
         });
     }
 
@@ -836,10 +834,9 @@ impl MlaLayer {
         out: &mut Vec<f32>,
         scratch: &mut MlaScratch,
         shape: &MlaShape,
-        cache: &mut KvCache,
+        seqs: &mut Seqs<'_, '_>,
         normed: &[f32],
         n_tokens: usize,
-        start_pos: usize,
         selection: Option<&[Vec<usize>]>,
     ) {
         let n_head = shape.n_head;
@@ -858,7 +855,7 @@ impl MlaLayer {
         let kv = &mut *kv;
 
         for t in 0..n_tokens {
-            let pos = start_pos + t;
+            let pos = seqs.pos(t);
             // The compressed half is normed; the rotary half is roped (or,
             // for a model that rotates nothing, left alone). The two
             // together are one cache row.
@@ -980,7 +977,15 @@ impl MlaLayer {
         // that is gigabytes of `memmove` to produce megabytes of distinct
         // bytes. A sparse selection picks arbitrary rows and keeps the
         // per-token gather below.
-        let dense_keys: Option<Vec<f32>> = selection.is_none().then(|| {
+        // The first token's position: a single sequence's `start_pos`.
+        let start_pos = seqs.pos(0);
+        // A batch's rows each read their own cache, so they take the
+        // per-token gather below over their own causal prefix.
+        let dense_keys: Option<Vec<f32>> = match (&mut *seqs, selection) {
+            (Seqs::One { cache, .. }, None) => Some(&mut **cache),
+            _ => None,
+        }
+        .map(|cache| {
             for t in 0..n_tokens {
                 let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
                 cache.layers[self.cache_index].push(kv_t, kv_t);
@@ -1035,8 +1040,17 @@ impl MlaLayer {
                 Some(all) => &all[..(start_pos + t + 1) * shape.kv_row],
                 None => {
                     let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
+                    let pos = seqs.pos(t);
+                    let cache = seqs.cache(t);
                     cache.layers[self.cache_index].push(kv_t, kv_t);
-                    let chosen: &[usize] = &selection.expect("the sparse path")[t];
+                    let causal: Vec<usize>;
+                    let chosen: &[usize] = match selection {
+                        Some(selection) => &selection[t],
+                        None => {
+                            causal = (0..=pos).collect();
+                            &causal
+                        }
+                    };
                     let mut keys = vec![0f32; chosen.len() * shape.kv_row];
                     {
                         let slot = &cache.layers[self.cache_index];
@@ -1141,6 +1155,334 @@ impl MlaScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::kv_cache::KvCache;
+
+    /// A deterministic `[out, in]` F32 matrix with small distinct values.
+    fn matrix(in_dim: usize, out_dim: usize, seed: f32) -> QuantMatrix {
+        let rows = (0..in_dim * out_dim)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 0.5)
+            .collect();
+        QuantMatrix::from_f32_rows(rows, in_dim, out_dim)
+    }
+
+    fn values(n: usize, seed: f32) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 * 0.61 + seed).cos()).collect()
+    }
+
+    const N_EMBD: usize = 16;
+
+    fn kda() -> (KdaLayer, KdaShape) {
+        let shape = KdaShape {
+            n_head: 2,
+            head_dim: 4,
+            d_inner: 8,
+            d_conv: 3,
+            gate_lower_bound: None,
+            eps: 1e-6,
+            l2_eps: 1e-6,
+        };
+        let d = shape.d_inner;
+        let layer = KdaLayer {
+            wq: matrix(N_EMBD, d, 0.1),
+            wk: matrix(N_EMBD, d, 0.2),
+            wv: matrix(N_EMBD, d, 0.3),
+            conv_kernel: values(3 * d * shape.d_conv, 0.4),
+            f_a: matrix(N_EMBD, shape.head_dim, 0.5),
+            f_b: Some(matrix(shape.head_dim, d, 0.6)),
+            dt_bias: values(d, 0.7),
+            a: vec![0.5, 1.5],
+            beta: matrix(N_EMBD, shape.n_head, 0.8),
+            g: matrix(N_EMBD, d, 0.9),
+            g_b: None,
+            o_norm: values(shape.head_dim, 1.0),
+            wo: matrix(d, N_EMBD, 1.1),
+            cache_index: 0,
+        };
+        (layer, shape)
+    }
+
+    fn mla() -> (MlaLayer, MlaShape) {
+        let shape = MlaShape {
+            n_head: 2,
+            kv_lora_rank: 6,
+            head_k_mla: 4,
+            head_v_mla: 4,
+            kv_row: 6,
+            rope: None,
+            rope_dim: 0,
+            kq_scale: 0.5,
+            eps: 1e-6,
+        };
+        let layer = MlaLayer {
+            q: Query::Plain(matrix(N_EMBD, shape.n_head * shape.head_k_mla, 1.2)),
+            wkv_a_mqa: matrix(N_EMBD, shape.kv_row, 1.3),
+            kv_a_norm: values(shape.kv_lora_rank, 1.4),
+            wk_b: crate::engine::loader::test_expert_matrix(
+                shape.n_head,
+                shape.kv_lora_rank,
+                shape.head_k_mla,
+            ),
+            wv_b: crate::engine::loader::test_expert_matrix(
+                shape.n_head,
+                shape.head_v_mla,
+                shape.kv_lora_rank,
+            ),
+            gate: None,
+            wo: matrix(shape.n_head * shape.head_v_mla, N_EMBD, 1.5),
+            cache_index: 0,
+        };
+        (layer, shape)
+    }
+
+    /// Two sequences of different lengths, each prompted on its own, then
+    /// one more token apiece: as one batch of two rows, and as two solo
+    /// steps on caches prompted the same way. `step` runs the sub-layer.
+    fn batch_against_solo(
+        cache: impl Fn() -> KvCache,
+        step: impl Fn(&mut Seqs<'_, '_>, &[f32], usize) -> Vec<f32>,
+    ) {
+        let lens = [3usize, 5];
+        let prompt = |len: usize, seed: f32| values(len * N_EMBD, seed);
+        let prompted = || -> Vec<KvCache> {
+            lens.iter()
+                .enumerate()
+                .map(|(i, &len)| {
+                    let mut c = cache();
+                    step(
+                        &mut Seqs::One {
+                            cache: &mut c,
+                            start_pos: 0,
+                        },
+                        &prompt(len, i as f32),
+                        len,
+                    );
+                    c
+                })
+                .collect()
+        };
+        let next: Vec<Vec<f32>> = (0..2).map(|i| values(N_EMBD, 5.0 + i as f32)).collect();
+
+        let mut solo_caches = prompted();
+        let solo: Vec<Vec<f32>> = solo_caches
+            .iter_mut()
+            .zip(lens)
+            .zip(&next)
+            .map(|((c, len), x)| {
+                step(
+                    &mut Seqs::One {
+                        cache: c,
+                        start_pos: len,
+                    },
+                    x,
+                    1,
+                )
+            })
+            .collect();
+
+        let mut batch_caches = prompted();
+        let mut rows: Vec<super::super::DecodeRow<'_>> = batch_caches
+            .iter_mut()
+            .zip(lens)
+            .enumerate()
+            .map(|(slot, (cache, pos))| super::super::DecodeRow { cache, pos, slot })
+            .collect();
+        let batch = step(&mut Seqs::Rows(&mut rows), &next.concat(), 2);
+
+        for (r, solo) in solo.iter().enumerate() {
+            let row = &batch[r * N_EMBD..(r + 1) * N_EMBD];
+            for (a, b) in row.iter().zip(solo) {
+                assert!(
+                    (a - b).abs() <= 1e-4 * (1.0 + b.abs()),
+                    "row {r}: {a} against {b}"
+                );
+            }
+        }
+    }
+
+    /// [`batch_against_solo`] with runs: one row brings a token and the
+    /// other a three-token draft, as a verify in a batched step, each
+    /// against its own pass over the same tokens.
+    fn runs_against_solo(
+        cache: impl Fn() -> KvCache,
+        step: impl Fn(&mut Seqs<'_, '_>, &[f32], usize) -> Vec<f32>,
+    ) {
+        let lens = [3usize, 5];
+        let widths = [1usize, 3];
+        let prompted = || -> Vec<KvCache> {
+            lens.iter()
+                .enumerate()
+                .map(|(i, &len)| {
+                    let mut c = cache();
+                    step(
+                        &mut Seqs::One {
+                            cache: &mut c,
+                            start_pos: 0,
+                        },
+                        &values(len * N_EMBD, i as f32),
+                        len,
+                    );
+                    c
+                })
+                .collect()
+        };
+        let next: Vec<Vec<f32>> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| values(w * N_EMBD, 5.0 + i as f32))
+            .collect();
+
+        let mut solo_caches = prompted();
+        let solo: Vec<f32> = solo_caches
+            .iter_mut()
+            .zip(lens)
+            .zip(widths)
+            .zip(&next)
+            .flat_map(|(((c, len), w), x)| {
+                step(
+                    &mut Seqs::One {
+                        cache: c,
+                        start_pos: len,
+                    },
+                    x,
+                    w,
+                )
+            })
+            .collect();
+
+        let mut batch_caches = prompted();
+        let mut rows: Vec<super::super::DecodeRow<'_>> = batch_caches
+            .iter_mut()
+            .zip(lens)
+            .enumerate()
+            .map(|(slot, (cache, pos))| super::super::DecodeRow { cache, pos, slot })
+            .collect();
+        let batch = step(&mut Seqs::runs(&mut rows, &widths), &next.concat(), 4);
+
+        for (i, (a, b)) in batch.iter().zip(&solo).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4 * (1.0 + b.abs()),
+                "token {}: {a} against {b}",
+                i / N_EMBD
+            );
+        }
+    }
+
+    #[test]
+    fn a_kda_batch_with_a_draft_steps_each_rows_state_as_its_own_pass() {
+        let (layer, shape) = kda();
+        runs_against_solo(
+            || KvCache::new_mixed(16, &[], &[shape.recurrent_spec()]),
+            |seqs, x, n| {
+                let mut out = Vec::new();
+                layer.forward_into(
+                    &crate::engine::backend::CpuBackend,
+                    &mut out,
+                    &mut KdaScratch::default(),
+                    &shape,
+                    seqs,
+                    x,
+                    n,
+                );
+                out
+            },
+        );
+    }
+
+    #[test]
+    fn an_mla_batch_with_a_draft_attends_each_rows_own_keys_as_its_own_pass() {
+        let (layer, shape) = mla();
+        runs_against_solo(
+            || KvCache::new_mixed(16, &[shape.kv_row], &[]),
+            |seqs, x, n| {
+                let mut out = Vec::new();
+                layer.forward_into(
+                    &crate::engine::backend::CpuBackend,
+                    &mut out,
+                    &mut MlaScratch::default(),
+                    &shape,
+                    seqs,
+                    x,
+                    n,
+                );
+                out
+            },
+        );
+    }
+
+    #[test]
+    fn a_kda_batch_steps_each_rows_state_as_its_solo_step() {
+        let (layer, shape) = kda();
+        batch_against_solo(
+            || KvCache::new_mixed(16, &[], &[shape.recurrent_spec()]),
+            |seqs, x, n| {
+                let mut out = Vec::new();
+                layer.forward_into(
+                    &crate::engine::backend::CpuBackend,
+                    &mut out,
+                    &mut KdaScratch::default(),
+                    &shape,
+                    seqs,
+                    x,
+                    n,
+                );
+                out
+            },
+        );
+    }
+
+    #[test]
+    fn an_mla_batch_attends_each_rows_own_keys_as_its_solo_step() {
+        let (layer, shape) = mla();
+        batch_against_solo(
+            || KvCache::new_mixed(16, &[shape.kv_row], &[]),
+            |seqs, x, n| {
+                let mut out = Vec::new();
+                layer.forward_into(
+                    &crate::engine::backend::CpuBackend,
+                    &mut out,
+                    &mut MlaScratch::default(),
+                    &shape,
+                    seqs,
+                    x,
+                    n,
+                );
+                out
+            },
+        );
+    }
+
+    /// The sparse form a lightning indexer drives: every token attends the
+    /// even positions before it and itself.
+    #[test]
+    fn a_sparse_mla_batch_attends_each_rows_own_selection_as_its_solo_step() {
+        let (layer, shape) = mla();
+        batch_against_solo(
+            || KvCache::new_mixed(16, &[shape.kv_row], &[]),
+            |seqs, x, n| {
+                let selection: Vec<Vec<usize>> = (0..n)
+                    .map(|t| {
+                        let pos = seqs.pos(t);
+                        (0..pos).filter(|p| p % 2 == 0).chain([pos]).collect()
+                    })
+                    .collect();
+                let mut out = Vec::new();
+                let mut scratch = MlaScratch::default();
+                let backend = crate::engine::backend::CpuBackend;
+                layer.project_query_into(&backend, &mut scratch, &shape, x, n);
+                layer.attend_into(
+                    &backend,
+                    &mut out,
+                    &mut scratch,
+                    &shape,
+                    seqs,
+                    x,
+                    n,
+                    Some(&selection),
+                );
+                out
+            },
+        );
+    }
 
     /// The per-head gate and the per-dimension gate must be told apart by
     /// the tensor's width, not by the architecture — `bailingmoe3` ships

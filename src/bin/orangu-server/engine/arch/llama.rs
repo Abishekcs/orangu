@@ -1535,6 +1535,10 @@ impl LlamaModel {
             ffn_up: dense.1,
             ffn_down: dense.2,
             activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
+            attn_gate: None,
+            attn_post_norm: None,
+            ffn_post_norm: None,
+            post_norm_eps: None,
         }
     }
 
@@ -2388,6 +2392,10 @@ impl ModelForward for LlamaModel {
     fn new_kv_cache(&self, capacity: usize) -> KvCache {
         let kv_dim = self.config.n_head_kv * self.head_dim();
         KvCache::new(self.config.n_layer, capacity, kv_dim)
+    }
+
+    fn batches_decode(&self) -> bool {
+        self.backend.as_wgpu().is_some() && !self.tail_on_host() && self.resident_prefill_serves(2)
     }
 
     fn forward_decode_batch(
@@ -3521,6 +3529,40 @@ mod real_model_tests {
         assert!(
             cosine > 0.99,
             "cosine similarity to real llama.cpp's embedding was only {cosine}, expected > 0.99"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn model() -> Option<LlamaModel> {
+        let vulkan = crate::engine::backend::vulkan::VulkanBackend::try_init()?;
+        let path = std::env::var("ORANGU_TEST_LLAMA_MODEL").expect("set ORANGU_TEST_LLAMA_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        Some(LlamaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model"))
+    }
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_matches_each_rows_solo_step() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        super::super::batch_checks::decode_batch_matches_each_rows_solo_step(&model, 3.5e-3);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_verifies_a_draft_as_its_own_pass_would() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        super::super::batch_checks::decode_batch_verifies_a_draft_as_its_own_pass_would(
+            &model, 3.5e-3,
         );
     }
 }

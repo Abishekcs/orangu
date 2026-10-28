@@ -276,7 +276,8 @@ impl Indexer {
     /// pooling gate to cache beside it.
     ///
     /// `qr` is the attention query's own LoRA intermediate, which the
-    /// indexer query is projected from; `normed` is the layer input.
+    /// indexer query is projected from; `normed` is the layer input;
+    /// `pos_of(t)` is token `t`'s position.
     pub(crate) fn inputs(
         &self,
         backend: &dyn Backend,
@@ -284,7 +285,7 @@ impl Indexer {
         qr: &[f32],
         normed: &[f32],
         n_tokens: usize,
-        start_pos: usize,
+        pos_of: &dyn Fn(usize) -> usize,
     ) -> IndexerInputs {
         let dim = shape.head_size;
         let mut q = backend.matmul(qr, n_tokens, &self.q_b);
@@ -296,7 +297,7 @@ impl Indexer {
         if let Some(rope) = &shape.rope {
             let rope_dim = shape.rope_dim;
             for t in 0..n_tokens {
-                let pos = start_pos + t;
+                let pos = pos_of(t);
                 // Unlike the main attention, the indexer's rotary
                 // dimensions are the *leading* ones of each head.
                 let q_t = &mut q[t * shape.n_head * dim..(t + 1) * shape.n_head * dim];

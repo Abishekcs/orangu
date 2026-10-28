@@ -702,9 +702,15 @@ impl Qwen4ExpModel {
     }
 
     /// [`hc_mix`] against this model's own dimensions.
-    fn hc_mix(&self, mixer: &HcMixer, x: &[f32], n_tokens: usize) -> (Vec<f32>, Option<Vec<f32>>) {
+    fn hc_mix(
+        &self,
+        backend: &dyn Backend,
+        mixer: &HcMixer,
+        x: &[f32],
+        n_tokens: usize,
+    ) -> (Vec<f32>, Option<Vec<f32>>) {
         hc_mix(
-            self.backend.as_ref(),
+            backend,
             self.dims.n_embd,
             self.hc,
             self.dims.rms_eps,
@@ -810,6 +816,7 @@ impl Qwen4ExpModel {
     /// be before any of its queries can score the block they complete.
     fn indexer_selection(
         &self,
+        backend: &dyn Backend,
         indexer: &Indexer,
         cache: &mut KvCache,
         cur: &[f32],
@@ -823,7 +830,7 @@ impl Qwen4ExpModel {
         let rope_dim = self.dims.rope_dim;
         let rope_base = self.dims.rope_freq_base;
 
-        let keys = self.backend.matmul(cur, n_tokens, &indexer.k_proj);
+        let keys = backend.matmul(cur, n_tokens, &indexer.k_proj);
         {
             let slot = &mut cache.layers[indexer.cache_index];
             for t in 0..n_tokens {
@@ -866,7 +873,7 @@ impl Qwen4ExpModel {
             tensor::rope_apply_inplace(dst, 1, dim, rope_dim, b * ratio, rope_base);
         });
 
-        let mut queries = self.backend.matmul(cur, n_tokens, &indexer.q_proj);
+        let mut queries = backend.matmul(cur, n_tokens, &indexer.q_proj);
         tensor::rmsnorm_inplace(&mut queries, &indexer.q_norm, n_tokens * n_head, dim, eps);
         for t in 0..n_tokens {
             tensor::rope_apply_inplace(
@@ -914,6 +921,7 @@ impl Qwen4ExpModel {
     /// causal convolution over the result, and adds both back.
     fn forward_ple(
         &self,
+        backend: &dyn Backend,
         ple: &Ple,
         layer: &PleLayer,
         cache: &mut KvCache,
@@ -929,9 +937,8 @@ impl Qwen4ExpModel {
         let rows = ple.hash.rows(tokens, &cache.recent_tokens);
         let embd = ple.gather(&rows, n_tokens);
 
-        let key = super::matmul_host_fallback(self.backend.as_ref(), &embd, n_tokens, &layer.key);
-        let value =
-            super::matmul_host_fallback(self.backend.as_ref(), &embd, n_tokens, &layer.value);
+        let key = super::matmul_host_fallback(backend, &embd, n_tokens, &layer.key);
+        let value = super::matmul_host_fallback(backend, &embd, n_tokens, &layer.value);
 
         // Both norms are grouped over one stream with a gamma spanning all
         // of them, exactly as in `hc_mix`.
@@ -999,10 +1006,10 @@ impl ModelForward for Qwen4ExpModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<f32>> {
-        let x = self.trunk(cache, tokens, start_pos)?;
-        Ok(self.last_logits(&x, tokens.len()))
+        let x = self.trunk(cache, tokens, start_pos, slot_id)?;
+        Ok(self.last_logits(self.backend.as_ref(), &x, tokens.len()))
     }
 
     /// The trunk's own multi-position path — the whole of [`Self::forward`]
@@ -1013,10 +1020,34 @@ impl ModelForward for Qwen4ExpModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<Vec<f32>>> {
-        let x = self.trunk(cache, tokens, start_pos)?;
-        Ok(self.all_logits(&x, tokens.len()))
+        let x = self.trunk(cache, tokens, start_pos, slot_id)?;
+        Ok(self.all_logits(self.backend.as_ref(), &x, tokens.len()))
+    }
+
+    /// Every layer's FFN runs on the host's turn of the step, so a batch is
+    /// the host layer loop with each row's mixers on its own cache.
+    fn batches_decode(&self) -> bool {
+        true
+    }
+
+    /// One decode step for several sequences ([`Self::trunk_rows`]) and one
+    /// vocabulary projection for every row.
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        if rows.len() < 2 || tokens.len() != rows.len() {
+            return Ok(None);
+        }
+        let x = self.trunk_rows(rows, tokens)?;
+        Ok(Some(self.all_logits(
+            &crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true),
+            &x,
+            tokens.len(),
+        )))
     }
 
     fn mtp_state_width(&self) -> Option<usize> {
@@ -1028,10 +1059,10 @@ impl ModelForward for Qwen4ExpModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let x = self.trunk(cache, tokens, start_pos)?;
-        let logits = self.last_logits(&x, tokens.len());
+        let x = self.trunk(cache, tokens, start_pos, slot_id)?;
+        let logits = self.last_logits(self.backend.as_ref(), &x, tokens.len());
         Ok((logits, x))
     }
 
@@ -1040,10 +1071,10 @@ impl ModelForward for Qwen4ExpModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
-        let x = self.trunk(cache, tokens, start_pos)?;
-        let logits = self.all_logits(&x, tokens.len());
+        let x = self.trunk(cache, tokens, start_pos, slot_id)?;
+        let logits = self.all_logits(self.backend.as_ref(), &x, tokens.len());
         Ok((logits, x))
     }
 
@@ -1074,8 +1105,15 @@ impl Qwen4ExpModel {
     /// this architecture, so the wide residual leaving the last block is the
     /// model's last un-collapsed state and the row an MTP head is trained
     /// against — see [`super::qwen4exp_mtp`].
-    fn trunk(&self, cache: &mut KvCache, tokens: &[u32], start_pos: usize) -> Result<Vec<f32>> {
+    fn trunk(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot: usize,
+    ) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
+        let backend = self.backend.as_ref();
         let n_embd = self.dims.n_embd;
         let hc = self.hc;
         let hc_dim = hc * n_embd;
@@ -1098,43 +1136,43 @@ impl Qwen4ExpModel {
 
         for (il, layer) in self.layers.iter().enumerate() {
             if let (Some(ple), Some(layer_ple)) = (self.ple.as_ref(), layer.ple.as_ref()) {
-                self.forward_ple(ple, layer_ple, cache, &mut x, tokens);
+                self.forward_ple(backend, ple, layer_ple, cache, &mut x, tokens);
             }
 
-            let (cur, inject) = self.hc_mix(&layer.hc_attn, &x, n_tokens);
+            let (cur, inject) = self.hc_mix(backend, &layer.hc_attn, &x, n_tokens);
             let inject = inject.expect("a per-layer mixer always carries its injection weights");
             let sub_out = match &layer.mixer {
                 Mixer::FullAttn { attn, indexer } => {
                     let selection =
-                        self.indexer_selection(indexer, cache, &cur, n_tokens, start_pos);
+                        self.indexer_selection(backend, indexer, cache, &cur, n_tokens, start_pos);
                     attn.forward(
-                        self.backend.as_ref(),
+                        backend,
                         &self.dims,
                         cache,
                         &cur,
                         n_tokens,
                         start_pos,
                         selection.as_deref(),
+                        slot,
                     )
                 }
                 Mixer::Recurrent(recurrent) => recurrent.forward(
-                    self.backend.as_ref(),
+                    backend,
                     &self.dims,
                     cache,
                     &cur,
                     n_tokens,
                     OutputGate::Sigmoid,
+                    slot,
                 ),
             };
             self.hc_combine(&mut x, &sub_out, &inject, n_tokens);
 
-            let (cur, inject) = self.hc_mix(&layer.hc_ffn, &x, n_tokens);
+            let (cur, inject) = self.hc_mix(backend, &layer.hc_ffn, &x, n_tokens);
             let inject = inject.expect("a per-layer mixer always carries its injection weights");
             let ffn_out = {
                 use qwen_hybrid::HybridFfn as _;
-                layer
-                    .ffn
-                    .forward(self.backend.as_ref(), n_embd, &cur, n_tokens, il)
+                layer.ffn.forward(backend, n_embd, &cur, n_tokens, il)
             };
             self.hc_combine(&mut x, &ffn_out, &inject, n_tokens);
         }
@@ -1147,23 +1185,111 @@ impl Qwen4ExpModel {
         Ok(x)
     }
 
+    /// [`Self::trunk`] for one token in each of a batch's rows: each row's
+    /// embedding injection, indexer and attention or recurrent mixer on its
+    /// own cache and slot as its solo step would, and each layer's stream
+    /// mixes and FFN once over every row.
+    fn trunk_rows(&self, rows: &mut [super::DecodeRow<'_>], tokens: &[u32]) -> Result<Vec<f32>> {
+        let n_rows = rows.len();
+        let decode = crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true);
+        let backend: &dyn Backend = &decode;
+        let n_embd = self.dims.n_embd;
+        let hc_dim = self.hc * n_embd;
+
+        let mut x = vec![0f32; n_rows * hc_dim];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            anyhow::ensure!(
+                tok < self.config.n_vocab,
+                "token id {tok} is out of vocab range"
+            );
+            let embd = self.tok_embeddings.row(tok);
+            for c in 0..self.hc {
+                let at = (t * self.hc + c) * n_embd;
+                x[at..at + n_embd].copy_from_slice(&embd);
+            }
+        }
+
+        for (il, layer) in self.layers.iter().enumerate() {
+            if let (Some(ple), Some(layer_ple)) = (self.ple.as_ref(), layer.ple.as_ref()) {
+                for ((row, x), tok) in rows.iter_mut().zip(x.chunks_exact_mut(hc_dim)).zip(tokens) {
+                    self.forward_ple(
+                        backend,
+                        ple,
+                        layer_ple,
+                        row.cache,
+                        x,
+                        std::slice::from_ref(tok),
+                    );
+                }
+            }
+
+            let (cur, inject) = self.hc_mix(backend, &layer.hc_attn, &x, n_rows);
+            let inject = inject.expect("a per-layer mixer always carries its injection weights");
+            let mut sub_out = Vec::with_capacity(n_rows * n_embd);
+            for (row, cur) in rows.iter_mut().zip(cur.chunks_exact(n_embd)) {
+                sub_out.extend(match &layer.mixer {
+                    Mixer::FullAttn { attn, indexer } => {
+                        let selection =
+                            self.indexer_selection(backend, indexer, row.cache, cur, 1, row.pos);
+                        attn.forward(
+                            backend,
+                            &self.dims,
+                            row.cache,
+                            cur,
+                            1,
+                            row.pos,
+                            selection.as_deref(),
+                            row.slot,
+                        )
+                    }
+                    Mixer::Recurrent(recurrent) => recurrent.forward(
+                        backend,
+                        &self.dims,
+                        row.cache,
+                        cur,
+                        1,
+                        OutputGate::Sigmoid,
+                        row.slot,
+                    ),
+                });
+            }
+            self.hc_combine(&mut x, &sub_out, &inject, n_rows);
+
+            let (cur, inject) = self.hc_mix(backend, &layer.hc_ffn, &x, n_rows);
+            let inject = inject.expect("a per-layer mixer always carries its injection weights");
+            let ffn_out = {
+                use qwen_hybrid::HybridFfn as _;
+                layer.ffn.forward(backend, n_embd, &cur, n_rows, il)
+            };
+            self.hc_combine(&mut x, &ffn_out, &inject, n_rows);
+        }
+
+        if let Some(ple) = self.ple.as_ref() {
+            for (row, &tok) in rows.iter_mut().zip(tokens) {
+                row.cache.push_recent_token(tok, ple.hash.lookback());
+            }
+        }
+        Ok(x)
+    }
+
     /// The last position's logits from the trunk's output.
     ///
     /// The head mixer is per token, so only that token's streams are
     /// collapsed — a prefill chunk of hundreds of positions would otherwise
     /// pay a `[n_vocab]` projection per position for one row anybody reads.
-    fn last_logits(&self, x: &[f32], n_tokens: usize) -> Vec<f32> {
+    fn last_logits(&self, backend: &dyn Backend, x: &[f32], n_tokens: usize) -> Vec<f32> {
         let hc_dim = self.hc * self.dims.n_embd;
         let last = &x[(n_tokens - 1) * hc_dim..];
-        let (out, _) = self.hc_mix(&self.head, last, 1);
-        self.backend.matmul(&out, 1, &self.output_weight)
+        let (out, _) = self.hc_mix(backend, &self.head, last, 1);
+        backend.matmul(&out, 1, &self.output_weight)
     }
 
     /// Every position's logits, one row per input token — what speculative
     /// decoding's verify step checks each drafted token against.
-    fn all_logits(&self, x: &[f32], n_tokens: usize) -> Vec<Vec<f32>> {
-        let (out, _) = self.hc_mix(&self.head, x, n_tokens);
-        let logits = self.backend.matmul(&out, n_tokens, &self.output_weight);
+    fn all_logits(&self, backend: &dyn Backend, x: &[f32], n_tokens: usize) -> Vec<Vec<f32>> {
+        let (out, _) = self.hc_mix(backend, &self.head, x, n_tokens);
+        let logits = backend.matmul(&out, n_tokens, &self.output_weight);
         logits
             .chunks(self.config.n_vocab)
             .map(<[f32]>::to_vec)

@@ -73,14 +73,85 @@ impl ModelForward for Qwen35Model {
         self.trunk.new_kv_cache(capacity)
     }
 
+    fn batches_decode(&self) -> bool {
+        self.trunk.batches_decode()
+    }
+
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        Ok(self
+            .trunk
+            .decode_batch(rows, &[], tokens, None)?
+            .map(|outcomes| {
+                outcomes
+                    .into_iter()
+                    .map(|outcome| match outcome {
+                        super::ForwardOutcome::Logits(logits) => logits,
+                        _ => unreachable!("a batch asked for no sampling returns logits"),
+                    })
+                    .collect()
+            }))
+    }
+
+    fn forward_decode_batch_sampling(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+        samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        self.trunk.decode_batch(rows, &[], tokens, Some(samples))
+    }
+
+    fn batches_verify(&self) -> bool {
+        super::batch_verify() && self.trunk.verifies_on_device()
+    }
+
+    fn forward_decode_batch_verify(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[&[u32]],
+        samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<Vec<super::ForwardOutcome>>>> {
+        if !self.batches_verify() || tokens.len() != rows.len() || samples.len() != rows.len() {
+            return Ok(None);
+        }
+        let widths: Vec<usize> = tokens.iter().map(|t| t.len()).collect();
+        let flat: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
+        // A verifying row's tokens all come back as logits.
+        let row_samples: Vec<Option<super::GreedySampleParams<'_>>> = samples
+            .iter()
+            .zip(&widths)
+            .flat_map(|(sample, &w)| {
+                let one = if w == 1 { *sample } else { None };
+                std::iter::once(one).chain(std::iter::repeat_n(None, w - 1))
+            })
+            .collect();
+        let Some(outcomes) = self
+            .trunk
+            .decode_batch(rows, &widths, &flat, Some(&row_samples))?
+        else {
+            return Ok(None);
+        };
+        let mut outcomes = outcomes.into_iter();
+        Ok(Some(
+            widths
+                .iter()
+                .map(|&w| outcomes.by_ref().take(w).collect())
+                .collect(),
+        ))
+    }
+
     fn forward(
         &self,
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<f32>> {
-        self.trunk.forward(cache, tokens, start_pos)
+        self.trunk.forward(cache, tokens, start_pos, slot_id)
     }
 
     fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
@@ -117,7 +188,7 @@ impl ModelForward for Qwen35Model {
         start_pos: usize,
     ) -> Result<Vec<f32>> {
         self.trunk
-            .forward_range(cache, hidden, tokens.len(), start_pos, layers)
+            .forward_range(cache, hidden, tokens.len(), start_pos, layers, 0)
     }
 
     fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
@@ -136,9 +207,10 @@ impl ModelForward for Qwen35Model {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<Vec<f32>>> {
-        self.trunk.forward_all_logits(cache, tokens, start_pos)
+        self.trunk
+            .forward_all_logits(cache, tokens, start_pos, slot_id)
     }
 }
 
@@ -346,5 +418,48 @@ mod real_model_tests {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .unwrap();
         assert_eq!(top_id, 11751, "expected ' Paris' (11751) as top prediction");
+    }
+}
+
+/// The batched decode and verify against this model's own solo path, on a
+/// real file and the GPU (`ORANGU_TEST_DEVICE` picks the adapter):
+/// `ORANGU_TEST_QWEN35_MODEL=/path/to/Ornith-1.5-9B-Q4_K_M.gguf cargo test --release --bin orangu-server
+/// qwen35::batch_tests -- --ignored`.
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// The bound `a_verify_on_the_device_steps_as_the_token_loop_does`
+    /// holds the rows path to: a batch's rows take the GEMM kernels and a
+    /// solo step the decode ones, and the recurrence carries the difference.
+    const TOLERANCE: f64 = 4e-2;
+
+    fn model() -> Option<Qwen35Model> {
+        let vulkan = crate::engine::backend::vulkan::VulkanBackend::try_init()?;
+        let path = std::env::var("ORANGU_TEST_QWEN35_MODEL").expect("set ORANGU_TEST_QWEN35_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        Some(Qwen35Model::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model"))
+    }
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_matches_each_rows_solo_step() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        super::super::batch_checks::decode_batch_matches_each_rows_solo_step(&model, TOLERANCE);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_verifies_a_draft_as_its_own_pass_would() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        super::super::batch_checks::decode_batch_verifies_a_draft_as_its_own_pass_would(
+            &model, TOLERANCE,
+        );
     }
 }

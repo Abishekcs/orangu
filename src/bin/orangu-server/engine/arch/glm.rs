@@ -639,7 +639,7 @@ impl GlmModel {
                 qr,
                 normed,
                 n_tokens,
-                start_pos,
+                &|t| start_pos + t,
             )
         });
 

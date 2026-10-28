@@ -70,7 +70,8 @@ use std::sync::Arc;
 use super::hyper::{HyperConnection, HyperScratch, HyperShape};
 use super::indexer::pool_block;
 use super::{
-    ExpertGating, ExpertRouting, ModelForward, SwigluLimit, attend, rms_norm_rows, top_k_indices,
+    ExpertGating, ExpertRouting, ModelForward, Seqs, SwigluLimit, attend, rms_norm_rows,
+    top_k_indices,
 };
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::KvCache;
@@ -589,12 +590,10 @@ impl Deepseek4Model {
     /// Runs `tokens` through every layer, returning each token's final
     /// hidden state (`[n_tokens, n_embd]`, collapsed out of the four
     /// residual streams and normed — what the output projection consumes).
-    fn run_layers(
-        &self,
-        cache: &mut KvCache,
-        tokens: &[u32],
-        start_pos: usize,
-    ) -> Result<Vec<f32>> {
+    /// Every layer over `tokens`, to the final norm: one sequence's run, or
+    /// one token for each of a batch's rows, every projection and expert read
+    /// once for all of them and each row's keys its own.
+    fn run_layers(&self, seqs: &mut Seqs<'_, '_>, tokens: &[u32]) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
         let eps = self.config.rms_eps;
@@ -613,14 +612,19 @@ impl Deepseek4Model {
         // Grown once and reused by every layer rather than allocated per
         // half-layer. `flat` is the big one: `hc` times the hidden state.
         let mut scratch = LayerScratch::default();
+        let decode = crate::engine::backend::DecodeKernels::for_batch(
+            self.backend.as_ref(),
+            seqs.is_batch(),
+        );
+        let backend: &dyn Backend = &decode;
 
         for layer in &self.layers {
-            self.forward_layer(layer, cache, &mut x, tokens, start_pos, &mut scratch)?;
+            self.forward_layer(backend, layer, seqs, &mut x, tokens, &mut scratch)?;
         }
 
         let mut out = Vec::new();
         self.hyper.collapse_into(
-            self.backend.as_ref(),
+            backend,
             &mut out,
             &self.hc_head,
             &x,
@@ -635,11 +639,11 @@ impl Deepseek4Model {
 
     fn forward_layer(
         &self,
+        backend: &dyn Backend,
         layer: &Deepseek4Layer,
-        cache: &mut KvCache,
+        seqs: &mut Seqs<'_, '_>,
         x: &mut [f32],
         tokens: &[u32],
-        start_pos: usize,
         scratch: &mut LayerScratch,
     ) -> Result<()> {
         let n_tokens = tokens.len();
@@ -659,7 +663,6 @@ impl Deepseek4Model {
                 },
             attn: attn_scratch,
         } = scratch;
-        let backend = self.backend.as_ref();
 
         // A genuine copy, unlike the norm inputs: the out-mix writes `x`
         // while still reading the streams as they were before this
@@ -678,7 +681,7 @@ impl Deepseek4Model {
         );
         let cur = collapsed_attn;
         tensor::rmsnorm_inplace(cur, &layer.attn_norm, n_tokens, n_embd, eps);
-        let attn = self.attention(layer, cache, attn_scratch, cur, n_tokens, start_pos)?;
+        let attn = self.attention(backend, layer, seqs, attn_scratch, cur, n_tokens)?;
         self.hyper.expand(x, &attn, residual, post, comb, n_tokens);
 
         residual.clear();
@@ -695,7 +698,7 @@ impl Deepseek4Model {
         );
         let cur = collapsed_ffn;
         tensor::rmsnorm_inplace(cur, &layer.ffn.norm, n_tokens, n_embd, eps);
-        let ffn = self.moe_ffn(&layer.ffn, cur, tokens);
+        let ffn = self.moe_ffn(backend, &layer.ffn, cur, tokens);
         self.hyper.expand(x, &ffn, residual, post, comb, n_tokens);
         Ok(())
     }
@@ -707,12 +710,12 @@ impl Deepseek4Model {
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
+        backend: &dyn Backend,
         layer: &Deepseek4Layer,
-        cache: &mut KvCache,
+        seqs: &mut Seqs<'_, '_>,
         scratch: &mut AttnScratch,
         cur: &[f32],
         n_tokens: usize,
-        start_pos: usize,
     ) -> Result<Vec<f32>> {
         let n_embd = self.config.n_embd;
         let eps = self.config.rms_eps;
@@ -732,16 +735,16 @@ impl Deepseek4Model {
             projected,
             out: out_buf,
         } = scratch;
-        self.backend.matmul_into(qr, cur, n_tokens, &layer.wq_a);
+        backend.matmul_into(qr, cur, n_tokens, &layer.wq_a);
         tensor::rmsnorm_inplace(qr, &layer.attn_q_a_norm, n_tokens, self.q_lora_rank, eps);
         let qr = &*qr;
-        self.backend.matmul_into(q, qr, n_tokens, &layer.wq_b);
+        backend.matmul_into(q, qr, n_tokens, &layer.wq_b);
         rms_norm_rows(q, head_dim, eps);
-        self.backend.matmul_into(kv, cur, n_tokens, &layer.wkv);
+        backend.matmul_into(kv, cur, n_tokens, &layer.wkv);
         tensor::rmsnorm_inplace(kv, &layer.attn_kv_norm, n_tokens, head_dim, eps);
 
         for t in 0..n_tokens {
-            let pos = start_pos + t;
+            let pos = seqs.pos(t);
             let q_t = &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim];
             for h in 0..n_head {
                 tensor::rope_apply_params_inplace(
@@ -764,10 +767,10 @@ impl Deepseek4Model {
         }
 
         let comp = layer.compressor.as_ref().map(|c| {
-            let values = self.backend.matmul(cur, n_tokens, &c.wkv);
-            let mut scores = self.backend.matmul(cur, n_tokens, &c.wgate);
+            let values = backend.matmul(cur, n_tokens, &c.wkv);
+            let mut scores = backend.matmul(cur, n_tokens, &c.wgate);
             for t in 0..n_tokens {
-                let ape_row = (start_pos + t) % layer.ratio;
+                let ape_row = seqs.pos(t) % layer.ratio;
                 tensor::add_inplace(
                     &mut scores[t * c.width..(t + 1) * c.width],
                     &c.ape[ape_row * c.width..(ape_row + 1) * c.width],
@@ -776,10 +779,10 @@ impl Deepseek4Model {
             (values, scores)
         });
         let lid = layer.indexer.as_ref().map(|ix| {
-            let values = self.backend.matmul(cur, n_tokens, &ix.comp.wkv);
-            let mut scores = self.backend.matmul(cur, n_tokens, &ix.comp.wgate);
+            let values = backend.matmul(cur, n_tokens, &ix.comp.wkv);
+            let mut scores = backend.matmul(cur, n_tokens, &ix.comp.wgate);
             for t in 0..n_tokens {
-                let ape_row = (start_pos + t) % CSA_RATIO;
+                let ape_row = seqs.pos(t) % CSA_RATIO;
                 tensor::add_inplace(
                     &mut scores[t * ix.comp.width..(t + 1) * ix.comp.width],
                     &ix.comp.ape[ape_row * ix.comp.width..(ape_row + 1) * ix.comp.width],
@@ -788,10 +791,10 @@ impl Deepseek4Model {
             // The indexer's query shares the attention query's LoRA
             // intermediate, and ropes with the compressed-key parameters
             // whatever the layer's own are.
-            let mut iq = self.backend.matmul(qr, n_tokens, &ix.q_b);
+            let mut iq = backend.matmul(qr, n_tokens, &ix.q_b);
             let inope = self.indexer_head_size - rope_dim;
             for t in 0..n_tokens {
-                let pos = start_pos + t;
+                let pos = seqs.pos(t);
                 let row = &mut iq[t * self.indexer_n_head * self.indexer_head_size
                     ..(t + 1) * self.indexer_n_head * self.indexer_head_size];
                 for h in 0..self.indexer_n_head {
@@ -807,7 +810,7 @@ impl Deepseek4Model {
                     );
                 }
             }
-            let mut weights = self.backend.matmul(cur, n_tokens, &ix.proj);
+            let mut weights = backend.matmul(cur, n_tokens, &ix.proj);
             let iscale = 1.0 / ((self.indexer_head_size * self.indexer_n_head) as f32).sqrt();
             for w in weights.iter_mut() {
                 *w *= iscale;
@@ -817,7 +820,8 @@ impl Deepseek4Model {
 
         let mut attn_out = vec![0f32; n_tokens * n_head * head_dim];
         for t in 0..n_tokens {
-            let pos = start_pos + t;
+            let pos = seqs.pos(t);
+            let cache = seqs.cache(t);
 
             cache.layers[layer.slots.raw].push(
                 &kv[t * head_dim..(t + 1) * head_dim],
@@ -949,7 +953,7 @@ impl Deepseek4Model {
                 group[t * o_group_dim..(t + 1) * o_group_dim]
                     .copy_from_slice(&attn_out[at..at + o_group_dim]);
             }
-            self.backend.matmul_into(
+            backend.matmul_into(
                 projected,
                 &group,
                 n_tokens,
@@ -961,8 +965,7 @@ impl Deepseek4Model {
                     .copy_from_slice(&projected[t * self.o_lora_rank..(t + 1) * self.o_lora_rank]);
             }
         }
-        self.backend
-            .matmul_into(out_buf, &oa, n_tokens, &layer.wo_b);
+        backend.matmul_into(out_buf, &oa, n_tokens, &layer.wo_b);
         debug_assert_eq!(out_buf.len(), n_tokens * n_embd);
         Ok(std::mem::take(out_buf))
     }
@@ -1049,7 +1052,7 @@ impl Deepseek4Model {
     /// selection is either the hash table's (the first `hash_layer_count`
     /// layers) or the top `expert_used_count` by biased probability; the
     /// weights always come from the *unbiased* probabilities.
-    fn moe_ffn(&self, ffn: &Moe, cur: &[f32], tokens: &[u32]) -> Vec<f32> {
+    fn moe_ffn(&self, backend: &dyn Backend, ffn: &Moe, cur: &[f32], tokens: &[u32]) -> Vec<f32> {
         let n_embd = self.config.n_embd;
         let mut out = vec![0f32; tokens.len() * n_embd];
         let mut experts =
@@ -1064,7 +1067,7 @@ impl Deepseek4Model {
         // submission out of the parallel region below, where it would queue
         // behind the shared expert's.
         let n_tokens = tokens.len();
-        let logits = super::moe_router_logits(self.backend.as_ref(), cur, n_tokens, &ffn.gate_inp);
+        let logits = super::moe_router_logits(backend, cur, n_tokens, &ffn.gate_inp);
         let n_expert = logits.len() / n_tokens;
         let mut selection: Vec<Vec<(usize, f32)>> = tokens
             .iter()
@@ -1100,10 +1103,10 @@ impl Deepseek4Model {
         // which is right whatever this architecture's activation is.
         let routed_branch = || {
             if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
-                && self.backend.as_wgpu().is_some()
+                && backend.as_wgpu().is_some()
             {
                 super::evaluate_routed_experts_batched(
-                    self.backend.as_ref(),
+                    backend,
                     &selection,
                     cur,
                     n_embd,
@@ -1119,7 +1122,7 @@ impl Deepseek4Model {
                         .map(|&(t, _)| &cur[t * n_embd..(t + 1) * n_embd])
                         .collect();
                     let gate = super::project_expert(
-                        self.backend.as_ref(),
+                        backend,
                         &ffn.gate_exps,
                         expert,
                         0,
@@ -1127,7 +1130,7 @@ impl Deepseek4Model {
                         &inputs,
                     );
                     let up = super::project_expert(
-                        self.backend.as_ref(),
+                        backend,
                         &ffn.up_exps,
                         expert,
                         0,
@@ -1141,7 +1144,7 @@ impl Deepseek4Model {
                         .collect();
                     let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
                     super::project_expert(
-                        self.backend.as_ref(),
+                        backend,
                         &ffn.down_exps,
                         expert,
                         0,
@@ -1167,18 +1170,16 @@ impl Deepseek4Model {
         // device has no shader for would otherwise reach a backend that
         // panics rather than declining.
         let shared_branch = || {
-            let gate =
-                super::matmul_host_fallback(self.backend.as_ref(), cur, n_tokens, &ffn.gate_shexp);
-            let up =
-                super::matmul_host_fallback(self.backend.as_ref(), cur, n_tokens, &ffn.up_shexp);
+            let gate = super::matmul_host_fallback(backend, cur, n_tokens, &ffn.gate_shexp);
+            let up = super::matmul_host_fallback(backend, cur, n_tokens, &ffn.up_shexp);
             let h = swiglu(&gate, &up, ffn.clamp_shexp);
-            super::matmul_host_fallback(self.backend.as_ref(), &h, n_tokens, &ffn.down_shexp)
+            super::matmul_host_fallback(backend, &h, n_tokens, &ffn.down_shexp)
         };
 
         // Different processors, no dependency between them, summed at the
         // end — see `super::moe_overlap_min_tokens`.
         let overlap = super::moe_overlap(
-            self.backend.as_ref(),
+            backend,
             n_tokens,
             &[&ffn.gate_shexp, &ffn.up_shexp, &ffn.down_shexp],
         );
@@ -1237,7 +1238,7 @@ impl ModelForward for Deepseek4Model {
         _slot_id: usize,
     ) -> Result<Vec<f32>> {
         anyhow::ensure!(!tokens.is_empty(), "forward called with no tokens");
-        let hidden = self.run_layers(cache, tokens, start_pos)?;
+        let hidden = self.run_layers(&mut Seqs::One { cache, start_pos }, tokens)?;
         let n_embd = self.config.n_embd;
         let last = &hidden[(tokens.len() - 1) * n_embd..];
         Ok(self.backend.matmul(last, 1, &self.output_weight))
@@ -1260,7 +1261,7 @@ impl ModelForward for Deepseek4Model {
             !tokens.is_empty(),
             "forward_all_logits called with no tokens"
         );
-        let hidden = self.run_layers(cache, tokens, start_pos)?;
+        let hidden = self.run_layers(&mut Seqs::One { cache, start_pos }, tokens)?;
         let n_embd = self.config.n_embd;
         Ok((0..tokens.len())
             .map(|t| {
@@ -1279,7 +1280,82 @@ impl ModelForward for Deepseek4Model {
             "forward_hidden_states called with no tokens"
         );
         let mut cache = self.new_kv_cache(tokens.len());
-        self.run_layers(&mut cache, tokens, 0)
+        self.run_layers(
+            &mut Seqs::One {
+                cache: &mut cache,
+                start_pos: 0,
+            },
+            tokens,
+        )
+    }
+
+    /// Every layer runs on the host's turn of the step, so a batch is the
+    /// same layer loop with each row's keys and compressed blocks on its own
+    /// cache.
+    fn batches_decode(&self) -> bool {
+        true
+    }
+
+    /// One decode step for several sequences: every projection and expert
+    /// read once for all the rows, each row's attention on its own cache,
+    /// and one vocabulary projection for every row.
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let n_rows = rows.len();
+        if n_rows < 2 || tokens.len() != n_rows {
+            return Ok(None);
+        }
+        let hidden = self.run_layers(&mut Seqs::Rows(rows), tokens)?;
+        let backend = crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true);
+        let flat = backend.matmul(&hidden, n_rows, &self.output_weight);
+        let n_vocab = flat.len() / n_rows;
+        Ok(Some(
+            flat.chunks_exact(n_vocab).map(<[f32]>::to_vec).collect(),
+        ))
+    }
+
+    /// A verify on the host's turn of the step like any other row, so it
+    /// takes its tokens into the batch.
+    fn batches_verify(&self) -> bool {
+        super::batch_verify()
+    }
+
+    /// One step for several sequences, each row bringing its own run of
+    /// tokens from its own position — one for a decode step, a draft for a
+    /// verify: every projection and expert read once for all of them, each
+    /// row's attention on its own cache, and every token's logits back, as
+    /// its own step or `forward_all_logits` gives them.
+    fn forward_decode_batch_verify(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[&[u32]],
+        _samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<Vec<super::ForwardOutcome>>>> {
+        if !self.batches_verify()
+            || tokens.len() != rows.len()
+            || tokens.iter().any(|t| t.is_empty())
+        {
+            return Ok(None);
+        }
+        let widths: Vec<usize> = tokens.iter().map(|t| t.len()).collect();
+        let flat: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
+        let n_tokens = flat.len();
+        let hidden = self.run_layers(&mut Seqs::runs(rows, &widths), &flat)?;
+        let backend = crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true);
+        let logits = backend.matmul(&hidden, n_tokens, &self.output_weight);
+        let n_vocab = logits.len() / n_tokens;
+        let mut rows_out = logits
+            .chunks_exact(n_vocab)
+            .map(|row| super::ForwardOutcome::Logits(row.to_vec()));
+        Ok(Some(
+            widths
+                .iter()
+                .map(|&w| rows_out.by_ref().take(w).collect())
+                .collect(),
+        ))
     }
 }
 

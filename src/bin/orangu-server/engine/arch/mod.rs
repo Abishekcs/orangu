@@ -3120,6 +3120,61 @@ pub struct DecodeRow<'a> {
     pub slot: usize,
 }
 
+/// The sequences a pass's tokens belong to: one sequence's run of tokens
+/// from `start_pos`, or one token for each of a batch's rows, each at its
+/// own position in its own cache.
+pub(crate) enum Seqs<'s, 'c> {
+    One {
+        cache: &'s mut KvCache,
+        start_pos: usize,
+    },
+    Rows(&'s mut [DecodeRow<'c>]),
+    /// A run of tokens for each of a batch's rows, in row order, each run
+    /// from its row's position — a verifying row's draft beside the
+    /// others' single tokens. Token `t` is token `owner[t].1` of row
+    /// `owner[t].0`.
+    Runs {
+        rows: &'s mut [DecodeRow<'c>],
+        owner: Vec<(usize, usize)>,
+    },
+}
+
+impl<'s, 'c> Seqs<'s, 'c> {
+    /// [`Seqs::Runs`] for `rows`, row `i` bringing `widths[i]` tokens.
+    pub(crate) fn runs(rows: &'s mut [DecodeRow<'c>], widths: &[usize]) -> Self {
+        let owner = widths
+            .iter()
+            .enumerate()
+            .flat_map(|(r, &w)| (0..w).map(move |k| (r, k)))
+            .collect();
+        Seqs::Runs { rows, owner }
+    }
+
+    /// Whether the pass's tokens are a batch's rows rather than one
+    /// sequence's run.
+    pub(crate) fn is_batch(&self) -> bool {
+        !matches!(self, Seqs::One { .. })
+    }
+
+    /// The position of the pass's token `t`.
+    pub(crate) fn pos(&self, t: usize) -> usize {
+        match self {
+            Seqs::One { start_pos, .. } => start_pos + t,
+            Seqs::Rows(rows) => rows[t].pos,
+            Seqs::Runs { rows, owner } => rows[owner[t].0].pos + owner[t].1,
+        }
+    }
+
+    /// The cache the pass's token `t` belongs to.
+    pub(crate) fn cache(&mut self, t: usize) -> &mut KvCache {
+        match self {
+            Seqs::One { cache, .. } => cache,
+            Seqs::Rows(rows) => rows[t].cache,
+            Seqs::Runs { rows, owner } => rows[owner[t].0].cache,
+        }
+    }
+}
+
 /// `ORANGU_RESIDENT_PREFILL_CHECK=1`: a chunk's residual from the
 /// device-resident stream against the step-by-step path's, per row —
 /// the largest relative error and the row it is on. A last-bit
@@ -3168,7 +3223,7 @@ pub(crate) fn report_resident_check(
 
 /// One layer of a dense transformer as the device-resident prefill stream
 /// runs it — see [`run_layers_resident`]. The architectures that use the
-/// stream (`llama`, `phi`, `mistral`) each build one per layer from their
+/// stream (`llama`, `phi`, `mistral`, `muse`) each build one per layer from their
 /// own weights; nothing here is architecture-specific.
 pub(crate) struct ResidentLayer<'a> {
     pub attn_norm: &'a [f32],
@@ -3194,6 +3249,14 @@ pub(crate) struct ResidentLayer<'a> {
     pub ffn_up: &'a crate::engine::loader::QuantMatrix,
     pub ffn_down: &'a crate::engine::loader::QuantMatrix,
     pub activation: crate::engine::backend::vulkan::FfnActivation,
+    /// A sigmoid gate on the attention output, projected from the normed
+    /// input.
+    pub attn_gate: Option<&'a crate::engine::loader::QuantMatrix>,
+    /// The norms on the attention's and the FFN's outputs before their
+    /// residual adds, and their own epsilon where it is not the layer's.
+    pub attn_post_norm: Option<&'a [f32]>,
+    pub ffn_post_norm: Option<&'a [f32]>,
+    pub post_norm_eps: Option<f32>,
 }
 
 /// A prefill chunk with the **residual stream on the device**: `x` (the
@@ -3283,7 +3346,7 @@ pub(crate) fn run_layers_resident<'a>(
             pairing: l.pairing,
             yarn: l.yarn,
             normalize_v: false,
-            attn_gate: None,
+            attn_gate: l.attn_gate,
             normed: &[],
             n_tokens,
             start_pos,
@@ -3331,17 +3394,17 @@ pub(crate) fn run_layers_resident<'a>(
             AttnOutSrc::Gpu(&bufs[0], 0, n_tokens),
             n_tokens,
             l.wo,
-            None,
+            l.attn_post_norm,
             l.ffn_norm,
             l.ffn_gate,
             l.ffn_up,
             l.ffn_down,
-            None,
+            l.ffn_post_norm,
             eps,
             l.activation,
             Some((&bufs[1], 0)),
             None,
-            None,
+            l.post_norm_eps,
         );
         if out.is_none() {
             give_up(vulkan, cache, kv_stage, std::mem::take(&mut pending_kv));
@@ -3465,7 +3528,7 @@ pub(crate) fn run_layers_resident_batch<'a>(
             pairing: l.pairing,
             yarn: l.yarn,
             normalize_v: false,
-            attn_gate: None,
+            attn_gate: l.attn_gate,
             normed: &[],
             n_tokens: n_rows,
             start_pos: 0,
@@ -3549,17 +3612,17 @@ pub(crate) fn run_layers_resident_batch<'a>(
             AttnOutSrc::Gpu(&bufs[0], 0, n_rows),
             n_rows,
             l.wo,
-            None,
+            l.attn_post_norm,
             l.ffn_norm,
             l.ffn_gate,
             l.ffn_up,
             l.ffn_down,
-            None,
+            l.ffn_post_norm,
             eps,
             l.activation,
             Some((&bufs[1], 0)),
             None,
-            None,
+            l.post_norm_eps,
         );
         if out.is_none() {
             vulkan.end_prefill_group();
@@ -3611,6 +3674,16 @@ pub(crate) static RANGE_CHAINS: std::sync::Mutex<()> = std::sync::Mutex::new(())
 
 pub trait ModelForward: Send + Sync {
     fn config(&self) -> &ModelConfig;
+
+    /// Whether [`Self::forward_decode_batch`] can serve this model as loaded.
+    /// A decoding slot joins a batch only when it is: the batch waits for
+    /// every slot's step before it runs, and a model that then declines
+    /// steps them one after another, so the slots that would have run side
+    /// by side take turns instead. A `true` model may still decline a batch
+    /// of a shape it cannot serve, which then runs row by row.
+    fn batches_decode(&self) -> bool {
+        false
+    }
 
     /// One decode step for several sequences at once — `tokens[i]` at
     /// `rows[i].pos` into `rows[i].cache` — returning each row's next-token
@@ -5510,4 +5583,369 @@ pub(crate) fn ffn_gate_up_pair(
     let on = *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_FFN_GATE_UP"));
     on.then(|| crate::engine::loader::QuantMatrix::adjacent_pair(gate, up))
         .flatten()
+}
+
+/// Checks any architecture's batched decode against its own solo path, on
+/// whatever model a GPU test loads: each row of a batch must get the logits
+/// its sequence's own step or verify gives, to the narrow-pass kernels'
+/// rounding, and pick the same token.
+#[cfg(test)]
+pub(crate) mod batch_checks {
+    use super::{DecodeRow, ForwardOutcome, ModelForward};
+    use crate::engine::kv_cache::{KvCache, RollbackPoint};
+
+    /// Where a verify from `pos` can be taken back to: a recurrent cache's
+    /// states, saved before it; nothing for one of attention rows alone.
+    fn checkpoint(cache: &KvCache, pos: usize) -> Option<RollbackPoint> {
+        cache
+            .has_recurrent()
+            .then(|| cache.rollback_point(pos).expect("a local cache rolls back"))
+    }
+
+    /// Keeps the first `kept` of the `input` a verify from `pos` took in, as
+    /// a request does: the attention rows cut back, a recurrent state put
+    /// back behind its `kept`-th row (or saved and run again).
+    fn keep(
+        model: &dyn ModelForward,
+        cache: &mut KvCache,
+        checkpoint: Option<&RollbackPoint>,
+        pos: usize,
+        input: &[u32],
+        kept: usize,
+        slot: usize,
+    ) {
+        match checkpoint {
+            Some(checkpoint) => {
+                if !cache.keep_verified(checkpoint, kept) {
+                    cache.rollback(checkpoint).expect("roll back");
+                    model
+                        .forward(cache, &input[..kept], pos, slot)
+                        .expect("the kept tokens again");
+                }
+            }
+            None => cache.truncate(pos + kept).expect("roll back"),
+        }
+    }
+
+    /// Two prompts of distinct lengths, prefilled into their own caches.
+    fn prefilled(model: &dyn ModelForward) -> ([Vec<u32>; 2], Vec<KvCache>) {
+        let prompts: [Vec<u32>; 2] = [
+            (0..40u32).map(|i| 100 + (i * 37) % 2000).collect(),
+            (0..23u32).map(|i| 300 + (i * 53) % 1700).collect(),
+        ];
+        let caches = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut cache = model.new_kv_cache(96);
+                model.forward(&mut cache, p, 0, i).expect("prefill");
+                cache
+            })
+            .collect();
+        (prompts, caches)
+    }
+
+    fn compare(what: &str, b: &[f32], s: &[f32], tolerance: f64) {
+        let (mut diff2, mut val2) = (0f64, 0f64);
+        for (x, y) in b.iter().zip(s) {
+            diff2 += f64::from((x - y) * (x - y));
+            val2 += f64::from(y * y);
+        }
+        let rms = (diff2 / val2).sqrt();
+        let (ab, as_) = (
+            crate::engine::sampling::argmax(b),
+            crate::engine::sampling::argmax(s),
+        );
+        println!("{what}: rms {rms:.2e}, argmax {ab} / {as_}");
+        assert!(rms < tolerance, "{what} rms {rms}");
+        // Another pick passes only as a tie: the solo pass ranks it within
+        // `tolerance` of its top logit, relative to that logit.
+        if ab != as_ {
+            let top = s[as_ as usize];
+            let gap = top - s[ab as usize];
+            println!("{what}: a tie, {gap:.4} below the top logit {top:.3}");
+            assert!(
+                f64::from(gap) <= tolerance * f64::from(top.abs()),
+                "{what} picks another token, {gap} below the top"
+            );
+        }
+    }
+
+    /// The bound a batched row is held to: `tolerance`, or a multiple of the
+    /// model's own difference between its multi-token passes and its decode
+    /// steps over the same tokens, whichever is wider — three times, or ten
+    /// where a recurrent state carries the difference into every later
+    /// step. A batch takes the
+    /// multi-token kernels, and on a device with integer-dot GEMM those
+    /// quantize the activations a decode step keeps in float, so a
+    /// quantized file carries that difference into every batched row with
+    /// no batching involved. Both multi-token passes are measured — a
+    /// prompt's (the last row) and a verify's (every row) — since an
+    /// architecture may run them on different paths.
+    fn bound(model: &dyn ModelForward, tolerance: f64) -> f64 {
+        let rms = |b: &[f32], s: &[f32]| {
+            let (mut diff2, mut val2) = (0f64, 0f64);
+            for (x, y) in b.iter().zip(s) {
+                diff2 += f64::from((x - y) * (x - y));
+                val2 += f64::from(y * y);
+            }
+            (diff2 / val2).sqrt()
+        };
+        let prompt: Vec<u32> = (0..40u32).map(|i| 100 + (i * 37) % 2000).collect();
+        let next = [911u32, 57, 1302];
+        let prefilled = || {
+            let mut cache = model.new_kv_cache(96);
+            model.forward(&mut cache, &prompt, 0, 0).expect("prefill");
+            cache
+        };
+        let mut stepped = prefilled();
+        let steps: Vec<Vec<f32>> = (0..next.len())
+            .map(|i| {
+                model
+                    .forward(&mut stepped, &next[i..=i], prompt.len() + i, 0)
+                    .expect("decode step")
+            })
+            .collect();
+        let last = model
+            .forward(&mut prefilled(), &next, prompt.len(), 0)
+            .expect("prompt pass");
+        let mut floor = rms(&last, steps.last().expect("steps"));
+        if let Ok(rows) = model.forward_all_logits(&mut prefilled(), &next, prompt.len(), 0) {
+            for (b, s) in rows.iter().zip(&steps) {
+                floor = floor.max(rms(b, s));
+            }
+        }
+        let factor = if model.new_kv_cache(1).has_recurrent() {
+            10.0
+        } else {
+            3.0
+        };
+        let bound = tolerance.max(factor * floor);
+        println!(
+            "the model's own multi-token passes are up to {floor:.2e} off its decode steps; bound {bound:.2e}"
+        );
+        bound
+    }
+
+    fn logits_of(o: &ForwardOutcome) -> Vec<f32> {
+        match o {
+            ForwardOutcome::Logits(l) => l.clone(),
+            _ => panic!("no sampling was asked for"),
+        }
+    }
+
+    /// Two sequences' decode steps taken together give each the logits of
+    /// its own solo steps — over a batched step, one with the rows in the
+    /// other order, and a solo step after them.
+    pub(crate) fn decode_batch_matches_each_rows_solo_step(
+        model: &dyn ModelForward,
+        tolerance: f64,
+    ) {
+        assert!(model.batches_decode(), "the model says it does not batch");
+        let tolerance = bound(model, tolerance);
+        let next: [[u32; 3]; 2] = [[911, 57, 1302], [1207, 640, 88]];
+        let (prompts, mut solo_caches) = prefilled(model);
+        let solo: Vec<Vec<Vec<f32>>> = solo_caches
+            .iter_mut()
+            .enumerate()
+            .map(|(i, cache)| {
+                (0..3)
+                    .map(|step| {
+                        model
+                            .forward(cache, &next[i][step..=step], prompts[i].len() + step, i)
+                            .expect("solo step")
+                    })
+                    .collect()
+            })
+            .collect();
+        let (_, mut caches) = prefilled(model);
+        let mut got: Vec<Vec<Vec<f32>>> = vec![Vec::new(), Vec::new()];
+        for (step, order) in [[0usize, 1], [1, 0]].iter().enumerate() {
+            let (first, second) = caches.split_at_mut(1);
+            let mut by_seq = [Some(&mut first[0]), Some(&mut second[0])];
+            let mut rows: Vec<DecodeRow<'_>> = order
+                .iter()
+                .map(|&i| DecodeRow {
+                    cache: by_seq[i].take().expect("each sequence once"),
+                    pos: prompts[i].len() + step,
+                    slot: i,
+                })
+                .collect();
+            let tokens: Vec<u32> = order.iter().map(|&i| next[i][step]).collect();
+            let batched = model
+                .forward_decode_batch(&mut rows, &tokens)
+                .expect("batched step")
+                .expect("the batch serves this model");
+            for (&i, logits) in order.iter().zip(batched) {
+                got[i].push(logits);
+            }
+        }
+        for (i, cache) in caches.iter_mut().enumerate() {
+            got[i].push(
+                model
+                    .forward(cache, &next[i][2..=2], prompts[i].len() + 2, i)
+                    .expect("solo step after the batch"),
+            );
+        }
+        for i in 0..2 {
+            for step in 0..3 {
+                compare(
+                    &format!("sequence {i} step {step}"),
+                    &got[i][step],
+                    &solo[i][step],
+                    tolerance,
+                );
+            }
+        }
+        for (b, s) in caches.iter().zip(&solo_caches) {
+            assert_eq!(b.committed_len(), s.committed_len());
+        }
+    }
+
+    /// A verify taken into a batched step gives the verifying sequence the
+    /// logits of its own `forward_verify` at every position and the decoding
+    /// one those of its own step, then the same with the roles swapped after
+    /// a rollback, then both verifying at once, then a solo step on each.
+    pub(crate) fn decode_batch_verifies_a_draft_as_its_own_pass_would(
+        model: &dyn ModelForward,
+        tolerance: f64,
+    ) {
+        assert!(
+            model.batches_verify(),
+            "the model says it does not batch a verify"
+        );
+        let tolerance = bound(model, tolerance);
+        let (prompts, mut solo) = prefilled(model);
+        let (_, mut batched) = prefilled(model);
+        let mut pos = [prompts[0].len(), prompts[1].len()];
+        let rounds: [(usize, Vec<u32>, usize, Vec<u32>); 4] = [
+            (0, vec![911], 1, vec![1207, 640, 88, 1500, 7]),
+            (1, vec![33], 0, vec![57, 1302, 400, 12]),
+            (0, vec![12], 1, vec![5, 1606, 7]),
+            (1, vec![13], 0, vec![808, 9, 1010]),
+        ];
+        for (round, (dec, dec_tokens, ver, ver_tokens)) in rounds.iter().enumerate() {
+            let solo_dec = model
+                .forward(&mut solo[*dec], dec_tokens, pos[*dec], *dec)
+                .expect("solo step");
+            let solo_mark = checkpoint(&solo[*ver], pos[*ver]);
+            let batched_mark = checkpoint(&batched[*ver], pos[*ver]);
+            let solo_ver = model
+                .forward_verify(&mut solo[*ver], ver_tokens, pos[*ver], *ver)
+                .expect("solo verify");
+            let (lo, hi) = batched.split_at_mut(1);
+            let (dec_cache, ver_cache) = if *dec == 0 {
+                (&mut lo[0], &mut hi[0])
+            } else {
+                (&mut hi[0], &mut lo[0])
+            };
+            let mut rows = vec![
+                DecodeRow {
+                    cache: dec_cache,
+                    pos: pos[*dec],
+                    slot: *dec,
+                },
+                DecodeRow {
+                    cache: ver_cache,
+                    pos: pos[*ver],
+                    slot: *ver,
+                },
+            ];
+            let tokens: [&[u32]; 2] = [dec_tokens, ver_tokens];
+            let out = model
+                .forward_decode_batch_verify(&mut rows, &tokens, &[None, None])
+                .expect("batched verify")
+                .expect("the batch serves this model");
+            assert_eq!(out[0].len(), 1);
+            assert_eq!(out[1].len(), ver_tokens.len());
+            compare(
+                &format!("round {round}: the decoding row"),
+                &logits_of(&out[0][0]),
+                &solo_dec,
+                tolerance,
+            );
+            for (k, (o, s)) in out[1].iter().zip(&solo_ver).enumerate() {
+                compare(
+                    &format!("round {round}: verify position {k}"),
+                    &logits_of(o),
+                    s,
+                    tolerance,
+                );
+            }
+            pos[*dec] += 1;
+            // Two of the draft kept: the token and one more.
+            for (caches, mark) in [(&mut solo, &solo_mark), (&mut batched, &batched_mark)] {
+                keep(
+                    model,
+                    &mut caches[*ver],
+                    mark.as_ref(),
+                    pos[*ver],
+                    ver_tokens,
+                    2,
+                    *ver,
+                );
+            }
+            pos[*ver] += 2;
+        }
+        let drafts: [Vec<u32>; 2] = [vec![71, 802, 13, 1999], vec![640, 5, 1201, 77, 9]];
+        let solo_marks: Vec<_> = (0..2).map(|i| checkpoint(&solo[i], pos[i])).collect();
+        let batched_marks: Vec<_> = (0..2).map(|i| checkpoint(&batched[i], pos[i])).collect();
+        let solo_out: Vec<Vec<Vec<f32>>> = (0..2)
+            .map(|i| {
+                model
+                    .forward_verify(&mut solo[i], &drafts[i], pos[i], i)
+                    .expect("solo verify")
+            })
+            .collect();
+        let (lo, hi) = batched.split_at_mut(1);
+        let mut rows = vec![
+            DecodeRow {
+                cache: &mut lo[0],
+                pos: pos[0],
+                slot: 0,
+            },
+            DecodeRow {
+                cache: &mut hi[0],
+                pos: pos[1],
+                slot: 1,
+            },
+        ];
+        let tokens: [&[u32]; 2] = [&drafts[0], &drafts[1]];
+        let out = model
+            .forward_decode_batch_verify(&mut rows, &tokens, &[None, None])
+            .expect("batched verify")
+            .expect("the batch serves this model");
+        for i in 0..2 {
+            for (k, (o, s)) in out[i].iter().zip(&solo_out[i]).enumerate() {
+                compare(
+                    &format!("both verify: sequence {i} position {k}"),
+                    &logits_of(o),
+                    s,
+                    tolerance,
+                );
+            }
+            for (caches, marks) in [(&mut solo, &solo_marks), (&mut batched, &batched_marks)] {
+                keep(
+                    model,
+                    &mut caches[i],
+                    marks[i].as_ref(),
+                    pos[i],
+                    &drafts[i],
+                    1,
+                    i,
+                );
+            }
+            pos[i] += 1;
+        }
+        for i in 0..2 {
+            let s = model
+                .forward(&mut solo[i], &[5], pos[i], i)
+                .expect("solo step");
+            let b = model
+                .forward(&mut batched[i], &[5], pos[i], i)
+                .expect("solo step after the batch");
+            compare(&format!("sequence {i} after the batch"), &b, &s, tolerance);
+            assert_eq!(batched[i].committed_len(), solo[i].committed_len());
+        }
+    }
 }

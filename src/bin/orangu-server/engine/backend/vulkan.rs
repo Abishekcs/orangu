@@ -352,10 +352,38 @@ struct UploadStaging {
 struct StagingPiece<'a>(wgpu::WriteOnly<'a, [u8]>);
 unsafe impl Send for StagingPiece<'_> {}
 
+/// Runs `work` over `items` on up to one OS thread per core, this thread
+/// taking the first share — for the copies a caller makes while holding
+/// [`VulkanBackend::prefill_region_guard`]. A rayon worker waiting in a
+/// join runs other queued work, and work that takes the same guard would
+/// then block beneath the one already holding it; a thread waiting on an
+/// OS join runs nothing else.
+fn on_os_threads<T: Send>(items: Vec<T>, work: impl Fn(T) + Sync) {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let threads = items.len().min(cores);
+    if threads <= 1 {
+        items.into_iter().for_each(work);
+        return;
+    }
+    let mut shares: Vec<Vec<T>> = (0..threads).map(|_| Vec::new()).collect();
+    for (i, item) in items.into_iter().enumerate() {
+        shares[i % threads].push(item);
+    }
+    let work = &work;
+    std::thread::scope(|scope| {
+        let mut shares = shares.into_iter();
+        let mine = shares.next().unwrap_or_default();
+        for share in shares {
+            scope.spawn(move || share.into_iter().for_each(work));
+        }
+        mine.into_iter().for_each(work);
+    });
+}
+
 /// Fills a mapped staging range from `src` with every core: 4 MiB pieces,
-/// one per task.
+/// on [`on_os_threads`].
 fn fill_staging(view: wgpu::WriteOnly<'_, [u8]>, src: &[u8]) {
-    use rayon::prelude::*;
     const PIECE: usize = 4 << 20;
     let mut pieces = Vec::with_capacity(src.len().div_ceil(PIECE));
     let mut rest = view;
@@ -365,29 +393,28 @@ fn fill_staging(view: wgpu::WriteOnly<'_, [u8]>, src: &[u8]) {
         rest = tail;
     }
     pieces.push(StagingPiece(rest));
-    pieces
-        .into_par_iter()
-        .zip(src.par_chunks(PIECE))
-        .for_each(|(mut piece, bytes)| piece.0.copy_from_slice(bytes));
+    let work: Vec<(StagingPiece<'_>, &[u8])> = pieces.into_iter().zip(src.chunks(PIECE)).collect();
+    on_os_threads(work, |(mut piece, bytes)| piece.0.copy_from_slice(bytes));
 }
 
 /// Appends `src` to the empty `dst` in parallel 4 MiB pieces, written
 /// straight into its spare capacity (no zero-fill first) — a wide result's
 /// copy out of its readback. One thread moved a 400 MB `gate_up` result at
-/// about 2 GB/s, a third of the call's time on the device.
+/// about 2 GB/s, a third of the call's time on the device. On
+/// [`on_os_threads`].
 fn copy_out_parallel(src: &[f32], dst: &mut Vec<f32>) {
-    use rayon::prelude::*;
     const PIECE: usize = 1 << 20;
     debug_assert!(dst.is_empty());
     dst.reserve_exact(src.len());
-    dst.spare_capacity_mut()[..src.len()]
-        .par_chunks_mut(PIECE)
-        .zip(src.par_chunks(PIECE))
-        .for_each(|(d, s)| {
-            for (d, s) in d.iter_mut().zip(s) {
-                d.write(*s);
-            }
-        });
+    let work: Vec<_> = dst.spare_capacity_mut()[..src.len()]
+        .chunks_mut(PIECE)
+        .zip(src.chunks(PIECE))
+        .collect();
+    on_os_threads(work, |(d, s)| {
+        for (d, s) in d.iter_mut().zip(s) {
+            d.write(*s);
+        }
+    });
     // Safety: every one of the first `src.len()` slots was written above.
     unsafe { dst.set_len(src.len()) };
 }
@@ -4593,11 +4620,16 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     /// instead, so that a device that isn't there is an error naming the
     /// ones that are rather than a silent fall-back to a different one.
     ///
+    /// `ORANGU_TEST_DEVICE=<part of a name>` picks that adapter instead, so
+    /// a GPU test can run on one card while another is busy.
+    ///
     /// **Tests only**, for the same reason [`Self::try_init`] is.
     #[cfg(test)]
     pub fn try_init_backends(backends: wgpu::Backends) -> Option<Self> {
         let candidates = Self::devices(backends);
-        let selected = device::select_all(&candidates, &device::DeviceRequest::Auto).ok()?;
+        let request = std::env::var("ORANGU_TEST_DEVICE")
+            .map_or(device::DeviceRequest::Auto, device::DeviceRequest::Name);
+        let selected = device::select_all(&candidates, &request).ok()?;
         let indices: Vec<usize> = selected.iter().map(|&p| candidates[p].index).collect();
         Self::try_init_selected(backends, &indices)
     }
@@ -7481,18 +7513,15 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     /// 1.4 tok/s after one streamed prefill). The queue's own staging is
     /// transient and leaves that heap as it found it.
     fn write_weight_bytes(&self, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
-        use rayon::prelude::*;
         const ALIGN: usize = wgpu::COPY_BUFFER_ALIGNMENT as usize;
         const PIECE: usize = 4 << 20;
         let head = bytes.len() - bytes.len() % ALIGN;
         if head > 0 {
-            bytes[..head]
-                .par_chunks(PIECE)
-                .enumerate()
-                .for_each(|(i, piece)| {
-                    self.queue
-                        .write_buffer(buffer, offset + (i * PIECE) as u64, piece);
-                });
+            let pieces: Vec<(usize, &[u8])> = bytes[..head].chunks(PIECE).enumerate().collect();
+            on_os_threads(pieces, |(i, piece)| {
+                self.queue
+                    .write_buffer(buffer, offset + (i * PIECE) as u64, piece);
+            });
         }
         if head < bytes.len() {
             let mut tail = [0u8; ALIGN];
@@ -7786,6 +7815,34 @@ impl Backend for VulkanBackend {
             max_matmul_tokens_per_submission()
         );
         self.matmul_batch_striped(ops, n_tokens)
+    }
+
+    /// A decode batch's rows go where each sequence's own step would put
+    /// them: to the host's decode kernel when one token of these weights
+    /// would go there (`backend::prefers_host_matmul_rows`), and to the
+    /// device otherwise.
+    fn matmul_decode(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        let op = MatmulOp { x, n_tokens, w };
+        if super::prefers_host_matmul_rows(std::slice::from_ref(&op)) {
+            return CpuBackend.matmul_decode(x, n_tokens, w);
+        }
+        self.matmul(x, n_tokens, w)
+    }
+
+    fn matmul_decode_into(&self, out: &mut Vec<f32>, x: &[f32], n_tokens: usize, w: &QuantMatrix) {
+        *out = self.matmul_decode(x, n_tokens, w);
+    }
+
+    /// [`Self::matmul_decode`] for a batch of ops, judged together as the
+    /// host rule judges a step's.
+    fn matmul_batch_decode(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        if super::prefers_host_matmul_rows(ops) {
+            return ops
+                .iter()
+                .map(|op| CpuBackend.matmul_decode(op.x, op.n_tokens, op.w))
+                .collect();
+        }
+        self.matmul_batch(ops)
     }
 
     fn take_scratch(&self, len: usize) -> Vec<f32> {
@@ -10334,6 +10391,15 @@ pub struct RecurrentLayerInput<'a> {
     pub batch_slot: usize,
 }
 
+/// One sequence of [`VulkanBackend::record_recurrent_rows`]'s batch beyond
+/// the first: its state, its row count, and whether a verify keeps the
+/// states behind its rows.
+pub struct RecurrentRowsSeq<'a> {
+    pub state: crate::engine::kv_cache::DeviceStateAccess<'a>,
+    pub n_rows: usize,
+    pub keep_rows: bool,
+}
+
 /// [`VulkanBackend::fused_attention_layer`])'s parameters — a full-attention
 /// sub-layer's whole decode step from its (already rotated) normed input,
 /// for the Qwen hybrid trunk: `record_fused_attention` with the sigmoid
@@ -10610,9 +10676,9 @@ fn rotation_key(rot: Option<&crate::engine::hadamard::Rotation>) -> RotationKey 
 }
 
 /// What a recurrent step's bind groups over a mirror's scratch depend on
-/// besides the mirror itself: the output rotation and whether the kernel
-/// stores in grouped order.
-type RecurrentBgKey = (RotationKey, bool);
+/// besides the mirror itself: the output rotation, whether the kernel
+/// stores in grouped order, and the slot whose `ssm_out` entry they bind.
+type RecurrentBgKey = (RotationKey, bool, usize);
 
 /// The bind groups of one recurrent step over one mirror — see
 /// `VulkanStateMirror::bind_groups`.
@@ -10626,8 +10692,9 @@ struct MirrorBindGroups {
 }
 
 /// The bind groups of a recurrent layer's projections that share the QKV
-/// entry's input region, and the input rotation over it — per layer,
-/// independent of the slot (`GatedDeltaResources::layer_bind_groups`).
+/// entry's input region, and the input rotation over it — per layer and
+/// slot, since the region is the slot's (`GatedDeltaResources::
+/// layer_bind_groups`).
 struct LayerBindGroups {
     /// The QKV fold alone, in place — when the QKV projection is not on
     /// the integer dot; otherwise the fold and its quantize are one
@@ -10649,7 +10716,7 @@ type SharedInputDispatch = (wgpu::BindGroup, Option<wgpu::BindGroup>);
 
 /// What a layer's projection bind groups depend on: the QKV fold (block
 /// and signs, by address) and whether beta/alpha share its input.
-type LayerBgKey = (RotationKey, bool);
+type LayerBgKey = (RotationKey, bool, usize);
 
 /// Where everything sits in a recurrent layer's scratch, in floats: the
 /// state matrices, then the delta kernel's output / `ssm_out`'s input
@@ -13852,6 +13919,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             });
             (proj, k_entry, v_entry)
         });
+        // The attention gate beside Q/K/V, in the pooled region's fourth
+        // slot as the prefill chain has it.
+        let gate_entry = input.attn_gate.map(|w| {
+            self.op_entry_at(
+                &MatmulOp {
+                    x: &[],
+                    n_tokens: n_rows,
+                    w,
+                },
+                0,
+                ROLE_ATTN_QKV + 3,
+            )
+        });
+        let gate_g = gate_entry
+            .as_ref()
+            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()));
         let kv_guards = kv_entries.as_ref().map(|(proj, k, v)| {
             (
                 *proj,
@@ -13882,6 +13965,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 norm_bgs.push(norm_into(g));
             }
         }
+        if let Some(g) = &gate_g {
+            norm_bgs.push(norm_into(g));
+        }
         let (mut encoder, grouped) =
             self.take_prefill_encoder("orangu-server batched decode attention encoder");
         {
@@ -13896,6 +13982,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             self.record_matmul(&mut pass, wq, &q_g);
             self.op_stamp(&mut pass, "bd.attn.wq");
+            if let (Some(w), Some(g)) = (input.attn_gate, &gate_g) {
+                self.record_matmul(&mut pass, w, g);
+                self.op_stamp(&mut pass, "bd.attn.gate");
+            }
             if let Some((proj, k_g, v_g)) = &kv_guards {
                 self.record_matmul(&mut pass, proj.wk, k_g);
                 self.op_stamp(&mut pass, "bd.attn.wk");
@@ -13939,6 +14029,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             });
             (k_rows, v_rows)
         });
+        let gate_rows = gate_g.as_ref().map(|g| {
+            let rows = self.scratch_buffer(n_rows * q_dim);
+            encoder.copy_buffer_to_buffer(
+                &g.output_buffer,
+                g.output_offset,
+                &rows,
+                0,
+                (n_rows * q_dim) as u64 * 4,
+            );
+            rows
+        });
 
         // Every sequence's rows into its own single-token regions first, and
         // its attention output back after them all: each copy ends a compute
@@ -13958,6 +14059,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 sq_g.output_offset,
                 (q_dim as u64) * 4,
             );
+            if let (Some(w), Some(gate_rows)) = (input.attn_gate, &gate_rows) {
+                let sg = self.op_entry_for(w, slot);
+                let sg_g = sg.lock().unwrap_or_else(|p| p.into_inner());
+                encoder.copy_buffer_to_buffer(
+                    gate_rows,
+                    (i * q_dim) as u64 * 4,
+                    &sg_g.output_buffer,
+                    sg_g.output_offset,
+                    (q_dim as u64) * 4,
+                );
+            }
             if let (Some((proj, ..)), Some((k_rows, v_rows))) = (&kv_guards, &kv_rows) {
                 let sk = self.op_entry_for(proj.wk, slot);
                 let sk_g = sk.lock().unwrap_or_else(|p| p.into_inner());
@@ -14000,7 +14112,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 FusedAttnInput {
                     projections_ready: true,
                     normalize_v: input.normalize_v,
-                    attn_gate: None,
+                    attn_gate: input.attn_gate,
                     q_bias: input.q_bias,
                     pairing: input.pairing,
                     normed: GpuInput::Gpu(
@@ -18503,7 +18615,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let in_bytes = (n_embd as u64) * 4;
         let layer_bgs = {
-            let key = (rotation_key(qkv_rotation), ba_shares_qkv);
+            let key = (rotation_key(qkv_rotation), ba_shares_qkv, batch_slot);
             let mut cache = core
                 .res
                 .layer_bind_groups
@@ -18747,15 +18859,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// `ssm_out` and what follows (`fused_post_attention_prefill_rows`).
     /// With `keep_rows` (a verify's, whose later rows may be rejected) the
     /// state behind every row but the last is kept on the mirror
-    /// (`DeviceStateMirror::restore_row`). `None`, with nothing recorded,
-    /// for a folded layer or a shape outside the kernels.
-    pub fn record_recurrent_rows(
-        &self,
+    /// (`DeviceStateMirror::restore_row`).
+    ///
+    /// `others` are further sequences whose rows follow these in `x` — a
+    /// batched step's other slots, each with its own state: the projections
+    /// still run once over every row, and each sequence's conv step and
+    /// delta rule then walk its own rows over its own state. The gated rows
+    /// come back in `x`'s order. `None`, with nothing recorded, for a folded
+    /// layer or a shape outside the kernels.
+    pub fn record_recurrent_rows<'a>(
+        &'a self,
         x: (&wgpu::Buffer, u64),
         attn_norm: &[f32],
         n_rows: usize,
         keep_rows: bool,
-        input: RecurrentLayerInput<'_>,
+        input: RecurrentLayerInput<'a>,
+        others: Vec<RecurrentRowsSeq<'a>>,
     ) -> Option<(wgpu::Buffer, u64)> {
         let RecurrentLayerInput {
             normed: _,
@@ -18784,6 +18903,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if qkv_rotation.is_some() || ba_rotation.is_some() || out_rotation.is_some() {
             return None;
         }
+        let seqs: Vec<RecurrentRowsSeq<'a>> = std::iter::once(RecurrentRowsSeq {
+            state,
+            n_rows,
+            keep_rows,
+        })
+        .chain(others)
+        .collect();
         let hd = head_dim;
         let n_embd = wqkv.in_dim;
         let key_dim = n_k * hd;
@@ -18798,27 +18924,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             || conv_kernel.len() != conv_channels * d_conv
             || dt_bias.len() != n_v
             || ssm_a.len() != n_v
-            || state.conv.len() != conv_channels * (d_conv - 1)
             || !(1..=8).contains(&d_conv)
             || !hd.is_multiple_of(4)
-            || n_rows == 0
+            || seqs
+                .iter()
+                .any(|s| s.n_rows == 0 || s.state.conv.len() != conv_channels * (d_conv - 1))
         {
             return None;
         }
-        let core = self.recurrent_core(RecurrentCore {
-            state,
-            ssm_norm,
-            eps,
-            sigmoid_gate,
-            grouped,
-            n_k,
-            n_v,
-            head_dim,
-            out_rotation: None,
-            ssm_out,
-            batch_slot,
-        })?;
-        self.upload_recurrent_consts(&core, conv_kernel, dt_bias, ssm_a);
+        let mut cores = Vec::with_capacity(seqs.len());
+        let mut widths = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            widths.push((seq.n_rows, seq.keep_rows));
+            cores.push(self.recurrent_core(RecurrentCore {
+                state: seq.state,
+                ssm_norm,
+                eps,
+                sigmoid_gate,
+                grouped,
+                n_k,
+                n_v,
+                head_dim,
+                out_rotation: None,
+                ssm_out,
+                batch_slot,
+            })?);
+        }
+        let core = &cores[0];
+        self.upload_recurrent_consts(core, conv_kernel, dt_bias, ssm_a);
         let state_len = core.layout.state_len;
         let conv_len = core.layout.conv_len;
         let (prep, delta) = {
@@ -18882,6 +19015,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .clone()
         };
 
+        let total_rows: usize = widths.iter().map(|&(w, _)| w).sum();
         let _region_guard = self.prefill_region_guard();
         let projections = [wqkv, wgate, wbeta, walpha];
         let entries: Vec<_> = projections
@@ -18891,7 +19025,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.op_entry_at(
                     &MatmulOp {
                         x: &[],
-                        n_tokens: n_rows,
+                        n_tokens: total_rows,
                         w,
                     },
                     0,
@@ -18903,7 +19037,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .iter()
             .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()))
             .collect();
-        let row_elems = n_rows * n_embd;
+        let row_elems = total_rows * n_embd;
         let normed = self.scratch_buffer(row_elems);
         let norm_w = self.upload_new(attn_norm);
         let meta_embd = self.elem_meta_buffer(n_embd as u32, eps);
@@ -18915,53 +19049,73 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
         let stage = projections
             .iter()
-            .any(|w| self.mmq_for(w, n_rows))
-            .then(|| self.mmq_stage(BindSrc::Whole(&normed), n_rows, n_embd));
-        // The projections back to back, in the prep kernel's order, and the
-        // rows' delta inputs followed by their outputs.
-        let proj_len = n_rows * (conv_channels + value_dim + 2 * n_v);
-        let proj = self.scratch_buffer(proj_len);
+            .any(|w| self.mmq_for(w, total_rows))
+            .then(|| self.mmq_stage(BindSrc::Whole(&normed), total_rows, n_embd));
         let inp = conv_channels + 2 * n_v + value_dim;
-        let out_off = n_rows * inp;
-        let rows = self.scratch_buffer(out_off + n_rows * value_dim);
-        // `out_scale` set: the kernels write the states behind the rows. Off,
-        // the binding is the rows' own buffer, which they then never touch.
-        let keep = if keep_rows { 1.0 } else { 0.0 };
-        let row_states = if keep_rows {
-            core.mirror.row_states_for(n_rows - 1)
-        } else {
-            rows.clone()
-        };
-        let prep_meta = self.elem_meta_buffer_of(ElemMeta {
-            len: n_rows as u32,
-            aux: core.layout.conv_off() as u32,
-            extra: 0.0,
-            out_scale: keep,
-        });
-        let delta_meta = self.elem_meta_buffer_of(ElemMeta {
-            len: n_rows as u32,
-            aux: out_off as u32,
-            extra: eps,
-            out_scale: keep,
-        });
-        let bg_prep = self.recurrent_rows_bind_group(
-            &proj,
-            &core.res.consts,
-            &core.res.consts,
-            &core.scratch,
-            &rows,
-            &prep_meta,
-            &row_states,
-        );
-        let bg_delta = self.recurrent_rows_bind_group(
-            &core.res.norm,
-            &core.res.norm,
-            &core.res.norm,
-            &core.scratch,
-            &rows,
-            &delta_meta,
-            &row_states,
-        );
+        // Each sequence's projections back to back, in the prep kernel's
+        // order, and its rows' delta inputs followed by their outputs.
+        struct SeqBuffers {
+            proj: wgpu::Buffer,
+            rows: wgpu::Buffer,
+            out_off: usize,
+            bg_prep: wgpu::BindGroup,
+            bg_delta: wgpu::BindGroup,
+        }
+        let bufs: Vec<SeqBuffers> = cores
+            .iter()
+            .zip(&widths)
+            .map(|(core, &(n, keep_rows))| {
+                let proj = self.scratch_buffer(n * (conv_channels + value_dim + 2 * n_v));
+                let out_off = n * inp;
+                let rows = self.scratch_buffer(out_off + n * value_dim);
+                // `out_scale` set: the kernels write the states behind the
+                // rows. Off, the binding is the rows' own buffer, which they
+                // then never touch.
+                let keep = if keep_rows { 1.0 } else { 0.0 };
+                let row_states = if keep_rows {
+                    core.mirror.row_states_for(n - 1)
+                } else {
+                    rows.clone()
+                };
+                let prep_meta = self.elem_meta_buffer_of(ElemMeta {
+                    len: n as u32,
+                    aux: core.layout.conv_off() as u32,
+                    extra: 0.0,
+                    out_scale: keep,
+                });
+                let delta_meta = self.elem_meta_buffer_of(ElemMeta {
+                    len: n as u32,
+                    aux: out_off as u32,
+                    extra: eps,
+                    out_scale: keep,
+                });
+                let bg_prep = self.recurrent_rows_bind_group(
+                    &proj,
+                    &core.res.consts,
+                    &core.res.consts,
+                    &core.scratch,
+                    &rows,
+                    &prep_meta,
+                    &row_states,
+                );
+                let bg_delta = self.recurrent_rows_bind_group(
+                    &core.res.norm,
+                    &core.res.norm,
+                    &core.res.norm,
+                    &core.scratch,
+                    &rows,
+                    &delta_meta,
+                    &row_states,
+                );
+                SeqBuffers {
+                    proj,
+                    rows,
+                    out_off,
+                    bg_prep,
+                    bg_delta,
+                }
+            })
+            .collect();
 
         let (mut encoder, grouped_enc) =
             self.take_prefill_encoder("orangu-server recurrent rows encoder");
@@ -18972,12 +19126,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             });
             pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
             pass.set_bind_group(0, &bg_norm, &[]);
-            pass.dispatch_workgroups(n_rows as u32, 1, 1);
+            pass.dispatch_workgroups(total_rows as u32, 1, 1);
             self.op_stamp(&mut pass, "rr.norm");
         }
         // The float kernels read their entry's own input region.
         for (w, g) in projections.iter().zip(&guards) {
-            if stage.is_none() || !self.mmq_for(w, n_rows) {
+            if stage.is_none() || !self.mmq_for(w, total_rows) {
                 encoder.copy_buffer_to_buffer(
                     &normed,
                     0,
@@ -18996,39 +19150,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.record_mmq_quantize(&mut pass, qbg, *qwg);
             }
             for (w, g) in projections.iter().zip(&guards) {
-                self.record_projection(&mut pass, w, g, stage.as_ref().map(|s| &s.0), n_rows);
+                self.record_projection(&mut pass, w, g, stage.as_ref().map(|s| &s.0), total_rows);
             }
             self.op_stamp(&mut pass, "rr.proj");
         }
-        let mut at = 0u64;
-        for (w, g) in projections.iter().zip(&guards) {
-            let bytes = (n_rows * w.out_dim) as u64 * 4;
-            encoder.copy_buffer_to_buffer(&g.output_buffer, g.output_offset, &proj, at, bytes);
-            at += bytes;
+        let mut first_row = 0usize;
+        for (seq, &(n, _)) in bufs.iter().zip(&widths) {
+            let mut at = 0u64;
+            for (w, g) in projections.iter().zip(&guards) {
+                let row_bytes = (w.out_dim as u64) * 4;
+                let bytes = n as u64 * row_bytes;
+                encoder.copy_buffer_to_buffer(
+                    &g.output_buffer,
+                    g.output_offset + first_row as u64 * row_bytes,
+                    &seq.proj,
+                    at,
+                    bytes,
+                );
+                at += bytes;
+            }
+            first_row += n;
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server recurrent rows step pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&prep);
-            pass.set_bind_group(0, &bg_prep, &[]);
-            pass.dispatch_workgroups(self.strided_workgroups(inp), 1, 1);
-            self.op_stamp(&mut pass, "rr.prep");
-            pass.set_pipeline(&delta);
-            pass.set_bind_group(0, &bg_delta, &[]);
-            pass.dispatch_workgroups(n_v as u32, 1, 1);
-            self.op_stamp(&mut pass, "rr.delta");
+            for seq in &bufs {
+                pass.set_pipeline(&prep);
+                pass.set_bind_group(0, &seq.bg_prep, &[]);
+                pass.dispatch_workgroups(self.strided_workgroups(inp), 1, 1);
+                self.op_stamp(&mut pass, "rr.prep");
+                pass.set_pipeline(&delta);
+                pass.set_bind_group(0, &seq.bg_delta, &[]);
+                pass.dispatch_workgroups(n_v as u32, 1, 1);
+                self.op_stamp(&mut pass, "rr.delta");
+            }
         }
+        // One sequence's outputs are read where its kernel wrote them;
+        // several are gathered in `x`'s order.
+        let out = if let [seq] = &bufs[..] {
+            (seq.rows.clone(), (seq.out_off as u64) * 4)
+        } else {
+            let out = self.scratch_buffer(total_rows * value_dim);
+            let mut at = 0u64;
+            for (seq, &(n, _)) in bufs.iter().zip(&widths) {
+                let bytes = (n * value_dim) as u64 * 4;
+                encoder.copy_buffer_to_buffer(&seq.rows, (seq.out_off as u64) * 4, &out, at, bytes);
+                at += bytes;
+            }
+            (out, 0)
+        };
         self.park_or_submit(encoder, grouped_enc);
         drop(guards);
-        *core.fresh = crate::engine::kv_cache::Fresh::Device;
-        if keep_rows {
-            core.mirror
-                .row_states_current
-                .store(n_rows - 1, std::sync::atomic::Ordering::Relaxed);
+        for (core, &(n, keep_rows)) in cores.into_iter().zip(&widths) {
+            *core.fresh = crate::engine::kv_cache::Fresh::Device;
+            if keep_rows {
+                core.mirror
+                    .row_states_current
+                    .store(n - 1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        Some((rows, (out_off as u64) * 4))
+        Some(out)
     }
 
     /// What the two recurrent entry points share: the shape checks, the
@@ -19209,9 +19392,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let scratch = vm.scratch.clone();
         let bgs = {
+            // The slot too: `ssm_out`'s entry, which the matmul writes
+            // through, is the slot's.
             let key: RecurrentBgKey = (
                 rotation_key(out_rotation),
                 out_rotation.is_some_and(|r| r.has_permutation()),
+                batch_slot,
             );
             let mut cache = vm
                 .bind_groups

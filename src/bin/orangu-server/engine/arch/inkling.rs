@@ -88,7 +88,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use super::{ExpertGating, ModelForward};
+use super::{ExpertGating, ModelForward, Seqs};
 use crate::engine::backend::{Backend, MatmulOp};
 use crate::engine::kv_cache::{KvCache, RecurrentLayerState, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
@@ -513,12 +513,12 @@ impl InklingModel {
     /// the caller applies.
     fn attention(
         &self,
-        cache: &mut KvCache,
+        backend: &dyn Backend,
+        seqs: &mut Seqs<'_, '_>,
         layer: &InklingLayer,
         il: usize,
         normed: &[f32],
         n_tokens: usize,
-        start_pos: usize,
     ) -> Vec<f32> {
         let cfg = &self.config;
         let n_head = cfg.n_head;
@@ -530,7 +530,7 @@ impl InklingModel {
         // Q, K, V and the relative-bias coefficients are four independent
         // projections of the same normed input — one batched dispatch
         // rather than four round trips (see `Backend::matmul_batch`).
-        let mut qkvr = self.backend.matmul_batch(&[
+        let mut qkvr = backend.matmul_batch(&[
             MatmulOp {
                 x: normed,
                 n_tokens,
@@ -562,20 +562,8 @@ impl InklingModel {
         // cache holds is already convolved, and a later token reads it
         // unchanged.
         let base = il * CONV_PER_LAYER;
-        shortconv(
-            &mut cache.recurrent[base + CONV_K],
-            &mut k,
-            n_tokens,
-            kv_dim,
-            &layer.conv_k,
-        );
-        shortconv(
-            &mut cache.recurrent[base + CONV_V],
-            &mut v,
-            n_tokens,
-            kv_dim,
-            &layer.conv_v,
-        );
+        shortconv_seqs(seqs, base + CONV_K, &mut k, n_tokens, kv_dim, &layer.conv_k);
+        shortconv_seqs(seqs, base + CONV_V, &mut v, n_tokens, kv_dim, &layer.conv_v);
 
         tensor::rmsnorm_inplace(&mut q, &layer.attn_q_norm, n_tokens * n_head, head_dim, eps);
         tensor::rmsnorm_inplace(
@@ -586,16 +574,22 @@ impl InklingModel {
             eps,
         );
 
-        {
-            let layer_cache = &mut cache.layers[il];
-            for t in 0..n_tokens {
-                layer_cache.push(
-                    &k[t * kv_dim..(t + 1) * kv_dim],
-                    &v[t * kv_dim..(t + 1) * kv_dim],
-                );
-            }
+        for t in 0..n_tokens {
+            seqs.cache(t).layers[il].push(
+                &k[t * kv_dim..(t + 1) * kv_dim],
+                &v[t * kv_dim..(t + 1) * kv_dim],
+            );
         }
-        let layer_cache = &cache.layers[il];
+        let positions: Vec<usize> = (0..n_tokens).map(|t| seqs.pos(t)).collect();
+        // The cache each token attends: a batch's rows each their own.
+        let layer_caches: Vec<&crate::engine::kv_cache::LayerCache> = match &*seqs {
+            Seqs::One { cache, .. } => vec![&cache.layers[il]; n_tokens],
+            Seqs::Rows(rows) => rows.iter().map(|row| &row.cache.layers[il]).collect(),
+            Seqs::Runs { rows, owner } => owner
+                .iter()
+                .map(|&(r, _)| &rows[r].cache.layers[il])
+                .collect(),
+        };
 
         let group = n_head / layer.n_head_kv;
         // `1 / head_dim`, not `1 / sqrt(head_dim)` — see this module's own
@@ -615,7 +609,8 @@ impl InklingModel {
             |(rel, scores), (index, out)| {
                 let t = index / n_head;
                 let h = index % n_head;
-                let qpos = start_pos + t;
+                let qpos = positions[t];
+                let layer_cache = layer_caches[t];
                 let first = if layer.is_swa && self.n_swa > 0 {
                     qpos.saturating_sub(self.n_swa - 1)
                 } else {
@@ -657,7 +652,7 @@ impl InklingModel {
             },
         );
 
-        self.backend.matmul(&ctx, n_tokens, &layer.wo)
+        backend.matmul(&ctx, n_tokens, &layer.wo)
     }
 
     /// One layer's feed-forward half, `[n_tokens, n_embd]`, with
@@ -665,6 +660,7 @@ impl InklingModel {
     /// buffer — see `Backend::matmul_into`.
     fn ffn_into(
         &self,
+        backend: &dyn Backend,
         out: &mut Vec<f32>,
         scratch: &mut super::FfnScratch,
         layer: &InklingLayer,
@@ -674,17 +670,10 @@ impl InklingModel {
         match &layer.ffn {
             // Was an open-coded copy of `super::swiglu_ffn` — same batched
             // gate/up, same in-place SiLU, same multiply, same down.
-            Ffn::Dense { gate, up, down } => super::swiglu_ffn_into(
-                self.backend.as_ref(),
-                out,
-                scratch,
-                normed,
-                n_tokens,
-                gate,
-                up,
-                down,
-            ),
-            Ffn::Moe(moe) => *out = self.moe_ffn(moe, normed, n_tokens),
+            Ffn::Dense { gate, up, down } => {
+                super::swiglu_ffn_into(backend, out, scratch, normed, n_tokens, gate, up, down)
+            }
+            Ffn::Moe(moe) => *out = self.moe_ffn(backend, moe, normed, n_tokens),
         }
         if layer.ffn_scale != 1.0 {
             for v in out.iter_mut() {
@@ -704,7 +693,13 @@ impl InklingModel {
     /// what every other MoE here does) leaves the shared branch weighted as
     /// if the routed branch summed to one, and produces fluent, subtly
     /// wrong output.
-    fn moe_ffn(&self, moe: &Moe, normed: &[f32], n_tokens: usize) -> Vec<f32> {
+    fn moe_ffn(
+        &self,
+        backend: &dyn Backend,
+        moe: &Moe,
+        normed: &[f32],
+        n_tokens: usize,
+    ) -> Vec<f32> {
         let n_embd = self.config.n_embd;
         let mut experts =
             moe_stats::LayerRecorder::for_tensors(&[&moe.gate_exps, &moe.up_exps, &moe.down_exps]);
@@ -719,8 +714,7 @@ impl InklingModel {
             vec![Vec::with_capacity(n_tokens); self.n_expert_shared];
         // One router matmul for the whole batch, not one per token — see
         // `super::moe_router_logits`.
-        let logits =
-            super::moe_router_logits(self.backend.as_ref(), normed, n_tokens, &moe.gate_inp);
+        let logits = super::moe_router_logits(backend, normed, n_tokens, &moe.gate_inp);
         let n_logit = logits.len() / n_tokens.max(1);
         for t in 0..n_tokens {
             let probs: Vec<f32> = self.gating.probs(&logits[t * n_logit..(t + 1) * n_logit]);
@@ -764,10 +758,10 @@ impl InklingModel {
         // The activation stays on the host between the projections,
         // which is right whatever this architecture's activation is.
         let contribs = if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
-            && self.backend.as_wgpu().is_some()
+            && backend.as_wgpu().is_some()
         {
             super::evaluate_routed_experts_batched(
-                self.backend.as_ref(),
+                backend,
                 &selection,
                 normed,
                 n_embd,
@@ -782,10 +776,11 @@ impl InklingModel {
                     .iter()
                     .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
                     .collect();
-                let hidden = self.expert_hidden(&moe.gate_exps, &moe.up_exps, expert, &inputs);
+                let hidden =
+                    self.expert_hidden(backend, &moe.gate_exps, &moe.up_exps, expert, &inputs);
                 let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
                 super::project_expert(
-                    self.backend.as_ref(),
+                    backend,
                     &moe.down_exps,
                     expert,
                     0,
@@ -812,10 +807,10 @@ impl InklingModel {
             .collect();
         let mut out = vec![0f32; n_tokens * n_embd];
         for (j, weights) in shared_weights.iter().enumerate() {
-            let hidden = self.expert_hidden(&moe.gate_shexp, &moe.up_shexp, j, &inputs);
+            let hidden = self.expert_hidden(backend, &moe.gate_shexp, &moe.up_shexp, j, &inputs);
             let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
             let down = super::project_expert(
-                self.backend.as_ref(),
+                backend,
                 &moe.down_shexp,
                 j,
                 0,
@@ -846,27 +841,14 @@ impl InklingModel {
     /// which index they read).
     fn expert_hidden(
         &self,
+        backend: &dyn Backend,
         gate_exps: &ExpertQuantMatrix,
         up_exps: &ExpertQuantMatrix,
         expert: usize,
         inputs: &[&[f32]],
     ) -> Vec<Vec<f32>> {
-        let gate = super::project_expert(
-            self.backend.as_ref(),
-            gate_exps,
-            expert,
-            0,
-            gate_exps.out_dim,
-            inputs,
-        );
-        let up = super::project_expert(
-            self.backend.as_ref(),
-            up_exps,
-            expert,
-            0,
-            up_exps.out_dim,
-            inputs,
-        );
+        let gate = super::project_expert(backend, gate_exps, expert, 0, gate_exps.out_dim, inputs);
+        let up = super::project_expert(backend, up_exps, expert, 0, up_exps.out_dim, inputs);
         gate.into_iter()
             .zip(up)
             .map(|(gate, up)| {
@@ -880,22 +862,22 @@ impl InklingModel {
     /// Every layer, from the token embeddings to the last residual —
     /// `[n_tokens, n_embd]`. Shared by `forward` and
     /// `forward_hidden_states`, which differ only in what they do with it.
-    fn run_layers(
-        &self,
-        cache: &mut KvCache,
-        tokens: &[u32],
-        start_pos: usize,
-    ) -> Result<Vec<f32>> {
+    /// Every layer over `tokens`: one sequence's run, or one token for each
+    /// of a batch's rows, every projection and expert read once for all of
+    /// them and each row's keys and convolution states its own.
+    fn run_layers(&self, seqs: &mut Seqs<'_, '_>, tokens: &[u32]) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
         let eps = cfg.rms_eps;
-        anyhow::ensure!(
-            cache.recurrent.len() == self.layers.len() * CONV_PER_LAYER,
-            "this cache has {} short-convolution states, expected {}",
-            cache.recurrent.len(),
-            self.layers.len() * CONV_PER_LAYER
-        );
+        for t in 0..n_tokens {
+            let held = seqs.cache(t).recurrent.len();
+            anyhow::ensure!(
+                held == self.layers.len() * CONV_PER_LAYER,
+                "this cache has {held} short-convolution states, expected {}",
+                self.layers.len() * CONV_PER_LAYER
+            );
+        }
 
         let mut x = vec![0f32; n_tokens * n_embd];
         for (t, &tok) in tokens.iter().enumerate() {
@@ -907,6 +889,11 @@ impl InklingModel {
 
         // Same reuse as `attn_out`, replacing what used to be `x.clone()`
         // per norm — see `tensor::rmsnorm_into`.
+        let decode = crate::engine::backend::DecodeKernels::for_batch(
+            self.backend.as_ref(),
+            seqs.is_batch(),
+        );
+        let backend: &dyn Backend = &decode;
         let mut normed: Vec<f32> = Vec::new();
         let mut ffn_normed: Vec<f32> = Vec::new();
         // Projection outputs, on the same principle — see
@@ -916,9 +903,10 @@ impl InklingModel {
 
         for (il, layer) in self.layers.iter().enumerate() {
             tensor::rmsnorm_into(&mut normed, &x, &layer.attn_norm, n_tokens, n_embd, eps);
-            let mut attn = self.attention(cache, layer, il, &normed, n_tokens, start_pos);
-            shortconv(
-                &mut cache.recurrent[il * CONV_PER_LAYER + CONV_ATTN],
+            let mut attn = self.attention(backend, seqs, layer, il, &normed, n_tokens);
+            shortconv_seqs(
+                seqs,
+                il * CONV_PER_LAYER + CONV_ATTN,
                 &mut attn,
                 n_tokens,
                 n_embd,
@@ -927,9 +915,17 @@ impl InklingModel {
             tensor::add_inplace(&mut x, &attn);
 
             tensor::rmsnorm_into(&mut ffn_normed, &x, &layer.ffn_norm, n_tokens, n_embd, eps);
-            self.ffn_into(&mut ffn_out, &mut ffn_scratch, layer, &ffn_normed, n_tokens);
-            shortconv(
-                &mut cache.recurrent[il * CONV_PER_LAYER + CONV_MLP],
+            self.ffn_into(
+                backend,
+                &mut ffn_out,
+                &mut ffn_scratch,
+                layer,
+                &ffn_normed,
+                n_tokens,
+            );
+            shortconv_seqs(
+                seqs,
+                il * CONV_PER_LAYER + CONV_MLP,
                 &mut ffn_out,
                 n_tokens,
                 n_embd,
@@ -1000,6 +996,28 @@ fn shortconv(
     }
 }
 
+/// [`shortconv`] over a pass's tokens, each through the state of its own
+/// sequence's convolution `index`.
+fn shortconv_seqs(
+    seqs: &mut Seqs<'_, '_>,
+    index: usize,
+    seq: &mut [f32],
+    n_tokens: usize,
+    channels: usize,
+    kernel: &[f32],
+) {
+    match seqs {
+        Seqs::One { cache, .. } => {
+            shortconv(&mut cache.recurrent[index], seq, n_tokens, channels, kernel)
+        }
+        Seqs::Rows(_) | Seqs::Runs { .. } => {
+            for (t, x) in seq.chunks_exact_mut(channels).enumerate() {
+                shortconv(&mut seqs.cache(t).recurrent[index], x, 1, channels, kernel);
+            }
+        }
+    }
+}
+
 impl ModelForward for InklingModel {
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
         self.backend.as_wgpu()
@@ -1038,15 +1056,66 @@ impl ModelForward for InklingModel {
     ) -> Result<Vec<f32>> {
         anyhow::ensure!(!tokens.is_empty(), "forward called with no tokens");
         let n_embd = self.config.n_embd;
-        let x = self.run_layers(cache, tokens, start_pos)?;
+        let x = self.run_layers(&mut Seqs::One { cache, start_pos }, tokens)?;
         Ok(self.project_logits(&x[(tokens.len() - 1) * n_embd..]))
+    }
+
+    /// Every layer runs on the host's turn of the step, so a batch is the
+    /// same layer loop with each row's keys and convolution states on its
+    /// own cache.
+    fn batches_decode(&self) -> bool {
+        true
+    }
+
+    /// One decode step for several sequences: every projection and expert
+    /// read once for all the rows, each row's convolutions and attention on
+    /// its own cache, and one vocabulary projection for every row.
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let n_rows = rows.len();
+        if n_rows < 2 || tokens.len() != n_rows {
+            return Ok(None);
+        }
+        let mut x = self.run_layers(&mut Seqs::Rows(rows), tokens)?;
+        let n_embd = self.config.n_embd;
+        tensor::rmsnorm_inplace(
+            &mut x,
+            &self.output_norm,
+            n_rows,
+            n_embd,
+            self.config.rms_eps,
+        );
+        for v in x.iter_mut() {
+            *v /= self.logit_denom;
+        }
+        let backend = crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true);
+        let flat = backend.matmul(&x, n_rows, &self.output_weight);
+        let n_vocab = flat.len() / n_rows;
+        Ok(Some(
+            flat.chunks_exact(n_vocab)
+                .map(|row| {
+                    let mut row = row.to_vec();
+                    self.mask_padding_logits(&mut row);
+                    row
+                })
+                .collect(),
+        ))
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         // A one-shot, whole-prompt pass — no KV cache reuse across calls,
         // the same convention `LlamaModel::forward_hidden_states` uses.
         let mut cache = self.new_kv_cache(tokens.len().max(1));
-        let mut x = self.run_layers(&mut cache, tokens, 0)?;
+        let mut x = self.run_layers(
+            &mut Seqs::One {
+                cache: &mut cache,
+                start_pos: 0,
+            },
+            tokens,
+        )?;
         tensor::rmsnorm_inplace(
             &mut x,
             &self.output_norm,
@@ -1089,6 +1158,64 @@ mod tests {
         let mut decode = vec![4.0f32];
         shortconv(&mut cache.recurrent[0], &mut decode, 1, 1, &kernel);
         assert_eq!(decode, vec![0.5 * 2.0 + 0.25 * 3.0 + 2.0 * 4.0 + 4.0]);
+    }
+
+    /// A batch's rows each step their own sequence's window: two sequences
+    /// prompted differently, then one token apiece as one batch, give what
+    /// each one's own step gives.
+    #[test]
+    fn a_batch_convolves_each_row_through_its_own_window() {
+        let kernel = [0.5f32, 0.25, 2.0];
+        let prompted = |prompt: &[f32]| {
+            let mut cache = KvCache::new_mixed(8, &[0], &[RecurrentSpec::delta_net(1, 3, 0, 0)]);
+            shortconv_seqs(
+                &mut Seqs::One {
+                    cache: &mut cache,
+                    start_pos: 0,
+                },
+                0,
+                &mut prompt.to_vec(),
+                prompt.len(),
+                1,
+                &kernel,
+            );
+            cache
+        };
+        let prompts: [&[f32]; 2] = [&[1.0, 2.0, 3.0], &[7.0, -1.0]];
+        let next = [4.0f32, 5.0];
+
+        let solo: Vec<f32> = prompts
+            .iter()
+            .zip(next)
+            .map(|(prompt, x)| {
+                let mut cache = prompted(prompt);
+                let mut step = vec![x];
+                shortconv(&mut cache.recurrent[0], &mut step, 1, 1, &kernel);
+                step[0]
+            })
+            .collect();
+
+        let mut caches: Vec<KvCache> = prompts.iter().map(|p| prompted(p)).collect();
+        let mut rows: Vec<super::super::DecodeRow<'_>> = caches
+            .iter_mut()
+            .zip(prompts)
+            .enumerate()
+            .map(|(slot, (cache, prompt))| super::super::DecodeRow {
+                cache,
+                pos: prompt.len(),
+                slot,
+            })
+            .collect();
+        let mut batch = next.to_vec();
+        shortconv_seqs(&mut Seqs::Rows(&mut rows), 0, &mut batch, 2, 1, &kernel);
+        assert_eq!(batch, solo);
+        assert_eq!(
+            solo,
+            vec![
+                0.5 * 2.0 + 0.25 * 3.0 + 2.0 * 4.0 + 4.0,
+                0.5 * 7.0 - 0.25 + 2.0 * 5.0 + 5.0
+            ]
+        );
     }
 
     /// The relative-bias bank is built per `(token, head)` and only out to

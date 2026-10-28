@@ -688,6 +688,154 @@ impl PhiModel {
         Ok(x)
     }
 
+    /// The fused QKV and gate/up tensors of every layer as row views, which
+    /// [`Self::resident_layer`] describes a layer with.
+    #[allow(clippy::type_complexity)]
+    fn resident_views(
+        &self,
+    ) -> Vec<(
+        (QuantMatrix, QuantMatrix, QuantMatrix),
+        (QuantMatrix, QuantMatrix),
+    )> {
+        let (n_embd, kv_dim) = (self.config.n_embd, self.kv_dim());
+        self.layers
+            .iter()
+            .map(|layer| (layer.qkv_views(n_embd, kv_dim), layer.ffn_gate_up()))
+            .collect()
+    }
+
+    /// Layer `il` as the device-resident stream runs it, from `views`
+    /// ([`Self::resident_views`]).
+    #[allow(clippy::type_complexity)]
+    fn resident_layer<'a>(
+        &'a self,
+        il: usize,
+        views: &'a [(
+            (QuantMatrix, QuantMatrix, QuantMatrix),
+            (QuantMatrix, QuantMatrix),
+        )],
+        yarn: crate::engine::backend::vulkan::RopeYarn,
+    ) -> super::ResidentLayer<'a> {
+        let cfg = &self.config;
+        let head_dim = self.head_dim();
+        let layer = &self.layers[il];
+        let ((wq, wk, wv), (gate, up)) = &views[il];
+        super::ResidentLayer {
+            attn_norm: &layer.attn_norm,
+            wq,
+            wk,
+            wv,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
+            q_norm: None,
+            k_norm: None,
+            pairing: tensor::RopeLayout::Neox,
+            yarn,
+            rope_dim: cfg.rope_dim,
+            rope_freq_base: cfg.rope_freq_base,
+            freq_factors: self.rope_freq_factors.as_deref(),
+            n_swa: 0,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            wo: &layer.wo,
+            ffn_norm: &layer.ffn_norm,
+            ffn_gate: gate,
+            ffn_up: up,
+            ffn_down: &layer.w_down,
+            activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
+            attn_gate: None,
+            attn_post_norm: None,
+            ffn_post_norm: None,
+            post_norm_eps: None,
+        }
+    }
+
+    /// One decode step for several sequences on the device-resident stream,
+    /// the weights read once for all of them, as `arch::llama`'s. `widths`
+    /// as `super::run_layers_resident_batch` takes them (empty: one token a
+    /// row), `tokens` every row's tokens in order and `samples` one per
+    /// token; with `samples` the head and each row's sampler run on the
+    /// device after the layers, otherwise the residual comes home for the
+    /// head. The outcomes are one per token.
+    fn decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        widths: &[usize],
+        tokens: &[u32],
+        samples: Option<&[Option<super::GreedySampleParams<'_>>]>,
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        if rows.len() < 2 || !self.resident_prefill_serves(tokens.len()) {
+            return Ok(None);
+        }
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        let n_rows = tokens.len();
+        anyhow::ensure!(
+            n_rows
+                == if widths.is_empty() {
+                    rows.len()
+                } else {
+                    widths.iter().sum()
+                },
+            "one token per row of the pass"
+        );
+        let cfg = &self.config;
+        let x = self.token_embeddings(tokens)?;
+        // Each row of the pass is its request's: a verifying request's
+        // tokens all take its slot.
+        let slots: Vec<usize> = if widths.is_empty() {
+            rows.iter().map(|r| r.slot).collect()
+        } else {
+            rows.iter()
+                .zip(widths)
+                .flat_map(|(r, &w)| std::iter::repeat_n(r.slot, w))
+                .collect()
+        };
+        let views = self.resident_views();
+        let yarn = self.rope_yarn();
+        let Some(h_dev) = super::run_layers_resident_batch(
+            vulkan,
+            rows,
+            widths,
+            &x,
+            cfg.n_head,
+            cfg.n_head_kv,
+            self.head_dim(),
+            cfg.rms_eps,
+            0,
+            0..self.layers.len(),
+            |il| self.resident_layer(il, &views, yarn),
+        )?
+        else {
+            return Ok(None);
+        };
+        let pos = rows.first().map_or(0, |r| r.pos);
+        if let Some(samples) = samples.filter(|_| vulkan.gpu_sample())
+            && let Some(outcomes) = vulkan.decode_batch_tail(
+                crate::engine::backend::vulkan::AttnOutSrc::Gpu(&h_dev, 0, n_rows),
+                n_rows,
+                &self.output_norm,
+                cfg.rms_eps,
+                &self.output_weight,
+                None,
+                samples,
+                &slots,
+            )
+        {
+            vulkan.finish_op_span(pos);
+            return Ok(Some(outcomes));
+        }
+        let h = vulkan.readback_rows(&h_dev, n_rows * cfg.n_embd);
+        vulkan.finish_op_span(pos);
+        Ok(Some(
+            self.head(&h, n_rows)?
+                .into_iter()
+                .map(super::ForwardOutcome::Logits)
+                .collect(),
+        ))
+    }
+
     /// The device-resident prefill stream — see [`super::run_layers_resident`].
     fn run_layers_resident(
         &self,
@@ -707,15 +855,9 @@ impl PhiModel {
         // here pushes past them.
         vulkan.fill_deferred_kv_rows(cache);
         let x = self.token_embeddings(tokens)?;
-        let n_embd = cfg.n_embd;
-        let kv_dim = self.kv_dim();
         let head_dim = self.head_dim();
         // The fused QKV and gate/up tensors as row views, once per chunk.
-        let views: Vec<_> = self
-            .layers
-            .iter()
-            .map(|layer| (layer.qkv_views(n_embd, kv_dim), layer.ffn_gate_up()))
-            .collect();
+        let views = self.resident_views();
         let yarn = self.rope_yarn();
         super::run_layers_resident(
             vulkan,
@@ -729,34 +871,7 @@ impl PhiModel {
             head_dim,
             cfg.rms_eps,
             0..self.layers.len(),
-            |il| {
-                let layer = &self.layers[il];
-                let ((wq, wk, wv), (gate, up)) = &views[il];
-                super::ResidentLayer {
-                    attn_norm: &layer.attn_norm,
-                    wq,
-                    wk,
-                    wv,
-                    q_bias: None,
-                    k_bias: None,
-                    v_bias: None,
-                    q_norm: None,
-                    k_norm: None,
-                    pairing: tensor::RopeLayout::Neox,
-                    yarn,
-                    rope_dim: cfg.rope_dim,
-                    rope_freq_base: cfg.rope_freq_base,
-                    freq_factors: self.rope_freq_factors.as_deref(),
-                    n_swa: 0,
-                    scale: 1.0 / (head_dim as f32).sqrt(),
-                    wo: &layer.wo,
-                    ffn_norm: &layer.ffn_norm,
-                    ffn_gate: gate,
-                    ffn_up: up,
-                    ffn_down: &layer.w_down,
-                    activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
-                }
-            },
+            |il| self.resident_layer(il, &views, yarn),
         )
     }
 
@@ -779,15 +894,9 @@ impl PhiModel {
         // Rows a resident chunk parked are brought home before anything
         // here pushes past them.
         vulkan.fill_deferred_kv_rows(cache);
-        let n_embd = cfg.n_embd;
-        let kv_dim = self.kv_dim();
         let head_dim = self.head_dim();
         // The fused QKV and gate/up tensors as row views, once per chunk.
-        let views: Vec<_> = self
-            .layers
-            .iter()
-            .map(|layer| (layer.qkv_views(n_embd, kv_dim), layer.ffn_gate_up()))
-            .collect();
+        let views = self.resident_views();
         let yarn = self.rope_yarn();
         super::run_layers_resident(
             vulkan,
@@ -801,34 +910,7 @@ impl PhiModel {
             head_dim,
             cfg.rms_eps,
             layers,
-            |il| {
-                let layer = &self.layers[il];
-                let ((wq, wk, wv), (gate, up)) = &views[il];
-                super::ResidentLayer {
-                    attn_norm: &layer.attn_norm,
-                    wq,
-                    wk,
-                    wv,
-                    q_bias: None,
-                    k_bias: None,
-                    v_bias: None,
-                    q_norm: None,
-                    k_norm: None,
-                    pairing: tensor::RopeLayout::Neox,
-                    yarn,
-                    rope_dim: cfg.rope_dim,
-                    rope_freq_base: cfg.rope_freq_base,
-                    freq_factors: self.rope_freq_factors.as_deref(),
-                    n_swa: 0,
-                    scale: 1.0 / (head_dim as f32).sqrt(),
-                    wo: &layer.wo,
-                    ffn_norm: &layer.ffn_norm,
-                    ffn_gate: gate,
-                    ffn_up: up,
-                    ffn_down: &layer.w_down,
-                    activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
-                }
-            },
+            |il| self.resident_layer(il, &views, yarn),
         )
     }
 
@@ -1177,6 +1259,71 @@ impl ModelForward for PhiModel {
         KvCache::new(self.config.n_layer, capacity, self.kv_dim())
     }
 
+    fn batches_decode(&self) -> bool {
+        self.resident_prefill_serves(2)
+    }
+
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        Ok(self.decode_batch(rows, &[], tokens, None)?.map(|outcomes| {
+            outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    super::ForwardOutcome::Logits(logits) => logits,
+                    _ => unreachable!("a batch asked for no sampling returns logits"),
+                })
+                .collect()
+        }))
+    }
+
+    fn forward_decode_batch_sampling(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+        samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        self.decode_batch(rows, &[], tokens, Some(samples))
+    }
+
+    fn batches_verify(&self) -> bool {
+        super::batch_verify() && self.backend.as_wgpu().is_some()
+    }
+
+    fn forward_decode_batch_verify(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[&[u32]],
+        samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<Vec<super::ForwardOutcome>>>> {
+        if !self.batches_verify() || tokens.len() != rows.len() || samples.len() != rows.len() {
+            return Ok(None);
+        }
+        let widths: Vec<usize> = tokens.iter().map(|t| t.len()).collect();
+        let flat: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
+        // A verifying row's tokens all come back as logits.
+        let row_samples: Vec<Option<super::GreedySampleParams<'_>>> = samples
+            .iter()
+            .zip(&widths)
+            .flat_map(|(sample, &w)| {
+                let one = if w == 1 { *sample } else { None };
+                std::iter::once(one).chain(std::iter::repeat_n(None, w - 1))
+            })
+            .collect();
+        let Some(outcomes) = self.decode_batch(rows, &widths, &flat, Some(&row_samples))? else {
+            return Ok(None);
+        };
+        let mut outcomes = outcomes.into_iter();
+        Ok(Some(
+            widths
+                .iter()
+                .map(|&w| outcomes.by_ref().take(w).collect())
+                .collect(),
+        ))
+    }
+
     fn forward(
         &self,
         cache: &mut KvCache,
@@ -1243,6 +1390,26 @@ impl ModelForward for PhiModel {
     ) -> Result<Vec<Vec<f32>>> {
         let x = self.run_layers(cache, tokens, start_pos)?;
         self.head(&x, tokens.len())
+    }
+
+    /// On the device-resident prefill stream with every row's residual
+    /// kept, then the head over all of them, as `arch::llama`'s. One token
+    /// is a decode step; anything the stream does not serve takes the step
+    /// path.
+    fn forward_verify(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if tokens.len() == 1 {
+            return Ok(vec![self.forward(cache, tokens, start_pos, slot_id)?]);
+        }
+        match self.run_layers_resident(cache, tokens, start_pos, true)? {
+            Some(x) => self.head(&x, tokens.len()),
+            None => self.forward_all_logits(cache, tokens, start_pos, slot_id),
+        }
     }
 
     /// Plain causal attention at every layer and nothing carried from one
@@ -1333,20 +1500,18 @@ impl ModelForward for PhiModel {
             "hidden state holds {} values, expected {n_rows} rows of {n_embd}",
             hidden.len()
         );
-        Ok(hidden
-            .chunks_exact(n_embd)
-            .map(|row| {
-                let mut row = row.to_vec();
-                tensor::rmsnorm_inplace(
-                    &mut row,
-                    &self.output_norm,
-                    1,
-                    n_embd,
-                    self.config.rms_eps,
-                );
-                self.backend.matmul(&row, 1, &self.output_weight)
-            })
-            .collect())
+        // One projection of every row, so the output matrix is read once.
+        let mut x = hidden.to_vec();
+        tensor::rmsnorm_inplace(
+            &mut x,
+            &self.output_norm,
+            n_rows,
+            n_embd,
+            self.config.rms_eps,
+        );
+        let flat = self.backend.matmul(&x, n_rows, &self.output_weight);
+        let n_vocab = flat.len() / n_rows.max(1);
+        Ok(flat.chunks_exact(n_vocab).map(<[f32]>::to_vec).collect())
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -1506,6 +1671,44 @@ mod real_model_tests {
         assert!(
             text.contains("Paris"),
             "expected the answer to name Paris, got {text:?}"
+        );
+    }
+}
+
+/// The batched decode and verify against this model's own solo path, on a
+/// real file and the GPU (`ORANGU_TEST_DEVICE` picks the adapter):
+/// `ORANGU_TEST_PHI_MODEL=/path/to/Phi-4-mini-instruct-Q4_K_M.gguf cargo test --release --bin orangu-server
+/// decode_batch -- --ignored`.
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn model() -> Option<PhiModel> {
+        let vulkan = crate::engine::backend::vulkan::VulkanBackend::try_init()?;
+        let path = std::env::var("ORANGU_TEST_PHI_MODEL").expect("set ORANGU_TEST_PHI_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        Some(PhiModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model"))
+    }
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_matches_each_rows_solo_step() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        super::super::batch_checks::decode_batch_matches_each_rows_solo_step(&model, 3.5e-3);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_verifies_a_draft_as_its_own_pass_would() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        super::super::batch_checks::decode_batch_verifies_a_draft_as_its_own_pass_would(
+            &model, 3.5e-3,
         );
     }
 }

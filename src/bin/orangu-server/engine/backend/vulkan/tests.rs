@@ -17342,3 +17342,33 @@ fn coop_decode_attention_q8_0_at(
         }
     }
 }
+
+/// A copy made under `prefill_region_guard` runs its pieces on the calling
+/// thread and plain OS threads, never on other rayon workers: a worker
+/// waiting in a join takes up whatever its pool has queued, and work that
+/// takes the same guard would block beneath the copy holding it.
+#[test]
+fn a_copy_under_the_region_guard_stays_off_the_rayon_pool() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("a pool builds");
+    let caller_and_pool_workers = pool.install(|| {
+        let caller = std::thread::current().id();
+        let seen = std::sync::Mutex::new(Vec::new());
+        on_os_threads((0..64).collect::<Vec<usize>>(), |_| {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            let here = std::thread::current().id();
+            let pool_worker = rayon::current_thread_index().is_some();
+            seen.lock().unwrap().push((here == caller, pool_worker));
+        });
+        seen.into_inner().unwrap()
+    });
+    assert_eq!(caller_and_pool_workers.len(), 64);
+    for (on_caller, pool_worker) in caller_and_pool_workers {
+        assert!(
+            on_caller || !pool_worker,
+            "a piece ran on another rayon worker"
+        );
+    }
+}

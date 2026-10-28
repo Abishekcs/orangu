@@ -487,7 +487,104 @@ impl ModelForward for NemotronModel {
         // A decode step alternates between the card and the host's expert
         // turns; the card's clock is held up through it.
         let _clock = super::hold_clock_for_step(self.backend.as_ref(), n_tokens);
+        let x = self.run_layers(&mut Seqs::One { cache, start_pos }, tokens)?;
+        decode_stages::scope(Stage::Head, || {
+            let mut last = x[(n_tokens - 1) * n_embd..].to_vec();
+            tensor::rmsnorm_inplace(&mut last, &self.output_norm, 1, n_embd, self.rms_eps);
+            Ok(self.backend.matmul(&last, 1, &self.output_weight))
+        })
+    }
 
+    /// Every block runs on the host's turn of the step, so a batch is the
+    /// same path with each row's recurrence and attention on its own cache.
+    fn batches_decode(&self) -> bool {
+        true
+    }
+
+    /// One decode step for several sequences: every projection and expert
+    /// read once for all the rows, the recurrence and attention per row on
+    /// its own cache, and one output projection for every row.
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        if rows.len() < 2 || tokens.len() != rows.len() {
+            return Ok(None);
+        }
+        let n_rows = rows.len();
+        let n_embd = self.config.n_embd;
+        let _clock = super::hold_clock_for_step(self.backend.as_ref(), 1);
+        let mut x = self.run_layers(&mut Seqs::Rows(rows), tokens)?;
+        decode_stages::scope(Stage::Head, || {
+            tensor::rmsnorm_inplace(&mut x, &self.output_norm, n_rows, n_embd, self.rms_eps);
+            let flat =
+                crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true)
+                    .matmul(&x, n_rows, &self.output_weight);
+            let n_vocab = flat.len() / n_rows;
+            Ok(Some(
+                flat.chunks_exact(n_vocab).map(<[f32]>::to_vec).collect(),
+            ))
+        })
+    }
+
+    fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
+        anyhow::bail!("embeddings are not yet supported for Nemotron-H models")
+    }
+}
+
+impl NemotronModel {
+    /// The selective state-space recurrence, one token at a time.
+    ///
+    /// Sequential by construction: each token's state depends on the
+    /// previous token's, so unlike attention there is nothing to batch
+    /// across the prompt. The projection that feeds it *is* batched, which
+    /// is where the width is.
+    #[allow(clippy::too_many_arguments)]
+    fn ssm_block_into(
+        &self,
+        backend: &dyn Backend,
+        layer: &SsmLayer,
+        seqs: &mut Seqs<'_, '_>,
+        out: &mut Vec<f32>,
+        block: &mut BlockScratch,
+        normed: &[f32],
+        n_tokens: usize,
+    ) {
+        let projected = &mut block.projected;
+        decode_stages::scope(Stage::RecurrentProject, || {
+            backend.matmul_into(projected, normed, n_tokens, &layer.in_proj)
+        });
+        let projected = &*projected;
+        let row = layer.in_proj.out_dim;
+
+        // The recurrence is sequential, but the two projections around it
+        // are not: both run once for the whole batch. Only the mixing in
+        // between walks token by token, and it writes into `ys` rather than
+        // projecting each token as it goes — one output matmul per block
+        // instead of one per token.
+        let mut ys = vec![0f32; n_tokens * self.d_inner];
+        decode_stages::scope(Stage::RecurrentDelta, || {
+            for t in 0..n_tokens {
+                self.ssm_mix_token(
+                    layer,
+                    seqs.recurrent(t, layer.cache_index),
+                    &projected[t * row..(t + 1) * row],
+                    &mut ys[t * self.d_inner..(t + 1) * self.d_inner],
+                );
+            }
+        });
+        decode_stages::scope(Stage::RecurrentOut, || {
+            backend.matmul_into(out, &ys, n_tokens, &layer.out_proj)
+        });
+    }
+
+    /// The embeddings and every block over `tokens` — one sequence's chunk,
+    /// or one token each of a batch of sequences — returning the residual
+    /// stream as it leaves the last block, before the output norm.
+    fn run_layers(&self, seqs: &mut Seqs<'_, '_>, tokens: &[u32]) -> Result<Vec<f32>> {
+        let n_tokens = tokens.len();
+        let n_embd = self.config.n_embd;
         let mut x = vec![0f32; n_tokens * n_embd];
         decode_stages::scope(Stage::Embed, || -> Result<()> {
             for (t, &tok) in tokens.iter().enumerate() {
@@ -508,6 +605,11 @@ impl ModelForward for NemotronModel {
         // `Backend::matmul_into`.
         let mut sub_out: Vec<f32> = Vec::new();
         let mut block = BlockScratch::default();
+        let decode = crate::engine::backend::DecodeKernels::for_batch(
+            self.backend.as_ref(),
+            matches!(seqs, Seqs::Rows(_)),
+        );
+        let backend: &dyn Backend = &decode;
 
         // Every block is one sub-layer under one norm, so the residual is
         // added once per block rather than twice.
@@ -520,161 +622,131 @@ impl ModelForward for NemotronModel {
             };
             tensor::rmsnorm_into(&mut normed, &x, norm, n_tokens, n_embd, self.rms_eps);
             match layer {
-                Layer::Ssm(l) => {
-                    self.ssm_block_into(l, cache, &mut sub_out, &mut block, &normed, n_tokens)
-                }
-                Layer::Attn(l) => self.attn_block_into(
+                Layer::Ssm(l) => self.ssm_block_into(
+                    backend,
                     l,
-                    cache,
+                    seqs,
+                    &mut sub_out,
+                    &mut block,
+                    &normed,
+                    n_tokens,
+                ),
+                Layer::Attn(l) => self.attn_block_into(
+                    backend,
+                    l,
+                    seqs,
                     &normed,
                     &mut sub_out,
                     &mut block,
                     n_tokens,
-                    start_pos,
                 ),
-                Layer::Moe(l) => sub_out = self.moe_block(l, &normed, n_tokens),
+                Layer::Moe(l) => sub_out = self.moe_block(backend, l, &normed, n_tokens),
                 Layer::Ffn(l) => {
-                    self.ffn_block_into(&mut sub_out, &mut block, l, &normed, n_tokens)
+                    self.ffn_block_into(backend, &mut sub_out, &mut block, l, &normed, n_tokens)
                 }
             }
             tensor::add_inplace(&mut x, &sub_out);
         }
 
-        decode_stages::scope(Stage::Head, || {
-            let mut last = x[(n_tokens - 1) * n_embd..].to_vec();
-            tensor::rmsnorm_inplace(&mut last, &self.output_norm, 1, n_embd, self.rms_eps);
-            Ok(self.backend.matmul(&last, 1, &self.output_weight))
-        })
+        Ok(x)
     }
 
-    fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
-        anyhow::bail!("embeddings are not yet supported for Nemotron-H models")
-    }
-}
-
-impl NemotronModel {
-    /// The selective state-space recurrence, one token at a time.
-    ///
-    /// Sequential by construction: each token's state depends on the
-    /// previous token's, so unlike attention there is nothing to batch
-    /// across the prompt. The projection that feeds it *is* batched, which
-    /// is where the width is.
-    fn ssm_block_into(
+    /// One token of the selective state-space recurrence: `projected` is
+    /// its row of the block's input projection, `state` the sequence's,
+    /// and `y` receives its gated, group-normalized output.
+    fn ssm_mix_token(
         &self,
         layer: &SsmLayer,
-        cache: &mut KvCache,
-        out: &mut Vec<f32>,
-        block: &mut BlockScratch,
-        normed: &[f32],
-        n_tokens: usize,
+        state: &mut crate::engine::kv_cache::RecurrentLayerState,
+        projected: &[f32],
+        y: &mut [f32],
     ) {
         let head_dim = self.ssm_head_dim();
         let d_state = self.d_state;
         let group_width = self.d_inner / self.n_group;
         // How many heads share one `B`/`C` group vector.
         let heads_per_group = self.n_ssm_head / self.n_group;
-        let projected = &mut block.projected;
-        decode_stages::scope(Stage::RecurrentProject, || {
-            self.backend
-                .matmul_into(projected, normed, n_tokens, &layer.in_proj)
-        });
-        let projected = &*projected;
-        let row = layer.in_proj.out_dim;
+        let (z, x_bc, dt) = self.ssm_parts(projected);
 
-        // The recurrence is sequential, but the two projections around it
-        // are not: both run once for the whole batch. Only the mixing in
-        // between walks token by token, and it writes into `ys` rather than
-        // projecting each token as it goes — one output matmul per block
-        // instead of one per token.
-        let mut ys = vec![0f32; n_tokens * self.d_inner];
-        let state = &mut cache.recurrent[layer.cache_index];
-        decode_stages::scope(Stage::RecurrentDelta, || {
-            for t in 0..n_tokens {
-                let (z, x_bc, dt) = self.ssm_parts(&projected[t * row..(t + 1) * row]);
+        let mut conv = state.conv_step(x_bc, &layer.conv1d);
+        for (v, bias) in conv.iter_mut().zip(&layer.conv1d_bias) {
+            *v = tensor::silu(*v + bias);
+        }
+        let (x, groups) = conv.split_at(self.d_inner);
+        let (b, c) = groups.split_at(self.n_group * d_state);
 
-                let mut conv = state.conv_step(x_bc, &layer.conv1d);
-                for (v, bias) in conv.iter_mut().zip(&layer.conv1d_bias) {
-                    *v = tensor::silu(*v + bias);
-                }
-                let (x, groups) = conv.split_at(self.d_inner);
-                let (b, c) = groups.split_at(self.n_group * d_state);
-
-                let y = &mut ys[t * self.d_inner..(t + 1) * self.d_inner];
-                // One task per head. Each head owns its own state matrix
-                // and its own `head_dim` of the output, and reads only its
-                // group's `B`/`C` and its own inputs, so the update is a
-                // fan-out with nothing to synchronize — the same shape the
-                // delta rule's fan-out has, and before it was one this loop
-                // ran every head on one core while the rest of the pool
-                // sat between two expert stages. Per head the arithmetic
-                // is `ssm_head_step`, serial or not, so the fan-out is
-                // bit-identical to the loop it replaces.
-                let (states, state_size) = state.delta_states_mut();
-                let step_head = |h: usize, head_state: &mut [f32], y_h: &mut [f32]| {
-                    let group = h / heads_per_group;
-                    ssm_head_step(
-                        head_state,
-                        &x[h * head_dim..(h + 1) * head_dim],
-                        &b[group * d_state..(group + 1) * d_state],
-                        &c[group * d_state..(group + 1) * d_state],
-                        tensor::softplus(dt[h] + layer.dt_bias[h]),
-                        layer.a[h],
-                        layer.d[h],
-                        y_h,
-                    );
-                };
-                if ssm_fanout() {
-                    use rayon::prelude::*;
-                    states
-                        .par_chunks_mut(state_size)
-                        .zip(y.par_chunks_mut(head_dim))
-                        .enumerate()
-                        .for_each(|(h, (head_state, y_h))| step_head(h, head_state, y_h));
-                } else {
-                    for (h, (head_state, y_h)) in states
-                        .chunks_mut(state_size)
-                        .zip(y.chunks_mut(head_dim))
-                        .enumerate()
-                    {
-                        step_head(h, head_state, y_h);
-                    }
-                }
-
-                // Gate first, then normalize — each group of the gated result
-                // over its own `d_inner / n_group`-wide weight vector.
-                for (v, &g) in y.iter_mut().zip(z) {
-                    *v *= tensor::silu(g);
-                }
-                for (group, chunk) in y.chunks_mut(group_width).enumerate() {
-                    let weight = &layer.group_norm[group * group_width..(group + 1) * group_width];
-                    tensor::rmsnorm_inplace(chunk, weight, 1, group_width, self.rms_eps);
-                }
+        // One task per head. Each head owns its own state matrix
+        // and its own `head_dim` of the output, and reads only its
+        // group's `B`/`C` and its own inputs, so the update is a
+        // fan-out with nothing to synchronize — the same shape the
+        // delta rule's fan-out has, and before it was one this loop
+        // ran every head on one core while the rest of the pool
+        // sat between two expert stages. Per head the arithmetic
+        // is `ssm_head_step`, serial or not, so the fan-out is
+        // bit-identical to the loop it replaces.
+        let (states, state_size) = state.delta_states_mut();
+        let step_head = |h: usize, head_state: &mut [f32], y_h: &mut [f32]| {
+            let group = h / heads_per_group;
+            ssm_head_step(
+                head_state,
+                &x[h * head_dim..(h + 1) * head_dim],
+                &b[group * d_state..(group + 1) * d_state],
+                &c[group * d_state..(group + 1) * d_state],
+                tensor::softplus(dt[h] + layer.dt_bias[h]),
+                layer.a[h],
+                layer.d[h],
+                y_h,
+            );
+        };
+        if ssm_fanout() {
+            use rayon::prelude::*;
+            states
+                .par_chunks_mut(state_size)
+                .zip(y.par_chunks_mut(head_dim))
+                .enumerate()
+                .for_each(|(h, (head_state, y_h))| step_head(h, head_state, y_h));
+        } else {
+            for (h, (head_state, y_h)) in states
+                .chunks_mut(state_size)
+                .zip(y.chunks_mut(head_dim))
+                .enumerate()
+            {
+                step_head(h, head_state, y_h);
             }
-        });
-        decode_stages::scope(Stage::RecurrentOut, || {
-            self.backend
-                .matmul_into(out, &ys, n_tokens, &layer.out_proj)
-        });
+        }
+
+        // Gate first, then normalize — each group of the gated result
+        // over its own `d_inner / n_group`-wide weight vector.
+        for (v, &g) in y.iter_mut().zip(z) {
+            *v *= tensor::silu(g);
+        }
+        for (group, chunk) in y.chunks_mut(group_width).enumerate() {
+            let weight = &layer.group_norm[group * group_width..(group + 1) * group_width];
+            tensor::rmsnorm_inplace(chunk, weight, 1, group_width, self.rms_eps);
+        }
     }
 
-    /// Unrotated causal GQA — no RoPE, no QK-norm, no biases.
+    /// Unrotated causal GQA — no RoPE, no QK-norm, no biases. The
+    /// projections run once for every row; each sequence's rows go into its
+    /// own cache and attend over it.
     #[allow(clippy::too_many_arguments)]
     fn attn_block_into(
         &self,
+        backend: &dyn Backend,
         layer: &AttnLayer,
-        cache: &mut KvCache,
+        seqs: &mut Seqs<'_, '_>,
         normed: &[f32],
         out: &mut Vec<f32>,
         block: &mut BlockScratch,
         n_tokens: usize,
-        start_pos: usize,
     ) {
         let head_dim = self.head_dim;
         let n_head = self.n_head;
         let n_head_kv = layer.n_head_kv;
         let kv_dim = n_head_kv * head_dim;
+        let q_dim = n_head * head_dim;
 
-        self.backend.matmul_batch_into(
+        backend.matmul_batch_into(
             &mut block.qkv,
             &[
                 MatmulOp {
@@ -697,37 +769,60 @@ impl NemotronModel {
         // Borrowed in dispatch order rather than popped, so the buffers stay
         // in the scratch and the next layer inherits their capacity.
         let (q, k, v) = (&block.qkv[0], &block.qkv[1], &block.qkv[2]);
-
-        let layer_cache = &mut cache.layers[layer.cache_index];
-        for t in 0..n_tokens {
-            layer_cache.push(
-                &k[t * kv_dim..(t + 1) * kv_dim],
-                &v[t * kv_dim..(t + 1) * kv_dim],
-            );
-        }
+        let params = |start_pos: usize, n_tokens: usize| crate::engine::attention::Params {
+            backend,
+            // This layer's card — see `attention::Params::device`.
+            device: layer.wo.device(),
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            causal: true,
+            n_swa: 0,
+            start_pos,
+            n_tokens,
+        };
 
         let mut attn_out = Vec::new();
-        crate::engine::attention::attention(
-            &mut attn_out,
-            q,
-            layer_cache,
-            &crate::engine::attention::Params {
-                backend: self.backend.as_ref(),
-                // This layer's card — see `attention::Params::device`.
-                device: layer.wo.device(),
-                n_head,
-                n_head_kv,
-                head_dim,
-                scale: 1.0 / (head_dim as f32).sqrt(),
-                causal: true,
-                n_swa: 0,
-                start_pos,
-                n_tokens,
-            },
-            |t| (0, start_pos + t),
-        );
-        self.backend
-            .matmul_into(out, &attn_out, n_tokens, &layer.wo);
+        match seqs {
+            Seqs::One { cache, start_pos } => {
+                let start_pos = *start_pos;
+                let layer_cache = &mut cache.layers[layer.cache_index];
+                for t in 0..n_tokens {
+                    layer_cache.push(
+                        &k[t * kv_dim..(t + 1) * kv_dim],
+                        &v[t * kv_dim..(t + 1) * kv_dim],
+                    );
+                }
+                crate::engine::attention::attention(
+                    &mut attn_out,
+                    q,
+                    layer_cache,
+                    &params(start_pos, n_tokens),
+                    |t| (0, start_pos + t),
+                );
+            }
+            Seqs::Rows(rows) => {
+                let mut row_out = Vec::new();
+                for (t, row) in rows.iter_mut().enumerate() {
+                    let layer_cache = &mut row.cache.layers[layer.cache_index];
+                    layer_cache.push(
+                        &k[t * kv_dim..(t + 1) * kv_dim],
+                        &v[t * kv_dim..(t + 1) * kv_dim],
+                    );
+                    let pos = row.pos;
+                    crate::engine::attention::attention(
+                        &mut row_out,
+                        &q[t * q_dim..(t + 1) * q_dim],
+                        layer_cache,
+                        &params(pos, 1),
+                        |_| (0, pos),
+                    );
+                    attn_out.extend_from_slice(&row_out);
+                }
+            }
+        }
+        backend.matmul_into(out, &attn_out, n_tokens, &layer.wo);
     }
 
     /// The router's logits and the shared expert's up projection, from one
@@ -747,14 +842,15 @@ impl NemotronModel {
     /// [`super::matmul_host_fallback`] on its own.
     fn router_and_shared_up(
         &self,
+        backend: &dyn Backend,
         layer: &MoeLayer,
         normed: &[f32],
         n_tokens: usize,
     ) -> (Vec<f32>, Vec<f32>) {
-        if self.backend.supports_type(layer.up_shexp.ggml_type())
-            && self.backend.supports_type(layer.gate_inp.ggml_type())
+        if backend.supports_type(layer.up_shexp.ggml_type())
+            && backend.supports_type(layer.gate_inp.ggml_type())
         {
-            let mut both = self.backend.matmul_batch(&[
+            let mut both = backend.matmul_batch(&[
                 MatmulOp {
                     x: normed,
                     n_tokens,
@@ -771,8 +867,8 @@ impl NemotronModel {
             return (logits, shared_up);
         }
         (
-            super::matmul_host_fallback(self.backend.as_ref(), normed, n_tokens, &layer.gate_inp),
-            super::matmul_host_fallback(self.backend.as_ref(), normed, n_tokens, &layer.up_shexp),
+            super::matmul_host_fallback(backend, normed, n_tokens, &layer.gate_inp),
+            super::matmul_host_fallback(backend, normed, n_tokens, &layer.up_shexp),
         )
     }
 
@@ -782,7 +878,13 @@ impl NemotronModel {
     /// The shared branch is unweighted: it is added at full strength
     /// alongside the routed sum, not folded into the routing weights the way
     /// the architectures with a gated shared expert do.
-    fn moe_block(&self, layer: &MoeLayer, normed: &[f32], n_tokens: usize) -> Vec<f32> {
+    fn moe_block(
+        &self,
+        backend: &dyn Backend,
+        layer: &MoeLayer,
+        normed: &[f32],
+        n_tokens: usize,
+    ) -> Vec<f32> {
         let n_embd = self.config.n_embd;
         let mut experts =
             moe_stats::LayerRecorder::for_tensors(&[&layer.up_exps, &layer.down_exps]);
@@ -798,7 +900,7 @@ impl NemotronModel {
         // input upload and one round trip instead of two, per MoE block per
         // token.
         let n_expert = layer.gate_inp.out_dim;
-        let (logits, shared_up) = self.router_and_shared_up(layer, normed, n_tokens);
+        let (logits, shared_up) = self.router_and_shared_up(backend, layer, normed, n_tokens);
         let mut selection: Vec<Vec<(usize, f32)>> = decode_stages::scope(Stage::FfnSelect, || {
             (0..n_tokens)
                 .map(|t| {
@@ -838,9 +940,9 @@ impl NemotronModel {
         // stack crosses the bus per layer — measured level with the host
         // GEMM, which keeps the card's memory for the KV pool instead.
         let routed_branch = || {
-            if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+            if super::gpu_experts() && backend.as_wgpu().is_some() {
                 super::evaluate_routed_experts_batched_gateless(
-                    self.backend.as_ref(),
+                    backend,
                     &selection,
                     normed,
                     n_embd,
@@ -860,7 +962,7 @@ impl NemotronModel {
                         .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
                         .collect();
                     let hidden: Vec<Vec<f32>> = super::project_expert(
-                        self.backend.as_ref(),
+                        backend,
                         &layer.up_exps,
                         expert,
                         0,
@@ -875,7 +977,7 @@ impl NemotronModel {
                     .collect();
                     let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
                     super::project_expert(
-                        self.backend.as_ref(),
+                        backend,
                         &layer.down_exps,
                         expert,
                         0,
@@ -901,19 +1003,11 @@ impl NemotronModel {
             decode_stages::scope(Stage::FfnShared, || {
                 let mut shared = shared_up;
                 relu_squared(&mut shared);
-                super::matmul_host_fallback(
-                    self.backend.as_ref(),
-                    &shared,
-                    n_tokens,
-                    &layer.down_shexp,
-                )
+                super::matmul_host_fallback(backend, &shared, n_tokens, &layer.down_shexp)
             })
         };
-        let overlap = super::moe_overlap(
-            self.backend.as_ref(),
-            n_tokens,
-            std::slice::from_ref(&&layer.down_shexp),
-        );
+        let overlap =
+            super::moe_overlap(backend, n_tokens, std::slice::from_ref(&&layer.down_shexp));
         let (mut out, contribs) = if overlap {
             rayon::join(shared_branch, routed_branch)
         } else {
@@ -944,6 +1038,7 @@ impl NemotronModel {
     /// host rather than panic inside the backend.
     fn ffn_block_into(
         &self,
+        backend: &dyn Backend,
         out: &mut Vec<f32>,
         block: &mut BlockScratch,
         layer: &FfnLayer,
@@ -951,9 +1046,35 @@ impl NemotronModel {
         n_tokens: usize,
     ) {
         let up = &mut block.up;
-        super::matmul_host_fallback_into(up, self.backend.as_ref(), normed, n_tokens, &layer.up);
+        super::matmul_host_fallback_into(up, backend, normed, n_tokens, &layer.up);
         relu_squared(up);
-        super::matmul_host_fallback_into(out, self.backend.as_ref(), up, n_tokens, &layer.down);
+        super::matmul_host_fallback_into(out, backend, up, n_tokens, &layer.down);
+    }
+}
+
+/// The sequences one pass runs: a chunk of one sequence from `start_pos`,
+/// or one token for each of a batch's rows, each at its own position in its
+/// own cache.
+enum Seqs<'s, 'c> {
+    One {
+        cache: &'s mut KvCache,
+        start_pos: usize,
+    },
+    Rows(&'s mut [super::DecodeRow<'c>]),
+}
+
+impl Seqs<'_, '_> {
+    /// The state of recurrent layer `index` that the pass's token `t`
+    /// belongs to.
+    fn recurrent(
+        &mut self,
+        t: usize,
+        index: usize,
+    ) -> &mut crate::engine::kv_cache::RecurrentLayerState {
+        match self {
+            Seqs::One { cache, .. } => &mut cache.recurrent[index],
+            Seqs::Rows(rows) => &mut rows[t].cache.recurrent[index],
+        }
     }
 }
 

@@ -737,6 +737,204 @@ impl MuseModel {
         Ok(x)
     }
 
+    /// Layer `il` as the device-resident stream runs it in a batched decode
+    /// step.
+    fn resident_layer(&self, il: usize) -> super::ResidentLayer<'_> {
+        let layer = &self.layers[il];
+        let head_dim = self.head_dim();
+        super::ResidentLayer {
+            attn_norm: &layer.attn_norm,
+            wq: &layer.wq,
+            wk: &layer.wk,
+            wv: &layer.wv,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
+            q_norm: Some(&layer.attn_q_norm),
+            k_norm: Some(&layer.attn_k_norm),
+            pairing: self.rope.layout,
+            yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
+            rope_dim: if layer.is_swa { self.rope.rope_dim } else { 0 },
+            rope_freq_base: self.rope.freq_base,
+            freq_factors: None,
+            n_swa: if layer.is_swa { self.n_swa } else { 0 },
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            wo: &layer.wo,
+            ffn_norm: &layer.ffn_norm,
+            ffn_gate: &layer.ffn_gate,
+            ffn_up: &layer.ffn_up,
+            ffn_down: &layer.ffn_down,
+            activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
+            attn_gate: Some(&layer.w_gate),
+            attn_post_norm: Some(&layer.attn_post_norm),
+            ffn_post_norm: Some(&layer.ffn_post_norm),
+            post_norm_eps: Some(POST_NORM_EPS),
+        }
+    }
+
+    /// The devices a batched decode step runs on, in layer order, with the
+    /// layers each holds: the fused chains on, every layer on a device, and
+    /// the prefill attention on each of them.
+    fn batch_runs(
+        &self,
+    ) -> Option<
+        Vec<(
+            &crate::engine::backend::VulkanBackend,
+            std::ops::Range<usize>,
+        )>,
+    > {
+        if !muse_fused() {
+            return None;
+        }
+        super::decode_device_runs(
+            self.backend.as_ref(),
+            self.layers.iter().map(|layer| layer.wo.device()),
+        )?
+        .into_iter()
+        .map(|(device, layers)| {
+            let vulkan = self.backend.as_wgpu_on(device)?;
+            vulkan
+                .prefill_fused_attention_enabled()
+                .then_some((vulkan, layers))
+        })
+        .collect()
+    }
+
+    /// One decode step for several sequences on the device-resident stream,
+    /// the weights read once for all of them, as `arch::mistral`'s, one run
+    /// of layers per device with the rows' residual brought home between
+    /// them: `widths` as `super::run_layers_resident_batch` takes them
+    /// (empty: one token a row), `samples` one per token. With `samples`, no
+    /// logit scale to apply first and the head on the last run's device, the
+    /// head and each row's sampler run there after the layers; otherwise
+    /// the residual comes home for the head. The outcomes are one per token.
+    fn decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        widths: &[usize],
+        tokens: &[u32],
+        samples: Option<&[Option<super::GreedySampleParams<'_>>]>,
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        if rows.len() < 2 {
+            return Ok(None);
+        }
+        let Some(runs) = self.batch_runs() else {
+            return Ok(None);
+        };
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        let n_rows = tokens.len();
+        anyhow::ensure!(
+            n_rows
+                == if widths.is_empty() {
+                    rows.len()
+                } else {
+                    widths.iter().sum()
+                },
+            "one token per row of the pass"
+        );
+        let mut x = vec![0f32; n_rows * n_embd];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            anyhow::ensure!(tok < cfg.n_vocab, "token id {tok} is out of vocab range");
+            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+        }
+        super::rms_norm_rows(&mut x, n_embd, cfg.rms_eps);
+        // Each row of the pass is its request's: a verifying request's
+        // tokens all take its slot.
+        let slots: Vec<usize> = if widths.is_empty() {
+            rows.iter().map(|r| r.slot).collect()
+        } else {
+            rows.iter()
+                .zip(widths)
+                .flat_map(|(r, &w)| std::iter::repeat_n(r.slot, w))
+                .collect()
+        };
+        let pos = rows.first().map_or(0, |r| r.pos);
+        let (last, before) = runs.split_last().expect("a model has layers");
+        for (index, (vulkan, layers)) in before.iter().enumerate() {
+            let Some(h_dev) = super::run_layers_resident_batch(
+                vulkan,
+                rows,
+                widths,
+                &x,
+                cfg.n_head,
+                cfg.n_head_kv,
+                self.head_dim(),
+                cfg.rms_eps,
+                0,
+                layers.clone(),
+                |il| self.resident_layer(il),
+            )?
+            else {
+                // Only the first run may decline: the caches before a later
+                // one already hold this step's rows.
+                anyhow::ensure!(
+                    index == 0,
+                    "layers {layers:?} cannot take a batched decode step"
+                );
+                return Ok(None);
+            };
+            x = vulkan.readback_rows(&h_dev, n_rows * n_embd);
+            vulkan.finish_op_span(pos);
+        }
+        let (vulkan, layers) = last;
+        let Some(h_dev) = super::run_layers_resident_batch(
+            vulkan,
+            rows,
+            widths,
+            &x,
+            cfg.n_head,
+            cfg.n_head_kv,
+            self.head_dim(),
+            cfg.rms_eps,
+            0,
+            layers.clone(),
+            |il| self.resident_layer(il),
+        )?
+        else {
+            anyhow::ensure!(
+                before.is_empty(),
+                "layers {layers:?} cannot take a batched decode step"
+            );
+            return Ok(None);
+        };
+        let tail_on_device = self
+            .backend
+            .as_wgpu_on(self.output_weight.device())
+            .is_some_and(|tail| std::ptr::eq(tail, *vulkan));
+        if let Some(samples) =
+            samples.filter(|_| tail_on_device && vulkan.gpu_sample() && self.logit_scale.is_none())
+            && let Some(outcomes) = vulkan.decode_batch_tail(
+                crate::engine::backend::vulkan::AttnOutSrc::Gpu(&h_dev, 0, n_rows),
+                n_rows,
+                &self.output_norm,
+                cfg.rms_eps,
+                &self.output_weight,
+                self.final_logit_softcapping,
+                samples,
+                &slots,
+            )
+        {
+            vulkan.finish_op_span(pos);
+            return Ok(Some(outcomes));
+        }
+        let mut h = vulkan.readback_rows(&h_dev, n_rows * n_embd);
+        vulkan.finish_op_span(pos);
+        tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_rows, n_embd, cfg.rms_eps);
+        let flat = self.backend.matmul(&h, n_rows, &self.output_weight);
+        let n_vocab = flat.len() / n_rows;
+        Ok(Some(
+            flat.chunks_exact(n_vocab)
+                .map(|row| {
+                    let mut row = row.to_vec();
+                    self.apply_logit_transforms(&mut row);
+                    super::ForwardOutcome::Logits(row)
+                })
+                .collect(),
+        ))
+    }
+
     /// `logit_scale` then `final_logit_softcapping`, in that order, over one
     /// `[n_vocab]` row — upstream's own order, and the one that makes the
     /// cap mean what it says: a scale applied *after* it would push the
@@ -808,6 +1006,71 @@ impl ModelForward for MuseModel {
         let mut logits = self.backend.matmul(last, 1, &self.output_weight);
         self.apply_logit_transforms(&mut logits);
         Ok(logits)
+    }
+
+    fn batches_decode(&self) -> bool {
+        self.batch_runs().is_some()
+    }
+
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        Ok(self.decode_batch(rows, &[], tokens, None)?.map(|outcomes| {
+            outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    super::ForwardOutcome::Logits(logits) => logits,
+                    _ => unreachable!("a batch asked for no sampling returns logits"),
+                })
+                .collect()
+        }))
+    }
+
+    fn forward_decode_batch_sampling(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+        samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        self.decode_batch(rows, &[], tokens, Some(samples))
+    }
+
+    fn batches_verify(&self) -> bool {
+        super::batch_verify() && self.batch_runs().is_some()
+    }
+
+    fn forward_decode_batch_verify(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[&[u32]],
+        samples: &[Option<super::GreedySampleParams<'_>>],
+    ) -> Result<Option<Vec<Vec<super::ForwardOutcome>>>> {
+        if !self.batches_verify() || tokens.len() != rows.len() || samples.len() != rows.len() {
+            return Ok(None);
+        }
+        let widths: Vec<usize> = tokens.iter().map(|t| t.len()).collect();
+        let flat: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
+        // A verifying row's tokens all come back as logits.
+        let row_samples: Vec<Option<super::GreedySampleParams<'_>>> = samples
+            .iter()
+            .zip(&widths)
+            .flat_map(|(sample, &w)| {
+                let one = if w == 1 { *sample } else { None };
+                std::iter::once(one).chain(std::iter::repeat_n(None, w - 1))
+            })
+            .collect();
+        let Some(outcomes) = self.decode_batch(rows, &widths, &flat, Some(&row_samples))? else {
+            return Ok(None);
+        };
+        let mut outcomes = outcomes.into_iter();
+        Ok(Some(
+            widths
+                .iter()
+                .map(|&w| outcomes.by_ref().take(w).collect())
+                .collect(),
+        ))
     }
 
     fn forward_all_logits(
@@ -937,6 +1200,46 @@ mod real_model_tests {
             " Paris",
             "top prediction was {:?}",
             tokenizer.decode(&[top_id as u32])
+        );
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// A batch's rows take the GEMM kernels and a solo step the decode ones,
+    /// and on this model that difference depends on the token: its own
+    /// prompt pass over three tokens is 7e-3 to 8.8e-2 off its three decode
+    /// steps.
+    const TOLERANCE: f64 = 1.5e-1;
+
+    fn model() -> Option<MuseModel> {
+        let vulkan = crate::engine::backend::vulkan::VulkanBackend::try_init()?;
+        let path = std::env::var("ORANGU_TEST_MUSE_MODEL").expect("set ORANGU_TEST_MUSE_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        Some(MuseModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model"))
+    }
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_matches_each_rows_solo_step() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        super::super::batch_checks::decode_batch_matches_each_rows_solo_step(&model, TOLERANCE);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_verifies_a_draft_as_its_own_pass_would() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        super::super::batch_checks::decode_batch_verifies_a_draft_as_its_own_pass_would(
+            &model, TOLERANCE,
         );
     }
 }

@@ -1530,7 +1530,7 @@ fn run(
     // This slot decodes with the others from here on — one forward for all
     // of them per step (`engine::decode_batch`). Only the plain path: a
     // draft or a multi-token head steps on its own schedule.
-    let batches = draft.is_none() && mtp.is_none();
+    let batches = draft.is_none() && mtp.is_none() && model.batches_decode();
     let mut batch_registration = batches.then(|| decode_batcher.register()).flatten();
     // Another request's prefill narrows its chunks while this one decodes —
     // see `decode_yield_width`.
@@ -1957,6 +1957,16 @@ fn run(
     // gets a `duplicate()` and the slot keeps the original, since each needs
     // to own its copy.
     let mut workers = Vec::new();
+    // `ORANGU_TRACE_TOKENS=1`: the exact token ids a request ran and emitted,
+    // so a reply can be teacher-forced through another path without
+    // re-tokenizing its text.
+    if trace_tokens() {
+        let (prompt, reply) = history.split_at(req.prompt_tokens.len().min(history.len()));
+        log::info!(
+            "orangu-server: [slot {}] tokens prompt={prompt:?} reply={reply:?}",
+            guard.id()
+        );
+    }
     if let Some(mut final_cache) = cache.take() {
         workers = final_cache.request_finished();
         let history = std::mem::take(&mut history);
@@ -3765,11 +3775,34 @@ fn spec_echo_draft(on_device: bool) -> usize {
         .unwrap_or(if on_device { 16 } else { 0 })
 }
 
+/// Set at start-up when the served model has no multi-position forward to
+/// verify a draft with, which turns prompt lookup off for the process.
+static NO_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns prompt-lookup speculation off for this process: the served model
+/// cannot verify a draft (`ModelForward::forward_verify` refused a probe).
+pub fn disable_prompt_lookup() {
+    NO_VERIFY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether speculation is on for this process, before the model is asked.
+pub fn speculation_enabled() -> bool {
+    speculative_config().is_some()
+}
+
+fn trace_tokens() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_TRACE_TOKENS"))
+}
+
 fn speculative_config() -> Option<(usize, usize)> {
     // On unless turned off: with `engine::draft_control` deciding per step,
     // a draft is verified only while verifying pays, and an empty one costs
     // nothing. Off under test, where a request's forward count is asserted.
-    if cfg!(test) || !crate::engine::env::flag_on_unless_disabled("ORANGU_SPECULATIVE") {
+    if cfg!(test)
+        || NO_VERIFY.load(std::sync::atomic::Ordering::Relaxed)
+        || !crate::engine::env::flag_on_unless_disabled("ORANGU_SPECULATIVE")
+    {
         return None;
     }
     let read = |name: &str, default: usize| {

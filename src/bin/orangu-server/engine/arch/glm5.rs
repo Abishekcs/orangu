@@ -64,6 +64,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use super::Seqs;
 use super::hyper::{HyperConnection, HyperScratch, HyperShape};
 use super::indexer::{Indexer, IndexerShape};
 use super::kda::{GLM5NEXT_KDA_NAMES, KdaLayer, KdaShape, MlaLayer, MlaShape};
@@ -431,12 +432,10 @@ impl Glm5Model {
     /// Runs `tokens` through every trunk layer, collapses the stream bundle
     /// and returns each token's final normed hidden state (`[n_tokens,
     /// n_embd]`) — what the output projection consumes.
-    fn run_layers(
-        &self,
-        cache: &mut KvCache,
-        tokens: &[u32],
-        start_pos: usize,
-    ) -> Result<Vec<f32>> {
+    /// Every layer over `tokens`, to the final norm: one sequence's run, or
+    /// one token for each of a batch's rows, every projection and expert read
+    /// once for all of them and each row's state and keys its own.
+    fn run_layers(&self, seqs: &mut Seqs<'_, '_>, tokens: &[u32]) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         // **Hold the card's clock, and stamp the dispatches.** This family
         // orchestrates from the host — the delta rule, the routed experts
@@ -451,7 +450,7 @@ impl Glm5Model {
         // this machine. The reasoning is the shape, and `ORANGU_CLOCK_HOLD=0`
         // turns the hold off.
         let _clock = super::hold_clock_for_step(self.backend.as_ref(), n_tokens);
-        let _ops = super::OpSpan::open(self.backend.as_ref(), start_pos);
+        let _ops = super::OpSpan::open(self.backend.as_ref(), seqs.pos(0));
         let n_embd = self.config.n_embd;
 
         let mut embeddings = vec![0f32; n_tokens * n_embd];
@@ -467,7 +466,7 @@ impl Glm5Model {
 
         let mut scratch = Scratch::default();
         for (il, layer) in self.layers.iter().enumerate() {
-            self.forward_layer(il, layer, cache, &mut x, n_tokens, start_pos, &mut scratch)?;
+            self.forward_layer(il, layer, seqs, &mut x, n_tokens, &mut scratch)?;
         }
 
         let mut out = Vec::new();
@@ -487,13 +486,16 @@ impl Glm5Model {
         &self,
         il: usize,
         layer: &Layer,
-        cache: &mut KvCache,
+        seqs: &mut Seqs<'_, '_>,
         x: &mut [f32],
         n_tokens: usize,
-        start_pos: usize,
         scratch: &mut Scratch,
     ) -> Result<()> {
-        let backend = self.backend.as_ref();
+        let decode = crate::engine::backend::DecodeKernels::for_batch(
+            self.backend.as_ref(),
+            seqs.is_batch(),
+        );
+        let backend: &dyn Backend = &decode;
         let n_embd = self.config.n_embd;
         let eps = self.config.rms_eps;
         let Scratch {
@@ -537,7 +539,7 @@ impl Glm5Model {
                 attn_out,
                 kda_scratch,
                 &self.kda,
-                cache,
+                seqs,
                 cur,
                 n_tokens,
             ),
@@ -555,10 +557,13 @@ impl Glm5Model {
                         mla_scratch.qr(),
                         cur,
                         n_tokens,
-                        start_pos,
+                        &|t| seqs.pos(t),
                     );
                     (0..n_tokens)
-                        .map(|t| ix.select(&self.indexer, cache, &inputs, t, start_pos + t))
+                        .map(|t| {
+                            let pos = seqs.pos(t);
+                            ix.select(&self.indexer, seqs.cache(t), &inputs, t, pos)
+                        })
                         .collect::<Vec<Vec<usize>>>()
                 });
                 sparse.mla.attend_into(
@@ -566,10 +571,9 @@ impl Glm5Model {
                     attn_out,
                     mla_scratch,
                     &self.mla,
-                    cache,
+                    seqs,
                     cur,
                     n_tokens,
-                    start_pos,
                     selection.as_deref(),
                 );
             }
@@ -659,7 +663,7 @@ impl ModelForward for Glm5Model {
         _slot_id: usize,
     ) -> Result<Vec<f32>> {
         anyhow::ensure!(!tokens.is_empty(), "forward called with no tokens");
-        let hidden = self.run_layers(cache, tokens, start_pos)?;
+        let hidden = self.run_layers(&mut Seqs::One { cache, start_pos }, tokens)?;
         let n_embd = self.config.n_embd;
         let last = &hidden[(tokens.len() - 1) * n_embd..];
         Ok(self.backend.matmul(last, 1, &self.output_weight))
@@ -671,6 +675,40 @@ impl ModelForward for Glm5Model {
             "forward_hidden_states called with no tokens"
         );
         let mut cache = self.new_kv_cache(tokens.len());
-        self.run_layers(&mut cache, tokens, 0)
+        self.run_layers(
+            &mut Seqs::One {
+                cache: &mut cache,
+                start_pos: 0,
+            },
+            tokens,
+        )
+    }
+
+    /// Every layer runs on the host's turn of the step, so a batch is the
+    /// same layer loop with each row's state and keys on its own cache.
+    fn batches_decode(&self) -> bool {
+        true
+    }
+
+    /// One decode step for several sequences: every projection and expert
+    /// read once for all the rows, each row's recurrence, indexer and
+    /// attention on its own cache, and one vocabulary projection for every
+    /// row.
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let n_rows = rows.len();
+        if n_rows < 2 || tokens.len() != n_rows {
+            return Ok(None);
+        }
+        let hidden = self.run_layers(&mut Seqs::Rows(rows), tokens)?;
+        let backend = crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true);
+        let flat = backend.matmul(&hidden, n_rows, &self.output_weight);
+        let n_vocab = flat.len() / n_rows;
+        Ok(Some(
+            flat.chunks_exact(n_vocab).map(<[f32]>::to_vec).collect(),
+        ))
     }
 }

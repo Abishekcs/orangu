@@ -354,6 +354,7 @@ impl MtpHead for Qwen4ExpMtpHead {
             n_tokens,
             start_pos,
             selection.as_deref(),
+            0,
         );
         qwen4exp::hc_combine(n_embd, self.hc, &mut x, &attn_out, &inject, n_tokens);
 

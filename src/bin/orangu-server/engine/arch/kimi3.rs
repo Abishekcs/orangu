@@ -62,6 +62,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use super::Seqs;
 use super::kda::{KIMI3_KDA_NAMES, KdaLayer, KdaShape, MlaLayer, MlaShape};
 use super::{ExpertGating, ExpertRouting, ModelForward, rms_norm_scale, row_mean_sq};
 use crate::engine::backend::Backend;
@@ -388,12 +389,10 @@ impl Kimi3Model {
         })
     }
 
-    fn run_layers(
-        &self,
-        cache: &mut KvCache,
-        tokens: &[u32],
-        start_pos: usize,
-    ) -> Result<Vec<f32>> {
+    /// Every layer over `tokens`, to the final norm: one sequence's run, or
+    /// one token for each of a batch's rows, every projection and expert read
+    /// once for all of them and each row's state and keys its own.
+    fn run_layers(&self, seqs: &mut Seqs<'_, '_>, tokens: &[u32]) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         // **Hold the card's clock, and stamp the dispatches.** This family
         // orchestrates from the host — the delta rule, the routed experts
@@ -407,8 +406,13 @@ impl Kimi3Model {
         // Not measured on this architecture: the files it serves do not fit
         // this machine. The reasoning is the shape, and `ORANGU_CLOCK_HOLD=0`
         // turns the hold off.
-        let _clock = super::hold_clock_for_step(self.backend.as_ref(), n_tokens);
-        let _ops = super::OpSpan::open(self.backend.as_ref(), start_pos);
+        let decode = crate::engine::backend::DecodeKernels::for_batch(
+            self.backend.as_ref(),
+            seqs.is_batch(),
+        );
+        let backend: &dyn Backend = &decode;
+        let _clock = super::hold_clock_for_step(backend, n_tokens);
+        let _ops = super::OpSpan::open(backend, seqs.pos(0));
         let n_embd = self.config.n_embd;
 
         let mut x = vec![0f32; n_tokens * n_embd];
@@ -451,23 +455,22 @@ impl Kimi3Model {
             tensor::rmsnorm_inplace(cur, &layer.attn_norm, n_tokens, n_embd, self.config.rms_eps);
             match &layer.attn {
                 Attn::Kda(kda) => kda.forward_into(
-                    self.backend.as_ref(),
+                    backend,
                     &mut attn_out,
                     &mut kda_scratch,
                     &self.kda,
-                    cache,
+                    seqs,
                     cur,
                     n_tokens,
                 ),
                 Attn::Mla(mla) => mla.forward_into(
-                    self.backend.as_ref(),
+                    backend,
                     &mut attn_out,
                     &mut mla_scratch,
                     &self.mla,
-                    cache,
+                    seqs,
                     cur,
                     n_tokens,
-                    start_pos,
                 ),
             }
             if is_checkpoint {
@@ -485,12 +488,12 @@ impl Kimi3Model {
             tensor::rmsnorm_inplace(cur, &layer.ffn_norm, n_tokens, n_embd, self.config.rms_eps);
             match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    self.backend.matmul_into(&mut ffn_gate, cur, n_tokens, gate);
-                    self.backend.matmul_into(&mut ffn_up, cur, n_tokens, up);
+                    backend.matmul_into(&mut ffn_gate, cur, n_tokens, gate);
+                    backend.matmul_into(&mut ffn_up, cur, n_tokens, up);
                     let h = situ_vec(&ffn_gate, &ffn_up, self.situ_beta, self.situ_linear_beta);
-                    self.backend.matmul_into(&mut ffn_out, &h, n_tokens, down);
+                    backend.matmul_into(&mut ffn_out, &h, n_tokens, down);
                 }
-                Ffn::Moe(moe) => ffn_out = self.latent_moe(moe, cur, n_tokens),
+                Ffn::Moe(moe) => ffn_out = self.latent_moe(backend, moe, cur, n_tokens),
             }
             tensor::add_inplace(&mut x, &ffn_out);
         }
@@ -559,9 +562,15 @@ impl Kimi3Model {
     /// The latent MoE: route on the full-width input, run the selected
     /// experts in the latent space, norm and project back up, then add the
     /// shared experts — which read the full-width input directly.
-    fn latent_moe(&self, moe: &LatentMoe, normed: &[f32], n_tokens: usize) -> Vec<f32> {
+    fn latent_moe(
+        &self,
+        backend: &dyn Backend,
+        moe: &LatentMoe,
+        normed: &[f32],
+        n_tokens: usize,
+    ) -> Vec<f32> {
         let latent = moe.gate_exps.in_dim;
-        let routed_in = self.backend.matmul(normed, n_tokens, &moe.routed_down);
+        let routed_in = backend.matmul(normed, n_tokens, &moe.routed_down);
 
         let mut latent_out = vec![0f32; n_tokens * latent];
         let mut experts =
@@ -569,8 +578,7 @@ impl Kimi3Model {
         // The router scores the full-width input, so routing the whole batch
         // up front costs nothing extra and lets the experts — which run in
         // the latent space — be grouped. See `super::evaluate_routed_experts`.
-        let logits =
-            super::moe_router_logits(self.backend.as_ref(), normed, n_tokens, &moe.gate_inp);
+        let logits = super::moe_router_logits(backend, normed, n_tokens, &moe.gate_inp);
         let mut selection =
             super::route_batch(&self.routing, &logits, n_tokens, moe.exp_probs_b.as_deref());
         // Trim to the expert budget *before* anything is recorded or
@@ -592,10 +600,10 @@ impl Kimi3Model {
         // The activation stays on the host between the projections,
         // which is right whatever this architecture's activation is.
         let contribs = if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
-            && self.backend.as_wgpu().is_some()
+            && backend.as_wgpu().is_some()
         {
             super::evaluate_routed_experts_batched(
-                self.backend.as_ref(),
+                backend,
                 &selection,
                 &routed_in,
                 latent,
@@ -611,7 +619,7 @@ impl Kimi3Model {
                     .map(|&(t, _)| &routed_in[t * latent..(t + 1) * latent])
                     .collect();
                 let gate = super::project_expert(
-                    self.backend.as_ref(),
+                    backend,
                     &moe.gate_exps,
                     expert,
                     0,
@@ -619,7 +627,7 @@ impl Kimi3Model {
                     &inputs,
                 );
                 let up = super::project_expert(
-                    self.backend.as_ref(),
+                    backend,
                     &moe.up_exps,
                     expert,
                     0,
@@ -633,7 +641,7 @@ impl Kimi3Model {
                     .collect();
                 let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
                 super::project_expert(
-                    self.backend.as_ref(),
+                    backend,
                     &moe.down_exps,
                     expert,
                     0,
@@ -662,12 +670,12 @@ impl Kimi3Model {
         if let Some(norm) = &moe.routed_norm {
             tensor::rmsnorm_inplace(&mut latent_out, norm, n_tokens, latent, self.config.rms_eps);
         }
-        let mut out = self.backend.matmul(&latent_out, n_tokens, &moe.routed_up);
+        let mut out = backend.matmul(&latent_out, n_tokens, &moe.routed_up);
 
-        let gate = self.backend.matmul(normed, n_tokens, &moe.gate_shexp);
-        let up = self.backend.matmul(normed, n_tokens, &moe.up_shexp);
+        let gate = backend.matmul(normed, n_tokens, &moe.gate_shexp);
+        let up = backend.matmul(normed, n_tokens, &moe.up_shexp);
         let h = situ_vec(&gate, &up, self.situ_beta, self.situ_linear_beta);
-        let shared = self.backend.matmul(&h, n_tokens, &moe.down_shexp);
+        let shared = backend.matmul(&h, n_tokens, &moe.down_shexp);
         tensor::add_inplace(&mut out, &shared);
         out
     }
@@ -699,7 +707,7 @@ impl ModelForward for Kimi3Model {
         _slot_id: usize,
     ) -> Result<Vec<f32>> {
         anyhow::ensure!(!tokens.is_empty(), "forward called with no tokens");
-        let hidden = self.run_layers(cache, tokens, start_pos)?;
+        let hidden = self.run_layers(&mut Seqs::One { cache, start_pos }, tokens)?;
         let n_embd = self.config.n_embd;
         let last = &hidden[(tokens.len() - 1) * n_embd..];
         Ok(self.backend.matmul(last, 1, &self.output_weight))
@@ -711,7 +719,40 @@ impl ModelForward for Kimi3Model {
             "forward_hidden_states called with no tokens"
         );
         let mut cache = self.new_kv_cache(tokens.len());
-        self.run_layers(&mut cache, tokens, 0)
+        self.run_layers(
+            &mut Seqs::One {
+                cache: &mut cache,
+                start_pos: 0,
+            },
+            tokens,
+        )
+    }
+
+    /// Every layer runs on the host's turn of the step, so a batch is the
+    /// same layer loop with each row's state and keys on its own cache.
+    fn batches_decode(&self) -> bool {
+        true
+    }
+
+    /// One decode step for several sequences: every projection and expert
+    /// read once for all the rows, each row's recurrence and attention on
+    /// its own cache, and one vocabulary projection for every row.
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let n_rows = rows.len();
+        if n_rows < 2 || tokens.len() != n_rows {
+            return Ok(None);
+        }
+        let hidden = self.run_layers(&mut Seqs::Rows(rows), tokens)?;
+        let backend = crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true);
+        let flat = backend.matmul(&hidden, n_rows, &self.output_weight);
+        let n_vocab = flat.len() / n_rows;
+        Ok(Some(
+            flat.chunks_exact(n_vocab).map(<[f32]>::to_vec).collect(),
+        ))
     }
 }
 

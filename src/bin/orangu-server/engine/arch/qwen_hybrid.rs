@@ -458,6 +458,8 @@ impl FullAttn {
     /// ordinary causal attention over everything up to the token's own
     /// position, which is what this trunk's own three architectures do and
     /// what the shared (GPU-capable) `engine::attention` path implements.
+    /// `slot` is the request's, which the device step caches its resources
+    /// under.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
@@ -468,6 +470,7 @@ impl FullAttn {
         n_tokens: usize,
         start_pos: usize,
         selection: Option<&[Vec<usize>]>,
+        slot: usize,
     ) -> Vec<f32> {
         let eps = dims.rms_eps;
         let head_dim = dims.head_dim;
@@ -515,7 +518,7 @@ impl FullAttn {
                     o_rotation: self.o_in.as_ref(),
                     wo: &self.wo,
                     cache: &mut cache.layers[self.cache_index],
-                    batch_slot: 0,
+                    batch_slot: slot,
                 },
             );
             if let Some(out) = out {
@@ -758,7 +761,9 @@ impl Recurrent {
 
     /// The sub-layer itself: `normed` (`[n_tokens, n_embd]`) in, the vector
     /// to add back into the residual stream out. `gate` picks the output
-    /// gate's nonlinearity — see [`OutputGate`].
+    /// gate's nonlinearity — see [`OutputGate`]; `slot` is the request's,
+    /// which the device step caches its resources under.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
         backend: &dyn Backend,
@@ -767,6 +772,7 @@ impl Recurrent {
         normed: &[f32],
         n_tokens: usize,
         gate: OutputGate,
+        slot: usize,
     ) -> Vec<f32> {
         let eps = dims.rms_eps;
         let key_dim = dims.key_dim();
@@ -809,7 +815,7 @@ impl Recurrent {
                     head_dim,
                     out_rotation: self.out_in.as_ref(),
                     ssm_out: &self.ssm_out,
-                    batch_slot: 0,
+                    batch_slot: slot,
                 })
             });
             if let Some(out) = out {
@@ -981,7 +987,7 @@ impl Recurrent {
                         head_dim,
                         out_rotation: self.out_in.as_ref(),
                         ssm_out: &self.ssm_out,
-                        batch_slot: 0,
+                        batch_slot: slot,
                     })
                 });
                 if let Some(out) = tail {
@@ -1951,11 +1957,14 @@ impl<F: HybridFfn> Trunk<F> {
         KvCache::new_mixed(capacity, &kv_dims, &recurrent_specs)
     }
 
+    /// `slot_id` is the request's slot: a one-token step on the device
+    /// caches its resources under it, as [`Self::decode_batch`] does.
     pub(crate) fn forward(
         &self,
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
+        slot_id: usize,
     ) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.dims.n_embd;
@@ -2007,7 +2016,8 @@ impl<F: HybridFfn> Trunk<F> {
         if n_tokens == 1
             && crate::engine::env::flag_on_unless_disabled("ORANGU_HYBRID_DEVICE_TOKEN")
             && let Some(vulkan) = self.backend.as_wgpu()
-            && let Some(logits) = self.forward_token_on_device(vulkan, cache, &x, start_pos)
+            && let Some(logits) =
+                self.forward_token_on_device(vulkan, cache, &x, start_pos, slot_id)
         {
             // The head ran on the device with the layers.
             return Ok(logits);
@@ -2024,6 +2034,7 @@ impl<F: HybridFfn> Trunk<F> {
                         n_tokens,
                         start_pos,
                         &mut scratch,
+                        slot_id,
                     )?,
                     Layer::Recurrent(weights, ffn) => self.forward_recurrent_layer(
                         backend,
@@ -2034,6 +2045,7 @@ impl<F: HybridFfn> Trunk<F> {
                         &mut x,
                         n_tokens,
                         &mut scratch,
+                        slot_id,
                     )?,
                 }
             }
@@ -2132,6 +2144,7 @@ impl<F: HybridFfn> Trunk<F> {
         n_tokens: usize,
         start_pos: usize,
         layers: std::ops::Range<usize>,
+        slot: usize,
     ) -> Result<Vec<f32>> {
         anyhow::ensure!(
             x.len() == n_tokens * self.dims.n_embd,
@@ -2156,6 +2169,7 @@ impl<F: HybridFfn> Trunk<F> {
                     n_tokens,
                     start_pos,
                     &mut scratch,
+                    slot,
                 )?,
                 Layer::Recurrent(weights, ffn) => self.forward_recurrent_layer(
                     backend,
@@ -2166,6 +2180,7 @@ impl<F: HybridFfn> Trunk<F> {
                     &mut x,
                     n_tokens,
                     &mut scratch,
+                    slot,
                 )?,
             }
         }
@@ -2176,6 +2191,16 @@ impl<F: HybridFfn> Trunk<F> {
     /// layer's residual stream: the final norm, a folded head's rotation,
     /// the output projection.
     pub(crate) fn head_rows(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
+        self.head_rows_on(self.backend.as_ref(), hidden, n_rows)
+    }
+
+    /// [`Self::head_rows`] with its projection on `backend`.
+    fn head_rows_on(
+        &self,
+        backend: &dyn Backend,
+        hidden: &[f32],
+        n_rows: usize,
+    ) -> Result<Vec<Vec<f32>>> {
         let n_embd = self.dims.n_embd;
         anyhow::ensure!(
             hidden.len() == n_rows * n_embd,
@@ -2196,7 +2221,7 @@ impl<F: HybridFfn> Trunk<F> {
             rot.apply(&mut rows, n_embd);
         }
         let n_vocab = self.output_weight.out_dim;
-        let flat = self.backend.matmul(&rows, n_rows, &self.output_weight);
+        let flat = backend.matmul(&rows, n_rows, &self.output_weight);
         anyhow::ensure!(
             flat.len() == n_rows * n_vocab,
             "the head produced {} logits, expected {n_rows} rows of {n_vocab}",
@@ -2213,6 +2238,7 @@ impl<F: HybridFfn> Trunk<F> {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
+        slot: usize,
     ) -> Result<Vec<Vec<f32>>> {
         let n_tokens = tokens.len();
         if let Some(vulkan) = self.backend.as_wgpu()
@@ -2229,7 +2255,7 @@ impl<F: HybridFfn> Trunk<F> {
             );
         }
         let x = self.embed(tokens)?;
-        let x = self.forward_range(cache, x, n_tokens, start_pos, 0..self.layers.len())?;
+        let x = self.forward_range(cache, x, n_tokens, start_pos, 0..self.layers.len(), slot)?;
         decode_stages::scope(Stage::Head, || self.head_rows(&x, n_tokens))
     }
 
@@ -2241,16 +2267,21 @@ impl<F: HybridFfn> Trunk<F> {
             .is_some_and(|vulkan| self.rows_on_device_serve(vulkan))
     }
 
-    /// Whether [`Self::rows_on_device`] can record every layer: no fold, the
-    /// split beta/alpha projections, a dense FFN, the delta kernel's head
-    /// shapes, no prompt backend of its own — checked before anything is
-    /// recorded, since a layer that declined halfway would leave the states
-    /// before it stepped.
+    /// Whether [`Self::rows_on_device`] takes a prompt or a verify: every
+    /// layer in its shape ([`Self::rows_on_device_shape`]) and no prompt
+    /// backend of its own.
     fn rows_on_device_serve(&self, vulkan: &crate::engine::backend::vulkan::VulkanBackend) -> bool {
+        self.prefill_backend.is_none() && self.rows_on_device_shape(vulkan)
+    }
+
+    /// Whether the device can record every layer over rows: no fold, the
+    /// split beta/alpha projections, a dense FFN, the delta kernel's head
+    /// shapes — checked before anything is recorded, since a layer that
+    /// declined halfway would leave the states before it stepped.
+    fn rows_on_device_shape(&self, vulkan: &crate::engine::backend::vulkan::VulkanBackend) -> bool {
         let dims = &self.dims;
         let hd = dims.ssm_head_dim;
         crate::engine::env::flag_on_unless_disabled("ORANGU_HYBRID_ROWS")
-            && self.prefill_backend.is_none()
             && vulkan.prefill_fused_attention_enabled()
             && self.head_in.is_none()
             && self.layers.iter().all(|layer| {
@@ -2437,6 +2468,7 @@ impl<F: HybridFfn> Trunk<F> {
                             ssm_out: &r.ssm_out,
                             batch_slot: 0,
                         },
+                        Vec::new(),
                     );
                     let Some(out) = out else {
                         vulkan.end_prefill_group();
@@ -2523,6 +2555,406 @@ impl<F: HybridFfn> Trunk<F> {
         Ok(Some(logits))
     }
 
+    /// One decode step for several sequences on the host's layer loop, one
+    /// token a row: each row's attention or recurrent sub-layer runs on its
+    /// own cache and slot as its solo step would, and each layer's FFN and
+    /// the head run once over every row. `None` for fewer than two rows.
+    pub(crate) fn decode_batch_host(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let n_rows = rows.len();
+        if n_rows < 2 || tokens.len() != n_rows {
+            return Ok(None);
+        }
+        let n_embd = self.dims.n_embd;
+        let mut x = decode_stages::scope(Stage::Embed, || self.embed(tokens))?;
+        let mut scratch = LayerScratch::default();
+        let decode = crate::engine::backend::DecodeKernels::for_batch(self.backend.as_ref(), true);
+        let backend: &dyn Backend = &decode;
+        for (il, layer) in self.layers.iter().enumerate() {
+            let (attn_norm, post_attention_norm, ffn) = match layer {
+                Layer::FullAttn(w, ffn) => (&w.attn_norm, &w.post_attention_norm, ffn),
+                Layer::Recurrent(w, ffn) => (&w.attn_norm, &w.post_attention_norm, ffn),
+            };
+            tensor::rmsnorm_into(
+                &mut scratch.normed,
+                &x,
+                attn_norm,
+                n_rows,
+                n_embd,
+                self.dims.rms_eps,
+            );
+            for (r, row) in rows.iter_mut().enumerate() {
+                let normed = &scratch.normed[r * n_embd..(r + 1) * n_embd];
+                let sub_out = match layer {
+                    Layer::FullAttn(w, _) => w.attn.forward(
+                        backend, &self.dims, row.cache, normed, 1, row.pos, None, row.slot,
+                    ),
+                    Layer::Recurrent(w, _) => w.recurrent.forward(
+                        backend,
+                        &self.dims,
+                        row.cache,
+                        normed,
+                        1,
+                        OutputGate::Silu,
+                        row.slot,
+                    ),
+                };
+                tensor::add_inplace(&mut x[r * n_embd..(r + 1) * n_embd], &sub_out);
+            }
+            self.apply_ffn(
+                backend,
+                il,
+                ffn,
+                post_attention_norm,
+                &mut x,
+                n_rows,
+                &mut scratch.ffn,
+                &mut scratch.ffn_out,
+                &mut scratch.ffn_work,
+            );
+        }
+        decode_stages::scope(Stage::Head, || self.head_rows_on(backend, &x, n_rows)).map(Some)
+    }
+
+    /// Whether [`Self::decode_batch`] can serve this trunk's decode steps: a
+    /// Vulkan device and every layer in [`Self::rows_on_device`]'s shape.
+    pub(crate) fn batches_decode(&self) -> bool {
+        self.backend
+            .as_wgpu()
+            .is_some_and(|vulkan| self.rows_on_device_shape(vulkan))
+    }
+
+    /// One step for several sequences — `rows[i]` takes `widths[i]` of
+    /// `tokens` from its own position (one apiece when `widths` is empty;
+    /// the one-token rows first, then the verifying ones) — with the
+    /// residual stream on the device and every projection over all of the
+    /// rows at once: an attention layer runs each one-token row as its
+    /// solo step would (`fused_attention_decode_batch`) and each verifying
+    /// row as its own verify would (`fused_attention_prefill_deferred`), a
+    /// recurrent layer steps each sequence's state over its own rows
+    /// (`record_recurrent_rows`), and each layer's output projection and
+    /// FFN is one chain over every row. Every row's logits come back, or
+    /// the token `samples` asks for. `None`, with nothing recorded, where
+    /// the batch cannot be served.
+    pub(crate) fn decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        widths: &[usize],
+        tokens: &[u32],
+        samples: Option<&[Option<super::GreedySampleParams<'_>>]>,
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        use crate::engine::backend::vulkan::{
+            AttnOutSrc, FfnActivation, FusedAttnPrefillInput, FusedAttnPrefillKv,
+            RecurrentLayerInput, RecurrentRowsSeq, RopeYarn,
+        };
+        if rows.len() < 2 {
+            return Ok(None);
+        }
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        if !self.rows_on_device_shape(vulkan) {
+            return Ok(None);
+        }
+        let ones;
+        let widths = if widths.is_empty() {
+            ones = vec![1; rows.len()];
+            &ones[..]
+        } else {
+            widths
+        };
+        let n_rows: usize = widths.iter().sum();
+        anyhow::ensure!(
+            widths.len() == rows.len() && n_rows == tokens.len(),
+            "one width per row and one token per row of the pass"
+        );
+        let n_dec = widths.iter().take_while(|&&w| w == 1).count();
+        anyhow::ensure!(
+            widths[n_dec..].iter().all(|&w| w > 1),
+            "the one-token rows of a batch come first"
+        );
+        // A verify is taken as rows only where its own pass would be.
+        if n_dec < rows.len() && !self.rows_on_device_serve(vulkan) {
+            return Ok(None);
+        }
+        let dims = &self.dims;
+        let n_embd = dims.n_embd;
+        let eps = dims.rms_eps;
+        let q_dim = dims.n_head * dims.head_dim;
+        let kv_dim = dims.n_head_kv * dims.head_dim;
+        let n_attn = self
+            .layers
+            .iter()
+            .filter(|l| matches!(l, Layer::FullAttn(..)))
+            .count();
+        // A stage per verifying row for its K/V rows, as its solo verify has.
+        let mut stages = Vec::with_capacity(rows.len() - n_dec);
+        for &w in &widths[n_dec..] {
+            let Some(stage) = (!super::gemma::prefill_kv_wait())
+                .then(|| vulkan.kv_readback_stage((n_attn * w * kv_dim * 2 * 4) as u64))
+                .flatten()
+            else {
+                return Ok(None);
+            };
+            stages.push(stage);
+        }
+        let mut pending_kv: Vec<Vec<(usize, Vec<crate::engine::backend::vulkan::PendingKvRows>)>> =
+            (n_dec..rows.len()).map(|_| Vec::new()).collect();
+        for row in &mut rows[n_dec..] {
+            row.cache.discard_pending_rows();
+        }
+        let x = self.embed(tokens)?;
+        let device_rows = crate::engine::backend::vulkan::prefill_rows_capacity(n_rows);
+        let mut bufs: [wgpu::Buffer; 2] =
+            std::array::from_fn(|_| vulkan.prefill_rows_buffer(device_rows * n_embd));
+        vulkan.upload_rows(&bufs[0], &x);
+        vulkan.begin_op_span();
+        let layers_per_submit = super::gemma::prefill_layers_per_submit();
+        let mut group_layers = 0usize;
+        vulkan.begin_prefill_group();
+        for (il, layer) in self.layers.iter().enumerate() {
+            let _scratch_lease = vulkan.scratch_lease();
+            let (sub_out, wo, post_attention_norm, ffn) = match layer {
+                Layer::FullAttn(w, ffn) => {
+                    let a = &w.attn;
+                    let attn_input = FusedAttnPrefillInput {
+                        x_gpu: Some((&bufs[0], 0)),
+                        attn_norm: Some(&w.attn_norm),
+                        q_bias: None,
+                        pairing: crate::engine::tensor::RopeLayout::Neox,
+                        yarn: RopeYarn::IDENTITY,
+                        normalize_v: false,
+                        attn_gate: Some(&a.wgate),
+                        normed: &[],
+                        n_tokens: n_rows,
+                        start_pos: 0,
+                        wq: &a.wq,
+                        q_norm: Some(&a.attn_q_norm),
+                        kv: Some(FusedAttnPrefillKv {
+                            k_bias: None,
+                            v_bias: None,
+                            wk: &a.wk,
+                            k_norm: Some(&a.attn_k_norm),
+                            wv: Some(&a.wv),
+                        }),
+                        n_head: dims.n_head,
+                        n_head_kv: dims.n_head_kv,
+                        head_dim: dims.head_dim,
+                        rope_dim: dims.rope_dim,
+                        rope_freq_base: dims.rope_freq_base,
+                        freq_factors: None,
+                        eps,
+                        n_swa: 0,
+                        causal: true,
+                        scale: 1.0 / (dims.head_dim as f32).sqrt(),
+                        want_attn_out_host: false,
+                    };
+                    let (dec_rows, verify_rows) = rows.split_at_mut(n_dec);
+                    let decoded = (n_dec > 0)
+                        .then(|| {
+                            let input = FusedAttnPrefillInput {
+                                n_tokens: n_dec,
+                                ..attn_input
+                            };
+                            vulkan.fused_attention_decode_batch(
+                                &input,
+                                &w.attn_norm,
+                                dec_rows,
+                                a.cache_index,
+                                0,
+                            )
+                        })
+                        .flatten();
+                    if n_dec > 0 && decoded.is_none() {
+                        vulkan.end_prefill_group();
+                        if il == 0 {
+                            return Ok(None);
+                        }
+                        anyhow::bail!("attention layer {il} cannot take a batched decode step");
+                    }
+                    let attn_out = if verify_rows.is_empty() {
+                        decoded.expect("a batch of one-token rows decoded above")
+                    } else {
+                        // Every row's attention output gathered for the
+                        // post-attention chain.
+                        let all = vulkan.prefill_rows_buffer(device_rows * q_dim);
+                        if let Some(decoded) = &decoded {
+                            vulkan.copy_rows(decoded, 0, &all, 0, n_dec * q_dim);
+                        }
+                        let mut at = n_dec;
+                        for (j, row) in verify_rows.iter_mut().enumerate() {
+                            let w = widths[n_dec + j];
+                            let input = FusedAttnPrefillInput {
+                                x_gpu: Some((&bufs[0], (at * n_embd * 4) as u64)),
+                                n_tokens: w,
+                                start_pos: row.pos,
+                                ..attn_input
+                            };
+                            let Some((attn, pending)) = vulkan.fused_attention_prefill_deferred(
+                                input,
+                                &mut row.cache.layers[a.cache_index],
+                                &mut stages[j],
+                            ) else {
+                                vulkan.end_prefill_group();
+                                anyhow::bail!(
+                                    "attention layer {il} cannot verify a draft in a batched step"
+                                );
+                            };
+                            if !pending.is_empty() {
+                                pending_kv[j].push((a.cache_index, pending));
+                            }
+                            vulkan.copy_rows(&attn.attn_out_buf, 0, &all, at * q_dim, w * q_dim);
+                            at += w;
+                        }
+                        all
+                    };
+                    ((attn_out, 0u64), &a.wo, &w.post_attention_norm, ffn)
+                }
+                Layer::Recurrent(w, ffn) => {
+                    let r = &w.recurrent;
+                    let BetaAlpha::Split { beta, alpha } = &r.beta_alpha else {
+                        unreachable!("rows_on_device_serve admits split beta/alpha only");
+                    };
+                    let mut seqs = rows
+                        .iter_mut()
+                        .zip(widths)
+                        .map(|(row, &w)| RecurrentRowsSeq {
+                            state: row.cache.recurrent[r.cache_index].device_step(),
+                            n_rows: w,
+                            keep_rows: w > 1,
+                        });
+                    let first = seqs.next().expect("a batch has rows");
+                    let others: Vec<RecurrentRowsSeq<'_>> = seqs.collect();
+                    let conv_channels = dims.conv_channels();
+                    let out = vulkan.record_recurrent_rows(
+                        (&bufs[0], 0),
+                        &w.attn_norm,
+                        first.n_rows,
+                        first.keep_rows,
+                        RecurrentLayerInput {
+                            normed: &[],
+                            qkv_rotation: None,
+                            ba_rotation: None,
+                            wqkv: &r.wqkv,
+                            wgate: &r.wqkv_gate,
+                            wbeta: beta,
+                            walpha: alpha,
+                            conv_kernel: &r.ssm_conv1d,
+                            d_conv: r.ssm_conv1d.len() / conv_channels,
+                            dt_bias: &r.ssm_dt_bias,
+                            ssm_a: &r.ssm_a,
+                            state: first.state,
+                            ssm_norm: &r.ssm_norm,
+                            eps,
+                            sigmoid_gate: false,
+                            grouped: dims.grouped_v_heads,
+                            n_k: dims.ssm_n_group,
+                            n_v: dims.ssm_dt_rank,
+                            head_dim: dims.ssm_head_dim,
+                            out_rotation: None,
+                            ssm_out: &r.ssm_out,
+                            batch_slot: 0,
+                        },
+                        others,
+                    );
+                    let Some(out) = out else {
+                        vulkan.end_prefill_group();
+                        if il == 0 {
+                            return Ok(None);
+                        }
+                        anyhow::bail!("recurrent layer {il} cannot take a batched decode step");
+                    };
+                    (out, &r.ssm_out, &w.post_attention_norm, ffn)
+                }
+            };
+            let (gate, up, down, ..) = ffn
+                .dense_parts()
+                .expect("rows_on_device_serve admits dense FFNs only");
+            if let Some(pair) = super::ffn_gate_up_pair(gate, up) {
+                vulkan.place_weight(&pair);
+            }
+            let out = vulkan.fused_post_attention_prefill_rows(
+                AttnOutSrc::Gpu(&sub_out.0, sub_out.1, n_rows),
+                AttnOutSrc::Gpu(&bufs[0], 0, n_rows),
+                n_rows,
+                wo,
+                None,
+                post_attention_norm,
+                gate,
+                up,
+                down,
+                None,
+                eps,
+                FfnActivation::Swiglu,
+                Some((&bufs[1], 0)),
+                None,
+                None,
+            );
+            if out.is_none() {
+                vulkan.end_prefill_group();
+                anyhow::bail!("layer {il}'s FFN cannot take a batched decode step");
+            }
+            bufs.swap(0, 1);
+            group_layers += 1;
+            // The first layer goes on its own: the device waits for the
+            // first submission, and every layer after it records while it
+            // runs.
+            if group_layers >= layers_per_submit.max(1) || il == 0 {
+                vulkan.end_prefill_group();
+                vulkan.begin_prefill_group();
+                group_layers = 0;
+            }
+        }
+        vulkan.end_prefill_group();
+        for ((row, stage), pending) in rows[n_dec..].iter_mut().zip(stages).zip(pending_kv) {
+            vulkan.fill_deferred_kv_rows(row.cache);
+            vulkan.fill_kv_rows(stage, pending, row.cache);
+        }
+        // Each row of the pass is its request's: a verifying request's
+        // tokens all take its slot.
+        let slots: Vec<usize> = rows
+            .iter()
+            .zip(widths)
+            .flat_map(|(r, &w)| std::iter::repeat_n(r.slot, w))
+            .collect();
+        let pos = rows.first().map_or(0, |r| r.pos);
+        let no_samples;
+        let samples = match samples.filter(|_| vulkan.gpu_sample()) {
+            Some(samples) => samples,
+            None => {
+                no_samples = vec![None; n_rows];
+                &no_samples[..]
+            }
+        };
+        let tail = decode_stages::scope(Stage::Head, || {
+            vulkan.decode_batch_tail(
+                AttnOutSrc::Gpu(&bufs[0], 0, n_rows),
+                n_rows,
+                &self.output_norm,
+                eps,
+                &self.output_weight,
+                None,
+                samples,
+                &slots,
+            )
+        });
+        let outcomes = match tail {
+            Some(outcomes) => outcomes,
+            None => {
+                let h = vulkan.readback_rows(&bufs[0], n_rows * n_embd);
+                decode_stages::scope(Stage::Head, || self.head_rows(&h, n_rows))?
+                    .into_iter()
+                    .map(super::ForwardOutcome::Logits)
+                    .collect()
+            }
+        };
+        vulkan.finish_op_span(pos);
+        Ok(Some(outcomes))
+    }
+
     /// One token's layer loop, the final norm and the output head as device
     /// submissions, the logits read back — see the call in
     /// [`Self::forward`]. `None` when a layer cannot be recorded (a
@@ -2534,6 +2966,7 @@ impl<F: HybridFfn> Trunk<F> {
         cache: &mut KvCache,
         x: &[f32],
         start_pos: usize,
+        slot_id: usize,
     ) -> Option<Vec<f32>> {
         use crate::engine::backend::vulkan::{
             FfnActivation, FusedAttentionLayerInput, RecurrentLayerInput,
@@ -2647,7 +3080,7 @@ impl<F: HybridFfn> Trunk<F> {
                                 o_rotation: a.o_in.as_ref(),
                                 wo: &a.wo,
                                 cache: &mut cache.layers[a.cache_index],
-                                batch_slot: 0,
+                                batch_slot: slot_id,
                             },
                             Some(&w.post_attention_norm),
                         );
@@ -2687,7 +3120,7 @@ impl<F: HybridFfn> Trunk<F> {
                                 head_dim: dims.ssm_head_dim,
                                 out_rotation: r.out_in.as_ref(),
                                 ssm_out: &r.ssm_out,
-                                batch_slot: 0,
+                                batch_slot: slot_id,
                             },
                             Some(&w.post_attention_norm),
                         );
@@ -2742,6 +3175,7 @@ impl<F: HybridFfn> Trunk<F> {
         n_tokens: usize,
         start_pos: usize,
         scratch: &mut LayerScratch,
+        slot: usize,
     ) -> Result<()> {
         let LayerScratch {
             normed,
@@ -2760,7 +3194,7 @@ impl<F: HybridFfn> Trunk<F> {
             self.dims.rms_eps,
         );
         let sub_out = layer.attn.forward(
-            backend, &self.dims, cache, normed, n_tokens, start_pos, None,
+            backend, &self.dims, cache, normed, n_tokens, start_pos, None, slot,
         );
 
         tensor::add_inplace(x, &sub_out);
@@ -2789,6 +3223,7 @@ impl<F: HybridFfn> Trunk<F> {
         x: &mut [f32],
         n_tokens: usize,
         scratch: &mut LayerScratch,
+        slot: usize,
     ) -> Result<()> {
         let LayerScratch {
             normed,
@@ -2813,6 +3248,7 @@ impl<F: HybridFfn> Trunk<F> {
             normed,
             n_tokens,
             OutputGate::Silu,
+            slot,
         );
 
         tensor::add_inplace(x, &sub_out);

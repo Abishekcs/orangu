@@ -1016,9 +1016,12 @@ gemma 4 checkpoint."
     /// The backend a pass of `n_tokens` runs on: the prompt backend for a
     /// multi-token pass of one sequence when the load-time probe chose one,
     /// the model's own otherwise.
-    fn pass_backend(&self, n_tokens: usize, batch: bool) -> &Arc<dyn Backend> {
+    /// `device_rows`: the cache holds rows the fused decode chain wrote to
+    /// the device alone, which a pass on the prompts backend would read as
+    /// holes — a draft verified after decode steps keeps to the device.
+    fn pass_backend(&self, n_tokens: usize, batch: bool, device_rows: bool) -> &Arc<dyn Backend> {
         match &self.prefill_backend {
-            Some(prompts) if n_tokens > 1 && !batch => prompts,
+            Some(prompts) if n_tokens > 1 && !batch && !device_rows => prompts,
             _ => &self.backend,
         }
     }
@@ -1523,8 +1526,12 @@ gemma 4 checkpoint."
         let mut x = x0.to_vec();
         // Where this pass runs: a prompt goes to the backend the load-time
         // probe picked for prompts (`Self::prefill_backend`), everything
-        // else — a decode step, a decode batch — to the model's own.
-        let backend = self.pass_backend(n_tokens, batch.is_some());
+        // else — a decode step, a decode batch, a pass over rows only the
+        // device holds — to the model's own.
+        let device_rows = one
+            .as_deref()
+            .is_some_and(|cache| cache.layers.iter().any(|l| l.has_device_only_rows()));
+        let backend = self.pass_backend(n_tokens, batch.is_some(), device_rows);
         // The chunk's host phases, for `ORANGU_CPU_TIMESTAMPS`: what the
         // host does before its chains are recorded, the recording itself,
         // the submission, and what it waits for afterwards. A device idle
@@ -3580,6 +3587,10 @@ impl ModelForward for GemmaModel {
         Ok(logits)
     }
 
+    fn batches_decode(&self) -> bool {
+        self.backend.as_wgpu().is_some() && !self.is_moe && self.causal
+    }
+
     fn forward_decode_batch(
         &self,
         rows: &mut [crate::engine::arch::DecodeRow<'_>],
@@ -4917,6 +4928,62 @@ mod real_model_tests {
     /// by one, a draft row read from the wrong offset 0.67. Run with
     /// `ORANGU_TEST_MODEL=/path/to/gemma-4-E2B.gguf cargo test --release
     /// --bin orangu-server batch_verifies -- --ignored`.
+    /// Prompts on the cores, decode on the device: the decode steps' rows
+    /// are on the device alone, and a draft verified after them must not
+    /// run on the cores over the holes in the host copy. Its logits match
+    /// the same tokens verified on a cache that never left the host. Run
+    /// with `ORANGU_TEST_MODEL=/path/to/gemma-4-E2B.gguf cargo test
+    /// --release --bin orangu-server verify_after_device_steps -- --ignored`.
+    #[test]
+    #[ignore]
+    fn gemma4_verify_after_device_steps_keeps_to_the_device() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let mut model =
+            GemmaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        model.prefill_backend = Some(Arc::new(crate::engine::backend::CpuBackend));
+        let prompt: Vec<u32> = std::iter::once(2)
+            .chain((0..40u32).map(|i| 100 + (i * 37) % 2000))
+            .collect();
+        let steps = [911u32, 57, 1302];
+        let draft = [400u32, 12, 808];
+        let mut stepped = model.new_kv_cache(96);
+        model.forward(&mut stepped, &prompt, 0, 0).expect("prefill");
+        for (k, &t) in steps.iter().enumerate() {
+            model
+                .forward(&mut stepped, &[t], prompt.len() + k, 0)
+                .expect("decode step");
+        }
+        assert!(
+            stepped.layers.iter().any(|l| l.has_device_only_rows()),
+            "the decode steps left rows on the device alone"
+        );
+        let pos = prompt.len() + steps.len();
+        let got = model
+            .forward_verify(&mut stepped, &draft, pos, 0)
+            .expect("verify after device steps");
+        let mut host = model.new_kv_cache(96);
+        let history: Vec<u32> = prompt.iter().chain(&steps).copied().collect();
+        model.forward(&mut host, &history, 0, 0).expect("prefill");
+        let want = model
+            .forward_verify(&mut host, &draft, pos, 0)
+            .expect("verify on the host cache");
+        for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+            let (mut diff2, mut val2) = (0f64, 0f64);
+            for (x, y) in g.iter().zip(w) {
+                diff2 += f64::from((x - y) * (x - y));
+                val2 += f64::from(y * y);
+            }
+            let rms = (diff2 / val2).sqrt();
+            println!("draft position {k}: rms {rms:.2e}");
+            assert!(rms < 0.25, "draft position {k} rms {rms}");
+        }
+    }
+
     #[test]
     #[ignore]
     fn gemma4_decode_batch_verifies_a_draft_as_its_own_pass_would() {
@@ -4927,7 +4994,13 @@ mod real_model_tests {
         };
         let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
         let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
-        let model = GemmaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        let mut model =
+            GemmaModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        // Both sides on the device: where the load-time probe sends prompts
+        // to the cores, their GEMM quantizes activations the device's
+        // passes do not, and the solo side would differ by that, not by
+        // the batch.
+        model.prefill_backend = None;
         assert!(model.batches_verify(), "this model batches a verify");
         let prompts: [Vec<u32>; 2] = [
             std::iter::once(2)

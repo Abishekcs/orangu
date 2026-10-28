@@ -70,9 +70,24 @@ impl ModelForward for Qwen3NextModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<f32>> {
-        self.trunk.forward(cache, tokens, start_pos)
+        self.trunk.forward(cache, tokens, start_pos, slot_id)
+    }
+
+    /// Every layer's experts run on the host's turn of the step, so a batch
+    /// is the host layer loop with each row's sub-layers on its own cache.
+    fn batches_decode(&self) -> bool {
+        true
+    }
+
+    /// One decode step for several sequences (`Trunk::decode_batch_host`).
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [super::DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        self.trunk.decode_batch_host(rows, tokens)
     }
 
     fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
@@ -109,7 +124,7 @@ impl ModelForward for Qwen3NextModel {
         start_pos: usize,
     ) -> Result<Vec<f32>> {
         self.trunk
-            .forward_range(cache, hidden, tokens.len(), start_pos, layers)
+            .forward_range(cache, hidden, tokens.len(), start_pos, layers, 0)
     }
 
     fn head(&self, hidden: &[f32], n_rows: usize) -> Result<Vec<Vec<f32>>> {
@@ -124,8 +139,33 @@ impl ModelForward for Qwen3NextModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<Vec<f32>>> {
-        self.trunk.forward_all_logits(cache, tokens, start_pos)
+        self.trunk
+            .forward_all_logits(cache, tokens, start_pos, slot_id)
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// A batch runs each layer's FFN over every row at once and a solo
+    /// step over one, and the recurrence carries the difference.
+    const TOLERANCE: f64 = 4e-2;
+
+    #[test]
+    #[ignore]
+    fn a_decode_batch_matches_each_rows_solo_step() {
+        let Some(vulkan) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let path =
+            std::env::var("ORANGU_TEST_QWEN3NEXT_MODEL").expect("set ORANGU_TEST_QWEN3NEXT_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model =
+            Qwen3NextModel::load_with_backend(&loaded, Arc::new(vulkan)).expect("build model");
+        super::super::batch_checks::decode_batch_matches_each_rows_solo_step(&model, TOLERANCE);
     }
 }
