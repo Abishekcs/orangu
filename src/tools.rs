@@ -100,7 +100,13 @@ struct EditFileRequest {
 struct ListDirectoryRequest {
     path: Option<String>,
     max_depth: Option<usize>,
+    /// A glob (`**/*.rs`) over the paths under `path`: the matching files
+    /// alone, newest first.
+    pattern: Option<String>,
 }
+
+/// The most files a `list_directory` pattern lists.
+const PATTERN_LIMIT: usize = 1000;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct FetchUrlRequest {
@@ -396,12 +402,13 @@ impl ToolExecutor {
 
         defs.push(tool(
             "list_directory",
-            "List files and directories.",
+            "List files and dirs, or files matching glob `pattern`.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "max_depth": {"type": "integer"}
+                    "max_depth": {"type": "integer"},
+                    "pattern": {"type": "string"}
                 }
             }),
         ));
@@ -495,6 +502,14 @@ impl ToolExecutor {
             defs.extend(mcp.definitions());
         }
         defs
+    }
+
+    /// The picture at `path` in the workspace — its media type and bytes —
+    /// for a caller that can hand a model the picture itself; `None` when
+    /// the file is not one ([`picture_type`]).
+    pub fn read_picture(&self, path: &str) -> Result<Option<(&'static str, Vec<u8>)>> {
+        let bytes = fs::read(self.resolve_workspace_path(path)?)?;
+        Ok(picture_type(&bytes).map(|kind| (kind, bytes)))
     }
 
     pub fn workspace(&self) -> &Path {
@@ -832,14 +847,26 @@ impl ToolExecutor {
         let args: ReadFileRequest = serde_json::from_value(Value::Object(arguments.clone()))?;
         let path = self.resolve_workspace_path(&args.path)?;
         let read_path = path.clone();
-        let (mut content, is_pdf) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let read = tokio::task::spawn_blocking(move || -> Result<_> {
             let bytes = fs::read(&read_path)?;
-            Ok((
+            if let Some(kind) = picture_type(&bytes) {
+                return Ok(Err((kind, bytes.len())));
+            }
+            Ok(Ok((
                 crate::pdf::decode_text(&read_path, &bytes)?,
                 crate::pdf::is_pdf(&read_path, &bytes),
-            ))
+            )))
         })
         .await??;
+        let (mut content, is_pdf) = match read {
+            Ok(text) => text,
+            Err((kind, len)) => {
+                return Ok(format!(
+                    "{} is a picture ({kind}, {len} bytes), not text: it has no lines to show",
+                    args.path
+                ));
+            }
+        };
 
         redact_secrets(&mut content);
 
@@ -941,10 +968,18 @@ impl ToolExecutor {
         )
         .map_err(|err| anyhow!("{err}"))?;
 
+        let replacements = if created || args.old_text.is_empty() {
+            0
+        } else if args.replace_all.unwrap_or(false) {
+            original.matches(args.old_text.as_str()).count()
+        } else {
+            1
+        };
         Ok(json!({
             "path": response.path,
             "created": created,
             "updated": true,
+            "replacements": replacements,
             "original_bytes": original.len(),
             "new_bytes": updated.len(),
             "mode": response.mode,
@@ -957,6 +992,13 @@ impl ToolExecutor {
         let args: ListDirectoryRequest = serde_json::from_value(Value::Object(arguments.clone()))?;
         let relative = args.path.unwrap_or_else(|| ".".to_string());
         let path = self.resolve_workspace_path(&relative)?;
+        if let Some(pattern) = args.pattern {
+            let workspace = self.workspace.clone();
+            return tokio::task::spawn_blocking(move || {
+                matching_files(&workspace, &path, &pattern)
+            })
+            .await?;
+        }
         let max_depth = args.max_depth.unwrap_or(2);
 
         let entries = WalkDir::new(&path)
@@ -1148,8 +1190,16 @@ pub fn apply_edit(
         return Ok(new_text.to_string());
     }
 
-    if !original.contains(old_text) {
+    let count = original.matches(old_text).count();
+    if count == 0 {
         return Err(anyhow!("old_text was not found in the file"));
+    }
+    // More than one place it could mean: which one is the caller's to say.
+    if count > 1 && !replace_all {
+        return Err(anyhow!(
+            "old_text occurs {count} times in the file: include more of the text around it, \
+             or set replace_all"
+        ));
     }
 
     let updated = if replace_all {
@@ -1159,6 +1209,87 @@ pub fn apply_edit(
     };
 
     Ok(updated)
+}
+
+/// The files under `root` whose path below it matches the glob `pattern`
+/// (`*` stays within a directory, `**` crosses them), newest first, as
+/// paths under `workspace`; `.git` is never entered. At most
+/// [`PATTERN_LIMIT`], with a note of how many more there are.
+fn matching_files(workspace: &Path, root: &Path, pattern: &str) -> Result<String> {
+    let matcher = globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map_err(|err| anyhow!("the pattern: {err}"))?
+        .compile_matcher();
+    let mut found = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.file_name() != ".git")
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(under) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        if !matcher.is_match(under) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let shown = entry
+            .path()
+            .strip_prefix(workspace)
+            .unwrap_or(under)
+            .display()
+            .to_string();
+        found.push((modified, shown));
+    }
+    if found.is_empty() {
+        return Ok("No files match.".into());
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let total = found.len();
+    let mut lines: Vec<String> = found
+        .into_iter()
+        .take(PATTERN_LIMIT)
+        .map(|(_, p)| p)
+        .collect();
+    if total > PATTERN_LIMIT {
+        lines.push(format!("({} more not shown)", total - PATTERN_LIMIT));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// The media type of a picture — PNG, JPEG, GIF or WebP — by its first
+/// bytes; `None` for anything else.
+pub fn picture_type(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("image/webp"),
+        _ => None,
+    }
 }
 
 fn render_file_slice(content: &str, start_line: Option<usize>, end_line: Option<usize>) -> String {
@@ -1394,6 +1525,88 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_edit_that_could_mean_two_places_is_refused() {
+        let err = apply_edit("a x b x", "x", "y", false, false).unwrap_err();
+        assert!(err.to_string().contains("occurs 2 times"), "{err}");
+        assert_eq!(
+            apply_edit("a x b x", "x", "y", true, false).unwrap(),
+            "a y b y"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_reports_its_replacements() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("f.txt"), "x x x").unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+        let args = json!({"path": "f.txt", "old_text": "x", "new_text": "y", "replace_all": true, "git": false});
+        let out: Value =
+            serde_json::from_str(&executor.replace_text(args.as_object().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(out["replacements"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_pattern_lists_the_matching_files_newest_first() {
+        let workspace = tempfile::tempdir().unwrap();
+        let dir = workspace.path();
+        fs::create_dir_all(dir.join("src/deep")).unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join("src/old.rs"), "").unwrap();
+        fs::write(dir.join(".git/hidden.rs"), "").unwrap();
+        fs::write(dir.join("src/notes.md"), "").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(dir.join("src/old.rs"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        fs::write(dir.join("src/deep/new.rs"), "").unwrap();
+        let executor = ToolExecutor::new(dir);
+        let list = |args: Value| {
+            let executor = &executor;
+            async move {
+                executor
+                    .list_directory(args.as_object().unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            list(json!({"pattern": "**/*.rs"})).await,
+            "src/deep/new.rs\nsrc/old.rs"
+        );
+        // `*` does not cross a directory; a `path` roots the pattern.
+        assert_eq!(
+            list(json!({"path": "src", "pattern": "*.rs"})).await,
+            "src/old.rs"
+        );
+        assert_eq!(list(json!({"pattern": "*.txt"})).await, "No files match.");
+    }
+
+    #[tokio::test]
+    async fn a_picture_is_named_as_one_and_read_as_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 1];
+        fs::write(workspace.path().join("shot.png"), png).unwrap();
+        fs::write(workspace.path().join("a.txt"), "text").unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+        let shown = executor
+            .show_file(json!({"path": "shot.png"}).as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            shown.contains("is a picture (image/png, 10 bytes)"),
+            "{shown}"
+        );
+        let (kind, bytes) = executor.read_picture("shot.png").unwrap().unwrap();
+        assert_eq!((kind, bytes.len()), ("image/png", 10));
+        assert!(executor.read_picture("a.txt").unwrap().is_none());
+        assert!(executor.read_picture("../outside.png").is_err());
+    }
 
     #[test]
     fn apply_single_edit() {

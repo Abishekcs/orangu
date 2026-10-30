@@ -816,10 +816,16 @@ impl Tokenizer {
     /// either, so it arrived as the literal five characters `<eos>` in the
     /// answer.
     ///
-    /// Matching on the vocabulary's own name for the token is not a guess
-    /// about content: no model emits `<eos>` as prose. A vocabulary without
-    /// such a token is unaffected.
-    const NAMED_END_TOKENS: [&'static str; 1] = ["<eos>"];
+    /// gemma-4 can also end a tool call with `<|tool_response>`: its chat
+    /// template closes a turn whose call has no result yet with that token
+    /// instead of `<turn|>`, so it is where the model hands over and waits.
+    /// Not stopping there, the model writes the tool's result itself and
+    /// carries on calling tools against results it made up.
+    ///
+    /// Matching on the vocabulary's own name for a token is not a guess
+    /// about content: no model emits `<eos>` or `<|tool_response>` as
+    /// prose. A vocabulary without such a token is unaffected.
+    const NAMED_END_TOKENS: [&'static str; 2] = ["<eos>", "<|tool_response>"];
 
     pub fn stop_token_ids(&self) -> Vec<u32> {
         let mut ids = Vec::with_capacity(3);
@@ -1697,6 +1703,16 @@ mod tests {
         // confirms construction succeeds and vocab_size is right.
         let tok = Tokenizer::from_gguf(&gguf).unwrap();
         assert_eq!(tok.vocab_size(), 3);
+    }
+
+    #[test]
+    fn a_gemma_tool_call_ends_where_its_result_would_begin() {
+        let gguf = build_gguf(&["a", "<eos>", "<turn|>", "<|tool_response>"], &[], 0, 2);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let stops = tok.stop_token_ids();
+        assert!(stops.contains(&2) && stops.contains(&1) && stops.contains(&3));
+        let plain = Tokenizer::from_gguf(&build_gguf(&["a", "b"], &[], 0, 1)).unwrap();
+        assert_eq!(plain.stop_token_ids(), vec![1]);
     }
 
     #[test]

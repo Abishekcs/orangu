@@ -137,7 +137,16 @@ pub fn record(prefix: &[u32]) {
     if prefix.len() < MIN_TOKENS {
         return;
     }
-    let prefix = &prefix[..prefix.len().min(MAX_TOKENS)];
+    // A picture's rows do not outlive the process, so a prefix is kept only
+    // up to the first one.
+    let end = prefix
+        .iter()
+        .position(|&t| super::vision::is_virtual(t))
+        .unwrap_or(prefix.len());
+    if end < MIN_TOKENS {
+        return;
+    }
+    let prefix = &prefix[..end.min(MAX_TOKENS)];
     let Ok(mut guard) = STATE.lock() else {
         return;
     };
@@ -222,6 +231,7 @@ pub async fn warm_up(
                 prompt_tokens: prefix,
                 sampling: crate::engine::sampling::SamplingParams::default(),
                 json_output: false,
+                json_schema: None,
                 max_tokens: 0,
                 stop_token_ids: Vec::new(),
                 cache_prompt: true,
@@ -230,6 +240,7 @@ pub async fn warm_up(
                 role: None,
                 cache_point: None,
                 background: true,
+                reasoning_budget: None,
             })
             .await;
         let mut ok = false;

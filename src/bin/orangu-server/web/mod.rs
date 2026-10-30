@@ -872,16 +872,50 @@ async fn send_message(
             .into_response();
     };
 
-    let (prompt, head) = match render_prompt(&state, &template, &session, &req.content, &extracted)
-    {
-        Ok(rendered) => rendered,
-        // {err:#} (anyhow's "alternate" chain format) rather than {err} —
-        // the latter only prints the outermost context, losing exactly the
-        // detail (which template line, which variable) that makes a
-        // template-rendering error diagnosable at all.
-        Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+    let (prompt, head, pictures) =
+        match render_prompt(&state, &template, &session, &req.content, &extracted) {
+            Ok(rendered) => rendered,
+            // {err:#} (anyhow's "alternate" chain format) rather than {err} —
+            // the latter only prints the outermost context, losing exactly the
+            // detail (which template line, which variable) that makes a
+            // template-rendering error diagnosable at all.
+            Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        };
+    let tokens = match (&state.engine.vision, pictures.is_empty()) {
+        (Some(vision), false) => {
+            // The session's stored pictures, as the data URLs a chat
+            // request would have carried.
+            let mut urls = Vec::with_capacity(pictures.len());
+            for name in &pictures {
+                let read = sessions::file_path(&id, name)
+                    .and_then(|path| Ok(std::fs::read(path)?))
+                    .map_err(|err| format!("{err:#}"));
+                let bytes = match read {
+                    Ok(bytes) => bytes,
+                    Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+                };
+                urls.push(format!(
+                    "data:;base64,{}",
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+                ));
+            }
+            let (tokenizer, vision) = (state.engine.tokenizer.clone(), vision.clone());
+            let encoded = tokio::task::spawn_blocking(move || {
+                crate::http::openai::encode_with_pictures(&tokenizer, &vision, &prompt, &urls)
+            })
+            .await;
+            match encoded {
+                Ok(Ok(tokens)) => tokens,
+                Ok(Err(err)) => {
+                    return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response();
+                }
+                Err(err) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+                }
+            }
+        }
+        _ => crate::http::encode_off_runtime(&state.engine.tokenizer, prompt, false).await,
     };
-    let tokens = crate::http::encode_off_runtime(&state.engine.tokenizer, prompt, false).await;
     // As for an OpenAI chat request: see `GenerateRequest::cache_point`.
     let cache_point = match head {
         Some(head) => {
@@ -897,6 +931,7 @@ async fn send_message(
         .generate(GenerateRequest {
             // These endpoints have no structured-output field of their own.
             json_output: false,
+            json_schema: None,
             prompt_tokens: tokens,
             sampling: SamplingParams::default(),
             max_tokens: MAX_TOKENS,
@@ -906,6 +941,7 @@ async fn send_message(
             role: None,
             cache_point,
             background: false,
+            reasoning_budget: None,
             cache_prompt: true,
             // The web console keeps one conversation per session but has no
             // notion of a slot; any free one is right.
@@ -1270,14 +1306,18 @@ fn html_delta<'a>(sent: &str, current: &'a str) -> (usize, &'a str) {
 
 /// The prompt for this turn and, for a model whose state cannot be rewound,
 /// the same conversation rendered without the generation prompt when that
-/// is a prefix of it — the end of the turn the next one repeats.
+/// is a prefix of it — the end of the turn the next one repeats. With a
+/// vision tower, also the session's stored pictures in the order their
+/// sentinels stand in the prompt.
 fn render_prompt(
     state: &WebState,
     template: &ChatTemplate,
     session: &Session,
     new_message: &str,
     new_attachments: &[Attachment],
-) -> anyhow::Result<(String, Option<String>)> {
+) -> anyhow::Result<(String, Option<String>, Vec<String>)> {
+    let mut pictures = Vec::new();
+    let seen = state.engine.vision.is_some();
     // Each message's stored attachments (with their extracted text) are
     // folded back into its content here rather than being persisted inline,
     // so the transcript stays clean while the model still sees the document
@@ -1288,13 +1328,17 @@ fn render_prompt(
         .map(|m: &SessionMessage| {
             ChatMessage::text(
                 &m.role,
-                &attachments::compose_content(&m.content, &m.attachments),
+                &attachments::compose_content(
+                    &m.content,
+                    &m.attachments,
+                    seen.then_some(&mut pictures),
+                ),
             )
         })
         .collect();
     messages.push(ChatMessage::text(
         "user",
-        &attachments::compose_content(new_message, new_attachments),
+        &attachments::compose_content(new_message, new_attachments, seen.then_some(&mut pictures)),
     ));
 
     let bos = state
@@ -1335,8 +1379,9 @@ fn render_prompt(
                 .ok()
         })
         .flatten()
-        .filter(|head| prompt.starts_with(head.as_str()) && head.len() < prompt.len());
-    Ok((prompt, head))
+        .filter(|head| prompt.starts_with(head.as_str()) && head.len() < prompt.len())
+        .filter(|_| pictures.is_empty());
+    Ok((prompt, head, pictures))
 }
 
 #[cfg(test)]

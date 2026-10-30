@@ -43,9 +43,19 @@ except `GET /health` and `GET /ready` requires:
 Authorization: Bearer <key>
 ```
 
-and answers `401` with `WWW-Authenticate: Bearer` without it. The `orangu`
-client sends its own `api_key` this way on every request, including the
-`/v1/models` probe, and so does any OpenAI-shaped client.
+or, equally,
+
+```
+x-api-key: <key>
+```
+
+and answers `401` with `WWW-Authenticate: Bearer` without one. The `orangu`
+client sends its own `api_key` as a bearer token on every request, including
+the `/v1/models` probe, and so does any OpenAI-shaped client; Anthropic SDKs
+send `x-api-key`. A refused `/v1/messages*`, `/v1/files*`, `/v1/skills*`,
+`/v1/agents*`, `/v1/environments*`, `/v1/sessions*`, `/v1/memory_stores*` or
+`/v1/vaults*` request gets the
+`401` in the Anthropic error shape (see **Anthropic-compatible endpoints**).
 
 The **web console** port has no key of its own and is not loopback-restricted
 — it assumes a trusted network. A server reachable from an untrusted one
@@ -148,8 +158,32 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 
 | Endpoint | |
 | :-- | :-- |
-| `GET /v1/models` | the one model this process serves |
-| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; `tools`/`tool_calls` and `response_format`; `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; needs a chat template; disabled under `--embedding` |
+| `GET /v1/models` | the one model this process serves, readable by OpenAI and Anthropic clients |
+| `GET /v1/models/{id}` | that model, when `id` names it; `404` otherwise |
+| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; `tools`/`tool_calls` and `response_format` (`json_object`, `json_schema`); `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; needs a chat template; disabled under `--embedding` |
+| `POST /v1/messages` | Anthropic's Messages API: streaming (SSE) and non-streaming; content blocks and PDF documents, `tools`/`tool_choice`/`tool_use`, continued replies, `stop_sequences`, `thinking`/`effort`; needs a chat template |
+| `POST /v1/messages/count_tokens` | the prompt token count a `/v1/messages` request would have |
+| `POST /v1/messages/batches`, `GET /v1/messages/batches` | Anthropic's Message Batches API: submit many `/v1/messages` requests at once, or list the batches |
+| `GET /v1/messages/batches/{id}`, `DELETE /v1/messages/batches/{id}` | one batch's status and counts; delete an ended one |
+| `POST /v1/messages/batches/{id}/cancel` | stop a batch; requests not yet started end `canceled` |
+| `GET /v1/messages/batches/{id}/results` | an ended batch's results, one JSON line per request |
+| `POST /v1/files`, `GET /v1/files` | Anthropic's Files API: upload a file (multipart, up to 500 MiB), or list them |
+| `GET /v1/files/{id}`, `DELETE /v1/files/{id}` | one file's metadata; delete it |
+| `GET /v1/files/{id}/content` | the file's bytes |
+| `/v1/memory_stores…` | memory stores, their memories and versions (see **Memory stores**) |
+| `/v1/vaults…` | vaults and their credentials (see **Vaults**) |
+| `POST /v1/skills`, `GET /v1/skills` | Anthropic's Skills API: upload a skill (multipart, a folder with a `SKILL.md`), or list them |
+| `GET /v1/skills/{id}`, `DELETE /v1/skills/{id}` | one skill; delete one with no versions left |
+| `POST /v1/skills/{id}/versions`, `GET /v1/skills/{id}/versions` | upload a new version of a skill, or list its versions |
+| `GET /v1/skills/{id}/versions/{version}`, `DELETE /v1/skills/{id}/versions/{version}` | one version; delete it |
+| `POST /v1/agents`, `GET /v1/agents` | Managed Agents: create an agent, or list them |
+| `GET /v1/agents/{id}`, `POST /v1/agents/{id}`, `POST /v1/agents/{id}/archive`, `GET /v1/agents/{id}/versions` | one agent (at a `version`); update it, archive it, list its versions |
+| `POST /v1/environments`, `GET /v1/environments` | create an environment, or list them |
+| `GET`, `POST`, `DELETE /v1/environments/{id}`, `POST /v1/environments/{id}/archive` | one environment; update, delete or archive it |
+| `POST /v1/sessions`, `GET /v1/sessions` | start a session of an agent in an environment, or list them |
+| `GET`, `POST`, `DELETE /v1/sessions/{id}`, `POST /v1/sessions/{id}/archive` | one session; update, delete or archive it |
+| `POST /v1/sessions/{id}/events`, `GET /v1/sessions/{id}/events` | send a session events (a message, a tool result, an interrupt), or list its events |
+| `GET /v1/sessions/{id}/events/stream` | a session's events as they happen, as server-sent events |
 | `POST /v1/completions` | legacy completion, no chat template needed; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled and L2-normalized; carries OpenAI's `usage` |
 | `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image` or `qwen_image_2_1` model; `501` on a language model |
@@ -180,14 +214,31 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 
 #### `GET /v1/models`
 
-The model this process serves, in OpenAI's listing shape. One entry, always —
-`orangu-server` loads exactly one model, and switching to another restarts the
-process (see **Loading a different model** in the *Inference server* chapter).
+The model this process serves. One entry, always — `orangu-server` loads
+exactly one model, and switching to another restarts the process (see
+**Loading a different model** in the *Inference server* chapter).
+
+The entry carries both OpenAI's fields (`object`, `created`, `owned_by`) and
+Anthropic's (`type`, `display_name`, `created_at`), and the listing both
+`object: "list"` and Anthropic's `has_more`/`first_id`/`last_id`, so either
+SDK's model listing reads it.
 
 ```json
 {"object":"list","data":[{"id":"ggml-org/gemma-4-E4B-it-GGUF","object":"model",
- "created":1755600000,"owned_by":"orangu-server"}]}
+ "created":1755600000,"owned_by":"orangu-server","type":"model",
+ "display_name":"ggml-org/gemma-4-E4B-it-GGUF","created_at":"2025-08-19T10:40:00Z"}],
+ "has_more":false,"first_id":"ggml-org/gemma-4-E4B-it-GGUF","last_id":"ggml-org/gemma-4-E4B-it-GGUF"}
 ```
+
+Each entry also carries Anthropic's `max_input_tokens` and `max_tokens` — the
+model's context, or the device's room when that is smaller — and
+`capabilities`: `batch`, `citations`, `pdf_input` and `structured_outputs`
+as supported, `thinking` as this model has it (whether the vocabulary marks
+reasoning off from the answer), and `image_input` as supported when the
+model has a vision tower (see **Pictures**).
+
+`GET /v1/models/{id}` returns the same entry when `id` is the served model's
+id, and `404` otherwise.
 
 #### `POST /v1/chat/completions`
 
@@ -242,8 +293,8 @@ nothing" stay distinguishable, and a client that does not know the field
 ignores it and sees the answer alone.
 
 This covers every format that *names* a reasoning body: a
-`<think>`…`</think>` span, a message addressed `to=self`, a body opened with
-`<|content_thinking|>`. Thinking never passes through the tool-call splitter
+`<think>`…`</think>` span, gemma-4's `thought` channel, a message addressed
+`to=self`, a body opened with `<|content_thinking|>`. Thinking never passes through the tool-call splitter
 — a call is something the model addresses to the caller, not part of a body
 it addressed to itself — so `tool_calls` are parsed from the answer only.
 
@@ -353,11 +404,34 @@ move left, which is what keeps a model from trailing blank lines to
 `json_object` means an **object**, matching the field's name: a bare string is
 technically valid JSON, and a caller asking for a record and receiving
 `"Name: Sophia, Age: 32"` gets something that parses and then fails at
-`result["name"]`, which is worse than failing outright. `json_schema` is
-accepted and treated the same way — output is constrained to valid JSON, but
-**not** to the schema's shape. Constraining to a schema is a larger job and is
-not implemented; the type is honoured rather than ignored so that a caller
-asking for it is not silently given free text.
+`result["name"]`, which is worse than failing outright.
+
+With `{"type": "json_schema", "json_schema": {"schema": {…}}}` the output is
+held to the **schema**, not just to JSON: a required property cannot be left
+out, an undeclared one cannot be added, an `integer` cannot be written as
+`36.5`, and an `enum` value cannot be anything else. What a schema may use:
+
+- `type` — one, or a list such as `["string", "null"]` — with `properties`,
+  `required` and `additionalProperties` for an object, and `items`,
+  `minItems` and `maxItems` for an array.
+- `enum`, `const`, `anyOf`, `oneOf`, a one-schema `allOf`, and `$ref` into
+  the same schema (`#/$defs/…`, `#/definitions/…`, `#`), recursion included.
+- `true`, `{}` or a schema with no `type`: any JSON value.
+
+An object with `properties` is written with its properties **in declared
+order**, each optional one either present or skipped, and no others. An
+object without `properties` takes any keys, valued as
+`additionalProperties` says (`false` allows only `{}`).
+
+Annotations and value checks — `description`, `title`, `format`, `pattern`,
+`minLength`, `minimum`, `uniqueItems` and the like — are accepted and not
+enforced. Keywords that change the shape in ways the constraint cannot
+follow — `not`, `if`/`then`/`else`, `patternProperties`, a many-schema
+`allOf`, `prefixItems` and the like — make the request a `400` naming the
+keyword, as do a `$ref` outside the schema and a `required` name that
+`properties` lacks. The schema is not added to the prompt here: describe
+what you want in the messages too, or the model writes the right keys while
+pausing in whitespace before each one.
 
 Two limits worth knowing. A constrained request cannot use the GPU's argmax
 fast path, which picks tokens without consulting the constraint, so each step
@@ -657,6 +731,953 @@ empty `delta` and a `video_progress` object (`id`, `step`, `steps`,
 `phase`, `eta_seconds`) until the final chunk delivers the content with
 `finish_reason: "stop"`. A failed clip is a `500` with the reason, or an
 `{"error"}` event when streamed.
+
+#### Citations
+
+A `document` or `search_result` block with `citations: {"enabled": true}`
+is shown to the model in numbered passages, and the model is asked to write
+the numbers it draws on after its claims. The server takes the numbers out
+of the reply again: the text before each one becomes a text block whose
+`citations` hold the passages it named, located as Anthropic locates them:
+
+| Source | Passage | Citation |
+|---|---|---|
+| text document | a sentence | `char_location` (`start_char_index`, `end_char_index`) |
+| PDF document | a sentence of a page | `page_location` (`start_page_number`, `end_page_number`) |
+| `content` document | a content block | `content_block_location` (`start_block_index`, `end_block_index`) |
+| search result | a content block | `search_result_location` (`search_result_index`, `source`, `title`) |
+
+Each citation carries `cited_text`, and a document's carries its
+`document_index` (counting every `document` block of the request, in order)
+and `document_title`. Streamed, a citation is a `citations_delta` on the
+text block it belongs to. A number that names no passage stays in the text
+as written. How well the model cites depends on the model: the passages
+are offered, not enforced. Citations cannot be combined with an output
+format (`400`).
+
+#### Pictures
+
+A gemma-4 model reads pictures when its vision tower — the
+`mmproj-*.gguf` `orangu-server download` fetches beside it — is loaded:
+`[orangu-server].vision` names one, or the server finds the one beside the
+model whose projection is the model's width (see the server chapter). The
+server says which at startup (`vision … (up to N tokens a picture)`).
+
+A picture reaches the model from:
+
+- `/v1/chat/completions` — an `image_url` part, a `data:` URL or an `http(s)`
+  URL;
+- `/v1/messages` — an `image` block, a `base64`, `url` or `file` source, in
+  a turn or in a `tool_result`;
+- a Managed Agents session's `user.message` `image` blocks, and its `read`
+  tool on a picture file;
+- the web console's attached pictures.
+
+PNG, JPEG, GIF, WebP and SVG are read; an `http(s)` URL is fetched by the
+server, which takes an `image/*` reply of up to 50 MB. Like every URL the
+server fetches for a request, it must reach a public address (see
+`fetch_private` in the server chapter). A picture is read at
+its own proportions, each side a multiple of 48 pixels, in 70 to
+`[orangu-server].vision_tokens` (default 280) prompt tokens — a larger
+picture at a smaller size. Its tokens count in `usage` and in
+`count_tokens` like text, and a picture seen again (the next turn of a
+conversation) comes from the prompt cache: it is read through the tower
+once while it stays in the server's store of recent pictures.
+
+A picture sent to a model without a vision tower is a `400`, as is one
+that cannot be decoded. The model's entry in `/v1/models` reports
+`image_input` accordingly.
+
+### Anthropic-compatible endpoints
+
+An Anthropic SDK works against `orangu-server` by pointing its base URL at the
+server (`base_url="http://127.0.0.1:8100"`) and setting its API key to the
+server's `api_key`, or to anything when none is set. `anthropic-version` and
+`anthropic-beta` are accepted and not read.
+
+A `/v1/messages` conversation is rendered through the same chat template as
+`/v1/chat/completions`, so the model sees the same prompt from either
+endpoint. Errors use Anthropic's envelope —
+`{"type":"error","error":{"type":"invalid_request_error","message":"…"}}` —
+with `authentication_error` (`401`), `not_found_error` (`404`),
+`overloaded_error` (`503`, with `Retry-After`) and `api_error` (`500`, `501`)
+for the other statuses. Every response carries a `request-id` header, the
+message's `id`.
+
+#### `POST /v1/messages`
+
+| Field | Default | |
+| :-- | :-- | :-- |
+| `model` | the served model | echoed back in the response; any value is served by the one model this process has |
+| `messages` | `[]` | `user`/`assistant` turns; `content` a string or a list of blocks |
+| `system` | none | a string, or a list of `text` blocks |
+| `max_tokens` | `8192` | cap on the answer |
+| `stream` | `false` | server-sent events |
+| `stop_sequences` | `[]` | strings that end the answer; the matched one is not included |
+| `temperature`, `top_p`, `top_k` | the role's | sampler |
+| `min_p`, `repeat_penalty`, `seed` | the role's | sampler fields under `/v1/chat/completions`'s names |
+| `tools` | none | custom tools (`name`, `description`, `input_schema`), Anthropic-defined client tools, and the server tools `web_search_*`, `web_fetch_*`, `code_execution_*`, `advisor_*` and `mcp_toolset` (see below) |
+| `container` | a new one | for code execution: a container's id, or `{"id": …, "skills": [{"type": "custom", "skill_id": …, "version": …}]}` (see **Code execution** below) |
+| `mcp_servers` | none | remote MCP servers whose tools the server calls itself: `[{"type": "url", "url": …, "name": …, "authorization_token": …}]` |
+| `tool_choice` | `auto` | `auto`, `any` (the reply is a tool call), `tool` with `name` (a call of that tool), `none` (the tools are withheld); `disable_parallel_tool_use: true` ends the reply at its first call |
+| `thinking` | the role's | `{"type": "disabled"}` turns reasoning off; `enabled` and `adaptive` turn it on; with `enabled`, `budget_tokens` caps each turn's reasoning — once the model has reasoned that many tokens, the token that ends its reasoning is the next one it writes (for a model that marks reasoning with `<think>` or a channel) — and picks an effort when `output_config` names none (under 4096 `low`, under 16384 `medium`, else `high`) |
+| `output_config` | none | `effort`: `"low"`, `"medium"`, `"high"` or `"max"`, passed to the template as its reasoning effort (`max` as `high`); `format`: `{"type": "json_schema", "schema": {…}}` holds the reply to the schema (see **Structured output** below) |
+| `output_format` | none | `output_config.format` under its earlier name |
+| `cache_control` | — | accepted on any block and at the top level; the prefix cache is automatic, so it changes nothing |
+| `cache_prompt`, `id_slot` | `true`, none | as on `/v1/chat/completions` |
+
+A request body may be up to 32 MiB; a larger one is a `413`
+`request_too_large`.
+
+Content blocks read from `messages`:
+
+- `text` — the turn's text; several are joined with newlines.
+- `image` — a `base64`, `url` or `file` source, read by the model where it
+  stands among the turn's text (see **Pictures**). An `image` inside a
+  `tool_result`'s content follows the result's text.
+- `document` — the text of a `text` source, a `content` source's `text`
+  blocks, or a base64 PDF's embedded text (scanned pages carry none), under
+  the document's `title` when it has one. A `url` source is fetched by the
+  server (a PDF or text, up to 32 MB) and read the same way. With
+  `citations: {"enabled": true}` its passages are numbered (see
+  **Citations**).
+- `search_result` — its `title`, `source` and text `content`, at the top
+  level of a turn or inside a `tool_result`.
+- `tool_use` (assistant) — becomes one of the turn's tool calls.
+- `tool_result` (user) — becomes the result of the call its `tool_use_id`
+  names; `is_error: true` prefixes its content with `Error:`.
+- `container_upload` (user) — copies a stored file into the code execution
+  container (see **Code execution** below); the model is told where it is.
+- `thinking` and `redacted_thinking` — skipped: earlier turns are rendered
+  without their reasoning.
+
+Anthropic-defined client tools — `bash_*`, `text_editor_*`, `memory_*` and
+`computer_*` — are declared to the model with their standard input schemas
+under the `name` the request gives them; the client runs them, as with any
+custom tool. Anthropic's server tools other than those below (tool search
+and the rest) are left out.
+
+A call the model makes to a tool the request does not have — a client
+tool it never declared, or a name it made up — is not handed to the client:
+the model is told there is no such tool, and which tools there are, and the
+reply goes on.
+
+**Server tools.** `web_search_*`, `web_fetch_*`, `code_execution_*`,
+`advisor_*` and the tools of the `mcp_servers` are run by the server itself. A reply that calls
+one gets a `server_tool_use` block (`mcp_tool_use` for an MCP tool, naming
+its `server_name`), then the result — `web_search_tool_result`,
+`web_fetch_tool_result`, `bash_code_execution_tool_result`,
+`text_editor_code_execution_tool_result`, `code_execution_tool_result`,
+`advisor_tool_result` or `mcp_tool_result` — and then the model goes on
+from the result, all within the one reply. A reply that also calls a
+client tool stops there with `tool_use`. After ten rounds of server tools a
+reply stops with `pause_turn`; sending it back as the last assistant turn
+continues it. Server tool blocks sent back in a conversation are read as the
+calls and results they record. `usage.server_tool_use` counts
+`web_search_requests` and `web_fetch_requests`.
+
+- `web_search` searches the SearXNG instance `[orangu-server].web_search`
+  names, and returns up to eight results — `url`, `title`, and the excerpt
+  the model read as `encrypted_content` (base64 text, not encrypted). With no
+  instance configured, a request declaring `web_search` is a `400`.
+  `max_uses`, `allowed_domains` and `blocked_domains` apply; a domain covers
+  its subdomains.
+- `web_fetch` fetches a page or PDF and returns its text as a document. It
+  fetches only URLs that have appeared in the conversation — in a message, a
+  search result, or a page fetched before — so the model cannot be steered to
+  addresses it was never shown, and only public addresses are reached
+  (see `fetch_private` in the server chapter). `max_uses`, `allowed_domains`,
+  `blocked_domains` and `max_content_tokens` apply. Errors come back as
+  `web_fetch_tool_result_error` with Anthropic's `error_code`s (`url_not_allowed`,
+  `url_not_accessible`, `unsupported_content_type`, `max_uses_exceeded`, …).
+- MCP servers are connected for each request over streamable HTTP, with
+  `authorization_token` as a bearer token. Without `mcp_toolset` entries,
+  every server's tools are available, narrowed by its
+  `tool_configuration` (`enabled`, `allowed_tools`). With them, only the
+  servers a toolset names are used, and its `default_config` and per-tool
+  `configs` decide which tools are enabled. When two servers offer the same
+  tool name, the first keeps it.
+- `code_execution` runs code in a sandboxed container — see **Code
+  execution** below.
+- `advisor` (`{"type": "advisor_20260301", "name": "advisor", "model": …}`)
+  is a second request to the served model, which reads the conversation so
+  far — its start and its most recent part when it is long — and answers
+  with guidance for the model to go on from. The call takes no input. Its
+  result's `content` is `advisor_result` (`text`, and `stop_reason`:
+  `end_turn`, or `max_tokens` when the advice was cut off, which the model is
+  told), or `advisor_tool_result_error` with an `error_code`
+  (`max_uses_exceeded`, `prompt_too_long`, `overloaded`, `unavailable`).
+  `model` is required and recorded; `max_uses` and `max_tokens` (2048 when
+  not given) apply. A conversation holding `advisor_tool_result` blocks
+  needs the advisor tool in `tools`, or it is a `400`.
+
+**Code execution.** With `[orangu-server].code_execution = bwrap`, a
+`code_execution_*` tool gives the model a Linux container to run code in;
+with it `off` (the default), a request declaring one is a `400`.
+`code_execution_20250522` is one `code_execution` tool taking Python `code`,
+answered with `code_execution_tool_result`. Every later version is two
+tools: `bash_code_execution`, taking a shell `command` and answered with
+`bash_code_execution_tool_result` (`stdout`, `stderr`, `return_code`), and
+`text_editor_code_execution`, taking `view`, `create` or `str_replace` on a
+`path` and answered with `text_editor_code_execution_tool_result`
+(`text_editor_code_execution_view_result`, `…_create_result` or
+`…_str_replace_result`, or `…_tool_result_error` with an `error_code` such
+as `file_not_found`). A command that fails to start comes back as an
+`unavailable` error, and one running past two minutes is stopped and comes
+back as `execution_time_exceeded`. Tools may be called from the model's
+code (see **Tools called from code**). Python state does not carry from one
+code execution call to the next: files do.
+
+A container is a directory under `[orangu-server].api_data`; its
+`/workspace` keeps its files from one command, and one request, to the
+next. The response's `container` gives its `id` and `expires_at` — 30 days
+after its last use — and a request that passes that id as `container`
+works in it again; an expired or unknown one is a `404`. Each command runs
+in a fresh bubblewrap sandbox as the server's user, in its own user, PID,
+network, IPC and UTS namespaces: no network, `/usr` and the few `/etc` files
+the dynamic loader and user lookup need read-only, a private `/tmp`, and
+nothing else of the host — not the home directory. A command may use up to
+5 GiB of address space and write files of up to 1 GiB; its stdout and
+stderr are each cut at 100,000 bytes. The text editor runs in the server on
+the same paths, and refuses one that leads outside `/workspace`, links
+included.
+
+The files a command writes in `/workspace` — new or changed, up to 20 of
+100 MiB or less, hidden ones and `__pycache__` left out — are stored in the
+Files API, and each one's `file_id` is listed in the result's `content` as
+a `bash_code_execution_output` (or `code_execution_output`) block, for
+`GET /v1/files/{id}/content` to download. A `container_upload` block,
+`{"type": "container_upload", "file_id": "file_…"}`, copies a stored file
+into `/workspace` under its file name (`name-1.ext` and so on when the name
+is taken) once per container.
+
+`container.skills` lists up to eight skills from the Skills API (see
+**Skills** below), each at its `version` (`latest` when it names none).
+Each one's folder is mounted read-only at `/skills/<name>`, and the system
+prompt lists each skill's name and description, telling the model to read
+its `SKILL.md` before using it. The response's `container.skills` gives the
+version each resolved to. Skills, and `container_upload` blocks, need the
+`code_execution` tool; a `type: "anthropic"` skill (Anthropic's own `pptx`,
+`xlsx` and the rest) is a `400`.
+
+**Structured output.** With `output_config.format` (or `output_format`) the
+reply is one `text` block holding a JSON document the schema describes —
+held there the way `response_format: json_schema` holds
+`/v1/chat/completions` (see **Structured output (`response_format`)**, for
+what a schema may use). The schema is also added to the system prompt, so
+the model knows what each field is for. It cannot be combined with `tools`
+or a continued assistant turn; either is a `400`. A schema the constraint
+cannot follow is a `400` naming why.
+
+**Tools called from code.** A client tool whose `allowed_callers` lists
+`code_execution_20260120` (or `code_execution_20260521`), in a request that
+declares one of those code execution tools, can be called by the model's
+Python code: the model gets a `code_execution` tool for Python beside the
+bash and editor ones, and in its code each such tool is an async function
+taking one dict of arguments and returning the result's text — `rows =
+json.loads(await query_sales({"region": "north"}))`, several at once with
+`asyncio.gather`. A tool without `"direct"` in its `allowed_callers` is
+offered to the model only that way.
+
+When the code calls tools, the reply stops with `stop_reason: "tool_use"`:
+the `server_tool_use` block of the code, then a `tool_use` block for each
+call, whose `caller` is `{"type": "code_execution_20260120", "tool_id":
+<the server_tool_use id>}` (calls made together arrive together). The code
+waits, paused. The next request — the conversation with that reply, then a
+user message of only `tool_result` blocks, each a string or text blocks —
+hands it the results, and the reply is either the code's next calls alone
+or, once it ends, its `code_execution_tool_result` followed by the model
+going on from what it printed. The model never sees the calls or their
+results, only the code and its output. A paused run waits about four and
+a half minutes and is lost on a restart; results for one no longer waiting
+are a `400`, as is a message holding anything besides the `tool_result`
+blocks, or a `tool_choice` naming a tool only code may call.
+
+**Strict tools.** A client tool declared `strict: true` has every call's
+input checked against its `input_schema` once the call is written — `type`,
+`properties`, `required`, `additionalProperties`, `items`, `minItems`,
+`maxItems`, `enum`, `const`, `anyOf`, `oneOf`, `allOf`, `$ref`, `minLength`,
+`maxLength`, `pattern`, `minimum` and `maximum`. A call that does not match
+never reaches the client: the model is told what is wrong with it and
+writes the call again, within the reply's turn limit (a reply that runs out
+of turns stops with `pause_turn`). A strict tool's input is not streamed as
+it is written; it arrives once it has been checked.
+
+**Continuing a reply.** A conversation that ends on an assistant turn holding
+text (and no `tool_use`) is continued: the reply carries on from that text,
+which the response does not repeat. Trailing whitespace on it is trimmed.
+
+**Forced tool calls.** `any` and `tool` begin the reply with the model's own
+tool-call syntax, found by rendering a sample call through the chat template.
+A template that renders no call this server recognises leaves the choice to
+the model. A continued reply is never forced.
+
+The response is a `message`:
+
+```json
+{"id":"msg_6ae28c2a000005","type":"message","role":"assistant",
+ "model":"gemma","content":[{"type":"text","text":"The capital of France is Paris."}],
+ "stop_reason":"end_turn","stop_sequence":null,
+ "usage":{"input_tokens":27,"output_tokens":7,
+          "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+```
+
+- `content` — a `thinking` block when the model reasoned (its `signature` is
+  empty), a `text` block for the answer, and one `tool_use` block per call,
+  with `input` as an object.
+- `stop_reason` — `end_turn`, `max_tokens`, `stop_sequence` (with the matched
+  string in `stop_sequence`), `tool_use` or `pause_turn`.
+- `container` — `id`, `expires_at` and `skills`, when the request declares
+  the code execution tool.
+- `usage` — `input_tokens` is the part of the prompt that was processed, and
+  `cache_read_input_tokens` the part served from the prefix cache; together
+  they are the whole prompt. `cache_creation_input_tokens` is always `0`:
+  caching is automatic and costs nothing to write.
+
+Streamed, the events are `message_start`, `ping`, then for each block
+`content_block_start`, its deltas (`thinking_delta`, `text_delta` or
+`input_json_delta`) and `content_block_stop`, then `message_delta` with
+`stop_reason`, the `container` when there is one, and the final `usage`,
+then `message_stop`. A failure mid-stream is an `error` event.
+
+A call to one of the client's tools is streamed as it is written: its
+`tool_use` block starts once the tool's name is written, and its input
+follows as `input_json_delta`s, which join into the same input the finished
+call has. How finely depends on the model's call format:
+
+- gemma-4's: each argument once written, and a long string such as a file's
+  content a few characters at a time.
+- JSON calls (`<tool_call>{…}` as Qwen2.5 and Hermes write them,
+  `[TOOL_CALLS]`): the arguments object's own text as it is written, up to
+  anything that is not JSON (a raw line break inside a string, say), after
+  which the rest waits for the whole call.
+- Tag formats (`<function=…>`/`<parameter=…>`, `<arg_key>`, invoke tags):
+  each parameter once it is whole, since its value's type (string or JSON)
+  is known only then.
+
+`eager_input_streaming` is accepted and changes nothing. Server tool calls
+send their input as one `input_json_delta`. If the model stops in the
+middle of a call (at `max_tokens`, or writing something that turns out not
+to be a call), the block is closed with the input written up to there,
+the text stays in the reply as written, and the call does not count: the
+reply stops with `max_tokens` or `end_turn`, not `tool_use`. A reply that
+ends on a whole call whose closing marker the model never wrote counts
+that call, streamed or not.
+
+#### `POST /v1/messages/count_tokens`
+
+Takes `messages`, `system`, `tools`, `tool_choice`, `thinking`,
+`output_config` and `container` as `/v1/messages` does, renders them the
+same way, and answers `{"input_tokens": N}` without generating or opening a
+container.
+
+#### Files
+
+`POST /v1/files` takes a `multipart/form-data` body with the file in a field
+named `file`, up to 500 MiB, and answers with its metadata:
+
+```json
+{"id":"file_17dbcfb6b1424048b4221e031616e562","type":"file","filename":"memo.pdf",
+ "mime_type":"application/pdf","size_bytes":569,"created_at":"2026-10-29T01:13:20Z",
+ "downloadable":true}
+```
+
+The `mime_type` is the one the upload declares, or else what the bytes are,
+or else what the file name suggests. Files are stored under
+`[orangu-server].api_data` and kept until deleted.
+
+`GET /v1/files` lists them newest first, `limit` at a time (default 20, at
+most 1000), paging with `after_id` and `before_id` and answering with
+`data`, `has_more`, `first_id` and `last_id`; `scope_id` lists only the
+files a session stored from its outputs. `GET /v1/files/{id}` is one
+file's metadata, `GET /v1/files/{id}/content` its bytes, and `DELETE
+/v1/files/{id}` answers `{"id": …, "type": "file_deleted"}`.
+
+A `document` or `image` block in `/v1/messages` can name a stored file
+instead of carrying it: `"source": {"type": "file", "file_id": "file_…"}`.
+A PDF is read as its embedded text, a picture as a picture, and any other
+file as UTF-8 text; a file that is none of these, or an unknown `file_id`,
+is a `400`. This applies inside `tool_result` content too, and in batched
+requests.
+
+#### Skills
+
+`POST /v1/skills` takes a `multipart/form-data` body: the skill's files,
+each in a `files` field (`files[]` too) whose file name is its path, and
+optionally a `display_name`. The files make one folder, with a `SKILL.md` at
+its root — `my-skill/SKILL.md`, `my-skill/scripts/run.py`, … — or are that
+folder's contents with no folder named, up to 30 MiB in all. `SKILL.md`
+opens with front matter giving the skill's `name` (lowercase letters,
+digits and hyphens, at most 64; the folder's name when it gives none) and
+`description` (at most 1024 characters):
+
+```markdown
+---
+name: csv-report
+description: Turns a CSV file into a summary report. Use when asked to report on a CSV.
+---
+# CSV report
+Run `python3 /skills/csv-report/report.py <file>` and …
+```
+
+The answer is the skill, its first version made from the upload:
+
+```json
+{"id":"skill_85ea05a10ee747ec8e6c4144ce3f3c9d","type":"skill",
+ "display_name":"CSV report","latest_version_id":"1793261310635549",
+ "source":{"type":"custom"},"created_at":"2026-10-29T03:28:30Z",
+ "updated_at":"2026-10-29T03:28:30Z"}
+```
+
+`display_name` is the `name` when the upload gives none. `POST
+/v1/skills/{id}/versions` takes another upload of the same skill — its
+`SKILL.md` has to give the same `name` — and answers with the version
+(`id`, `type: "skill_version"`, `skill_id`, `name`, `description`,
+`created_at`). A version's `id` is when it was made, in Unix microseconds.
+
+`GET /v1/skills` lists skills newest first, and `GET
+/v1/skills/{id}/versions` a skill's versions newest first, `limit` at a time
+(default 20, at most 1000): the answer has `data`, `has_more` and
+`next_page`, which passed back as `page` gives the next page. Every skill
+here is `custom`; `source=anthropic` lists none. `DELETE
+/v1/skills/{id}/versions/{version}` removes a version, and `DELETE
+/v1/skills/{id}` a skill whose versions are all removed — with versions
+left it is a `400`. Skills are stored under `[orangu-server].api_data`.
+
+#### Message Batches
+
+`POST /v1/messages/batches` takes `{"requests": [{"custom_id": …, "params":
+{…}}, …]}` — up to 100,000 requests and 256 MiB — where each `params` is a
+`/v1/messages` request body without `stream`. Every request is checked
+before the batch is accepted: a malformed one, a streamed one, or a
+`custom_id` that is not 1–64 letters, digits, `_` or `-`, or is used twice,
+refuses the whole batch with a `400`.
+
+The answer is the batch:
+
+```json
+{"id":"msgbatch_07d2c158d2c347e9a8e02e790f8c0656","type":"message_batch",
+ "processing_status":"in_progress",
+ "request_counts":{"processing":7,"succeeded":0,"errored":0,"canceled":0,"expired":0},
+ "created_at":"2026-10-29T01:13:30Z","expires_at":"2026-10-30T01:13:30Z",
+ "ended_at":null,"cancel_initiated_at":null,"archived_at":null,"results_url":null}
+```
+
+The server runs a batch's requests in the background, as many at once as it
+has slots, through the same path as a non-streamed `/v1/messages` request.
+They share the queue with interactive requests; one the full queue turns
+away is retried rather than failed. A batch is stored under
+`[orangu-server].api_data`, and one still running when the server stops is
+resumed when it starts again, without repeating a finished request. A
+request not finished 24 hours after the batch was created ends `expired`.
+
+`GET /v1/messages/batches/{id}` reports progress in `request_counts`, and
+`processing_status` moves from `in_progress` to `ended` (through
+`canceling` when cancelled). `POST /v1/messages/batches/{id}/cancel` lets the
+requests already running finish and ends the rest `canceled`. `GET
+/v1/messages/batches` lists batches newest first, paged as `GET /v1/files`
+is.
+
+Once a batch has ended, `results_url` names `GET
+/v1/messages/batches/{id}/results`: one JSON line per request, in the order
+they finished —
+
+```json
+{"custom_id":"q1","result":{"type":"succeeded","message":{"id":"msg_…","type":"message",…}}}
+{"custom_id":"bad","result":{"type":"errored","error":{"type":"error","error":{"type":"invalid_request_error","message":"…"}}}}
+```
+
+— where a `canceled` or `expired` result carries nothing else. Before then it
+is a `400`. `DELETE /v1/messages/batches/{id}` removes an ended batch and its
+results; a running one has to be cancelled first.
+
+#### Managed Agents
+
+The Managed Agents endpoints run an agent loop on the server: an **agent**
+is a stored configuration (model, system prompt, tools, MCP servers,
+skills), an **environment** says what its tools may reach, and a
+**session** runs the agent in an environment, in a code execution
+container of its own. A client sends events to a session and reads the
+events it produces. Anthropic's SDKs reach them as `client.beta.agents`,
+`client.beta.environments` and `client.beta.sessions`; the
+`anthropic-beta: managed-agents-2026-04-01` header they send is accepted
+and not required.
+
+`POST /v1/agents` takes `name` and `model` (an id, or `{"id": …, "speed":
+…, "effort": …}`), and optionally `description`, `system`, `tools`,
+`mcp_servers` (`[{"type": "url", "name": …, "url": …}]`), `skills`
+(`[{"type": "custom", "skill_id": …, "version": …}]`, from the Skills API)
+and `metadata`. `tools` lists:
+
+- `{"type": "agent_toolset_20260401"}` — the built-in tools `bash`, `read`,
+  `write`, `edit`, `glob`, `grep`, `web_fetch` and `web_search`. A
+  `default_config` (`enabled`, `permission_policy`) applies to all of them,
+  and a `configs` entry (`{"name": "bash", "enabled": false}`) to one; the
+  web tools' entries also take `allowed_domains` or `blocked_domains`. The
+  answer shows every tool's resolved config.
+- `{"type": "mcp_toolset", "mcp_server_name": …}` — the tools of one of the
+  agent's MCP servers, with the same `default_config` and `configs`.
+- `{"type": "custom", "name": …, "description": …, "input_schema": …}` — a
+  tool the client runs.
+
+The answer is the agent at `version` 1. `POST /v1/agents/{id}` changes the
+fields it names — `metadata` pairs merge, a `null` value removes one — and
+adds a version when anything changed; a `version` in the body must be the
+current one, or it is a `409`. `GET /v1/agents/{id}?version=N` is one
+version, and `GET /v1/agents/{id}/versions` lists them newest first. `POST
+/v1/agents/{id}/archive` makes an agent read-only for good: no new session
+can use it, and the list leaves it out unless `include_archived=true`.
+
+`POST /v1/environments` takes `name`, and optionally `description`,
+`metadata` and `config`: `{"type": "cloud", "networking": …}`. Networking is
+what the session's sandbox may reach:
+
+- `{"type": "unrestricted"}` — the server's own network.
+- `{"type": "limited", "allowed_hosts": […], "allow_mcp_servers": …}` — no
+  network at all in the sandbox. `allowed_hosts` limits the web tools to
+  those hosts (a bare name is that host, `*.example.com` its subdomains),
+  and the web tools are not offered when it lists none. A session of an
+  agent whose MCP servers it does not allow is a `400`. This is the
+  networking of an environment that gives none.
+
+`packages` lists nothing to install — the sandbox runs the server's own
+programs, so a package to install is a `400` — and `type: "self_hosted"` is
+a `400`. `DELETE /v1/environments/{id}` answers `{"id": …, "type":
+"environment_deleted"}`; `POST /v1/environments/{id}/archive` keeps it,
+read-only, for the sessions that use it.
+
+`POST /v1/sessions` takes `agent` — its id (the latest version), `{"type":
+"agent", "id": …, "version": …}`, or `{"type": "agent_with_overrides",
+"id": …, "model": …, "system": …, "tools": …, "mcp_servers": …, "skills":
+…}` — and `environment_id`, and optionally `title`, `metadata`,
+`resources` and `initial_events` (up to 50 `user.message` events, sent as
+the session starts). A `{"type": "file", "file_id": …, "mount_path": …}`
+resource copies a Files API file to `/mnt/session/uploads/<mount_path>`
+(`/mnt/session/uploads/<file_id>` without one), read-only, and the agent is
+told where it is. What the agent writes under `/mnt/session/outputs` is
+stored in the Files API each time a turn ends — a changed file replaces its
+earlier copy — and `GET /v1/files?scope_id=<session id>` lists those files,
+each with `scope: {"id": <session id>, "type": "session"}`. A
+`{"type": "memory_store", "memory_store_id": …, "access": …, "instructions":
+…}` resource (up to 8; see **Memory stores**) mounts the store at
+`/mnt/memory/<name>`, the store's name in lower case with anything but
+letters, digits, `-`, `_` and `.` made `-`; `access` is `read_write` (the
+default) or `read_only`, and the system prompt lists each mount with its
+access, the store's `description` and the resource's `instructions`. The
+agent's skills are copied to `/workspace/skills/<name>`. A session of an
+agent with `bash` or `grep` on needs `[orangu-server].code_execution =
+bwrap`. `vault_ids` lists the vaults whose credentials the session uses
+(see **Vaults**); `budget` is a `400`.
+
+A session is `idle` until it has work, `running` while the agent loop runs,
+and `idle` again when the loop stops. `POST /v1/sessions/{id}/events` takes
+`{"events": […]}` and answers with them as recorded (`{"data": […]}`); a
+bad one refuses them all:
+
+- `user.message` — `content` blocks (`text`, `image`, `document`) or a
+  string. Sent while the loop runs, it joins the conversation at the next
+  model request.
+- `user.interrupt` — stops the loop: a model request or tool call in
+  progress ends, and the session goes idle.
+- `user.custom_tool_result` — `custom_tool_use_id` (the id of the
+  `agent.custom_tool_use` event), `content`, `is_error`.
+- `user.tool_confirmation` — `tool_use_id` (the id of an `agent.tool_use`
+  or `agent.mcp_tool_use` event that asked), `result` `allow` or `deny`,
+  and a `deny_message` the agent is given on a deny.
+- `system.message` — text `content` added to the system prompt from then
+  on.
+- `user.define_outcome` — `description` (the task), `rubric` (`{"type":
+  "text", "content": …}` or `{"type": "file", "file_id": …}`, the criteria
+  the work is graded by) and `max_iterations` (1–20, default 3); it is also
+  accepted in `initial_events`. It is echoed with its `outcome_id`, and the
+  agent starts on it: the task and the rubric are its message. One outcome
+  is worked on at a time; another before the first has ended is a `400`.
+
+The loop sends the conversation through the path a non-streamed
+`/v1/messages` request takes, the agent's tools declared to the model, and
+records what happens as events: `session.status_running`;
+`span.model_request_start` and `span.model_request_end` (with
+`model_usage`) around each model request; `agent.message` for its text and
+`agent.thinking` when it reasons; `agent.tool_use` and `agent.tool_result`
+for a built-in tool, `agent.mcp_tool_use` and `agent.mcp_tool_result` for an
+MCP tool, `agent.custom_tool_use` for a custom one; `session.error` when a
+model request fails; and `session.status_idle` with a `stop_reason` —
+`end_turn`, `requires_action` (with the `event_ids` waiting on the client)
+or `retries_exhausted` after an error. The loop stops after 50 model
+requests and waits for the next message.
+
+When the agent's turn ends while an outcome is active, a grader — a model
+request of its own, which sees the task, the rubric, the agent's last
+messages, the files in `/mnt/session/outputs` (their text, up to 80 000
+characters in all) and a listing of `/workspace` — judges the work, and
+the events are `span.outcome_evaluation_start` and
+`span.outcome_evaluation_ongoing` (`outcome_id`, `iteration`, from 0), then
+`span.outcome_evaluation_end` with `result`, `explanation` and the grader's
+`usage`. `satisfied` and `failed` (a rubric the task cannot meet) end the
+outcome and the session goes idle; `needs_revision` hands the agent the
+explanation and it goes on, the session still running; on the last
+iteration it is `max_iterations_reached` instead, and the agent makes one
+final revision that is not graded. A `user.interrupt` while an outcome is
+active ends it as `interrupted` (with an empty
+`outcome_evaluation_start_id` when grading had not begun). Each ended
+grading is in the session's `outcome_evaluations` (`outcome_id`,
+`description`, `iteration`, `result`, `explanation`, `completed_at`).
+
+Each built-in and MCP call carries `evaluated_permission` and the
+`evaluation` behind it, from its `permission_policy`:
+
+- `always_allow` (the built-in tools' default) runs the call.
+- `always_ask` (the MCP tools' default) waits for a
+  `user.tool_confirmation`.
+- `auto` runs a call that touches only the container — `bash`, `read`,
+  `write`, `edit`, `glob`, `grep` — and asks about one that reaches outside
+  it: the web tools and MCP tools.
+
+A custom tool call always waits for its `user.custom_tool_result`. While a
+call waits, a `user.message` is a `400`.
+
+The built-in tools work in the container, whose working directory is
+`/workspace` and whose files last as long as the session. `read`, `write`,
+`edit` and `glob` are the workspace tools `orangu` gives a model
+(`show_file`, `create_file`, `modify_file`, and `list_directory` with a
+`pattern`), confined to `/workspace` and the session's mounts, and refusing
+to write in a read-only one — `edit`'s `old_string`
+must occur once, unless `replace_all`; `glob` lists the matching files,
+newest first. `read` of a picture (PNG, JPEG, GIF or WebP), on a model
+with a vision tower (see **Pictures**), returns the picture itself as an
+`image` block, for the model to look at. `bash` and `grep` run in the container's
+sandbox, as code execution commands do (see **Code execution**), with the
+environment's networking. `web_fetch` and `web_search` are the server tools
+of the same names, and need `[orangu-server].web_search` set for a search.
+
+`GET /v1/sessions/{id}/events` lists a session's events oldest first
+(`order=desc` for newest first; `types[]` to pick some), `limit` at a time
+(default 1000) — `data` and `next_page`, which passed back as `page` gives
+the next page. `GET /v1/sessions/{id}/events/stream` sends each event as it
+is recorded, as a server-sent event named by its `type`; it starts with the
+next event, so open it before sending and list the events for what came
+before.
+
+With `event_deltas[]=agent.message`, the stream also previews the agent's
+text while the model writes it: an `event_start` (`{"type": "event_start",
+"event": {"type": "agent.message", "id": …}}`), then `event_delta`s
+(`{"type": "event_delta", "event_id": …, "delta": {"type":
+"content_delta", "index": 0, "content": {"type": "text", "text": …}}}`),
+then the buffered `agent.message` with the same `id`, whose text the deltas
+are a prefix of. `event_deltas[]=agent.thinking` sends an `event_start` when
+the model begins to reason, and its `agent.thinking` takes the same id.
+Previews go only to the connection that asked for them, are never listed
+among the events, and are not replayed: a connection opened mid-request sees
+none for it. Any other value, or more than 100, is a `400`.
+
+`GET /v1/sessions` lists sessions newest first (filters `agent_id`,
+`agent_version`, `statuses[]`, `include_archived`; `order=asc`), paged as
+the events are. A session shows the agent it runs, its `resources`, its
+`usage` (tokens, and `active_seconds`) and `stats`. `POST
+/v1/sessions/{id}` changes `title`, `metadata`, and — while it is idle — the
+agent's `tools` and `mcp_servers` for this session only. `POST
+/v1/sessions/{id}/archive` stops it and makes it read-only, and `DELETE
+/v1/sessions/{id}` stops it and removes it with its container. Agents,
+environments and sessions are stored under `[orangu-server].api_data`; a
+session's loop stopped by a server restart leaves it idle, and the next
+event starts it again.
+
+#### Multiagent sessions
+
+An agent's `multiagent` block makes it a coordinator: `{"type":
+"multiagent_20261001", "subagents": {"type": "enabled", "predefined_agents":
+[…], "inline_agents": {"type": "enabled" | "disabled"}}, "workflows": …,
+"advisor": …}`, or the older `{"type": "coordinator", "agents": […]}`. A
+roster entry is an agent id (its latest version), `{"type": "agent", "id",
+"version"}`, or `{"type": "self"}` — the coordinator itself, delegating no
+further, which responses show as a reference to the agent's own id and
+version; at most 20, and an agent with a `multiagent` block of its own
+cannot be one (a `400`). `inline_agents` enabled (the default) lets the
+coordinator also define agents of its own, which run its model and tools;
+disabled, the list needs at least one agent (a `400`). An update that
+sends a `multiagent_20261001` block to an agent that has one is merged into
+it, level by level: a key left out keeps its value, a `null` one takes its
+default, a `predefined_agents` list replaces the stored one, and a member
+whose `type` changes is replaced whole. Workflows and the advisor are
+described below.
+
+In a session of a coordinator, its thread — the primary thread, whose
+events are the session's — has two more tools. `list_agents` shows the
+roster and the threads already started; `send_to_agent` (`message`, and
+`agent_name` for a new thread, `session_thread_id` for a follow-up, or
+`inline_agent` with a `name` and `system`) gives an agent a task in a
+thread of its own and returns at once. A thread runs in parallel with the
+others, in the session's container, with its own conversation, agent,
+tools and event stream; it sees none of the coordinator's conversation.
+When its turn ends, its last reply is its report: an
+`agent.thread_message_sent` on its stream, an
+`agent.thread_message_received` (`from_session_thread_id`,
+`from_agent_name`, `content`) on the session's, and a message the
+coordinator goes on from. A session holds at most 25 child threads,
+archived ones aside.
+
+The session's stream shows `session.thread_created`,
+`session.thread_status_running`, `session.thread_status_idle` (with its
+`stop_reason`) and `session.thread_status_terminated` for each child
+(`session_thread_id`, `agent_name`), the coordinator's
+`agent.thread_message_sent` for each task, and — with `session_thread_id`
+— every call of a child's that waits on the client, answered on the
+session's own events endpoint like any other (the answer reaches the
+thread that asked). The session is `running` while any thread runs, and its
+`session.status_idle` comes once all are idle, with `requires_action` and
+the waiting calls' `event_ids` when any thread waits. A `user.interrupt`
+stops every thread, or only the one its `session_thread_id` names.
+
+`GET /v1/sessions/{id}/threads` lists the threads, the primary first
+(`parent_thread_id` null), each with `agent`, `status` (`running`, `idle`
+or `terminated`), `usage` and `parent_thread_id`; `GET …/threads/{thread}`
+reads one, `POST …/threads/{thread}/archive` terminates an idle child (a
+running one is a `400`: interrupt it first), and `GET
+…/threads/{thread}/events` and `…/threads/{thread}/stream` are the thread's
+own events, listed and streamed as the session's are (`event_deltas[]`
+included). A child's tokens count in its own `usage` and the session's.
+
+**Advisor.** `"advisor": {"type": "enabled", "model": …}` in a
+`multiagent_20261001` block — or one `{"type": "advisor", "model": …}`
+entry among a coordinator's `agents` — gives the session's primary thread
+an `advisor` tool, with or without a roster. An update that leaves
+`advisor` out keeps it; `{"type": "disabled"}` removes it. While it is
+enabled, `anthropic.advisor` is a reserved name: listing an agent with that
+name is a `400`. Each consultation is a thread of its own, named
+`anthropic.advisor`, whose `agent` is `{"type": "advisor", "model": …}`: the
+session's stream shows `session.thread_created`,
+`session.thread_status_running`, the advice as an
+`agent.thread_message_received` (`from_agent_name` `anthropic.advisor`),
+then the thread's `session.thread_status_idle` and
+`session.thread_status_terminated`; no `agent.tool_use` is emitted for it.
+The advisor reads the primary thread's conversation and answers on the
+served model. A consultation that fails, or that a `user.interrupt` naming
+its thread abandons, leaves the agent going on with a notice that there is
+no advice; an interrupt of the whole session stops it with everything
+else. Advisor threads do not count toward the 25 child threads, and are
+invisible to `list_agents` and `send_to_agent`; their tokens count in
+their own `usage` and the session's.
+
+**Dynamic workflows.** `"workflows": {"type": "enabled"}` — the default in a
+`multiagent_20261001` block — lets the session's agent start workflow runs:
+a plan, which the agent writes as Python, that runs many agents in phases,
+in the background, while the agent works on or ends its turn. Its primary
+thread gets two tools for it, whose calls are on no stream:
+`ant__start_workflow_run` (a `name`, `description`, `phases` and
+`timeout_minutes` — 1 to 1440, 1440 when left out — and the plan's `code`)
+and `ant__stop_workflow_run`. Custom tool names starting with `ant__` are
+refused (a `400`). The plan runs in the session's container, with
+`await agent(prompt, name=…, system=…, use=…)`, which runs one agent in a
+thread of its own and returns its final message (raising `AgentFailed`
+when the agent fails), and `with phase(name):`, which marks a phase. An
+agent the plan defines runs the session agent's model, tools, MCP servers
+and skills, with the `system` the plan gives it; its thread's `agent` has
+`"type": "inline"`. `use=` names one of `workflows.predefined_agents`
+instead, which runs with its own configuration; with `inline_agents`
+disabled, every agent is one of those. Up to 64 of a run's agents work at
+once, and a run makes at most 1000 threads. A start whose code is that of
+a run still open is refused, with that run's id. When the plan ends, the agent
+is sent a notice with what the plan printed and takes a turn on it.
+
+The primary thread's stream shows each run: `workflow_run.created`
+(`workflow_run_id`, `name`, `description`, and `phases`, each with its
+`id`, `name` and `description`), `workflow_run.status_running`,
+`workflow_run.phase_started` (`workflow_run_phase_id`) and
+`workflow_run.phase_ended` (with `phase_started_id`), and last
+`workflow_run.status_ended`, whose `result` is `completed`, `stopped` (the
+agent stopped the run, or the session was archived) or `error`, with an
+`error` of type `program_error` (the plan's code failed),
+`thread_limit_error`, `timeout_error` or `unknown_error` (the server
+stopped while the run was open). A `workflow_run.error` with the same
+`error` comes before an `error` result, and alone, with a null
+`workflow_run_id`, for a start refused: `program_error` for code that does
+not compile, `max_workflow_runs_error` with 10 runs open. A run's threads
+carry its `workflow_run_id`, as do their `session.thread_created`; their
+status events are on the session's stream, their messages only on their
+own. They are archived when they report and when the run ends, do not
+count toward the 25 child threads, and are invisible to `list_agents`; an
+interrupt does not stop them, and archiving one while its run is open is a
+`400` whose `error.details.error_code` is `workflow_run_open`, as is a
+change to the session's agent. The session is `running` while a run is
+open, and says `session.status_idle` only with `requires_action`, until
+the runs have ended and the agent's turn on their notices ends. Archiving
+the session ends its runs as `stopped`; deleting it ends them.
+
+#### Vaults
+
+A vault holds credentials a session uses without seeing them: `POST
+/v1/vaults` (`display_name`, `metadata`), `GET` to list them
+(`include_archived`), `GET`/`POST`/`DELETE /v1/vaults/{id}`, and `POST
+…/archive`, which also archives its credentials. A session names vaults in
+`vault_ids` when it is created.
+
+A vault's credentials are `POST /v1/vaults/{id}/credentials` (`auth`,
+`display_name`, `metadata`), listed, read, changed, deleted and archived
+under it — at most 20 active ones a vault, unique by MCP server URL or
+variable name (a duplicate is a `409`). The secret fields (`token`,
+`access_token`, `refresh_token`, `client_secret`, `secret_value`) are
+written, never shown: they are kept in a file of their own under
+`[orangu-server].api_data` that only the server's user can read, and
+archiving deletes them. A credential's URL, variable name, token endpoint
+and client id do not change; archive it and create another.
+
+- `static_bearer` (`mcp_server_url`, `token`) and `mcp_oauth`
+  (`mcp_server_url`, `access_token`, `expires_at`, and `refresh`:
+  `refresh_token`, `client_id`, `token_endpoint`, `token_endpoint_auth` of
+  type `none`, `client_secret_basic` or `client_secret_post`, `scope`,
+  `resource`) are the bearer token of the session's MCP server at that URL
+  — matched with the scheme and host in lower case, a default port and a
+  trailing slash left out. An `mcp_oauth` token about to run out is
+  refreshed through its token endpoint first. `POST
+  …/credentials/{id}/mcp_oauth_validate` refreshes one when it can and asks
+  its server to `initialize` with the token: `status` is `valid`, `invalid`
+  (a 401 or 403) or `unknown`, with the `refresh` and `mcp_probe` HTTP
+  responses.
+- `environment_variable` (`secret_name`, `secret_value`, `networking` —
+  `{"type": "limited", "allowed_hosts": […]}`, `*.example.com` covering
+  subdomains, or `{"type": "unrestricted"}` — and `injection_location`
+  `{header, body}`, both on when left out) is a variable whose value in the
+  sandbox is a placeholder. In an environment with `unrestricted`
+  networking, the sandbox's `HTTPS_PROXY` and `HTTP_PROXY` name a proxy of
+  the session's, and its certificate bundle (`SSL_CERT_FILE`,
+  `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
+  `GIT_SSL_CAINFO`, `PIP_CERT`) trusts that proxy's own certificate
+  authority. A request to an allowed host is opened there, its
+  placeholders replaced with the secret in the headers and body the
+  credential allows, and sent on over TLS of its own; a request to any
+  other host passes through untouched, placeholder and all. With `limited`
+  networking the sandbox has no network, and the placeholder goes nowhere.
+  The secret reaches the host it was meant for — what that host sends
+  back, the agent sees.
+
+#### Memory stores
+
+A memory store is a named collection of small text documents (memories,
+each at most 100 KB, addressed by an absolute `path` such as `/notes/a.md`)
+that outlives the sessions it is attached to. Every change to a memory adds
+an immutable version (`memver_…`) recording the `operation` (`created`,
+`modified` or `deleted`), the path and content after it, and who made it:
+`created_by` is `{"type": "session_actor", "session_id": …}` for an agent,
+`{"type": "api_actor", …}` for an API call.
+
+- `POST /v1/memory_stores` (`name`, `description` — written for the model,
+  which is shown it — and `metadata`), `GET` to list them
+  (`include_archived`, `created_at_gte`/`_lte`), and `GET`/`POST`/`DELETE
+  /v1/memory_stores/{id}`. `POST /v1/memory_stores/{id}/archive` makes it
+  read-only: its memories can be read and deleted, not changed, and no new
+  session can attach it.
+- `POST /v1/memory_stores/{id}/memories` (`path`, `content`) creates one;
+  a path already taken is a `409` of type `memory_path_conflict_error`
+  naming the `conflicting_memory_id`. `GET …/memories` lists them in path
+  order (`path_prefix`; `depth` folds deeper ones into `memory_prefix`
+  entries, one per directory; `view=full` includes `content`). `GET`,
+  `POST` (or `PATCH`) and `DELETE …/memories/{memory_id}` read, change
+  (`content`, `path` or both; a `precondition` `{"type":
+  "content_sha256", "content_sha256": …}` that no longer matches is a
+  `409` of type `memory_precondition_failed_error`) and delete one
+  (`expected_content_sha256` likewise).
+- `GET …/memory_versions` lists the versions newest first (`memory_id`,
+  `operation`, `session_id`, `created_at_gte`/`_lte`; `view=full`), `GET
+  …/memory_versions/{id}` reads one, and `POST …/redact` clears a past
+  version's `content`, `content_sha256`, `content_size_bytes` and `path`,
+  keeping who made it and when; the current version cannot be redacted.
+
+An attached store's memories are written into the session's container as
+files when the session is created. After each `bash`, `write` or `edit`
+call the agent makes, what changed under a `read_write` mount is recorded
+in the store: a new file creates a memory, a changed one modifies it, a
+removed one deletes it. Files over 100 KB, files that are not text, and
+names starting with `.` are left out. Changes made to the store by others
+while the session runs are seen by later sessions, not by that one.
+
+#### Scheduled deployments
+
+A deployment runs an agent on a cron schedule, each firing a new session.
+`POST /v1/deployments` takes `name`, `description`, `agent` (an id or
+`{"type": "agent", "id", "version"}`, pinned to its latest version when
+none is named), `environment_id`, `vault_ids`, `resources`, `metadata`,
+`initial_events` — at least one `user.message` or `user.define_outcome`,
+with `system.message` events allowed too, which apply before the first
+message — and `schedule`: `{"type": "cron", "expression", "timezone"}`, a
+five-field POSIX expression (minute, hour, day of month, month, day of
+week; `*`, ranges, steps, lists, month and day names; day of week 7 is
+Sunday; a day matching either the day of month or the day of week fires
+when both are restricted) in an IANA time zone, `UTC` when left out. A
+schedule that never fires is a `400`, as is a `budget`. At most 1000
+deployments, archived ones aside.
+
+Times are wall-clock times in the zone: one a change of offset skips does
+not fire, and one it repeats fires twice. The scheduler checks at the start
+of every minute, so a run starts within a second or so of its time.
+`schedule.upcoming_runs_at` lists the next five fire times (also while
+paused; none once archived), and `schedule.last_run_at` when the last
+scheduled run started.
+
+`GET /v1/deployments` lists them (`agent_id`, `status`,
+`include_archived`); `GET`/`POST`/`DELETE /v1/deployments/{id}` read,
+change — any field `create` takes; a new schedule starts from now — and
+delete one. `POST …/pause` stops its scheduled runs (`status` `paused`,
+`paused_reason` `{"type": "manual"}`); `POST …/unpause` resumes from the
+next fire time, without making up for those missed; `POST …/archive` ends
+it for good. `POST …/run` makes a session now — while paused too — and
+returns the run.
+
+Every attempt is a run: `GET /v1/deployment_runs` (`deployment_id`,
+`has_error`) and `GET /v1/deployment_runs/{id}`, each with
+`trigger_context` (`{"type": "schedule", "scheduled_at"}` or `{"type":
+"manual"}`), the pinned `agent`, and the `session_id` it made or an
+`error`: `environment_not_found_error`, `environment_archived_error`,
+`vault_not_found_error`, `vault_archived_error`, `agent_archived_error` or
+`session_creation_rejected_error`, with a `message`. A scheduled run that
+fails on its environment or a vault pauses the deployment, with
+`paused_reason` `{"type": "error", "error": {"type": …}}`; other failures
+leave it running. Archiving an agent archives its deployments, and one
+whose agent is gone is archived when it next fires. The session a run
+makes has the deployment's `name` as its `title`, and no client is
+attached: calls that wait for approval wait until one answers them.
+
+#### Webhooks
+
+The server POSTs a thin event to each subscribed endpoint when a resource
+changes state: `{"type": "event", "id": "whe_…", "created_at", "data":
+{"type", "id", "organization_id": "local", "workspace_id": "default"}}`,
+`data.id` the resource's id. Each delivery carries `webhook-id` (the event's
+`id`), `webhook-timestamp` and `webhook-signature` — `v1,` and the base64
+HMAC-SHA256 of `{id}.{timestamp}.{body}`, keyed with the endpoint's secret —
+so the SDKs' `beta.webhooks.unwrap()` verifies it with that secret.
+
+Endpoints are kept by the server: `POST /v1/webhook_endpoints` (`url`, an
+http or https URL; `event_types`; `description`) returns the endpoint with
+its `secret` (`whsec_` and 32 random bytes in base64) — shown this once,
+and kept in a file only the server's user can read. `GET` lists them, `GET`,
+`POST` and `DELETE /v1/webhook_endpoints/{id}` read, change (`url`,
+`event_types`, `description`, and `enabled`) and delete one, and `POST
+…/rotate_secret` replaces the secret, returning the new one. An endpoint's
+URL is reached wherever it points, the server's own network included.
+
+A delivery that gets no `2xx` is tried up to three times in all, 5 to 120
+seconds apart; then the event is dropped. A redirect (`3xx`) disables the
+endpoint at once, as does a day of every delivery failing; `disabled_reason`
+says which, and `enabled: true` turns it back on. Events are not stored, and
+not delivered in order: fetch the resource.
+
+The event types: `session.status_scheduled`, `session.status_run_started`,
+`session.status_idled`, `session.status_terminated` (on archive),
+`session.thread_created`, `session.thread_idled` and
+`session.thread_terminated` (child threads), `session.outcome_evaluation_ended`,
+`session.updated`, `session.deleted`; `agent.created`, `agent.updated` (a
+new version), `agent.archived`; `environment.created`,
+`environment.updated` (a change), `environment.archived`,
+`environment.deleted`; `vault.created`, `vault.archived`, `vault.deleted`,
+`vault_credential.created`, `vault_credential.archived`,
+`vault_credential.deleted`, `vault_credential.refresh_failed`;
+`memory_store.created`, `memory_store.archived`, `memory_store.deleted`;
+`deployment.created`, `deployment.updated`, `deployment.paused`,
+`deployment.unpaused`, `deployment.archived`, `deployment.deleted`; and,
+for scheduled runs only, `deployment_run.started`,
+`deployment_run.succeeded` and `deployment_run.failed`.
+`session.status_rescheduled` and `agent.deleted` may be subscribed to as
+well; the server has no rescheduling or agent deletion, so they never come.
 
 ### What a request cost
 
@@ -1685,7 +2706,10 @@ chat template makes the whole endpoint a `501`.
 
 A PNG, JPEG, GIF, WebP or SVG attachment is kept as a picture rather than read as text:
 it is stored beside the session and comes back in the `attachments` event
-with an `image_url` the page shows as a thumbnail. On a `qwen_image` server
+with an `image_url` the page shows as a thumbnail. A model with a vision
+tower (see **Pictures**) reads the picture where it was attached, on that
+turn and every later one; a model without one is told a picture it cannot
+see was attached. On a `qwen_image` server
 the turn is a picture request — the text is the prompt, the last attached
 picture is what it starts from — and the events are `progress` (`step`,
 `steps`, `eta_seconds`) once per step, then the same `done` event as a text

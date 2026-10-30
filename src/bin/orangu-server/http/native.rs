@@ -848,6 +848,7 @@ pub async fn completion(
         .generate(GenerateRequest {
             // These endpoints have no structured-output field of their own.
             json_output: false,
+            json_schema: None,
             prompt_tokens: tokens,
             sampling,
             max_tokens: req.n_predict,
@@ -858,6 +859,7 @@ pub async fn completion(
             role: Some(role),
             cache_point: None,
             background: false,
+            reasoning_budget: None,
         })
         .await;
 

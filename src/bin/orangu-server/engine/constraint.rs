@@ -35,7 +35,7 @@
 //! `json_object` mode is the half of the OpenAI contract that says "valid
 //! JSON" and nothing more, and it is the half that makes the existing
 //! delimiter-anchored tool-call parsers reliable rather than hopeful. Schema
-//! shape (`json_schema` mode) is a strictly larger job and is not this.
+//! shape (`json_schema` mode) is `engine::json_schema`'s.
 //!
 //! # Where the cost goes
 //!

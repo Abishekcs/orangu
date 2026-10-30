@@ -886,7 +886,6 @@ pub(crate) fn joint_attention(
 /// own, a reference picture's token every key up to the end of its picture
 /// (see [`causal_limits`]).
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn attention(
     q: &[f32],
     n_q: usize,

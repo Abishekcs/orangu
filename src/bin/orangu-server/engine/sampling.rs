@@ -97,9 +97,40 @@ impl SamplingParams {
     }
 }
 
+/// The grammar a constraint holds output to.
+enum Grammar {
+    /// Any JSON object — `response_format: json_object`.
+    Json(crate::engine::constraint::JsonPrefix),
+    /// A document a JSON Schema describes.
+    Schema(Box<crate::engine::json_schema::SchemaPrefix>),
+}
+
+impl Grammar {
+    fn is_complete(&self) -> bool {
+        match self {
+            Self::Json(g) => g.is_complete(),
+            Self::Schema(g) => g.is_complete(),
+        }
+    }
+
+    fn allows(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Json(g) => g.allows(bytes),
+            Self::Schema(g) => g.allows(bytes),
+        }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Json(g) => g.push_bytes(bytes),
+            Self::Schema(g) => g.push_bytes(bytes),
+        }
+    }
+}
+
 /// What a constrained request is holding while it generates.
 pub struct Constraint {
-    grammar: crate::engine::constraint::JsonPrefix,
+    grammar: Grammar,
     /// Every token's emitted bytes, from the tokenizer — shared, built once.
     token_bytes: std::sync::Arc<Vec<Vec<u8>>>,
     /// Ids that end generation. Masked until the document is complete, so a
@@ -111,7 +142,22 @@ pub struct Constraint {
 impl Constraint {
     pub fn json(token_bytes: std::sync::Arc<Vec<Vec<u8>>>, stop_ids: Vec<u32>) -> Self {
         Self {
-            grammar: crate::engine::constraint::JsonPrefix::object(),
+            grammar: Grammar::Json(crate::engine::constraint::JsonPrefix::object()),
+            token_bytes,
+            stop_ids,
+        }
+    }
+
+    /// Holds output to a document `schema` describes.
+    pub fn schema(
+        schema: std::sync::Arc<crate::engine::json_schema::Schema>,
+        token_bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        stop_ids: Vec<u32>,
+    ) -> Self {
+        Self {
+            grammar: Grammar::Schema(Box::new(crate::engine::json_schema::SchemaPrefix::new(
+                schema,
+            ))),
             token_bytes,
             stop_ids,
         }
@@ -169,6 +215,9 @@ pub struct Sampler {
     /// `None` for an unconstrained request, which is every request that did
     /// not ask for a `response_format`.
     constraint: Option<Constraint>,
+    /// The token the next pick is, whatever the logits say — see
+    /// [`Self::force`].
+    forced: Option<u32>,
 }
 
 impl Sampler {
@@ -176,7 +225,15 @@ impl Sampler {
         Self {
             params,
             constraint: None,
+            forced: None,
         }
+    }
+
+    /// Makes `token` the next pick, once — how a reasoning budget closes
+    /// the reasoning. The steps until then sample here rather than on the
+    /// device, as [`Self::is_constrained`] says.
+    pub fn force(&mut self, token: u32) {
+        self.forced = Some(token);
     }
 
     /// Restricts this sampler to tokens the constraint still allows.
@@ -189,7 +246,7 @@ impl Sampler {
     /// argmax fast path cannot be used, since that samples without ever
     /// consulting the mask.
     pub fn is_constrained(&self) -> bool {
-        self.constraint.is_some()
+        self.constraint.is_some() || self.forced.is_some()
     }
 
     /// `true` iff `sample` would take its argmax fast path (`temperature
@@ -219,6 +276,9 @@ impl Sampler {
     /// exactly: the target's choice at each drafted position is the one plain
     /// decoding would have made there.
     pub fn sample(&mut self, logits: &[f32], recent_tokens: &[u32], pos: usize) -> u32 {
+        if let Some(id) = self.forced.take() {
+            return id;
+        }
         let id = self.pick(logits, recent_tokens, pos);
         if let Some(constraint) = self.constraint.as_mut() {
             constraint.accept(id);
@@ -734,5 +794,36 @@ mod constraint_tests {
         // Unconstrained, the same logits give the prose token.
         let mut plain = Sampler::new(params);
         assert_eq!(plain.sample(&logits, &[], 0), 5);
+    }
+
+    /// A schema narrows what JSON alone allows: with `a` a required string,
+    /// `1` — valid JSON, the model's favourite — is masked after `{"a":`,
+    /// and stopping waits until `a` has its string.
+    #[test]
+    fn a_schema_masks_what_its_shape_rules_out() {
+        let schema = crate::engine::json_schema::compile(&serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a"],
+        }))
+        .unwrap();
+        let mut c = Constraint::schema(Arc::new(schema), vocab(), vec![EOS]);
+        for id in [0, 2, 3] {
+            assert!(c.allows(id), "token {id}");
+            c.accept(id);
+        }
+        assert!(!c.allows(4), "`1` is JSON, but `a` is a string");
+        assert!(c.allows(2), "`\"a\"` is a string value");
+        c.accept(2);
+        assert!(!c.allows(EOS), "the object is still open");
+        c.accept(1);
+        assert!(c.allows(EOS), "`{{\"a\":\"a\"}}` is the whole document");
+        let empty = crate::engine::json_schema::compile(&serde_json::json!({
+            "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"],
+        }))
+        .unwrap();
+        let mut c = Constraint::schema(Arc::new(empty), vocab(), vec![EOS]);
+        c.accept(0);
+        assert!(!c.allows(1), "`{{}}` leaves out the required `a`");
     }
 }

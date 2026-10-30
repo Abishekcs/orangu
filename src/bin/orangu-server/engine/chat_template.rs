@@ -39,8 +39,9 @@ use serde::{Deserialize, Serialize};
 /// a picture. The text parts are joined into [`content`](Self::content)
 /// (so every chat template keeps seeing a string) and the pictures land in
 /// [`images`](Self::images), which is never serialized and so never reaches
-/// a template. A language model here has no vision path and ignores them;
-/// a `qwen_image` model starts its picture from the last one. See
+/// a template, with where in the text each one stood. A chat model with a
+/// vision tower reads them in place (`http::openai::render_chat`); a
+/// `qwen_image` model starts its picture from the last one. See
 /// [`ChatMessageWire`], which is what is actually deserialized.
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(from = "ChatMessageWire")]
@@ -52,6 +53,11 @@ pub struct ChatMessage {
     /// URLs or plain URLs). See the struct's own doc.
     #[serde(skip)]
     pub images: Vec<String>,
+    /// Where in [`content`](Self::content) each of [`images`](Self::images)
+    /// stood, as a byte offset — what puts a picture back between the
+    /// texts it was sent between.
+    #[serde(skip)]
+    pub image_at: Vec<usize>,
     /// Assistant messages: the calls this turn made. Left as raw JSON rather
     /// than a typed struct because templates reach into it in
     /// model-specific ways (`function['arguments']` as a mapping *or* a
@@ -77,6 +83,12 @@ impl ChatMessage {
             content: content.to_string(),
             ..Default::default()
         }
+    }
+
+    /// Adds a picture at the end of the text so far.
+    pub fn push_image(&mut self, url: String) {
+        self.image_at.push(self.content.len());
+        self.images.push(url);
     }
 }
 
@@ -105,6 +117,7 @@ impl From<ChatMessageWire> for ChatMessage {
     /// as content is a caller's mistake, not a reason to refuse the turn.
     fn from(wire: ChatMessageWire) -> Self {
         let mut images = Vec::new();
+        let mut image_at = Vec::new();
         let content = match wire.content {
             serde_json::Value::Null => String::new(),
             serde_json::Value::String(s) => s,
@@ -125,6 +138,7 @@ impl From<ChatMessageWire> for ChatMessage {
                                 u.get("url").and_then(|s| s.as_str()).or_else(|| u.as_str())
                             });
                             if let Some(url) = url {
+                                image_at.push(text.len());
                                 images.push(url.to_string());
                             }
                         }
@@ -139,6 +153,7 @@ impl From<ChatMessageWire> for ChatMessage {
             role: wire.role,
             content,
             images,
+            image_at,
             tool_calls: wire.tool_calls,
             tool_call_id: wire.tool_call_id,
             name: wire.name,

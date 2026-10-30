@@ -101,9 +101,10 @@ const FORMATS: &[(&str, &str, Syntax)] = [
 ]
 .as_slice();
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum Syntax {
     /// `call:NAME{key:value,...}` — see [`parse_gemma_dsl`].
+    #[default]
     GemmaDsl,
     /// A `<tool_call>` span, whose body may be any of three shapes — see
     /// [`parse_tool_call_body`].
@@ -221,6 +222,42 @@ fn recover_unopened(text: &str) -> Option<(usize, Vec<ParsedToolCall>, &str)> {
         return None;
     }
     Some((body_start, parsed, &text[at + CLOSE.len()..]))
+}
+
+/// Where the first tool-call opener in `text` starts, and which one it is.
+pub fn first_opener(text: &str) -> Option<(usize, &'static str)> {
+    next_opener(text).map(|(at, open, _, _)| (at, open))
+}
+
+/// `text` with its last call closed, when the model ended on a call it never
+/// wrote the closer of and the call reads whole once closed; `text` as it
+/// is otherwise.
+pub fn close_trailing(text: &str) -> String {
+    let Some((at, opener)) = last_opener(text) else {
+        return text.to_string();
+    };
+    let Some(close) = FORMATS
+        .iter()
+        .find(|(open, _, _)| *open == opener)
+        .map(|(_, close, _)| *close)
+        .filter(|close| !close.is_empty() && !text[at..].contains(close))
+    else {
+        return text.to_string();
+    };
+    let closed = format!("{}{close}", text.trim_end());
+    if split(&closed).calls.len() > split(text).calls.len() {
+        closed
+    } else {
+        text.to_string()
+    }
+}
+
+/// Where the last tool-call opener in `text` starts, and which one it is.
+pub fn last_opener(text: &str) -> Option<(usize, &'static str)> {
+    FORMATS
+        .iter()
+        .filter_map(|(open, _, _)| text.rfind(open).map(|at| (at, *open)))
+        .max_by_key(|(at, open)| (*at, open.len()))
 }
 
 fn next_opener(text: &str) -> Option<(usize, &'static str, &'static str, Syntax)> {
@@ -562,15 +599,36 @@ impl<'a> DslParser<'a> {
     }
 
     /// A bare key, or a quoted one — templates differ on `escape_keys`.
+    ///
+    /// A lone `"` before a bare key (`{"command:<|"|>ls<|"|>}`) is a slip
+    /// models make; read as an opening quote it swallows the `:` and the
+    /// call is lost, so a quoted key that is not followed by `:` is read
+    /// again as a bare one with the stray quote dropped.
     fn key(&mut self) -> Option<String> {
         if self.at_quote() {
-            return self.string();
+            let start = self.i;
+            if let Some(key) = self.string() {
+                let after = self.i;
+                self.skip_ws();
+                let followed = self.peek() == Some(':');
+                self.i = after;
+                if followed {
+                    return Some(key);
+                }
+            }
+            self.i = start;
+            if self.peek() != Some('"') {
+                return None;
+            }
+            self.bump();
         }
         let start = self.i;
         while matches!(self.peek(), Some(c) if c != ':' && c != ',' && !c.is_whitespace()) {
             self.bump();
         }
-        (self.i > start).then(|| self.s[start..self.i].to_string())
+        (self.i > start)
+            .then(|| self.s[start..self.i].trim_end_matches('"').to_string())
+            .filter(|key| !key.is_empty())
     }
 
     fn value(&mut self) -> Option<Value> {
@@ -734,6 +792,605 @@ impl<'a> DslParser<'a> {
     }
 }
 
+/// The name of the call `opener` opens, once the call has written both it
+/// and the start of its arguments: `span` is the text after the opener.
+pub fn call_name(opener: &str, span: &str) -> Option<String> {
+    let syntax = FORMATS.iter().find(|(open, _, _)| *open == opener)?.2;
+    let name = match syntax {
+        Syntax::GemmaDsl => gemma_call_name(span)?.to_string(),
+        Syntax::JsonArray => json_call_head(span)?.0,
+        Syntax::ToolCallSpan => {
+            let body = span.trim_start();
+            if body.starts_with(['{', '[']) {
+                json_call_head(span)?.0
+            } else if let Some(at) = body.find("<function=") {
+                let rest = &body[at + "<function=".len()..];
+                rest[..rest.find('>')?].trim().to_string()
+            } else {
+                body[..body.find("<arg_key>")?].trim().to_string()
+            }
+        }
+        Syntax::InvokeTags(prefix) => {
+            let open = format!("<{prefix}invoke ");
+            let at = span.find(&open)? + open.len();
+            let head = &span[at..at + span[at..].find('>')?];
+            attribute(head, "name")?
+        }
+    };
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+    plain.then_some(name)
+}
+
+/// How much of `text` could still begin a JSON document: up to the first
+/// control character inside a string, which JSON forbids.
+fn valid_json_prefix(text: &str) -> usize {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                c if (c as u32) < 0x20 => return i,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+        }
+    }
+    text.len()
+}
+
+/// What closes the JSON text `partial` was cut off in: a string it is in,
+/// a value a key still waits for, and each open object and array.
+fn json_closers(partial: &str) -> String {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in partial.chars() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    if in_string {
+        out.push('"');
+    }
+    if escaped {
+        out.insert(0, '\\');
+    }
+    let tail = format!("{partial}{out}");
+    let last = tail.trim_end().chars().last();
+    if last == Some(':') {
+        out.push_str("null");
+    }
+    while let Some(close) = stack.pop() {
+        out.push(close);
+    }
+    out
+}
+
+/// The end of the JSON value that starts at `start` in `text` — past its
+/// closing brace, bracket or quote — or `None` while it is still being
+/// written.
+fn json_value_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => {
+                    in_string = false;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            // A bare scalar ends where its container goes on.
+            b'}' | b']' | b',' if depth == 0 => return Some(i),
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A JSON call's name, and where its arguments object starts in `span`,
+/// once both are written — the name first, as every JSON call format
+/// writes it. `None` for arguments given as a string or written before the
+/// name.
+fn json_call_head(span: &str) -> Option<(String, usize)> {
+    let text = span.trim_start();
+    let offset = span.len() - text.len();
+    let mut i = match text.as_bytes().first()? {
+        b'{' => 1,
+        b'[' => text[1..].find('{')? + 2,
+        _ => return None,
+    };
+    let mut name = None;
+    loop {
+        let rest = &text[i..];
+        let key_at = i + rest.find(|c: char| !c.is_whitespace())?;
+        if text.as_bytes()[key_at] != b'"' {
+            return None;
+        }
+        let key_end = json_value_end(text, key_at)?;
+        let key: String = serde_json::from_str(&text[key_at..key_end]).ok()?;
+        let colon = key_end + text[key_end..].find(':')?;
+        let value_at = colon + 1 + text[colon + 1..].find(|c: char| !c.is_whitespace())?;
+        match key.as_str() {
+            "name" => {
+                let end = json_value_end(text, value_at)?;
+                name = Some(serde_json::from_str::<String>(&text[value_at..end]).ok()?);
+                i = end;
+            }
+            "arguments" | "parameters" => {
+                return (text.as_bytes()[value_at] == b'{')
+                    .then(|| name.map(|n| (n, offset + value_at)))
+                    .flatten();
+            }
+            _ => i = json_value_end(text, value_at)?,
+        }
+        let rest = &text[i..];
+        let next = i + rest.find(|c: char| !c.is_whitespace())?;
+        if text.as_bytes()[next] != b',' {
+            return None;
+        }
+        i = next + 1;
+    }
+}
+
+/// A tag format's call so far, cut after its last whole parameter and
+/// closed: its arguments as its own parser reads them. `None` until the
+/// call has a whole parameter.
+fn finished_tag_pairs(syntax: Syntax, span: &str) -> Option<Map<String, Value>> {
+    let closed = match syntax {
+        Syntax::InvokeTags(prefix) => {
+            let close = format!("</{prefix}parameter>");
+            let end = span.rfind(&close)? + close.len();
+            format!("{}</{prefix}invoke>", &span[..end])
+        }
+        _ if span.contains("<function=") => {
+            let end = span.rfind("</parameter>")? + "</parameter>".len();
+            format!("{}</function>", &span[..end])
+        }
+        _ => {
+            let end = span.rfind("</arg_value>")? + "</arg_value>".len();
+            span[..end].to_string()
+        }
+    };
+    let calls = match syntax {
+        Syntax::InvokeTags(prefix) => parse_invoke_tags(&closed, prefix),
+        _ => parse_tool_call_body(&closed),
+    };
+    match serde_json::from_str::<Value>(&calls.first()?.arguments).ok()? {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// A gemma-4 call's name, once its `{` has arrived: `span` is the text after
+/// its opener.
+fn gemma_call_name(span: &str) -> Option<&str> {
+    let body = span.trim_start();
+    let rest = body.strip_prefix("call:").unwrap_or(body);
+    let name = rest[..rest.find('{')?].trim();
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'))
+    .then_some(name)
+}
+
+/// The JSON text of `s` without its surrounding quotes.
+fn json_escaped(s: &str) -> String {
+    let quoted = Value::String(s.to_string()).to_string();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// How far a call's arguments have been written, read at the top level.
+enum Tail {
+    /// Mid-value, or between values.
+    Open,
+    /// Inside a top-level `<|"|>` string, whose opening delimiter is here.
+    String(usize),
+    /// The object's closing `}` is here.
+    Ended(usize),
+    /// A bare `"` at the top level — a spelling only the whole call can be
+    /// read in.
+    Unclear,
+}
+
+/// The last top-level `,` in `inner` (a call's arguments after their `{`)
+/// and where the text ends — the same lexing as [`DslParser::matching`].
+fn scan_arguments(inner: &str) -> (Option<usize>, Tail) {
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut last = None;
+    while i < inner.len() {
+        let rest = &inner[i..];
+        if let Some(after) = rest.strip_prefix(DSL_QUOTE) {
+            match after.find(DSL_QUOTE) {
+                Some(end) => {
+                    i += 2 * DSL_QUOTE.len() + end;
+                    continue;
+                }
+                None if depth == 0 => return (last, Tail::String(i)),
+                None => return (last, Tail::Open),
+            }
+        }
+        let Some(c) = rest.chars().next() else { break };
+        match c {
+            '"' if depth == 0 => return (last, Tail::Unclear),
+            '"' => {
+                let mut escaped = false;
+                let mut closed = false;
+                for (n, inner_c) in rest.char_indices().skip(1) {
+                    if escaped {
+                        escaped = false;
+                    } else if inner_c == '\\' {
+                        escaped = true;
+                    } else if inner_c == '"' {
+                        i += n + 1;
+                        closed = true;
+                        break;
+                    }
+                }
+                if !closed {
+                    return (last, Tail::Open);
+                }
+                continue;
+            }
+            '{' | '[' => depth += 1,
+            '}' if depth == 0 => return (last, Tail::Ended(i)),
+            ']' if depth == 0 => return (last, Tail::Unclear),
+            '}' | ']' => depth -= 1,
+            ',' if depth == 0 => last = Some(i),
+            _ => {}
+        }
+        i += c.len_utf8();
+    }
+    (last, Tail::Open)
+}
+
+/// One call's arguments as JSON text, a piece at a time while the model
+/// writes them. For gemma-4's DSL: each finished `key:value` pair once
+/// [`DslParser`] has read it, and a top-level `<|"|>` string — a file's
+/// content, a command — a few characters at a time. For a JSON call: its
+/// arguments object's own text as it is written. For the tag formats: each
+/// parameter once the format's parser reads it whole. The pieces join into
+/// the JSON the whole call parses to; [`finish`](Self::finish) writes the
+/// rest and says whether what was sent agrees with that parse.
+#[derive(Default)]
+pub struct ArgumentStream {
+    syntax: Syntax,
+    /// A JSON call's arguments: the bytes of their text already sent.
+    raw_sent: usize,
+    /// ...and that text.
+    raw: String,
+    opened: bool,
+    /// The pairs sent whole, or whose string was streamed and closed.
+    sent: Vec<(String, Value)>,
+    /// The key whose string is being streamed, and the text sent of it.
+    open: Option<(String, String)>,
+    /// A spelling that only the whole call can be read in was met: nothing
+    /// more is sent until [`finish`](Self::finish).
+    stalled: bool,
+    diverged: bool,
+}
+
+impl ArgumentStream {
+    fn separator(&self) -> &'static str {
+        if self.sent.is_empty() && self.open.is_none() {
+            ""
+        } else {
+            ","
+        }
+    }
+
+    /// The pairs in `completed` not sent yet, closing the streamed string
+    /// when it is one of them.
+    fn send_pairs(&mut self, completed: &str, out: &mut String) -> bool {
+        let mut parser = DslParser { s: completed, i: 0 };
+        let Some(pairs) = parser.object_body() else {
+            return false;
+        };
+        self.send_map(pairs, out)
+    }
+
+    /// The pairs of `pairs` not sent yet, closing the streamed string when
+    /// it is one of them.
+    fn send_map(&mut self, mut pairs: Map<String, Value>, out: &mut String) -> bool {
+        for (key, previous) in &self.sent {
+            if let Some(value) = pairs.remove(key) {
+                self.diverged |= *previous != value;
+            }
+        }
+        if let Some((key, streamed)) = self.open.take() {
+            let Some(value) = pairs.remove(&key) else {
+                self.open = Some((key, streamed));
+                // A pair finished while another's string is still open is
+                // not a reading this stream can follow.
+                self.stalled |= !pairs.is_empty();
+                return pairs.is_empty();
+            };
+            match value.as_str() {
+                Some(full) if full.starts_with(&streamed) => {
+                    out.push_str(&json_escaped(&full[streamed.len()..]));
+                }
+                _ => self.diverged = true,
+            }
+            out.push('"');
+            self.sent.push((key, value));
+        }
+        for (key, value) in pairs {
+            out.push_str(self.separator());
+            out.push_str(&Value::String(key.clone()).to_string());
+            out.push(':');
+            out.push_str(&value.to_string());
+            self.sent.push((key, value));
+        }
+        true
+    }
+
+    /// A stream for the call `opener` (one of [`FORMATS`]' openers) opens.
+    pub fn new(opener: &str) -> Self {
+        let syntax = FORMATS
+            .iter()
+            .find(|(open, _, _)| *open == opener)
+            .map_or(Syntax::GemmaDsl, |(_, _, syntax)| *syntax);
+        Self {
+            syntax,
+            ..Self::default()
+        }
+    }
+
+    /// What to send now: `span` is the call's text so far, after its
+    /// opener.
+    pub fn advance(&mut self, span: &str) -> String {
+        match self.syntax {
+            Syntax::GemmaDsl => self.advance_gemma(span),
+            Syntax::JsonArray => self.advance_json(span),
+            Syntax::ToolCallSpan if span.trim_start().starts_with(['{', '[']) => {
+                self.advance_json(span)
+            }
+            _ => self.advance_tags(span),
+        }
+    }
+
+    /// A JSON call's arguments object, as much of its text as is written.
+    fn advance_json(&mut self, span: &str) -> String {
+        let Some((_, start)) = json_call_head(span) else {
+            return String::new();
+        };
+        self.opened = true;
+        if self.stalled {
+            return String::new();
+        }
+        let end = json_value_end(span, start).unwrap_or(span.len());
+        let written = &span[start..end];
+        // Only what is still JSON goes out: a client parses the pieces as
+        // they come.
+        let valid = valid_json_prefix(written);
+        self.stalled = valid < written.len();
+        let ready = &written[..valid];
+        let out = ready.get(self.raw_sent..).unwrap_or_default().to_string();
+        self.raw_sent = self.raw_sent.max(ready.len());
+        self.raw = ready.to_string();
+        out
+    }
+
+    /// A tag format's parameters, each once it is whole.
+    fn advance_tags(&mut self, span: &str) -> String {
+        let Some(pairs) = finished_tag_pairs(self.syntax, span) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        if !self.opened {
+            self.opened = true;
+            out.push('{');
+        }
+        if !self.stalled && !self.send_map(pairs, &mut out) {
+            self.stalled = true;
+        }
+        out
+    }
+
+    fn advance_gemma(&mut self, span: &str) -> String {
+        let mut out = String::new();
+        let body = span.trim_start();
+        let rest = body.strip_prefix("call:").unwrap_or(body);
+        let Some(brace) = rest.find('{') else {
+            return out;
+        };
+        if !self.opened {
+            self.opened = true;
+            out.push('{');
+        }
+        if self.stalled {
+            return out;
+        }
+        let inner = &rest[brace + 1..];
+        let (last_comma, tail) = scan_arguments(inner);
+        let segment_start = match tail {
+            Tail::Ended(end) => {
+                self.send_pairs(&inner[..end], &mut out);
+                return out;
+            }
+            _ => match last_comma {
+                Some(comma) => {
+                    if !self.send_pairs(&inner[..comma], &mut out) {
+                        return out;
+                    }
+                    comma + 1
+                }
+                None => 0,
+            },
+        };
+        let quote = match tail {
+            Tail::String(at) => at - segment_start,
+            Tail::Unclear => {
+                self.stalled = true;
+                return out;
+            }
+            _ => return out,
+        };
+        let segment = &inner[segment_start..];
+        let opening = &segment[..quote + DSL_QUOTE.len()];
+        // The key, read by the parser itself from the pair with its string
+        // closed empty.
+        let mut parser = DslParser {
+            s: &format!("{opening}{DSL_QUOTE}"),
+            i: 0,
+        };
+        let Some(key) = parser
+            .object_body()
+            .filter(|pairs| pairs.len() == 1)
+            .and_then(|pairs| pairs.into_iter().next())
+            .filter(|(_, value)| value.as_str() == Some(""))
+            .map(|(key, _)| key)
+        else {
+            return out;
+        };
+        if self.sent.iter().any(|(k, _)| *k == key) {
+            self.stalled = true;
+            return out;
+        }
+        match &self.open {
+            Some((open, _)) if *open != key => {
+                self.stalled = true;
+                return out;
+            }
+            Some(_) => {}
+            None => {
+                out.push_str(self.separator());
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push_str(":\"");
+                self.open = Some((key, String::new()));
+            }
+        }
+        let raw = &segment[quote + DSL_QUOTE.len()..];
+        // A closing delimiter that has begun to arrive is not content.
+        let held = (1..DSL_QUOTE.len())
+            .rev()
+            .find(|&n| raw.ends_with(&DSL_QUOTE[..n]))
+            .unwrap_or(0);
+        let ready = &raw[..raw.len() - held];
+        if let Some((_, streamed)) = &mut self.open
+            && ready.len() > streamed.len()
+            && ready.starts_with(streamed.as_str())
+        {
+            out.push_str(&json_escaped(&ready[streamed.len()..]));
+            streamed.push_str(&ready[streamed.len()..]);
+        }
+        out
+    }
+
+    /// The rest of the JSON, once the whole call parsed to `arguments`, and
+    /// whether everything sent before agrees with them.
+    pub fn finish(mut self, span: &str, arguments: &str) -> (String, bool) {
+        if self.raw_sent > 0 {
+            let written = json_call_head(span).and_then(|(_, start)| {
+                let end = json_value_end(span, start)?;
+                Some(&span[start..end])
+            });
+            let parsed = |text: &str| serde_json::from_str::<Value>(text).ok();
+            return match written {
+                Some(text) => (
+                    text.get(self.raw_sent..).unwrap_or_default().to_string(),
+                    text.len() >= self.raw_sent && parsed(text) == parsed(arguments),
+                ),
+                None => (String::new(), false),
+            };
+        }
+        let whole = match serde_json::from_str::<Value>(arguments) {
+            Ok(Value::Object(map)) => map,
+            _ => Map::new(),
+        };
+        let mut out = String::new();
+        if !self.opened {
+            out.push('{');
+        }
+        if let Some((key, streamed)) = self.open.take() {
+            match whole.get(&key).and_then(Value::as_str) {
+                Some(full) if full.starts_with(&streamed) => {
+                    out.push_str(&json_escaped(&full[streamed.len()..]));
+                }
+                _ => self.diverged = true,
+            }
+            out.push('"');
+            let value = whole.get(&key).cloned().unwrap_or(Value::Null);
+            self.sent.push((key, value));
+        }
+        for (key, value) in &self.sent {
+            self.diverged |= whole.get(key) != Some(value);
+        }
+        for (key, value) in &whole {
+            if self.sent.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            out.push_str(if self.sent.is_empty() { "" } else { "," });
+            out.push_str(&Value::String(key.clone()).to_string());
+            out.push(':');
+            out.push_str(&value.to_string());
+            self.sent.push((key.clone(), value.clone()));
+        }
+        out.push('}');
+        (out, !self.diverged)
+    }
+
+    /// The rest of the JSON for a call that never parsed: what was sent,
+    /// closed.
+    pub fn abandon(self) -> String {
+        if self.raw_sent > 0 {
+            return json_closers(&self.raw);
+        }
+        let mut out = String::new();
+        if !self.opened {
+            out.push('{');
+        }
+        if self.open.is_some() {
+            out.push('"');
+        }
+        out.push('}');
+        out
+    }
+}
+
 /// The literal text a special token should be rendered as when it carries
 /// tool-call structure, or `None` for every other special token (which stays
 /// suppressed, as all of them used to be).
@@ -841,6 +1498,178 @@ mod tests {
 
     use super::*;
 
+    /// `span`'s call streamed as it grows `step` characters at a time,
+    /// then finished from the whole call's parse: the JSON sent, and
+    /// whether the stream agreed with the parse.
+    fn streamed(span: &str, step: usize) -> (String, bool) {
+        let mut stream = ArgumentStream::default();
+        let mut out = String::new();
+        let ends: Vec<usize> = span.char_indices().map(|(i, _)| i).collect();
+        for &end in ends.iter().step_by(step) {
+            out.push_str(&stream.advance(&span[..end]));
+        }
+        out.push_str(&stream.advance(span));
+        let parsed = parse_gemma_dsl(span);
+        let (rest, agreed) = stream.finish(span, &parsed[0].arguments);
+        out.push_str(&rest);
+        (out, agreed)
+    }
+
+    /// However a call arrives, the streamed pieces join into JSON equal to
+    /// what the whole call parses to.
+    #[test]
+    fn streamed_arguments_join_into_the_parsed_call() {
+        for span in [
+            "call:create_file{path:<|\"|>/a.py<|\"|>,content:<|\"|>print(\"hi, {x}\")\n<|\"|>}",
+            "call:f{opts:{a:1,b:[1,2]},name:<|\"|>x<|\"|>,n:5}",
+            "write{path:<|\"|>p<|\"|>}",
+            "call:bash{\"command:<|\"|>ls<|\"|>}",
+            "call:f{}",
+            "call:f{s:\"a,b\",t:<|\"|>c<|\"|>}",
+            "call:f{z:<|\"|>last<|\"|>,a:true}",
+        ] {
+            let whole: Value = serde_json::from_str(&parse_gemma_dsl(span)[0].arguments).unwrap();
+            for step in [1, 3, 7, 1000] {
+                let (json, agreed) = streamed(span, step);
+                assert!(agreed, "{span} by {step}: {json}");
+                let value: Value = serde_json::from_str(&json)
+                    .unwrap_or_else(|err| panic!("{span} by {step}: {json}: {err}"));
+                assert_eq!(value, whole, "{span} by {step}");
+            }
+        }
+    }
+
+    /// A file's content is sent while it is written, not when the call ends.
+    #[test]
+    fn a_string_argument_is_sent_as_it_is_written() {
+        let mut stream = ArgumentStream::default();
+        let mut out = String::new();
+        let mut span = String::new();
+        for part in [
+            "call:create_file{",
+            "path:<|\"|>/a.py<|\"|>,",
+            "content:<|\"|>import os\n",
+            "print(\"x\")",
+            "<|",
+        ] {
+            span.push_str(part);
+            out.push_str(&stream.advance(&span));
+        }
+        assert_eq!(
+            out,
+            "{\"path\":\"/a.py\",\"content\":\"import os\\nprint(\\\"x\\\")"
+        );
+    }
+
+    /// The opener's name is read once its `{` arrives, and a name that does
+    /// not look like one is not a call.
+    #[test]
+    fn a_gemma_call_is_named_once_its_brace_arrives() {
+        assert_eq!(gemma_call_name("call:create_file"), None);
+        assert_eq!(gemma_call_name("call:create_file{pa"), Some("create_file"));
+        assert_eq!(gemma_call_name("bash{"), Some("bash"));
+        assert_eq!(gemma_call_name("some prose {"), None);
+    }
+
+    /// Every other format, however its call arrives: the streamed pieces
+    /// join into JSON equal to the whole call's parse, and something was
+    /// sent before the call was whole.
+    #[test]
+    fn every_format_streams_into_the_parsed_call() {
+        let calls = [
+            (
+                "<tool_call>",
+                "</tool_call>",
+                "\n{\"name\": \"write\", \"arguments\": {\"path\": \"/a\", \"content\": \"x, \\\"y\\\" {z}\", \"n\": 5}}\n",
+            ),
+            (
+                "[TOOL_CALLS]",
+                "",
+                "[{\"name\": \"write\", \"arguments\": {\"n\": 5, \"b\": true, \"l\": [1, {\"a\": \"]\"}]}}]",
+            ),
+            (
+                "<tool_call>",
+                "</tool_call>",
+                "\n<function=write>\n<parameter=path>\n/a\n</parameter>\n<parameter=n>\n5\n</parameter>\n</function>\n",
+            ),
+            (
+                "<tool_call>",
+                "</tool_call>",
+                "write<arg_key>path</arg_key><arg_value>/a</arg_value><arg_key>n</arg_key><arg_value>5</arg_value>",
+            ),
+            (
+                "<atem:function_calls>",
+                "</atem:function_calls>",
+                "\n<atem:invoke name=\"write\">\n<atem:parameter name=\"path\">/a</atem:parameter>\n<atem:parameter name=\"n\">5</atem:parameter>\n</atem:invoke>\n",
+            ),
+        ];
+        for (opener, close, span) in calls {
+            let parsed = split(&format!("{opener}{span}{close}"));
+            let whole: Value = serde_json::from_str(&parsed.calls[0].arguments).unwrap();
+            assert_eq!(call_name(opener, span).as_deref(), Some("write"), "{span}");
+            for step in [1, 4, 1000] {
+                let mut stream = ArgumentStream::new(opener);
+                let mut out = String::new();
+                let ends: Vec<usize> = span.char_indices().map(|(i, _)| i).collect();
+                for &end in ends.iter().step_by(step) {
+                    out.push_str(&stream.advance(&span[..end]));
+                }
+                let early = out.len();
+                let (rest, agreed) = stream.finish(span, &parsed.calls[0].arguments);
+                out.push_str(&rest);
+                assert!(agreed, "{span} by {step}: {out}");
+                assert!(step == 1000 || early > 0, "{span}: nothing sent early");
+                let value: Value = serde_json::from_str(&out)
+                    .unwrap_or_else(|err| panic!("{span} by {step}: {out}: {err}"));
+                assert_eq!(value, whole, "{span} by {step}");
+            }
+        }
+    }
+
+    /// A JSON call whose arguments come before its name, or are a string,
+    /// is not streamed.
+    #[test]
+    fn a_json_call_is_streamed_only_name_first_with_object_arguments() {
+        assert!(json_call_head(r#"{"arguments": {"a": 1}, "name": "f"}"#).is_none());
+        assert!(json_call_head(r#"{"name": "f", "arguments": "{\"a\": 1}"}"#).is_none());
+        let (name, at) = json_call_head(r#" {"name": "f", "id": 3, "arguments": {"a"#).unwrap();
+        assert_eq!((name.as_str(), at), ("f", 37));
+    }
+
+    /// A call cut off in a string, or after a key, closes into valid JSON;
+    /// a call the model ended without its closer is closed when it reads
+    /// whole.
+    #[test]
+    fn a_cut_off_json_call_closes_and_an_unclosed_whole_one_counts() {
+        for cut in [
+            r#"{"a": "half"#,
+            r#"{"a": ["x", {"b": "#,
+            r#"{"a": 1, "b": "esc\"#,
+        ] {
+            let closed = format!("{cut}{}", json_closers(cut));
+            assert!(serde_json::from_str::<Value>(&closed).is_ok(), "{closed}");
+        }
+        let mut raw = ArgumentStream::new("<tool_call>");
+        let mut sent = raw.advance("{\"name\": \"f\", \"arguments\": {\"a\": \"line\nnext");
+        assert_eq!(sent, "{\"a\": \"line");
+        sent.push_str(&raw.abandon());
+        assert!(serde_json::from_str::<Value>(&sent).is_ok(), "{sent}");
+        let whole = "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}";
+        assert_eq!(split(&close_trailing(whole)).calls.len(), 1);
+        let cut = "<tool_call>\n{\"name\": \"f\", \"argu";
+        assert_eq!(close_trailing(cut), cut);
+        assert_eq!(close_trailing("plain text"), "plain text");
+    }
+
+    /// A call that never parsed is closed as it stood.
+    #[test]
+    fn an_abandoned_call_is_closed_as_it_stood() {
+        let mut stream = ArgumentStream::default();
+        let mut out = stream.advance("call:f{a:<|\"|>half");
+        out.push_str(&stream.abandon());
+        assert_eq!(out, "{\"a\":\"half\"}");
+    }
+
     #[test]
     fn a_gemma_dsl_call_becomes_openai_shaped_arguments() {
         let split = split("<|tool_call>call:show_file{path:\"src/main.rs\",lines:40}<tool_call|>");
@@ -850,6 +1679,18 @@ mod tests {
         let args: Value = serde_json::from_str(&split.calls[0].arguments).unwrap();
         assert_eq!(args["path"], "src/main.rs");
         assert_eq!(args["lines"], 40);
+    }
+
+    #[test]
+    fn a_stray_quote_before_a_key_does_not_lose_the_call() {
+        let q = DSL_QUOTE;
+        let split = split(&format!(
+            "<|tool_call>call:bash{{\"command:{q}ls /skills{q},\"n\":2}}<tool_call|>"
+        ));
+        assert_eq!(split.content, "");
+        let args: Value = serde_json::from_str(&split.calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "ls /skills");
+        assert_eq!(args["n"], 2);
     }
 
     #[test]

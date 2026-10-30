@@ -486,6 +486,7 @@ pub fn bundled_configuration(
         // a qwen_image model; these are never read.
         text_encoder: None,
         vision: None,
+        vision_tokens: crate::engine::vision::DEFAULT_MAX_TOKENS,
         vae: None,
         image_lora: ImageLora::Auto,
         image_lora_merge: true,
@@ -493,6 +494,7 @@ pub fn bundled_configuration(
         image_weights: crate::engine::image::transformer21::ImageWeights::default(),
         prompt_weights: crate::engine::prompt_weights::PromptWeights::default(),
         prefix_warmup: true,
+        fetch_private: false,
         image_cache: crate::engine::image::stepcache::ImageCache::default(),
         image_reference: crate::engine::image::ReferenceCap::Source,
         image: crate::engine::image::ImageDefaults::default(),
@@ -508,6 +510,9 @@ pub fn bundled_configuration(
         api_key: std::env::var("ORANGU_API_KEY")
             .ok()
             .filter(|k| !k.is_empty()),
+        api_data: default_api_data(),
+        web_search: "off".to_string(),
+        code_execution: "off".to_string(),
         // A bundle is built for a machine nobody will configure, so it takes
         // the ranking policy rather than an index that would only be right
         // on the box the bundle was built on.
@@ -1053,6 +1058,18 @@ pub struct ServerConfiguration {
     /// wants: a secret in a config file is a secret on disk and in every
     /// backup of it.
     pub api_key: Option<String>,
+    /// `[orangu-server].api_data`: where the Anthropic-compatible Files,
+    /// Message Batches and Skills APIs and code execution's containers keep
+    /// what they store — [`default_api_data`] unset.
+    pub api_data: PathBuf,
+    /// `[orangu-server].web_search`: the SearXNG instance the
+    /// Anthropic-compatible `web_search` server tool searches, by URL, or
+    /// `off` (the default).
+    pub web_search: String,
+    /// `[orangu-server].code_execution`: how the Anthropic-compatible
+    /// `code_execution` server tool runs code — `bwrap`, or `off` (the
+    /// default).
+    pub code_execution: String,
     /// `[orangu-server].queue_limit`: how many requests may wait for a slot
     /// before the server starts refusing with `503`; [`DEFAULT_QUEUE_LIMIT`]
     /// unset, and `0` queues without bound.
@@ -1087,6 +1104,10 @@ pub struct ServerConfiguration {
     /// `none` to draw attached pictures over instead of editing them.
     /// `None` finds one beside the text encoder, or under `models`.
     pub vision: Option<String>,
+    /// `[orangu-server].vision_tokens`: the most prompt tokens one picture
+    /// becomes for a chat model with a vision tower — a larger picture is
+    /// read at a smaller size. 70 to 1120.
+    pub vision_tokens: usize,
     /// `[orangu-server].vae`: for an `ltxv` model, LTX's convolutional video
     /// VAE; otherwise the Qwen-Image VAE (`.safetensors`) a
     /// `qwen_image` model decodes pictures with, absolute or relative to
@@ -1126,6 +1147,11 @@ pub struct ServerConfiguration {
     /// request. `ORANGU_PREFIX_WARMUP` overrides it. See
     /// `engine::warm_prefixes`.
     pub prefix_warmup: bool,
+    /// `[orangu-server].fetch_private` — `off` (the default): the URLs the
+    /// server fetches for a request (a picture, a document, `web_fetch`)
+    /// may only reach public addresses, never loopback, private, link-local
+    /// or other reserved ones. See `http::public_net`.
+    pub fetch_private: bool,
     /// `[orangu-server].image_cache`: `easy` (the default) or
     /// `easy:<threshold>` (EasyCache — a step whose predicted change is
     /// small reuses the last passes' residual), or `off` (every step runs
@@ -1299,6 +1325,15 @@ pub struct McpConfiguration {
 /// value is otherwise taken literally, but a models directory is the one
 /// place a user is likely to type a `~`-relative path, same as a shell
 /// would accept.
+/// `~/.orangu/api`, or `.orangu/api` under the current directory when no
+/// home directory resolves.
+pub fn default_api_data() -> PathBuf {
+    home::home_dir()
+        .unwrap_or_default()
+        .join(".orangu")
+        .join("api")
+}
+
 fn expand_tilde(path: &str) -> PathBuf {
     match path.strip_prefix('~') {
         Some(rest) => match home::home_dir() {
@@ -1676,6 +1711,25 @@ pub fn load_server_configuration(
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
 
+    let api_data = section
+        .get("api_data")
+        .map(|dir| expand_tilde(dir.trim()))
+        .unwrap_or_else(default_api_data);
+    let web_search = section
+        .get("web_search")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "off".to_string());
+    let code_execution = match section.get("code_execution").map(|v| v.trim()) {
+        None | Some("") | Some("off") => "off".to_string(),
+        Some("bwrap") => "bwrap".to_string(),
+        Some(other) => {
+            return Err(anyhow!(
+                "invalid value for [{SERVER_SECTION}].code_execution: '{other}' (bwrap or off)"
+            ));
+        }
+    };
+
     let queue_limit = match section.get("queue_limit") {
         Some(value) => value
             .trim()
@@ -1730,6 +1784,22 @@ pub fn load_server_configuration(
         .get("vision")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let vision_tokens = match section.get("vision_tokens").map(|v| v.trim()) {
+        Some(value) if !value.is_empty() => {
+            let tokens = value.parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("vision_tokens must be a number of tokens, not '{value}'")
+            })?;
+            anyhow::ensure!(
+                (crate::engine::vision::MIN_TOKENS..=crate::engine::vision::MAX_TOKENS)
+                    .contains(&tokens),
+                "vision_tokens must be between {} and {}, not {tokens}",
+                crate::engine::vision::MIN_TOKENS,
+                crate::engine::vision::MAX_TOKENS
+            );
+            tokens
+        }
+        _ => crate::engine::vision::DEFAULT_MAX_TOKENS,
+    };
     let vae = section
         .get("vae")
         .map(|value| value.trim().to_string())
@@ -1781,6 +1851,10 @@ pub fn load_server_configuration(
     let prefix_warmup = match section.get("prefix_warmup") {
         Some(value) => parse_bool(SERVER_SECTION, "prefix_warmup", value)?,
         None => true,
+    };
+    let fetch_private = match section.get("fetch_private") {
+        Some(value) => parse_bool(SERVER_SECTION, "fetch_private", value)?,
+        None => false,
     };
     let image_cache = match section.get("image_cache") {
         Some(value) => crate::engine::image::stepcache::ImageCache::parse(value)
@@ -1981,6 +2055,7 @@ pub fn load_server_configuration(
         draft_tokens,
         text_encoder,
         vision,
+        vision_tokens,
         vae,
         image_lora,
         image_lora_merge,
@@ -1988,6 +2063,7 @@ pub fn load_server_configuration(
         image_weights,
         prompt_weights,
         prefix_warmup,
+        fetch_private,
         image_cache,
         image_reference,
         image,
@@ -1997,6 +2073,9 @@ pub fn load_server_configuration(
         upscaler,
         video,
         api_key,
+        api_data,
+        web_search,
+        code_execution,
         tls,
         device,
         device_split,
@@ -3137,6 +3216,19 @@ mod tests {
         assert!(load("").unwrap().prefix_warmup);
         assert!(!load("prefix_warmup = off").unwrap().prefix_warmup);
         assert!(load("prefix_warmup = maybe").is_err());
+    }
+
+    /// `fetch_private` defaults to off and takes the usual booleans.
+    #[test]
+    fn fetch_private_defaults_off() {
+        let load = |keys: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{keys}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        assert!(!load("").unwrap().fetch_private);
+        assert!(load("fetch_private = on").unwrap().fetch_private);
+        assert!(load("fetch_private = maybe").is_err());
     }
 
     /// `prompt_weights` defaults to `auto`, takes `copy` and `file`, and

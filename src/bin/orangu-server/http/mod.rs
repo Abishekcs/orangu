@@ -14,12 +14,15 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Router assembly and shared state. Endpoint handlers live in
-//! `http::openai` (OpenAI-compatible) and `http::native`
-//! (llama.cpp-native); shutdown is handled here since it's neither.
+//! `http::openai` (OpenAI-compatible), `http::anthropic`
+//! (Anthropic-compatible) and `http::native` (llama.cpp-native); shutdown
+//! is handled here since it's none of them.
 
+pub mod anthropic;
 pub mod images;
 pub mod native;
 pub mod openai;
+pub mod public_net;
 pub mod videos;
 
 use crate::engine::backend::Backend;
@@ -80,6 +83,16 @@ pub struct AppState {
     /// Build, host, process and in-flight-request metrics for `/metrics`.
     pub process_metrics: Arc<crate::engine::metrics::ProcessMetrics>,
     pub shutdown_tx: mpsc::Sender<()>,
+    /// Where the Anthropic-compatible Files (`files/`), Message Batches
+    /// (`batches/`), Skills (`skills/`) and code execution (`containers/`)
+    /// APIs keep what they store — `[orangu-server].api_data`.
+    pub api_data: PathBuf,
+    /// The SearXNG instance the `web_search` server tool searches, by URL,
+    /// or `off` — `[orangu-server].web_search`.
+    pub web_search: String,
+    /// How the `code_execution` server tool runs code: `bwrap`, or `off` —
+    /// `[orangu-server].code_execution`.
+    pub code_execution: String,
 }
 
 /// Paths that stay reachable without a key.
@@ -142,7 +155,8 @@ async fn pause_while_working_for_a_parent(
 /// pairing is deliberate: nothing about binding to a network should silently
 /// also mean publishing an inference engine. `Authorization: Bearer <key>`
 /// because that is what the orangu client already sends (`orangu::llm`'s
-/// `bearer_auth`) and what every OpenAI-shaped client sends.
+/// `bearer_auth`) and what every OpenAI-shaped client sends; `x-api-key:
+/// <key>` because that is what every Anthropic SDK sends.
 async fn require_api_key(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -154,14 +168,34 @@ async fn require_api_key(
     if OPEN_PATHS.contains(&request.uri().path()) {
         return next.run(request).await;
     }
-    let presented = request
-        .headers()
+    let headers = request.headers();
+    let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-
-    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let x_api_key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+    let accepted = [bearer, x_api_key]
+        .into_iter()
+        .flatten()
+        .any(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()));
+    if !accepted {
+        let path = request.uri().path();
+        if path.starts_with("/v1/messages")
+            || path.starts_with("/v1/files")
+            || path.starts_with("/v1/skills")
+            || path.starts_with("/v1/agents")
+            || path.starts_with("/v1/environments")
+            || path.starts_with("/v1/sessions")
+            || path.starts_with("/v1/memory_stores")
+            || path.starts_with("/v1/vaults")
+            || path.starts_with("/v1/deployment")
+            || path.starts_with("/v1/webhook_endpoints")
+        {
+            return anthropic::error_response(
+                StatusCode::UNAUTHORIZED,
+                "this server requires an x-api-key or Authorization: Bearer <key> header",
+            );
+        }
         return unauthorized();
     }
     next.run(request).await
@@ -183,7 +217,7 @@ fn unauthorized() -> axum::response::Response {
     (
         axum::http::StatusCode::UNAUTHORIZED,
         [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
-        "unauthorized: this server requires an Authorization: Bearer <key> header\n",
+        "unauthorized: this server requires an Authorization: Bearer <key> (or x-api-key) header\n",
     )
         .into_response()
 }
@@ -290,12 +324,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let metrics = state.process_metrics.clone();
     // An image server takes a picture to start from as base64 in the JSON,
     // which axum's default 2 MB body cap would refuse long before
-    // `images::MAX_IMAGE_BYTES`. Everything else keeps that default.
-    let body_limit = axum::extract::DefaultBodyLimit::max(if state.engine.image.is_some() {
-        images::IMAGE_BODY_LIMIT
-    } else {
-        2 * 1024 * 1024
-    });
+    // `images::MAX_IMAGE_BYTES`; a model with a vision tower takes a
+    // conversation's pictures the same way. Everything else keeps that
+    // default.
+    let body_limit = axum::extract::DefaultBodyLimit::max(
+        if state.engine.image.is_some() || state.engine.vision.is_some() {
+            images::IMAGE_BODY_LIMIT
+        } else {
+            2 * 1024 * 1024
+        },
+    );
     let router = Router::new()
         .route("/health", get(native::health))
         .route("/ready", get(native::ready))
@@ -316,8 +354,278 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/embedding", post(native::embedding))
         .route("/apply-template", post(native::apply_template))
         .route("/v1/models", get(openai::list_models))
+        .route("/v1/models/{id}", get(openai::retrieve_model))
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/completions", post(openai::completions))
+        // Anthropic's own request limit, for conversations carrying
+        // documents and pictures inline.
+        .route(
+            "/v1/messages",
+            post(anthropic::messages).layer(axum::extract::DefaultBodyLimit::max(
+                anthropic::REQUEST_BODY_LIMIT,
+            )),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(anthropic::count_tokens).layer(axum::extract::DefaultBodyLimit::max(
+                anthropic::REQUEST_BODY_LIMIT,
+            )),
+        )
+        .route(
+            "/v1/messages/batches",
+            post(anthropic::batches::create)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    anthropic::batches::REQUEST_BODY_LIMIT,
+                ))
+                .get(anthropic::batches::list),
+        )
+        .route(
+            "/v1/messages/batches/{id}",
+            get(anthropic::batches::retrieve).delete(anthropic::batches::delete),
+        )
+        .route(
+            "/v1/messages/batches/{id}/cancel",
+            post(anthropic::batches::cancel),
+        )
+        .route(
+            "/v1/messages/batches/{id}/results",
+            get(anthropic::batches::results),
+        )
+        .route(
+            "/v1/files",
+            post(anthropic::files::upload)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    anthropic::files::UPLOAD_LIMIT,
+                ))
+                .get(anthropic::files::list),
+        )
+        .route(
+            "/v1/files/{id}",
+            get(anthropic::files::retrieve).delete(anthropic::files::delete),
+        )
+        .route("/v1/files/{id}/content", get(anthropic::files::content))
+        .route(
+            "/v1/skills",
+            post(anthropic::skills::create)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    anthropic::skills::UPLOAD_LIMIT,
+                ))
+                .get(anthropic::skills::list),
+        )
+        .route(
+            "/v1/skills/{id}",
+            get(anthropic::skills::retrieve).delete(anthropic::skills::delete),
+        )
+        .route(
+            "/v1/skills/{id}/versions",
+            post(anthropic::skills::create_version)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    anthropic::skills::UPLOAD_LIMIT,
+                ))
+                .get(anthropic::skills::list_versions),
+        )
+        .route(
+            "/v1/skills/{id}/versions/{version}",
+            get(anthropic::skills::retrieve_version).delete(anthropic::skills::delete_version),
+        )
+        .route(
+            "/v1/agents",
+            post(anthropic::agents::create_agent).get(anthropic::agents::list_agents),
+        )
+        .route(
+            "/v1/agents/{id}",
+            get(anthropic::agents::retrieve_agent).post(anthropic::agents::update_agent),
+        )
+        .route(
+            "/v1/agents/{id}/archive",
+            post(anthropic::agents::archive_agent),
+        )
+        .route(
+            "/v1/agents/{id}/versions",
+            get(anthropic::agents::list_agent_versions),
+        )
+        .route(
+            "/v1/environments",
+            post(anthropic::agents::create_environment).get(anthropic::agents::list_environments),
+        )
+        .route(
+            "/v1/environments/{id}",
+            get(anthropic::agents::retrieve_environment)
+                .post(anthropic::agents::update_environment)
+                .delete(anthropic::agents::delete_environment),
+        )
+        .route(
+            "/v1/environments/{id}/archive",
+            post(anthropic::agents::archive_environment),
+        )
+        .route(
+            "/v1/sessions",
+            post(anthropic::sessions::create_session)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    anthropic::REQUEST_BODY_LIMIT,
+                ))
+                .get(anthropic::sessions::list_sessions),
+        )
+        .route(
+            "/v1/sessions/{id}",
+            get(anthropic::sessions::retrieve_session)
+                .post(anthropic::sessions::update_session)
+                .delete(anthropic::sessions::delete_session),
+        )
+        .route(
+            "/v1/sessions/{id}/archive",
+            post(anthropic::sessions::archive_session),
+        )
+        .route(
+            "/v1/sessions/{id}/events",
+            post(anthropic::sessions::send_events)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    anthropic::REQUEST_BODY_LIMIT,
+                ))
+                .get(anthropic::sessions::list_events),
+        )
+        .route(
+            "/v1/sessions/{id}/events/stream",
+            get(anthropic::sessions::stream_events),
+        )
+        .route(
+            "/v1/sessions/{id}/threads",
+            get(anthropic::sessions::list_threads),
+        )
+        .route(
+            "/v1/sessions/{id}/threads/{thread}",
+            get(anthropic::sessions::retrieve_thread),
+        )
+        .route(
+            "/v1/sessions/{id}/threads/{thread}/archive",
+            post(anthropic::sessions::archive_thread),
+        )
+        .route(
+            "/v1/sessions/{id}/threads/{thread}/events",
+            get(anthropic::sessions::list_thread_events),
+        )
+        .route(
+            "/v1/sessions/{id}/threads/{thread}/stream",
+            get(anthropic::sessions::stream_thread_events),
+        )
+        .route(
+            "/v1/vaults",
+            post(anthropic::vaults::create_vault).get(anthropic::vaults::list_vaults),
+        )
+        .route(
+            "/v1/vaults/{id}",
+            get(anthropic::vaults::retrieve_vault)
+                .post(anthropic::vaults::update_vault)
+                .delete(anthropic::vaults::delete_vault),
+        )
+        .route(
+            "/v1/vaults/{id}/archive",
+            post(anthropic::vaults::archive_vault),
+        )
+        .route(
+            "/v1/vaults/{id}/credentials",
+            post(anthropic::vaults::create_credential).get(anthropic::vaults::list_credentials),
+        )
+        .route(
+            "/v1/vaults/{id}/credentials/{credential}",
+            get(anthropic::vaults::retrieve_credential)
+                .post(anthropic::vaults::update_credential)
+                .delete(anthropic::vaults::delete_credential),
+        )
+        .route(
+            "/v1/vaults/{id}/credentials/{credential}/archive",
+            post(anthropic::vaults::archive_credential),
+        )
+        .route(
+            "/v1/vaults/{id}/credentials/{credential}/mcp_oauth_validate",
+            post(anthropic::vaults::validate_credential),
+        )
+        .route(
+            "/v1/memory_stores",
+            post(anthropic::memory::create_store).get(anthropic::memory::list_stores),
+        )
+        .route(
+            "/v1/memory_stores/{id}",
+            get(anthropic::memory::retrieve_store)
+                .post(anthropic::memory::update_store)
+                .delete(anthropic::memory::delete_store),
+        )
+        .route(
+            "/v1/memory_stores/{id}/archive",
+            post(anthropic::memory::archive_store),
+        )
+        .route(
+            "/v1/memory_stores/{id}/memories",
+            get(anthropic::memory::list_memories).post(anthropic::memory::create_memory),
+        )
+        .route(
+            "/v1/memory_stores/{id}/memories/{memory}",
+            get(anthropic::memory::retrieve_memory)
+                .post(anthropic::memory::update_memory)
+                .patch(anthropic::memory::update_memory)
+                .delete(anthropic::memory::delete_memory),
+        )
+        .route(
+            "/v1/memory_stores/{id}/memory_versions",
+            get(anthropic::memory::list_versions),
+        )
+        .route(
+            "/v1/memory_stores/{id}/memory_versions/{version}",
+            get(anthropic::memory::retrieve_version),
+        )
+        .route(
+            "/v1/memory_stores/{id}/memory_versions/{version}/redact",
+            post(anthropic::memory::redact_version),
+        )
+        .route(
+            "/v1/deployments",
+            post(anthropic::deployments::create_deployment)
+                .get(anthropic::deployments::list_deployments),
+        )
+        .route(
+            "/v1/deployments/{id}",
+            get(anthropic::deployments::retrieve_deployment)
+                .post(anthropic::deployments::update_deployment)
+                .delete(anthropic::deployments::delete_deployment),
+        )
+        .route(
+            "/v1/deployments/{id}/pause",
+            post(anthropic::deployments::pause_deployment),
+        )
+        .route(
+            "/v1/deployments/{id}/unpause",
+            post(anthropic::deployments::unpause_deployment),
+        )
+        .route(
+            "/v1/deployments/{id}/archive",
+            post(anthropic::deployments::archive_deployment),
+        )
+        .route(
+            "/v1/deployments/{id}/run",
+            post(anthropic::deployments::run_deployment),
+        )
+        .route(
+            "/v1/deployment_runs",
+            get(anthropic::deployments::list_runs),
+        )
+        .route(
+            "/v1/deployment_runs/{id}",
+            get(anthropic::deployments::retrieve_run),
+        )
+        .route(
+            "/v1/webhook_endpoints",
+            post(anthropic::webhooks::create_endpoint).get(anthropic::webhooks::list_endpoints),
+        )
+        .route(
+            "/v1/webhook_endpoints/{id}",
+            get(anthropic::webhooks::retrieve_endpoint)
+                .post(anthropic::webhooks::update_endpoint)
+                .delete(anthropic::webhooks::delete_endpoint),
+        )
+        .route(
+            "/v1/webhook_endpoints/{id}/rotate_secret",
+            post(anthropic::webhooks::rotate_secret),
+        )
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/videos", post(videos::create).get(videos::list))

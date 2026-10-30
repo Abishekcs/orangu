@@ -799,6 +799,13 @@ struct Prepared {
     /// bearer token `http::require_api_key` checks. `None` leaves the server
     /// open.
     api_key: Option<String>,
+    /// `[orangu-server].api_data`, for [`http::AppState::api_data`].
+    api_data: PathBuf,
+    /// `[orangu-server].web_search`, for [`http::AppState::web_search`].
+    web_search: String,
+    /// `[orangu-server].code_execution`, for
+    /// [`http::AppState::code_execution`].
+    code_execution: String,
     /// `[orangu-server].tls_cert`/`tls_key`, resolved once. `None` serves
     /// plain HTTP.
     tls: Option<(PathBuf, PathBuf)>,
@@ -2807,6 +2814,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         &model_label,
         &model.new_kv_cache(1).structure_tag(),
     );
+    http::public_net::set_private_allowed(conf.fetch_private);
     // What earlier runs of this model reused, to warm after serving starts.
     let warm_prefixes = (!partial
         && engine::warm_prefixes::enabled(conf.prefix_warmup)
@@ -3027,6 +3035,14 @@ fn prepare(args: Args) -> Result<Prepared> {
         }
     }
     let recurrent = model.new_kv_cache(1).has_recurrent();
+    let vision = load_vision(
+        &source,
+        &conf,
+        architecture_key.as_deref(),
+        model.config().n_embd,
+        &tokenizer,
+        &backend,
+    )?;
     let engine = Arc::new(Engine {
         paged_kv: paged_kv.clone(),
         metrics: Arc::new(engine::metrics::ServerMetrics::new()),
@@ -3051,6 +3067,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         live_stats: conf.log.is_console() && !args.daemon,
         image,
         video,
+        vision,
         switch,
     });
 
@@ -3150,6 +3167,9 @@ fn prepare(args: Args) -> Result<Prepared> {
 
     Ok(Prepared {
         api_key: conf.api_key.clone(),
+        api_data: conf.api_data.clone(),
+        web_search: conf.web_search.clone(),
+        code_execution: conf.code_execution.clone(),
         tls: conf.tls.clone(),
         engine,
         prefix_cache_snapshot: prefix_cache_dir.map(|dir| (dir, prefix_fingerprint)),
@@ -3314,6 +3334,84 @@ fn load_draft_model(
         },
         footprint,
     ))
+}
+
+/// The vision tower for a `gemma4` model: `conf.vision` when it names one
+/// (absolute or under `models`; `none` for none), else the `mmproj-*.gguf` beside the model — in its
+/// directory, the one above, or a sibling revision's — whose projection is
+/// the model's width. `None` for every other architecture.
+fn load_vision(
+    source: &ModelSource,
+    conf: &config::ServerConfiguration,
+    architecture: Option<&str>,
+    n_embd: usize,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+) -> Result<Option<Arc<engine::vision::Vision>>> {
+    use engine::vision::Encoder;
+    let (models_dir, vision) = (&conf.models, conf.vision.as_deref());
+    if architecture != Some("gemma4") || vision == Some("none") {
+        return Ok(None);
+    }
+    let path = match vision {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                models_dir.join(path)
+            };
+            match Encoder::projector_width(&path) {
+                Some(width) if width == n_embd => path,
+                Some(width) => bail!(
+                    "vision {} writes width {width}, not the model's {n_embd}",
+                    path.display()
+                ),
+                None => bail!(
+                    "vision {} is not a gemma-4 vision projector",
+                    path.display()
+                ),
+            }
+        }
+        None => {
+            let ModelSource::File(model) = source else {
+                return Ok(None);
+            };
+            let mut dirs: Vec<PathBuf> =
+                model.parent().into_iter().map(Path::to_path_buf).collect();
+            dirs.extend(model.parent().and_then(Path::parent).map(Path::to_path_buf));
+            dirs.extend(sibling_snapshot_dirs(model));
+            let found = dirs
+                .iter()
+                .filter_map(|dir| std::fs::read_dir(dir).ok())
+                .flatten()
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("mmproj") && n.ends_with(".gguf"))
+                })
+                .find(|p| Encoder::projector_width(p) == Some(n_embd));
+            match found {
+                Some(path) => path,
+                None => {
+                    log::info!(
+                        "orangu-server: no vision projector beside the model — pictures are \
+                         refused; `orangu-server download` fetches the mmproj with the model"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    };
+    let encoder = Encoder::load(&path, backend.clone(), conf.vision_tokens)?;
+    let vision = engine::vision::Vision::new(encoder, &path, tokenizer)?;
+    log::info!(
+        "orangu-server: vision {} (up to {} tokens a picture)",
+        path.display(),
+        vision.max_tokens()
+    );
+    Ok(Some(Arc::new(vision)))
 }
 
 /// Every `snapshots/<commit>/` directory of the hub-cache repository `path`
@@ -4101,6 +4199,9 @@ fn start_workers_node(
 async fn serve(prepared: Prepared) -> Result<()> {
     let Prepared {
         api_key,
+        api_data,
+        web_search,
+        code_execution,
         tls,
         engine,
         prefix_cache_snapshot,
@@ -4192,7 +4293,13 @@ async fn serve(prepared: Prepared) -> Result<()> {
         started_at: std::time::Instant::now(),
         process_metrics: Arc::new(engine::metrics::ProcessMetrics::new()),
         shutdown_tx,
+        api_data,
+        web_search,
+        code_execution,
     });
+    http::anthropic::batches::resume(state.clone());
+    http::anthropic::sessions::resume_workflows(state.clone());
+    http::anthropic::deployments::start_scheduler(state.clone());
     // Cloned before `build_router` consumes `state`, for `build_metrics_router` below.
     let metrics_state = state.clone();
     let process_metrics = state.process_metrics.clone();

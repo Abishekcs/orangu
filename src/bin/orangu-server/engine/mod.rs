@@ -36,6 +36,7 @@ pub mod hadamard;
 pub mod head_split;
 pub mod image;
 pub mod iq_grids;
+pub mod json_schema;
 pub mod kv_cache;
 pub mod kv_pool;
 pub mod loader;
@@ -63,6 +64,7 @@ pub mod tokenizer;
 pub mod tool_calls;
 pub mod vecdot;
 pub mod video;
+pub mod vision;
 pub mod warm_prefixes;
 
 /// The NPU feed-forward service, if this machine has one holding blocks for

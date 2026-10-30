@@ -45,6 +45,20 @@ pub fn extract_text(bytes: &[u8]) -> Result<String> {
     Ok(text.to_owned())
 }
 
+/// The text of each page, in order, without letting a malformed document's
+/// parser panic escape. Fails like [`extract_text`] when no page has text.
+pub fn extract_pages(bytes: &[u8]) -> Result<Vec<String>> {
+    let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(bytes))
+        .map_err(|_| anyhow!("PDF parser failed while reading this document"))?
+        .context("Cannot extract PDF text; the document may be damaged or password-protected")?;
+    if pages.iter().all(|page| page.trim().is_empty()) {
+        bail!(
+            "PDF contains no extractable text; scanned documents require OCR before they can be queried"
+        );
+    }
+    Ok(pages)
+}
+
 pub fn read_text(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;

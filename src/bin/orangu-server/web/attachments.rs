@@ -15,9 +15,10 @@
 
 //! Turning user-uploaded files into text the engine can actually read.
 //!
-//! The engine is text-only — it has no vision path — so an attachment only
-//! reaches the model as text. This module decodes the browser-supplied
-//! bytes and pulls plain text out of the formats worth supporting:
+//! A picture reaches a model with a vision tower as itself (see
+//! [`compose_content`]); every other attachment reaches the model as text.
+//! This module decodes the browser-supplied bytes and pulls plain text out
+//! of the formats worth supporting:
 //! UTF-8 text/code, PDF, and the OOXML Office trio (Word/Excel/PowerPoint,
 //! plus OpenDocument spreadsheets via the same reader). Anything else is
 //! kept as a metadata-only reference — its name/type/size are mentioned to
@@ -108,7 +109,15 @@ pub fn extract(incoming: &IncomingAttachment) -> Result<Attachment> {
 /// Fold a message's typed text and its attachments into the single string
 /// the chat template sees. Extractable attachments are inlined as fenced
 /// blocks; the rest are named so the model at least knows a file was sent.
-pub fn compose_content(text: &str, attachments: &[Attachment]) -> String {
+///
+/// With `pictures` — a model with a vision tower — a picture stands in the
+/// text as its sentinel (`http::openai::picture_sentinel`), numbered by its
+/// place in `pictures`, where its stored name is pushed.
+pub fn compose_content(
+    text: &str,
+    attachments: &[Attachment],
+    mut pictures: Option<&mut Vec<String>>,
+) -> String {
     let text = text.trim();
     if attachments.is_empty() {
         return text.to_string();
@@ -130,8 +139,12 @@ pub fn compose_content(text: &str, attachments: &[Attachment]) -> String {
                     att.name, att.mime, body
                 ));
             }
-            // A language model here has no vision path, and saying so beats
-            // letting it guess at what the file held.
+            None if let (Some(name), Some(pictures)) = (&att.image, pictures.as_deref_mut()) => {
+                out.push_str(&crate::http::openai::picture_sentinel(pictures.len()));
+                pictures.push(name.clone());
+            }
+            // A model without a vision tower, told so rather than left to
+            // guess at what the file held.
             None if att.image.is_some() || att.image_bytes.is_some() => out.push_str(&format!(
                 "[Attached image \"{}\" ({}, {}) — a picture this model cannot see]",
                 att.name,
@@ -422,7 +435,7 @@ mod tests {
                     .unwrap()
                     .contains("secret ingredient is apricot")
             );
-            let content = compose_content("What is the ingredient?", &[att]);
+            let content = compose_content("What is the ingredient?", &[att], None);
             assert!(content.contains("What is the ingredient?"));
             assert!(content.contains("secret ingredient is apricot"));
             assert!(!content.contains("%PDF-"));
@@ -433,7 +446,7 @@ mod tests {
     fn unreadable_pdf_is_explicit_in_the_query() {
         let att = extract(&incoming("broken.pdf", "application/pdf", b"%PDF-broken")).unwrap();
         assert!(att.text.is_none());
-        let content = compose_content("Summarize this", &[att]);
+        let content = compose_content("Summarize this", &[att], None);
         assert!(content.contains("no readable text"));
         assert!(content.contains("OCR"));
     }
@@ -543,7 +556,7 @@ mod tests {
                 image_bytes: None,
             },
         ];
-        let out = compose_content("look at these", &atts);
+        let out = compose_content("look at these", &atts, None);
         assert!(out.starts_with("look at these"));
         assert!(out.contains("Attached document \"spec.txt\""));
         assert!(out.contains("BODY"));
@@ -554,8 +567,27 @@ mod tests {
     }
 
     #[test]
+    fn a_picture_stands_as_its_sentinel_for_a_model_that_sees() {
+        let picture = |name: &str| Attachment {
+            name: "img.png".into(),
+            mime: "image/png".into(),
+            size: 2048,
+            text: None,
+            image: Some(name.into()),
+            image_bytes: None,
+        };
+        let mut pictures = vec!["0-0.png".to_string()];
+        let out = compose_content("look", &[picture("1-0.png")], Some(&mut pictures));
+        assert_eq!(pictures, ["0-0.png", "1-0.png"]);
+        assert_eq!(
+            out,
+            format!("look\n\n{}", crate::http::openai::picture_sentinel(1))
+        );
+    }
+
+    #[test]
     fn compose_without_attachments_is_just_the_text() {
-        assert_eq!(compose_content("hi", &[]), "hi");
+        assert_eq!(compose_content("hi", &[], None), "hi");
     }
 
     #[test]
@@ -580,7 +612,7 @@ mod tests {
             image: None,
             image_bytes: None,
         }];
-        let out = compose_content("Please, render this", &atts);
+        let out = compose_content("Please, render this", &atts, None);
 
         // Parsing the composed prompt back must yield exactly one code
         // block holding the whole document — not the three fragments a

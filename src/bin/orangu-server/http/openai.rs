@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::AppState;
 use super::native::finish_reason_str;
-use crate::engine::chat_template::ChatMessage;
+use crate::engine::chat_template::{ChatMessage, Reasoning};
 use crate::engine::generate::{GenerateRequest, GenerateStats, StreamEvent};
 use crate::engine::image::ImageEvent;
 use crate::engine::loader::PoolingType;
@@ -61,7 +61,7 @@ use base64::Engine as _;
 /// Reaching this is no longer silent either way: the response carries
 /// `finish_reason: "length"`, and the client says so — see
 /// `llm::StreamMetrics::truncated`.
-const DEFAULT_MAX_TOKENS: usize = 8192;
+pub(crate) const DEFAULT_MAX_TOKENS: usize = 8192;
 
 /// OpenAI's `usage` object.
 pub(crate) fn usage_json(stats: &GenerateStats) -> serde_json::Value {
@@ -158,19 +158,80 @@ pub(crate) fn prompt_progress_json(stats: &GenerateStats) -> serde_json::Value {
     })
 }
 
+/// The served model in both OpenAI's shape (`object`, `created`,
+/// `owned_by`) and Anthropic's (`type`, `display_name`, `created_at`); each
+/// SDK reads its own fields and ignores the other's.
+fn model_json(state: &AppState) -> serde_json::Value {
+    let created = unix_now();
+    // What one request may hold: the model's context, or less when the
+    // device has room for less.
+    let context = crate::engine::generate::kv_device_token_ceiling()
+        .map_or(state.engine.model.config().n_ctx_train, |ceiling| {
+            ceiling.min(state.engine.model.config().n_ctx_train)
+        });
+    let created_at = chrono::DateTime::from_timestamp(created as i64, 0)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    json!({
+        "id": state.model_label,
+        "object": "model",
+        "created": created,
+        "owned_by": "orangu-server",
+        "type": "model",
+        "display_name": state.model_label,
+        "created_at": created_at,
+        "max_input_tokens": context,
+        "max_tokens": context,
+        "capabilities": {
+            "batch": {"supported": true},
+            "citations": {"supported": true},
+            "image_input": {"supported": state.engine.vision.is_some()},
+            "pdf_input": {"supported": true},
+            "structured_outputs": {"supported": true},
+            "thinking": {"supported": reasons_apart(&state.engine.tokenizer)},
+        },
+    })
+}
+
+/// Whether this vocabulary marks reasoning off from the answer, so a
+/// reasoning model's thinking reaches a client apart from its reply.
+fn reasons_apart(tokenizer: &crate::engine::tokenizer::Tokenizer) -> bool {
+    tokenizer.think_framing().is_some()
+        || tokenizer.channel_framing().is_some()
+        || tokenizer.message_framing().is_some()
+        || tokenizer.content_kinds().is_some()
+}
+
+/// `GET /v1/models`, with Anthropic's pagination fields beside OpenAI's
+/// `object: "list"` — there is one model, so there is never a next page.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({
         "object": "list",
-        "data": [{
-            "id": state.model_label,
-            "object": "model",
-            "created": unix_now(),
-            "owned_by": "orangu-server",
-        }]
+        "data": [model_json(&state)],
+        "has_more": false,
+        "first_id": state.model_label,
+        "last_id": state.model_label,
     }))
 }
 
-fn unix_now() -> u64 {
+/// `GET /v1/models/{id}`: the served model when `id` names it.
+pub async fn retrieve_model(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if id != state.model_label {
+        return super::anthropic::error_response(
+            StatusCode::NOT_FOUND,
+            format!(
+                "model '{id}' is not served here; this server serves '{}'",
+                state.model_label
+            ),
+        );
+    }
+    Json(model_json(&state)).into_response()
+}
+
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -254,13 +315,8 @@ pub(crate) fn default_cache_prompt() -> bool {
 
 /// Whether `response_format` asks for JSON.
 ///
-/// OpenAI's field is an object, `{"type": "json_object"}`. `json_schema` is
-/// recognised too and treated as `json_object` — the output is constrained to
-/// valid JSON, but **not** to the schema's shape, which is a strictly larger
-/// job. Answering "the type I do not implement is simply ignored" would be
-/// worse: a caller asking for a schema and receiving free text has no way to
-/// tell that the field never arrived, which is the exact failure this file's
-/// own comment about silently-dropped sampler fields already records.
+/// OpenAI's field is an object, `{"type": "json_object"}`. `json_schema`
+/// asks for JSON too, and its schema is then held to by [`response_schema`].
 ///
 /// Anything else — including `{"type": "text"}`, the default — is
 /// unconstrained.
@@ -269,6 +325,40 @@ fn wants_json(response_format: Option<&serde_json::Value>) -> bool {
         .and_then(|v| v.get("type"))
         .and_then(|v| v.as_str())
         .is_some_and(|t| matches!(t, "json_object" | "json_schema"))
+}
+
+/// The schema `response_format: {"type": "json_schema", "json_schema":
+/// {"schema": …}}` names, compiled; `None` for any other format. A schema
+/// that cannot be followed is a `400` naming the reason, never a request
+/// served unconstrained.
+fn response_schema(
+    response_format: Option<&serde_json::Value>,
+) -> Result<Option<Arc<crate::engine::json_schema::Schema>>, Box<axum::response::Response>> {
+    let Some(format) =
+        response_format.filter(|f| f.get("type").and_then(|t| t.as_str()) == Some("json_schema"))
+    else {
+        return Ok(None);
+    };
+    let Some(schema) = format.pointer("/json_schema/schema") else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "response_format json_schema needs json_schema.schema\n",
+            )
+                .into_response(),
+        ));
+    };
+    crate::engine::json_schema::compile(schema)
+        .map(|schema| Some(Arc::new(schema)))
+        .map_err(|err| {
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("response_format json_schema: {err}\n"),
+                )
+                    .into_response(),
+            )
+        })
 }
 
 /// `Role::Review`'s reasoning-suppression approximation: real llama-server
@@ -332,8 +422,18 @@ pub(crate) fn append_reasoning_suppression(
     role: crate::config::Role,
     tokenizer: &crate::engine::tokenizer::Tokenizer,
 ) {
-    if role.suppresses_reasoning()
-        && tokenizer.message_framing().is_none()
+    if role.suppresses_reasoning() {
+        append_empty_think_block(prompt, tokenizer);
+    }
+}
+
+/// [`EMPTY_THINK_BLOCK`], on the models [`append_reasoning_suppression`]
+/// says it is the right tool for, whatever the role.
+pub(crate) fn append_empty_think_block(
+    prompt: &mut String,
+    tokenizer: &crate::engine::tokenizer::Tokenizer,
+) {
+    if tokenizer.message_framing().is_none()
         && tokenizer.content_kinds().is_none()
         && tokenizer.think_framing().is_some()
     {
@@ -427,6 +527,288 @@ pub(crate) fn request_role(state: &AppState, headers: &HeaderMap) -> crate::conf
         .unwrap_or(state.engine.role)
 }
 
+/// A conversation rendered through the model's chat template: the prompt's
+/// tokens, and where a model whose state cannot be rewound may keep its
+/// cache — see `GenerateRequest::cache_point`.
+pub(crate) struct RenderedChat {
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) cache_point: Option<usize>,
+}
+
+/// How [`render_chat`] departs from rendering a conversation for the role's
+/// next turn. The default departs from nothing.
+#[derive(Default)]
+pub(crate) struct RenderOptions<'a> {
+    /// The reasoning settings to render with instead of the role's, and
+    /// whether to close the reasoning channel before the answer — see
+    /// [`append_empty_think_block`].
+    pub(crate) reasoning: Option<(Reasoning<'a>, bool)>,
+    /// An assistant turn the conversation ends in the middle of: the reply
+    /// continues this text instead of starting a turn of its own.
+    pub(crate) continue_from: Option<&'a str>,
+    /// Text the reply is made to begin with, written after the generation
+    /// prompt — a tool-call opener when a call is required.
+    pub(crate) suffix: Option<&'a str>,
+}
+
+/// Stands in for a continued turn's text while the template renders it, so
+/// where the text lands can be found whatever the template does around it.
+const CONTINUE_SENTINEL: &str = "\u{1}orangu-continue\u{1}";
+
+/// Renders `messages` (and `tools`, OpenAI's shape) into prompt tokens the
+/// way every chat endpoint does, so `/v1/chat/completions` and `/v1/messages`
+/// cannot drift apart on what a conversation becomes.
+pub(crate) async fn render_chat(
+    state: &AppState,
+    role: crate::config::Role,
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+    options: RenderOptions<'_>,
+) -> Result<RenderedChat, Box<axum::response::Response>> {
+    let Some(template) = state.engine.chat_template.clone() else {
+        return Err(Box::new(
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                "model has no tokenizer.chat_template; use /v1/completions instead",
+            )
+                .into_response(),
+        ));
+    };
+    let (bos, eos) = (
+        state
+            .engine
+            .tokenizer
+            .bos_token
+            .and_then(|id| state.engine.tokenizer.token_text(id))
+            .unwrap_or(""),
+        state
+            .engine
+            .tokenizer
+            .eos_token
+            .and_then(|id| state.engine.tokenizer.token_text(id))
+            .unwrap_or(""),
+    );
+    let (reasoning, suppress) = options
+        .reasoning
+        .unwrap_or((state.engine.reasoning_as(role), role.suppresses_reasoning()));
+    let bad_request =
+        |err: anyhow::Error| Box::new((StatusCode::BAD_REQUEST, err.to_string()).into_response());
+    // An empty `tools: []` is treated as no tools: a template gating on
+    // `{%- if tools -%}` would agree, and passing it through only invites a
+    // template to emit an empty declaration block.
+    let tools = tools.filter(|t| !matches!(t.as_array(), Some(a) if a.is_empty()));
+    // A conversation's pictures, each held in its text's place by a
+    // sentinel that is swapped for its tokens once the template has run.
+    let pictures: Vec<&str> = messages
+        .iter()
+        .flat_map(|m| m.images.iter().map(String::as_str))
+        .collect();
+    let vision = match (&state.engine.vision, pictures.is_empty()) {
+        (_, true) => None,
+        (Some(vision), false) => Some(vision.clone()),
+        (None, false) => {
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    "this model reads no pictures: it has no vision projector (an mmproj GGUF \
+                     beside it)",
+                )
+                    .into_response(),
+            ));
+        }
+    };
+    let with_pictures;
+    let messages = if vision.is_some() {
+        with_pictures = picture_sentinels(messages);
+        &with_pictures[..]
+    } else {
+        messages
+    };
+    let mut prompt = match options.continue_from {
+        // The turn is rendered as finished, with a sentinel for its text,
+        // and cut where the text would have ended: everything the template
+        // writes to close a turn comes after that point.
+        Some(text) => {
+            let mut messages = messages.to_vec();
+            messages.push(ChatMessage::text("assistant", CONTINUE_SENTINEL));
+            let rendered = template
+                .render_with_tools(&messages, false, bos, eos, reasoning, tools)
+                .map_err(bad_request)?;
+            let Some(at) = rendered.rfind(CONTINUE_SENTINEL) else {
+                return Err(Box::new(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "this model's chat template does not render an assistant turn's \
+                         text, so the turn cannot be continued",
+                    )
+                        .into_response(),
+                ));
+            };
+            let mut prompt = rendered[..at].to_string();
+            prompt.push_str(text);
+            prompt
+        }
+        None => {
+            let mut prompt = template
+                .render_with_tools(messages, true, bos, eos, reasoning, tools)
+                .map_err(bad_request)?;
+            if suppress {
+                append_empty_think_block(&mut prompt, &state.engine.tokenizer);
+            }
+            prompt
+        }
+    };
+    // Rendered a second time, without the generation prompt, for a model
+    // whose state cannot be rewound: the end of that rendering is where the
+    // next turn's prompt still agrees with this one — see
+    // `GenerateRequest::cache_point`.
+    let head = (state.engine.recurrent && options.continue_from.is_none() && vision.is_none())
+        .then(|| {
+            template
+                .render_with_tools(messages, false, bos, eos, reasoning, tools)
+                .ok()
+        })
+        .flatten()
+        .filter(|head| prompt.starts_with(head.as_str()) && head.len() < prompt.len());
+    if let Some(suffix) = options.suffix {
+        prompt.push_str(suffix);
+    }
+    let tokens = match vision {
+        Some(vision) => {
+            let pictures: Vec<String> = pictures.iter().map(|p| p.to_string()).collect();
+            let tokenizer = state.engine.tokenizer.clone();
+            tokio::task::spawn_blocking(move || {
+                encode_with_pictures(&tokenizer, &vision, &prompt, &pictures)
+            })
+            .await
+            .map_err(|err| bad_request(anyhow::anyhow!("reading the pictures: {err}")))?
+            .map_err(bad_request)?
+        }
+        None => crate::http::encode_off_runtime(&state.engine.tokenizer, prompt, false).await,
+    };
+    let cache_point = match head {
+        Some(head) => {
+            let head = crate::http::encode_off_runtime(&state.engine.tokenizer, head, false).await;
+            cache_point_of(&head, &tokens)
+        }
+        None => None,
+    };
+    Ok(RenderedChat {
+        tokens,
+        cache_point,
+    })
+}
+
+/// Opens and closes the sentinel standing for picture `k` in a prompt.
+const PICTURE_OPEN: &str = "\u{1}orangu-picture-";
+const PICTURE_CLOSE: char = '\u{1}';
+
+/// The sentinel standing for picture `k` until [`encode_with_pictures`]
+/// swaps it for the picture's tokens.
+pub(crate) fn picture_sentinel(k: usize) -> String {
+    format!("{PICTURE_OPEN}{k}{PICTURE_CLOSE}")
+}
+
+/// `messages` with a sentinel for each picture where it stood in its text,
+/// numbered in the conversation's order.
+fn picture_sentinels(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut k = 0;
+    messages
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            let mut content = String::with_capacity(m.content.len());
+            let mut from = 0;
+            for &at in &m.image_at {
+                let at = at.min(m.content.len());
+                content.push_str(&m.content[from..at]);
+                content.push_str(&picture_sentinel(k));
+                k += 1;
+                from = at;
+            }
+            content.push_str(&m.content[from..]);
+            m.content = content;
+            m
+        })
+        .collect()
+}
+
+/// The picture at `url`, fetched: at most [`super::images::MAX_IMAGE_BYTES`],
+/// through [`super::public_net`]'s guard, and refused when the server does
+/// not call it an image.
+fn fetch_picture(url: &str) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let parsed = reqwest::Url::parse(url)?;
+    super::public_net::check(&parsed).map_err(anyhow::Error::msg)?;
+    let response = super::public_net::guarded_blocking(reqwest::blocking::Client::builder())
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!("orangu-server/", env!("CARGO_PKG_VERSION")))
+        .build()?
+        .get(parsed)
+        .send()?
+        .error_for_status()?;
+    let kind = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        kind.starts_with("image/"),
+        "{url} is not a picture (Content-Type: {kind})"
+    );
+    let limit = super::images::MAX_IMAGE_BYTES;
+    let mut bytes = Vec::new();
+    response.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= limit,
+        "{url} is larger than the {} MB this server takes",
+        limit / (1024 * 1024)
+    );
+    Ok(bytes)
+}
+
+/// `prompt`'s tokens with each picture sentinel replaced by that picture's
+/// tokens — `pictures[k]` a data URL or an `http(s)` URL. The text between
+/// sentinels is encoded piece by piece.
+pub(crate) fn encode_with_pictures(
+    tokenizer: &crate::engine::tokenizer::Tokenizer,
+    vision: &crate::engine::vision::Vision,
+    prompt: &str,
+    pictures: &[String],
+) -> anyhow::Result<Vec<u32>> {
+    let mut tokens = Vec::new();
+    let mut rest = prompt;
+    while let Some(start) = rest.find(PICTURE_OPEN) {
+        tokens.extend(tokenizer.encode(&rest[..start], false));
+        let after = &rest[start + PICTURE_OPEN.len()..];
+        let end = after
+            .find(PICTURE_CLOSE)
+            .ok_or_else(|| anyhow::anyhow!("a picture's place in the prompt is malformed"))?;
+        let k: usize = after[..end]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("a picture's place in the prompt is malformed"))?;
+        let payload = pictures
+            .get(k)
+            .ok_or_else(|| anyhow::anyhow!("the prompt names a picture that was not sent"))?;
+        let bytes = if payload.starts_with("http://") || payload.starts_with("https://") {
+            fetch_picture(payload).map_err(|err| anyhow::anyhow!("picture {}: {err:#}", k + 1))?
+        } else {
+            super::images::decode_image_payload(payload)
+                .map_err(|err| anyhow::anyhow!("picture {}: {err}", k + 1))?
+                .1
+        };
+        tokens.extend(
+            vision
+                .tokens(&bytes)
+                .map_err(|err| anyhow::anyhow!("picture {}: {err:#}", k + 1))?,
+        );
+        rest = &after[end + PICTURE_CLOSE.len_utf8()..];
+    }
+    tokens.extend(tokenizer.encode(rest, false));
+    Ok(tokens)
+}
+
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -451,77 +833,23 @@ pub async fn chat_completions(
     if state.engine.video.is_some() {
         return video_chat(state, req).await;
     }
-    let Some(template) = state.engine.chat_template.clone() else {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "model has no tokenizer.chat_template; use /v1/completions instead",
-        )
-            .into_response();
-    };
     if let Some(rejection) = reject_unknown_slot(&state, req.id_slot) {
         return rejection;
     }
-    let (bos, eos) = (
-        state
-            .engine
-            .tokenizer
-            .bos_token
-            .and_then(|id| state.engine.tokenizer.token_text(id))
-            .unwrap_or(""),
-        state
-            .engine
-            .tokenizer
-            .eos_token
-            .and_then(|id| state.engine.tokenizer.token_text(id))
-            .unwrap_or(""),
-    );
-    // An empty `tools: []` is treated as no tools: a template gating on
-    // `{%- if tools -%}` would agree, and passing it through only invites a
-    // template to emit an empty declaration block.
-    let tools = req
-        .tools
-        .as_ref()
-        .filter(|t| !matches!(t.as_array(), Some(a) if a.is_empty()));
-    let mut prompt = match template.render_with_tools(
+    let RenderedChat {
+        tokens,
+        cache_point,
+    } = match render_chat(
+        &state,
+        role,
         &req.messages,
-        true,
-        bos,
-        eos,
-        state.engine.reasoning_as(role),
-        tools,
-    ) {
-        Ok(p) => p,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    append_reasoning_suppression(&mut prompt, role, &state.engine.tokenizer);
-    // Rendered a second time, without the generation prompt, for a model
-    // whose state cannot be rewound: the end of that rendering is where the
-    // next turn's prompt still agrees with this one — see
-    // `GenerateRequest::cache_point`.
-    let head = state
-        .engine
-        .recurrent
-        .then(|| {
-            template
-                .render_with_tools(
-                    &req.messages,
-                    false,
-                    bos,
-                    eos,
-                    state.engine.reasoning_as(role),
-                    tools,
-                )
-                .ok()
-        })
-        .flatten()
-        .filter(|head| prompt.starts_with(head.as_str()) && head.len() < prompt.len());
-    let tokens = crate::http::encode_off_runtime(&state.engine.tokenizer, prompt, false).await;
-    let cache_point = match head {
-        Some(head) => {
-            let head = crate::http::encode_off_runtime(&state.engine.tokenizer, head, false).await;
-            cache_point_of(&head, &tokens)
-        }
-        None => None,
+        req.tools.as_ref(),
+        RenderOptions::default(),
+    )
+    .await
+    {
+        Ok(rendered) => rendered,
+        Err(rejection) => return *rejection,
     };
 
     let sampling = sampling_for(
@@ -536,6 +864,10 @@ pub async fn chat_completions(
         },
     );
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    let json_schema = match response_schema(req.response_format.as_ref()) {
+        Ok(schema) => schema,
+        Err(rejection) => return *rejection,
+    };
     if let Some(rejection) = crate::http::reject_oversized_context(tokens.len()) {
         return rejection;
     }
@@ -551,12 +883,14 @@ pub async fn chat_completions(
             max_tokens,
             stop_token_ids,
             json_output: wants_json(req.response_format.as_ref()),
+            json_schema,
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: req.stream && req.timings_per_token,
             role: Some(role),
             cache_point,
             background: false,
+            reasoning_budget: None,
         })
         .await;
 
@@ -1017,13 +1351,13 @@ async fn video_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
 /// meaning "zero". A `temperature` of `0.0` is greedy and a `repeat_penalty`
 /// of `1.0` is off, so the difference between "unset" and "set to the
 /// neutral value" is real and cannot be collapsed.
-struct RequestSampling {
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    top_k: Option<usize>,
-    min_p: Option<f32>,
-    repeat_penalty: Option<f32>,
-    seed: Option<u64>,
+pub(crate) struct RequestSampling {
+    pub(crate) temperature: Option<f32>,
+    pub(crate) top_p: Option<f32>,
+    pub(crate) top_k: Option<usize>,
+    pub(crate) min_p: Option<f32>,
+    pub(crate) repeat_penalty: Option<f32>,
+    pub(crate) seed: Option<u64>,
 }
 
 /// The role's defaults with a request's overrides applied.
@@ -1033,7 +1367,7 @@ struct RequestSampling {
 /// `temperature` alone — and nothing about either endpoint made that
 /// deliberate. A field added to one and forgotten in the other is not a
 /// visible bug, because the ignored value simply has no effect.
-fn sampling_for(role: crate::config::Role, req: RequestSampling) -> SamplingParams {
+pub(crate) fn sampling_for(role: crate::config::Role, req: RequestSampling) -> SamplingParams {
     let mut sampling = SamplingParams::default_for_role(role);
     if let Some(v) = req.temperature {
         sampling.temperature = v;
@@ -1139,6 +1473,10 @@ pub async fn completions(
         },
     );
     let max_tokens = req.max_tokens.unwrap_or(256);
+    let json_schema = match response_schema(req.response_format.as_ref()) {
+        Ok(schema) => schema,
+        Err(rejection) => return *rejection,
+    };
     if let Some(rejection) = crate::http::reject_oversized_context(tokens.len()) {
         return rejection;
     }
@@ -1160,12 +1498,14 @@ pub async fn completions(
             max_tokens,
             stop_token_ids,
             json_output: wants_json(req.response_format.as_ref()),
+            json_schema,
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: false,
             role: Some(role),
             cache_point: None,
             background: false,
+            reasoning_budget: None,
         })
         .await;
 
@@ -1393,6 +1733,24 @@ pub(crate) async fn pooled_embedding(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pictures_are_held_in_place_by_numbered_sentinels() {
+        let mut first = ChatMessage::text("user", "");
+        first.push_image("data:image/png;base64,AAAA".into());
+        first.content.push_str("Compare");
+        let mut second = ChatMessage::text("user", "with");
+        second.push_image("data:image/png;base64,BBBB".into());
+        let marked = picture_sentinels(&[first, second]);
+        assert_eq!(
+            marked[0].content,
+            format!("{PICTURE_OPEN}0{PICTURE_CLOSE}Compare")
+        );
+        assert_eq!(
+            marked[1].content,
+            format!("with{PICTURE_OPEN}1{PICTURE_CLOSE}")
+        );
+    }
     use super::*;
     use std::time::Duration;
 

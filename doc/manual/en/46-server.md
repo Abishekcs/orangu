@@ -1611,7 +1611,8 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   row reports which it is on every start, `Yes` or `No`, on the line under
   the address it gates. Clients send it as
   `Authorization: Bearer <key>` — the orangu client already does, from its own
-  `api_key`, and so does every OpenAI-shaped client. **`ORANGU_API_KEY`
+  `api_key`, and so does every OpenAI-shaped client — or as `x-api-key: <key>`,
+  which is what Anthropic SDKs send. **`ORANGU_API_KEY`
   overrides the file**, which is the spelling a real deployment wants: a
   secret in a config file is a secret on disk and in every backup of it. Only
   `/health` and `/ready` stay reachable without the key: they say the process
@@ -1619,6 +1620,28 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   probe that fails before credentials are distributed. Everything else —
   `/v1/*`, `/metrics`, `/slots`, `/v1/shutdown` — answers `401` with
   `WWW-Authenticate: Bearer`.
+- `web_search` — the SearXNG instance (its base URL, with the JSON output
+  format enabled) the Anthropic-compatible `web_search` server tool
+  searches, or `off`, the default.
+- `code_execution` — how the Anthropic-compatible `code_execution` server
+  tool runs the code a model writes: `bwrap` runs each command in a
+  bubblewrap sandbox (no network, nothing of the host but `/usr` and a few
+  `/etc` files, read-only, and the container's own `/workspace`), and
+  `off`, the default, refuses a request that declares the tool. The same
+  sandbox runs a Managed Agents session's `bash` and `grep` tools, with the
+  server's network when the session's environment is `unrestricted`; with
+  `off`, a session of an agent that has them on is refused. `bwrap` has
+  to be installed and unprivileged user namespaces allowed. The code still
+  runs as the server's user, on the server's CPU and memory, so turn it on
+  only for clients trusted to run code there.
+- `api_data` — the directory the Anthropic-compatible Files, Message
+  Batches, Skills and Managed Agents APIs and code execution store their
+  data in: uploaded files under `files/`, batches under `batches/`, skills
+  under `skills/`, code execution containers under `containers/`, agents,
+  environments and sessions under `agents/`, `environments/` and
+  `sessions/`. Default `~/.orangu/api`.
+  What is stored there stays until it is deleted through the API — a
+  container until 30 days after its last use.
 - `queue_limit` — how many requests may **wait** for a slot before the server
   starts refusing (default `16`; `0` is unbounded). Beyond the limit a request is
   answered immediately with `503 Service Unavailable` and `Retry-After: 1`
@@ -1778,6 +1801,14 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   tools, ~1900 tokens) is cached before its first request. A request that
   arrives during the warm-up waits for it, never longer than its own cold
   prefill would have taken. `ORANGU_PREFIX_WARMUP` overrides it.
+- `fetch_private` — `off` (the default) or `on`: whether the URLs the server
+  fetches for a request — a picture or a document named by URL, a
+  `web_fetch` call — may reach loopback, private, link-local and other
+  reserved addresses. Off, a name is resolved and only its public addresses
+  are used, a literal address must be public, and each redirect is checked
+  the same way, so a client with the API key cannot reach this machine or
+  the network behind it through the server. MCP servers and the search
+  backend are configured addresses and are not checked.
 
 Every choice the server makes about the machine it is on — where prompts
 run, the core classes, the attention kernel, the prompt weights, the NPU
@@ -1866,6 +1897,7 @@ shown.
 | `tls_cert` / `tls_key`  | —                                          | PEM paths for serving HTTPS; both or neither                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `reasoning_effort`      | — (the template decides)                   | how hard a reasoning model is asked to think, in its own template's words; see **Roles** below                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `prefix_warmup`         | `yes`                                      | prefill the prompt prefixes requests reused again in the background after a restart; `ORANGU_PREFIX_WARMUP` overrides it                                                                                                                                                                                                                                                                                                                                                                             |
+| `fetch_private`         | `no`                                       | let the URLs a request makes the server fetch (pictures, documents, `web_fetch`) reach private and local addresses |
 | `draft_model`           | —                                          | a second, smaller model whose guesses the served model verifies                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `draft_tokens`          | `4`                                        | tokens the draft proposes per verification                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `backend`               | `auto`                                     | `auto`, `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, `npu`                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -1881,7 +1913,8 @@ shown.
 | `npu_cache_gb`          | a quarter of memory, 1–16                  | GiB of compiled NPU blocks one model may use; `0` stops compiling but still loads cached blocks                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`, LTX's Gemma 4 with its projection heads for `ltxv` (a GGUF, or the published `.safetensors`, converted once)                                                                                                                                                                                                                                                                                                      |
 | `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, Qwen-Image 2.1's own, or LTX's convolutional video VAE for `ltxv`                                                                                                                                                                                                                                                                                                                                                                                    |
-| `vision`                | found beside the text encoder              | the vision projector (`mmproj-*.gguf`) a `qwen_image_2_1` model edits attached pictures with; `none` draws over them instead                                                                                                                                                                                                                                                                                                                                                                         |
+| `vision`                | found beside the model or text encoder     | the vision projector (`mmproj-*.gguf`): a gemma-4 model reads chat pictures with it (see **Pictures in a chat**), a `qwen_image_2_1` model edits attached pictures with it; `none` reads no pictures, or draws over them |
+| `vision_tokens`         | `280`                                      | the most prompt tokens one chat picture becomes, `70` to `1120`; a larger picture is read at a smaller size |
 | `image_lora`            | `auto`                                     | the adapter applied to the picture transformer: `auto` the Lightning file under `models` (fetched with the model; a picture in 8 unguided steps), `none` the base model, or a `.safetensors` (or 4-step variant, rougher)                                                                                                                                                                                                                                                                            |
 | `image_lora_merge`      | `yes`                                      | fold the adapter into the weights at startup (a few minutes once, then no cost per pass); `no` applies it in `f32` every pass                                                                                                                                                                                                                                                                                                                                                                        |
 | `image_weights`         | `auto`                                     | how a `qwen_image_2_1` transformer's linears are held: `auto` per-row `int8` on the 8 × 8 `int8` tile (`i8mm`, `dotprod` or `AVX2`) when the transformer runs on the CPU and total memory is at least three times the 7 GB copy, `int8` whenever it runs on the CPU, `file` the file's K-quants (no copy); a transformer on a GPU keeps the file's; ~1.4–1.9× a step                                                                                                                                 |
@@ -2216,6 +2249,41 @@ Only a `gemma4` model exports the layer inputs. On any other architecture the
 draft is not attached and the startup log says why. A file with the DFlash2
 convolution and selector, or the DSpark Markov head, is refused, since those
 heads are not run. `ORANGU_NO_MTP=1` turns the draft off for a run.
+
+### Pictures in a chat
+
+A gemma-4 model reads pictures through its vision tower, the
+`mmproj-*.gguf` that `orangu-server download` fetches with it. At startup
+the server looks for one in the model's directory, the directory above it
+and the repository's other revisions, and takes the one whose projection is
+the model's width; `vision = <path>` (absolute, or under `models`) names
+one instead, and `vision = none` reads no pictures. It reports which:
+
+```
+orangu-server: vision …/mmproj-BF16.gguf (up to 280 tokens a picture)
+```
+
+A picture is read at its own proportions, each side a multiple of 48
+pixels, as 70 to `vision_tokens` (default `280`, at most `1120`) prompt
+tokens framed by the model's picture markers; a larger picture is read at a
+smaller size. More tokens show the model more detail, and cost a longer
+read through the tower and a longer prompt. The tower runs on the model's
+own backend, one picture at a time, and logs each picture it reads:
+
+```
+orangu-server: [vision] a picture read as 192 tokens in 5.87s
+```
+
+A picture is read once: the server keeps the rows of recent pictures
+(up to 512 MiB of them), and the same picture in the next turn is the same
+prompt tokens, which the prompt cache reuses like repeated text. On 12B,
+26B-A4B and 31B the sliding-window layers attend across a picture both
+ways, as the model was trained to; E2B and E4B read it in order, as they
+were. A prompt chunk never ends inside a picture.
+
+Where pictures come from — the HTTP endpoints, Managed Agents and the web
+console — is in the HTTP chapter's **Pictures** section. A picture sent to
+a model that reads none is refused with a `400`.
 
 ### The `[web]` section
 
@@ -3951,9 +4019,10 @@ picture comes back as an SVG document carrying it as PNG, there being no
 pixels-to-vector. An animated GIF or WebP is read as its first frame. The attachment itself shows as a thumbnail under
 your message.
 
-Attaching a picture to a _language_ model's chat does not send it to the
-model, which has no vision path; the model is told a picture was attached
-and not shown to it, so it does not guess at the contents.
+Attaching a picture to a _language_ model's chat sends it to the model when
+the model reads pictures (see **Pictures in a chat**); otherwise the model is
+told a picture was attached and not shown to it, so it does not guess at the
+contents.
 
 ### Through the API
 

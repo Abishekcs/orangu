@@ -103,6 +103,9 @@ pub struct GenerateRequest {
     /// they are, and it needs the tokenizer, which `SamplingParams` has no
     /// business knowing about.
     pub json_output: bool,
+    /// A JSON Schema the output is held to — a stricter `json_output`, which
+    /// it takes the place of when both are set.
+    pub json_schema: Option<Arc<crate::engine::json_schema::Schema>>,
     pub max_tokens: usize,
     pub stop_token_ids: Vec<u32>,
     /// Whether this request may reuse an already-computed KV cache for
@@ -158,6 +161,10 @@ pub struct GenerateRequest {
     /// left there: a slot keeps one conversation, and the one a client is in
     /// the middle of is worth more than a guess at an earlier one.
     pub background: bool,
+    /// The most tokens the model may reason for: once it has, the token
+    /// that closes its reasoning is the next one it writes. `None` leaves
+    /// the reasoning as long as the model makes it.
+    pub reasoning_budget: Option<usize>,
 }
 
 impl Default for GenerateRequest {
@@ -166,6 +173,7 @@ impl Default for GenerateRequest {
             prompt_tokens: Vec::new(),
             sampling: SamplingParams::default(),
             json_output: false,
+            json_schema: None,
             max_tokens: 0,
             stop_token_ids: Vec::new(),
             cache_prompt: true,
@@ -174,6 +182,7 @@ impl Default for GenerateRequest {
             role: None,
             cache_point: None,
             background: false,
+            reasoning_budget: None,
         }
     }
 }
@@ -355,6 +364,10 @@ pub struct Engine {
     /// are its text encoder (LTX's Gemma 4), and the generation endpoints
     /// answer with clips. `None` for every other architecture.
     pub video: Option<Arc<super::video::Pipeline>>,
+    /// The served model's vision tower, when one was found beside it: a
+    /// chat turn's pictures become prompt tokens through it. `None` for a
+    /// model that reads text alone.
+    pub vision: Option<Arc<super::vision::Vision>>,
     /// A `[workers]` top-level node's two ways of serving: through
     /// its tree, or alone on the model's own paths, switched by `POST
     /// /props`. [`Self::model`], [`Self::mtp`], [`Self::prefix_cache`] and
@@ -1281,7 +1294,13 @@ fn run(
     // cost (this is never actually `None` except mid-swap).
     let mut cache = Some(new_cache);
     let mut sampler = Sampler::new(req.sampling);
-    if req.json_output {
+    if let Some(schema) = req.json_schema.clone() {
+        sampler = sampler.with_constraint(crate::engine::sampling::Constraint::schema(
+            schema,
+            tokenizer.token_bytes_shared(),
+            req.stop_token_ids.clone(),
+        ));
+    } else if req.json_output {
         // The byte table is built on the tokenizer's first constrained
         // request and shared from then on, so an unconstrained deployment
         // never pays for it.
@@ -1520,6 +1539,7 @@ fn run(
     let mut spec_accepted = 0usize;
     let mut spec_steps = 0usize;
     let mut header = MessageHeader::for_prompt(tokenizer, &req.prompt_tokens, role);
+    let (mut reasoning_tokens, mut budget_spent) = (0usize, false);
     // One decoder for the whole stream, not one call per token: a character
     // wider than a byte is routinely several tokens, and decoding each of them
     // alone replaces both halves. See `tokenizer::StreamDecoder`.
@@ -1598,6 +1618,19 @@ fn run(
             } else {
                 StreamEvent::Token(text)
             });
+        }
+        // A reasoning budget spent: the next token closes the reasoning.
+        if let Some(budget) = req.reasoning_budget
+            && header.in_reasoning()
+        {
+            reasoning_tokens += 1;
+            if reasoning_tokens >= budget
+                && !budget_spent
+                && let Some(close) = header.reasoning_close()
+            {
+                sampler.force(close);
+                budget_spent = true;
+            }
         }
         // Whether anyone is still listening, asked **every token** rather than
         // only when there was text to send.
@@ -2147,6 +2180,9 @@ const MAX_HEADER_LEN: usize = 128;
 /// serves — those keep byte-for-byte the behavior they had. That is also
 /// what `Default` gives, which is how the tests build one framing at a
 /// time.
+/// The name of the channel gemma-4 reasons in.
+const REASONING_CHANNEL: &str = "thought";
+
 #[derive(Default)]
 struct MessageHeader {
     /// `(<|start|>, <|message|>)`, or `None` when this vocabulary has no
@@ -2236,6 +2272,15 @@ impl MessageHeader {
         self.reasoning_body
     }
 
+    /// The token that ends reasoning in this format: `</think>`, or
+    /// `<channel|>` for a channel-framed one. `None` for a format whose
+    /// reasoning ends some other way.
+    fn reasoning_close(&self) -> Option<u32> {
+        self.think
+            .map(|(_, close)| close)
+            .or(self.channel.map(|(_, close)| close))
+    }
+
     /// Whether generation resumes *inside* a `<think>` block.
     ///
     /// Read off the prompt for the same reason [`Self::
@@ -2289,19 +2334,25 @@ impl MessageHeader {
         // markers do, so it is settled here and returns rather than falling
         // through to them — a vocabulary has at most one of the three.
         if let Some((open, close)) = self.channel {
+            // A channel is hidden from a role that suppresses reasoning.
+            // Whether its body *is* reasoning — gemma-4's `thought` — is
+            // known once its name has been read (see `observe_text`).
             if id == open {
                 self.naming_channel = true;
                 self.channel_name.clear();
                 self.hidden_body = self.suppress_reasoning;
-                self.owed_separator |= !self.hidden_body && self.emitted_body;
                 return None;
             }
             if id == close {
                 // Whatever follows is the answer again: a new message, and
-                // one no marker will announce.
+                // one no marker will announce. Shown, reasoning leaves as
+                // events of its own and nothing joins it to the answer; any
+                // other body, or one hidden, would run into what follows.
+                self.owed_separator |=
+                    self.emitted_body && (self.suppress_reasoning || !self.reasoning_body);
                 self.naming_channel = false;
                 self.hidden_body = false;
-                self.owed_separator |= self.emitted_body;
+                self.reasoning_body = false;
                 return None;
             }
         }
@@ -2377,6 +2428,12 @@ impl MessageHeader {
             match text.find('\n') {
                 Some(at) => {
                     self.naming_channel = false;
+                    self.channel_name.push_str(&text[..at]);
+                    self.reasoning_body = self.channel_name.trim() == REASONING_CHANNEL;
+                    // Another body is a message beside the answer, kept
+                    // apart from it.
+                    self.owed_separator |=
+                        !self.reasoning_body && !self.hidden_body && self.emitted_body;
                     text = text.split_off(at + 1);
                 }
                 None => {
@@ -3154,6 +3211,7 @@ fn run_in_chunks(
         // when the cap applies.
         let uncapped = if width == 0 { usize::MAX } else { width };
         let n = uncapped.min(cap).min(tokens.len() - done);
+        let n = keep_pictures_whole(&tokens[done..], n, ring_bound.unwrap_or(usize::MAX));
         let started = Instant::now();
         let submits_before = crate::engine::decode_stages::submissions_so_far();
         let last = done + n >= tokens.len();
@@ -3210,6 +3268,29 @@ fn run_in_chunks(
         );
     }
     Ok(logits)
+}
+
+/// A chunk of `n` of `rest`'s tokens that does not end inside a picture's
+/// rows (`engine::vision`), whose rows may see each other both ways and so
+/// belong in one pass: cut before the picture, or — for a chunk that starts
+/// with it — run to its end, at most `limit` tokens.
+fn keep_pictures_whole(rest: &[u32], n: usize, limit: usize) -> usize {
+    use super::vision::is_virtual;
+    if n == 0 || n >= rest.len() || !is_virtual(rest[n - 1]) || !is_virtual(rest[n]) {
+        return n;
+    }
+    let start = rest[..n]
+        .iter()
+        .rposition(|&t| !is_virtual(t))
+        .map_or(0, |i| i + 1);
+    if start > 0 {
+        return start;
+    }
+    let end = rest
+        .iter()
+        .position(|&t| !is_virtual(t))
+        .unwrap_or(rest.len());
+    end.min(limit.max(n))
 }
 
 /// Whether a model with recurrent layers speculates: `ORANGU_SPEC_RECURRENT`
@@ -4537,7 +4618,14 @@ const NGRAM_LONGEST: usize = 64;
 /// copy just written. Empty when there's no match.
 fn ngram_draft(history: &[u32], shortest: usize, max_draft: usize) -> Vec<u32> {
     ngram_match(history, shortest)
-        .map(|(_, from)| history[from..(from + max_draft).min(history.len())].to_vec())
+        .map(|(_, from)| {
+            // A picture's rows are never a guess at the reply.
+            history[from..(from + max_draft).min(history.len())]
+                .iter()
+                .take_while(|&&t| !super::vision::is_virtual(t))
+                .copied()
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -4886,7 +4974,11 @@ mod message_header_tests {
                 }
                 Text(text) => {
                     if let Some(text) = header.observe_text((*text).to_string()) {
-                        out.push_str(&text);
+                        if header.in_reasoning() {
+                            out.push_str(&format!("[{text}]"));
+                        } else {
+                            out.push_str(&text);
+                        }
                     }
                 }
             }
@@ -5055,9 +5147,9 @@ mod message_header_tests {
         assert_eq!(shown_in_channels(true, &turn), "Here is the plan.");
     }
 
-    /// A channel body is a reasoning message, so it follows the same rule as
-    /// the other two formats' — shown separated from the answer, or dropped
-    /// entirely when the role suppresses reasoning.
+    /// A `thought` channel's body is reasoning, so it follows the same rule
+    /// as the other formats' — marked as reasoning (bracketed here) apart
+    /// from the answer, or dropped entirely when the role suppresses it.
     #[test]
     fn a_channel_body_follows_the_reasoning_rule() {
         let turn = [
@@ -5068,7 +5160,7 @@ mod message_header_tests {
         ];
         assert_eq!(
             shown_in_channels(false, &turn),
-            "Let me think.\n\n23, 29, 31."
+            "[Let me think.]23, 29, 31."
         );
         assert_eq!(shown_in_channels(true, &turn), "23, 29, 31.");
     }
@@ -5086,7 +5178,7 @@ mod message_header_tests {
             Marker(CHANNEL_CLOSE),
             Text("Done."),
         ];
-        assert_eq!(shown_in_channels(false, &turn), "Let me think.\n\nDone.");
+        assert_eq!(shown_in_channels(false, &turn), "[Let me][ think.]Done.");
     }
 
     /// A channel whose name never ends must not swallow the rest of the
@@ -5215,6 +5307,23 @@ mod message_header_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_chunk_never_ends_inside_a_picture() {
+        let v = super::super::vision::FIRST_ID;
+        // Text, a picture of four rows, text.
+        let tokens = [1, 2, v, v + 1, v + 2, v + 3, 3, 4];
+        // Ending inside the picture: cut before it.
+        assert_eq!(keep_pictures_whole(&tokens, 4, usize::MAX), 2);
+        // Ending right after it, or before it: unchanged.
+        assert_eq!(keep_pictures_whole(&tokens, 6, usize::MAX), 6);
+        assert_eq!(keep_pictures_whole(&tokens, 2, usize::MAX), 2);
+        // Starting with it: run to its end, within the limit.
+        assert_eq!(keep_pictures_whole(&tokens[2..], 2, usize::MAX), 4);
+        assert_eq!(keep_pictures_whole(&tokens[2..], 2, 3), 3);
+        // A virtual id is a picture row whatever its value.
+        assert!(!super::super::vision::is_virtual(v - 1));
+    }
     use super::*;
     use crate::engine::kv_cache::KvCache;
     use crate::engine::loader::{ModelConfig, PoolingType};
@@ -5551,6 +5660,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let req = GenerateRequest {
             json_output: false,
+            json_schema: None,
             prompt_tokens,
             sampling: greedy_params(),
             max_tokens,
@@ -5561,6 +5671,7 @@ mod tests {
             role: None,
             cache_point: None,
             background: false,
+            reasoning_budget: None,
         };
         let draft = DraftModel {
             model: draft,
@@ -5606,6 +5717,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let req = GenerateRequest {
             json_output: false,
+            json_schema: None,
             prompt_tokens,
             sampling: greedy_params(),
             max_tokens,
@@ -5616,6 +5728,7 @@ mod tests {
             role: None,
             cache_point: None,
             background: false,
+            reasoning_budget: None,
         };
         run(
             model,
@@ -5684,6 +5797,7 @@ mod tests {
         let prompt_pages = wait_for_prompt_pages(&paged.0, prompt_tokens.len(), None, || false);
         let req = GenerateRequest {
             json_output: false,
+            json_schema: None,
             prompt_tokens,
             sampling: greedy_params(),
             max_tokens,
@@ -5694,6 +5808,7 @@ mod tests {
             role: None,
             cache_point: None,
             background: false,
+            reasoning_budget: None,
         };
         run(
             model,
@@ -6017,6 +6132,7 @@ mod tests {
             max_tokens,
             cache_point,
             background: false,
+            reasoning_budget: None,
             ..Default::default()
         };
         run(
@@ -7727,12 +7843,14 @@ mod tests {
             live_stats: false,
             image: None,
             video: None,
+            vision: None,
             switch: None,
         };
 
         let mut rx = engine
             .generate(GenerateRequest {
                 json_output: false,
+                json_schema: None,
                 prompt_tokens: vec![1, 2, 3],
                 sampling: greedy_params(),
                 max_tokens: 4,
@@ -7743,6 +7861,7 @@ mod tests {
                 role: None,
                 cache_point: None,
                 background: false,
+                reasoning_budget: None,
             })
             .await;
 
@@ -8025,6 +8144,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let req = GenerateRequest {
             json_output: true,
+            json_schema: None,
             prompt_tokens,
             sampling,
             max_tokens: 60,

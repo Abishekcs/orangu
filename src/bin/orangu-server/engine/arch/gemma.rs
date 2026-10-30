@@ -1751,6 +1751,13 @@ gemma 4 checkpoint."
         // (0: one submission per layer's chain, the structure this replaced).
         let layers_per_submit = prefill_layers_per_submit();
         let mut group_layers = 0usize;
+        // A picture's rows, chunk-relative `[start, end)`, on a model whose
+        // sliding-window layers read a picture both ways.
+        let pictures = if one.is_some() && self.pictures_see_both_ways() {
+            picture_runs(tokens)
+        } else {
+            Vec::new()
+        };
 
         for (il, layer) in self
             .layers
@@ -1867,6 +1874,9 @@ gemma 4 checkpoint."
                 // — unless the cache it reads is on another card.
                 .as_wgpu_on(layer.wo.device())
                 .filter(|_| self.attention_on_own_device(il))
+                // The device kernels derive a causal window; a picture's
+                // two-way one is the host's.
+                .filter(|_| !(layer.is_swa && !pictures.is_empty()))
                 .filter(|vulkan| vulkan.prefill_fused_attention_enabled())
                 .and_then(|vulkan| {
                     let attn_input = crate::engine::backend::vulkan::FusedAttnPrefillInput {
@@ -2147,27 +2157,46 @@ gemma 4 checkpoint."
                 // cost in the pass, so it is worth exactly one implementation of
                 // *and* one decision about.
                 let is_swa = layer.is_swa;
-                let ran = crate::engine::attention::attention(
-                    &mut attn_out,
-                    &q,
-                    &mut cache.layers[cache_index],
-                    &crate::engine::attention::Params {
-                        backend: backend.as_ref(),
-                        // The cache's card, which is this layer's own unless
-                        // it shares a donor placed elsewhere — see
-                        // `attention::Params::device` and `Self::kv_device`.
-                        device: self.kv_device(il),
-                        n_head: self.n_head,
-                        n_head_kv: layer.n_head_kv,
-                        head_dim,
-                        scale: self.attention_scale,
-                        causal: self.causal,
-                        n_swa: if is_swa { self.n_swa } else { 0 },
-                        start_pos,
-                        n_tokens,
-                    },
-                    |t| self.attention_window(is_swa, start_pos + t, n_tokens),
-                );
+                let params = crate::engine::attention::Params {
+                    backend: backend.as_ref(),
+                    // The cache's card, which is this layer's own unless
+                    // it shares a donor placed elsewhere — see
+                    // `attention::Params::device` and `Self::kv_device`.
+                    device: self.kv_device(il),
+                    n_head: self.n_head,
+                    n_head_kv: layer.n_head_kv,
+                    head_dim,
+                    scale: self.attention_scale,
+                    causal: self.causal,
+                    n_swa: if is_swa { self.n_swa } else { 0 },
+                    start_pos,
+                    n_tokens,
+                };
+                let window = |t: usize| self.attention_window(is_swa, start_pos + t, n_tokens);
+                let ran = if is_swa && !pictures.is_empty() {
+                    // A picture's row sees every row of its picture.
+                    crate::engine::attention::attention_widened(
+                        &mut attn_out,
+                        &q,
+                        &mut cache.layers[cache_index],
+                        &params,
+                        |t| {
+                            let (from, to) = window(t);
+                            match pictures.iter().find(|&&(a, b)| (a..b).contains(&t)) {
+                                Some(&(_, end)) => (from, to.max(start_pos + end - 1)),
+                                None => (from, to),
+                            }
+                        },
+                    )
+                } else {
+                    crate::engine::attention::attention(
+                        &mut attn_out,
+                        &q,
+                        &mut cache.layers[cache_index],
+                        &params,
+                        window,
+                    )
+                };
                 if prefill_trace {
                     let where_ = match ran {
                         crate::engine::attention::Ran::OnGpu => "gpu_attention",
@@ -2774,15 +2803,7 @@ gemma 4 checkpoint."
         let n_embd = self.config.n_embd;
         let n_vocab = self.config.n_vocab;
         let eps = self.rms_eps();
-        let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(tok < n_vocab, "token id {tok} is out of vocab range");
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
-        }
-        for v in x.iter_mut() {
-            *v *= (n_embd as f32).sqrt();
-        }
+        let x = self.scaled_token_embeddings(tokens)?;
         let vulkan = self
             .backend
             .as_wgpu()
@@ -2869,6 +2890,13 @@ gemma 4 checkpoint."
     /// SYMMETRIC` case: masked when `|p1 - p0| > n_swa/2`, i.e. a window of
     /// radius `n_swa/2` centered on the query position, not `n_swa`
     /// trailing positions the way causal SWA works.
+    /// Whether a prompt's picture is read both ways on the sliding-window
+    /// layers — every gemma-4 but the two with per-layer embeddings, which
+    /// read it causally.
+    fn pictures_see_both_ways(&self) -> bool {
+        self.causal && self.n_swa > 0 && self.n_embd_per_layer == 0
+    }
+
     fn attention_window(&self, is_swa: bool, pos: usize, n_tokens: usize) -> (usize, usize) {
         if !self.causal {
             return if is_swa && self.n_swa > 0 {
@@ -2884,6 +2912,25 @@ gemma 4 checkpoint."
             (0, pos)
         }
     }
+}
+
+/// The runs of a picture's rows (virtual ids, see `engine::vision`) in
+/// `tokens`, as `[start, end)`.
+fn picture_runs(tokens: &[u32]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut t = 0;
+    while t < tokens.len() {
+        if crate::engine::vision::is_virtual(tokens[t]) {
+            let start = t;
+            while t < tokens.len() && crate::engine::vision::is_virtual(tokens[t]) {
+                t += 1;
+            }
+            runs.push((start, t));
+        } else {
+            t += 1;
+        }
+    }
+    runs
 }
 
 /// Reads `len` f32s back from a device-local wgpu buffer (the replay logits) —
@@ -3198,15 +3245,7 @@ impl GemmaModel {
         // GPU-fused decode branch): the keys/values it appends stay CPU-side,
         // so a caller can read them back or roll them off with
         // `KvCache::truncate`, and one weight stream covers every position.
-        let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(tok < n_vocab, "token id {tok} is out of vocab range");
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
-        }
-        for v in x.iter_mut() {
-            *v *= (n_embd as f32).sqrt();
-        }
+        let x = self.scaled_token_embeddings(tokens)?;
 
         // One projection of every position through the output norm + vocab
         // matrix, batched — the weight-heavy `lm_head` read is amortized across
@@ -3961,18 +4000,7 @@ impl ModelForward for GemmaModel {
         // does at its own top; recomputed independently here rather than
         // threaded through, matching `engine::arch::llama::LlamaModel::
         // run_layers`'s own independent-embedding-lookup style.
-        let mut x0 = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(
-                tok < self.config.n_vocab,
-                "token id {tok} is out of vocab range"
-            );
-            x0[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
-        }
-        for v in x0.iter_mut() {
-            *v *= (n_embd as f32).sqrt();
-        }
+        let x0 = self.scaled_token_embeddings(tokens)?;
 
         // A one-shot, whole-prompt pass — no KV cache reuse across calls,
         // same convention `LlamaModel::forward_hidden_states` uses.
@@ -4019,19 +4047,20 @@ impl GemmaModel {
         use rayon::prelude::*;
         let n_embd = self.config.n_embd;
         let n_vocab = self.config.n_vocab;
-        if let Some(&tok) = tokens.iter().find(|&&t| t as usize >= n_vocab) {
-            anyhow::bail!("token id {tok} is out of vocab range");
-        }
         let scale = (n_embd as f32).sqrt();
         let mut x = vec![0f32; tokens.len() * n_embd];
+        // A picture's rows (virtual ids past the vocabulary, see
+        // `engine::vision`) go in as the projector wrote them, unscaled.
         x.par_chunks_mut(n_embd)
             .zip(tokens.par_iter())
-            .for_each(|(dst, &tok)| {
-                let row = self.tok_embeddings.row(tok as usize);
-                for (d, r) in dst.iter_mut().zip(row.iter()) {
-                    *d = r * scale;
-                }
-            });
+            .try_for_each(|(dst, &tok)| {
+                crate::engine::vision::embed_row(tok, n_vocab, dst, |dst| {
+                    let row = self.tok_embeddings.row(tok as usize);
+                    for (d, r) in dst.iter_mut().zip(row.iter()) {
+                        *d = r * scale;
+                    }
+                })
+            })?;
         Ok(x)
     }
 
@@ -4051,6 +4080,12 @@ impl GemmaModel {
             .par_chunks_mut(row_width)
             .zip(tokens.par_iter())
             .for_each(|(dst, &tok)| {
+                // A picture's rows take the padding token's (id 0).
+                let tok = if tok as usize >= self.config.n_vocab {
+                    0
+                } else {
+                    tok
+                };
                 let row = per_layer_tok_embd.row(tok as usize);
                 for (d, r) in dst.iter_mut().zip(row.iter()) {
                     *d = r * tok_embd_scale;

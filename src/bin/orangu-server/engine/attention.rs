@@ -393,6 +393,41 @@ fn attention_timed(
         return Ran::OnGpu;
     }
 
+    attention_on_host(out, q, cache, params, window)
+}
+
+/// [`attention`] where `window(t)` departs from `causal`/`n_swa` — a
+/// prompt's picture, whose rows see each other both ways — which only the
+/// CPU loop reads. A cache with rows only its device holds cannot take the
+/// CPU loop, and gets the window the device derives instead.
+pub fn attention_widened(
+    out: &mut Vec<f32>,
+    q: &[f32],
+    cache: &mut LayerCache,
+    params: &Params<'_>,
+    window: impl Fn(usize) -> (usize, usize) + Sync,
+) -> Ran {
+    if cache.has_device_only_rows() {
+        return attention(out, q, cache, params, |t| derived_window(params, t));
+    }
+    attention_on_host(out, q, cache, params, window)
+}
+
+/// The CPU half of [`attention`].
+fn attention_on_host(
+    out: &mut Vec<f32>,
+    q: &[f32],
+    cache: &mut LayerCache,
+    params: &Params<'_>,
+    window: impl Fn(usize) -> (usize, usize) + Sync,
+) -> Ran {
+    let Params {
+        n_head,
+        n_head_kv,
+        head_dim,
+        n_tokens,
+        ..
+    } = *params;
     // Deliberately no `clear` — see `multi_head_attention`'s contract: it
     // fills every row it is given, empty windows included, so pre-zeroing
     // here is a second full pass over a buffer the kernel is about to write.

@@ -37,7 +37,7 @@ MCP support currently exposes tools only. Resources and prompts are not exposed;
 | `create_directory` | Create one directory | `path`, optional `mode`, `parents` |
 | `move_directory` | Move a directory and everything under it | `from`, `to`, optional `mode`, `parents` |
 | `delete_directory` | Delete an empty directory | `path` |
-| `list_directory` | List files and directories below the workspace | optional `path`, optional `max_depth` |
+| `list_directory` | List files and directories below the workspace, or the files a glob matches | optional `path`, optional `max_depth`, optional `pattern` |
 | `fetch_url` | Fetch an external URL and return readable text | `url`, optional `max_chars` |
 | `run_shell_command` | Run a shell command inside the workspace | `command`, optional `cwd`, optional `timeout_seconds` |
 | `expand_context` | Retrieve previously compressed/truncated output using its hash ID | `id` |
@@ -163,6 +163,7 @@ Behavior:
 - `end_line` defaults to the end of the file
 - `mode` defaults to `full`. Valid modes are `full` (read actual content), `signatures` (extract only public interfaces), or `map` (extract top-level item declarations for an overview).
 - Each returned line is prefixed as `N. text` (only applies to `full` mode)
+- A picture (PNG, JPEG, GIF or WebP, known by its first bytes, whatever its name) is not shown as text: the tool says it is a picture, with its media type and size. A client that can hand a model the picture itself — the Managed Agents `read` tool on a model with a vision tower — reads its bytes instead
 - Repeated unchanged whole-file reads in the same conversation may return a cache stub instead of resending the entire file
 - The cache stub means the model should reuse the earlier full content already in context; use `start_line` and `end_line` to request a fresh focused excerpt when needed
 
@@ -180,7 +181,7 @@ Behavior:
 
 Optional flags:
 
-- `replace_all` replaces every match instead of only the first one
+- `replace_all` replaces every match; without it `old_text` must occur exactly once
 
 Important details:
 
@@ -188,7 +189,8 @@ Important details:
 - If the file does not exist, it is created (mode `0644`) with `new_text` as its contents
 - If `old_text` is empty, the file content is replaced with `new_text`
 - If `old_text` is not found in an existing file, the tool returns an error
-- Successful edits return JSON with `path`, `created`, `updated`, `original_bytes`, `new_bytes`, `mode`, and `git`
+- If `old_text` occurs more than once and `replace_all` is not set, the tool returns an error saying how many times: the model includes more of the surrounding text, or sets `replace_all`
+- Successful edits return JSON with `path`, `created`, `updated`, `replacements` (how many matches were replaced; `0` for a created or wholly replaced file), `original_bytes`, `new_bytes`, `mode`, and `git`
 - Instead of `old_text`/`new_text`, `edits` may be given — an array of `{start_line, end_line, replacement}` line ranges, exactly as `orangu-server`'s `/v1/modify_file` takes them. `edits` wins if both are supplied
 - In a Git repository the change is staged with `git add`; pass `"git": false` to leave the index alone
 
@@ -210,6 +212,21 @@ Behavior:
 - Each result line is formatted as `kind<TAB>path`
 - `kind` is either `dir` or `file`
 - Paths are shown relative to the workspace when possible
+
+With `pattern`, a glob over the paths below `path`, it lists the matching
+files instead — one workspace-relative path per line, newest first:
+
+```json
+{
+  "path": "src",
+  "pattern": "**/*.rs"
+}
+```
+
+- `*` and `?` stay within one directory; `**` crosses any number of them
+- `.git` is never entered, and directories are not listed
+- At most 1000 paths, followed by a `(N more not shown)` line when there are more
+- `No files match.` when nothing does
 
 ## `fetch_url`
 
