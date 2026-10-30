@@ -5373,7 +5373,7 @@ mod tests {
         /// overlap.
         pause: Duration,
         /// No forward past position 0 runs until this many forwards at
-        /// position 0 have: requests started together all hold their
+        /// position 0 have finished: requests started together all hold their
         /// prompts before any of them decodes, however the threads are
         /// scheduled.
         meet: usize,
@@ -5492,9 +5492,7 @@ mod tests {
             self.forwarded_tokens
                 .fetch_add(tokens.len(), Ordering::Relaxed);
             self.forward_calls.fetch_add(1, Ordering::Relaxed);
-            if start_pos == 0 {
-                self.started.fetch_add(1, Ordering::AcqRel);
-            } else {
+            if start_pos > 0 {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while self.started.load(Ordering::Acquire) < self.meet && Instant::now() < deadline
                 {
@@ -5504,6 +5502,12 @@ mod tests {
             std::thread::sleep(self.pause);
             for (i, &t) in tokens.iter().enumerate() {
                 self.absorb(cache, t, start_pos + i);
+            }
+            // Counted once the prompt is held, not when its forward begins:
+            // a thread descheduled mid-prefill would otherwise let the
+            // others decode past it.
+            if start_pos == 0 {
+                self.started.fetch_add(1, Ordering::AcqRel);
             }
             let winner = self.winner(cache);
             Ok(self.logits_for(winner))
