@@ -1011,12 +1011,12 @@ impl ToolExecutor {
                 } else {
                     "file"
                 };
-                let display_path = entry
-                    .path()
-                    .strip_prefix(&self.workspace)
-                    .unwrap_or(entry.path())
-                    .display()
-                    .to_string();
+                let display_path = crate::files::to_slash(
+                    entry
+                        .path()
+                        .strip_prefix(&self.workspace)
+                        .unwrap_or(entry.path()),
+                );
                 format!("{kind}\t{display_path}")
             })
             .collect::<Vec<_>>()
@@ -1242,12 +1242,7 @@ fn matching_files(workspace: &Path, root: &Path, pattern: &str) -> Result<String
             .ok()
             .and_then(|m| m.modified().ok())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let shown = entry
-            .path()
-            .strip_prefix(workspace)
-            .unwrap_or(under)
-            .display()
-            .to_string();
+        let shown = crate::files::to_slash(entry.path().strip_prefix(workspace).unwrap_or(under));
         found.push((modified, shown));
     }
     if found.is_empty() {
