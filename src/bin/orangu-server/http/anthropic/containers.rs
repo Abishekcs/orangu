@@ -49,9 +49,11 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const OUTPUT_LIMIT: usize = 100_000;
 
 /// A command's address-space limit, as Anthropic's container's memory.
+#[cfg(unix)]
 const MEMORY_LIMIT: u64 = 5 << 30;
 
 /// The largest file a command may write.
+#[cfg(unix)]
 const FILE_SIZE_LIMIT: u64 = 1 << 30;
 
 /// How many files one command's outputs report, and the largest reported.
@@ -432,6 +434,7 @@ impl Container {
         cmd.args(program);
         // SAFETY: only async-signal-safe calls (setrlimit) run between fork
         // and exec.
+        #[cfg(unix)]
         unsafe {
             cmd.pre_exec(|| {
                 let limit = |resource, value: u64| {
@@ -497,12 +500,13 @@ impl Container {
         let stderr = tokio::spawn(read_capped(child.stderr.take()));
         let (code, timed_out) = match tokio::time::timeout(RUN_TIMEOUT, child.wait()).await {
             Ok(Ok(status)) => {
-                use std::os::unix::process::ExitStatusExt as _;
-                let code = status
-                    .code()
-                    .or_else(|| status.signal().map(|s| 128 + s))
-                    .unwrap_or(-1);
-                (code, false)
+                let code = status.code();
+                #[cfg(unix)]
+                let code = {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    code.or_else(|| status.signal().map(|s| 128 + s))
+                };
+                (code.unwrap_or(-1), false)
             }
             Ok(Err(err)) => return Err(format!("waiting for the sandbox: {err}")),
             Err(_) => {
@@ -938,13 +942,16 @@ mod tests {
         }
         // A link a command left behind is followed no further than the
         // workspace.
-        std::os::unix::fs::symlink("/etc", c.workspace().join("out")).unwrap();
-        let err = c
-            .edit(&input(json!({"command": "view", "path": "out/passwd"})))
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(err.code, "invalid_tool_input");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc", c.workspace().join("out")).unwrap();
+            let err = c
+                .edit(&input(json!({"command": "view", "path": "out/passwd"})))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(err.code, "invalid_tool_input");
+        }
     }
 
     #[tokio::test]

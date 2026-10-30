@@ -818,6 +818,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_link_out_of_the_workspace_is_not_followed() {
         let dir = tempfile::tempdir().unwrap();

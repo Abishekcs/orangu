@@ -82,19 +82,20 @@ fn write_secret(
     secret: &Map<String, Value>,
 ) -> Result<(), Box<Response>> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let path = secret_path(state, vault, credential);
     let write = || -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("tmp");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
         file.write_all(&serde_json::to_vec(secret).unwrap_or_default())?;
         std::fs::rename(tmp, &path)
     };

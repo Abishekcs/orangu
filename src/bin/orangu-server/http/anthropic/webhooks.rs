@@ -136,19 +136,20 @@ fn new_secret() -> String {
 /// Writes an endpoint's secret where only this user can read it.
 fn write_secret(state: &AppState, id: &str, secret: &str) -> Result<(), Box<Response>> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let path = secret_path(state, id);
     let write = || -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("tmp");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
         file.write_all(secret.as_bytes())?;
         std::fs::rename(tmp, &path)
     };
